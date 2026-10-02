@@ -11,10 +11,11 @@
     "build:client": "vite build",
     "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --packages=external --target=node20 --outfile=dist/server/index.js",
     "start": "node dist/server/index.js",
-    "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.server.json --noEmit"
+    "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.server.json --noEmit",
+    "deploy": "scripts/deploy.sh"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
+    "better-sqlite3": "^12.11.1",
     "ws": "^8.22.0"
   },
   "devDependencies": {
@@ -28,5 +29,8 @@
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "vite": "^8.3.2"
+  },
+  "engines": {
+    "node": ">=20.19"
   }
 }

@@ -33,10 +33,13 @@ npm start
 
 ## Deploy (draw.bsums.xyz)
 
-1. Copy the project to the server, then run `npm ci && npm run build`.
-2. Run `pm2 start ecosystem.config.cjs`, then `pm2 save`.
-3. Install `deploy/draw.bsums.xyz.conf` in nginx, then run `nginx -t && systemctl reload nginx`.
-4. Add TLS with `certbot --nginx -d draw.bsums.xyz`, or reuse the certificate of the other subdomains.
+`npm run deploy` builds locally, copies `dist/` and the package files to `~/draw` on `potato-vps1.bsums.xyz`, installs the runtime dependencies there, and reloads the pm2 app `draw`. The database in `~/draw/data` stays in place.
+
+The nginx site is `deploy/draw.bsums.xyz.conf`. It uses the `*.bsums.xyz` wildcard certificate. Install it one time:
+
+1. Copy it to `/etc/nginx/sites-available/draw.bsums.xyz`.
+2. Link it into `/etc/nginx/sites-enabled/`.
+3. Run `sudo nginx -t`, then `sudo systemctl reload nginx`.
 
 ## Layout
 
