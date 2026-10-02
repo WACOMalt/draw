@@ -1,0 +1,115 @@
+:root {
+  --bg-0: #1d1d1d; /* canvas surround */
+  --bg-1: #262626; /* bars */
+  --bg-2: #2f2f2f; /* panels */
+  --bg-3: #3a3a3a; /* inputs, hover */
+  --bg-4: #474747;
+  --border: #161616;
+  --line: #3d3d3d;
+  --text: #d6d6d6;
+  --text-dim: #9a9a9a;
+  --text-faint: #6c6c6c;
+  --accent: #31a8ff;
+  --accent-dim: #1f6fb0;
+  --danger: #ff6b6b;
+  --radius: 4px;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--text);
+  font: 12px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: var(--bg-4);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+button.primary {
+  background: var(--accent-dim);
+  border-color: #174e7c;
+}
+button.primary:hover {
+  background: var(--accent);
+  color: #0b1d2c;
+}
+button.icon {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+}
+button.icon:hover:not(:disabled) {
+  background: var(--bg-3);
+}
+button.icon.on {
+  background: var(--bg-4);
+  border-color: var(--border);
+}
+
+input[type='text'],
+input[type='number'],
+select {
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 6px;
+  outline: none;
+}
+input[type='text']:focus,
+input[type='number']:focus,
+select:focus {
+  border-color: var(--accent);
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+input[type='number']::-webkit-inner-spin-button {
+  display: none;
+}
+
+svg.i {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
