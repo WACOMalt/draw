@@ -4,6 +4,9 @@ module.exports = {
     {
       name: 'draw',
       script: 'dist/server/index.js',
+      // Node binary for this app only. It must match the Node that built better-sqlite3.
+      // On potato-vps1 the deploy script sets DRAW_NODE=/usr/local/bin/node (Node 24).
+      interpreter: process.env.DRAW_NODE || 'node',
       cwd: __dirname,
       env: {
         NODE_ENV: 'production',
