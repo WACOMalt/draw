@@ -47,7 +47,8 @@ else
   read -rp "SMTP host [mail.hover.com]: " SMTP_HOST; SMTP_HOST="${SMTP_HOST:-mail.hover.com}"
   read -rp "SMTP port [465]: " SMTP_PORT; SMTP_PORT="${SMTP_PORT:-465}"
   read -rp "SMTP user (a dedicated mailbox is best, e.g. noreply@bsums.xyz): " SMTP_USER
-  read -rp "From [Draw <$SMTP_USER>]: " SMTP_FROM; SMTP_FROM="${SMTP_FROM:-Draw <$SMTP_USER>}"
+  # Hosted mail rejects a From address other than the login mailbox, so ask only for the name.
+  read -rp "Sender name shown in emails [Draw]: " SMTP_FROM; SMTP_FROM="${SMTP_FROM:-Draw}"
   read -rsp "SMTP password (not shown; empty = set up mail later): " SMTP_PASS; echo
   # The password goes through a pipe only: never into a file, an argument list or the history.
   # printf is a shell builtin, so it does not show in the process list either.
@@ -126,15 +127,27 @@ rm -f "$TMP_SUDOERS"
 sudo systemctl daemon-reload
 
 step "Stop the pm2 app and move the database"
+PM2_WAS_LIVE=0
 if command -v pm2 >/dev/null && pm2 describe draw >/dev/null 2>&1; then
   pm2 delete draw >/dev/null && pm2 save >/dev/null
+  PM2_WAS_LIVE=1
   echo "pm2 app 'draw' removed (its files stay in $OLD)"
 fi
-if [ -f "$OLD/data/canvas.db" ] && ! sudo test -f "$DATA/canvas.db"; then
+sudo systemctl stop draw.service 2>/dev/null || true
+# Copy pm2's database when it was the live one: on a first run, and also on a re-run after a
+# rollback (pm2 has the newest drawings then). The replaced copy is kept as a backup.
+if [ -f "$OLD/data/canvas.db" ] && { [ "$PM2_WAS_LIVE" = 1 ] || ! sudo test -f "$DATA/canvas.db"; }; then
+  if sudo test -f "$DATA/canvas.db"; then
+    BACKUP="$DATA/canvas.db.before-$(date +%Y%m%d-%H%M%S)"
+    sudo mv "$DATA/canvas.db" "$BACKUP"
+    echo "kept the previous copy as $BACKUP"
+  fi
+  # A stale journal next to a different database would corrupt it: remove it first.
+  sudo rm -f "$DATA/canvas.db-wal" "$DATA/canvas.db-shm"
   for f in "$OLD"/data/canvas.db "$OLD"/data/canvas.db-wal "$OLD"/data/canvas.db-shm; do
     [ -f "$f" ] && sudo install -o draw -g draw -m 600 "$f" "$DATA/"
   done
-  echo "copied the database to $DATA"
+  echo "copied the database from $OLD/data to $DATA"
 fi
 
 step "Install the latest release and start"
@@ -148,6 +161,6 @@ cat <<EOF
 Update later:   bash $APP/update-server.sh
 Status:         sudo systemctl --no-pager status draw.service
 Logs:           sudo journalctl --no-pager -u draw.service -n 200
-Change SMTP:    REDO_SMTP=1 bash setup-systemd.sh
+Change SMTP:    REDO_SMTP=1 bash setup-systemd.sh   (asks for the SMTP details again)
 Rollback:       sudo systemctl disable --now draw.service && pm2 start $OLD/ecosystem.config.cjs && pm2 save
 EOF

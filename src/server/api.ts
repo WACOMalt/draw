@@ -97,9 +97,22 @@ async function sendVerify(ctx: ApiContext, user: UserRow): Promise<void> {
   const { token, hash } = newToken();
   ctx.store.createEmailToken(hash, user.id, 'verify', VERIFY_TTL);
   const url = `${ctx.publicUrl}/api/auth/verify?token=${token}`;
-  await ctx.mailer.send(
+  await deliver(
+    ctx,
     actionMail(user.email, 'Confirm your Draw account', `Hi ${user.name}, confirm your email to finish creating your Draw account.`, 'Confirm email', url, 'The link works for 48 hours. If you did not sign up, ignore this email.'),
   );
+}
+
+class MailFailed extends Error {}
+
+/** Sends, and turns an SMTP failure into a clear API error (logged with the server's reason). */
+async function deliver(ctx: ApiContext, mail: Parameters<Mailer['send']>[0]): Promise<void> {
+  try {
+    await ctx.mailer.send(mail);
+  } catch (e) {
+    console.error(`mail to ${mail.to} failed:`, (e as Error).message);
+    throw new MailFailed();
+  }
 }
 
 // --- auth handlers -------------------------------------------------------------------------------
@@ -123,7 +136,8 @@ const register: Handler = async (ctx, req) => {
   if (existing?.email_verified_at) {
     // Do not reveal that the account exists. Tell its owner instead.
     if (limits.mail.allow(email)) {
-      await ctx.mailer.send(
+      await deliver(
+        ctx,
         actionMail(email, 'Your Draw account', 'Someone tried to create a Draw account with this email, but you already have one.', 'Reset password', `${ctx.publicUrl}/?forgot=1`, 'If this was you and you forgot your password, use the button. Otherwise ignore this email.'),
       );
     }
@@ -188,7 +202,8 @@ const forgot: Handler = async (ctx, req) => {
   if (user && limits.mail.allow(user.email)) {
     const { token, hash } = newToken();
     ctx.store.createEmailToken(hash, user.id, 'reset', RESET_TTL);
-    await ctx.mailer.send(
+    await deliver(
+      ctx,
       actionMail(user.email, 'Reset your Draw password', 'Use the button to choose a new password for your Draw account.', 'Choose a new password', `${ctx.publicUrl}/?reset=${token}`, 'The link works for 2 hours and only once. If you did not ask for this, ignore this email.'),
     );
   }
@@ -496,6 +511,10 @@ export async function handleApi(ctx: ApiContext, raw: http.IncomingMessage, res:
   try {
     send(await route[2](ctx, req));
   } catch (e) {
+    if (e instanceof MailFailed) {
+      send(err(502, 'mail_failed'));
+      return true;
+    }
     console.error(`api ${method} ${url.pathname}`, e);
     if (!res.headersSent) send(err(500, 'internal'));
   }

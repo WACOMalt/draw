@@ -87,6 +87,8 @@ export function errorText(code: string | undefined): string {
       return 'That account already owns this canvas.';
     case 'login_required':
       return 'Log in first.';
+    case 'mail_failed':
+      return 'We could not send the email. Try again in a few minutes.';
     case 'mail_unavailable':
       return 'Email is not set up on this server yet, so accounts cannot be confirmed. Try again later.';
     case 'network':

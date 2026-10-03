@@ -16,7 +16,22 @@ interface SmtpConfig {
   secure: boolean; // true: implicit TLS (465). false: STARTTLS (587)
   user: string;
   pass: string;
-  from: string; // e.g. "Draw <noreply@bsums.xyz>"
+  /** Display name, or "Name <address>". The address used is always `user` (see senderFor). */
+  from?: string;
+}
+
+/**
+ * The From header for a mailbox. Hosted mail (Hover and most others) rejects a message whose
+ * From address is not the mailbox that logged in ("550 5.7.1 Message Rejected"), so only the
+ * display name comes from the setting.
+ */
+export function senderFor(user: string, from: string | undefined): string {
+  let name = (from ?? '').trim();
+  const lt = name.indexOf('<');
+  if (lt >= 0) name = name.slice(0, lt).trim();
+  else if (name.includes('@')) name = '';
+  name = name.replace(/^"|"$/g, '').replace(/["\\\r\n]/g, '').trim() || 'Draw';
+  return `"${name}" <${user}>`;
 }
 
 export interface Mail {
@@ -29,6 +44,7 @@ export interface Mail {
 export class Mailer {
   private transport: Transporter | null = null;
   private from = 'Draw <noreply@localhost>';
+  private envelopeFrom = '';
   readonly mode: 'smtp' | 'dev';
 
   constructor() {
@@ -50,7 +66,8 @@ export class Mailer {
         auth: { user: cfg.user, pass: cfg.pass },
         requireTLS: !cfg.secure, // never send the password in clear text
       });
-      this.from = cfg.from ?? `Draw <${cfg.user}>`;
+      this.from = senderFor(cfg.user, cfg.from);
+      this.envelopeFrom = cfg.user;
       this.mode = 'smtp';
     } else {
       this.mode = 'dev';
@@ -62,7 +79,7 @@ export class Mailer {
 
   async send(mail: Mail): Promise<void> {
     if (this.transport) {
-      await this.transport.sendMail({ from: this.from, ...mail });
+      await this.transport.sendMail({ from: this.from, envelope: { from: this.envelopeFrom, to: mail.to }, ...mail });
       return;
     }
     console.log(`\n--- mail to ${mail.to}: ${mail.subject}\n${mail.text}\n---`);
