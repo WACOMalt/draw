@@ -227,7 +227,8 @@ Shortcuts: `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hi
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).
 - Deploy: `npm run deploy` builds, copies the build to `~/draw` on the server, installs the runtime packages, and reloads pm2.
-- Release: `npm run release` bumps the version (patch by default) in every file that holds it, checks, commits, builds the desktop installers, deploys, and tags `vX.Y.Z`. Each release has a new version, so `dnf upgrade` works. The client shows the version, and `/api/health` reports the version of the server.
+- Release: every push to `main` runs `.github/workflows/release.yml` on GitHub-hosted runners. It type-checks, builds the web/server bundle and the desktop installers (Linux, Windows, macOS universal), and publishes them as a GitHub Release `vMAJOR.MINOR.RUN`. MAJOR.MINOR come from `package.json`. The patch is the run number, so each push has a new version and `dnf upgrade` works. The client shows the version, and `/api/health` reports the version of the server.
+- Server update: `bash ~/draw/update-server.sh` downloads `draw-web.tar.gz` from the latest release (or a given tag), installs the runtime packages, swaps `dist/` only after the install succeeds, and reloads pm2. It never touches `data/`. GitHub has no access to the server.
 - Run: pm2 with `ecosystem.config.cjs`. The server listens on `127.0.0.1:${PORT}` (default 3210).
 - nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. TLS comes from the existing certbot setup.
 - Data: `DB_PATH` (default `./data/canvas.db`). Back up this one file.
@@ -239,14 +240,14 @@ Desktop app (Tauri v2, `src-tauri/`):
 - The app has no service worker. "Export PNG" uses the native save dialog (dialog and fs plugins).
 - On Linux, the app sets `__NV_DISABLE_EXPLICIT_SYNC=1`. NVIDIA explicit sync on Wayland crashes the WebKitGTK GPU path. Disabling the GPU path instead makes every frame one frame late.
 - In WebKit (the Linux app, Safari), both renderers draw two more identical frames after the view stops changing. Thus the last frame always shows.
-- `npm run desktop:build` makes the installers for the current OS. Linux gives an `.rpm` and an AppImage. Windows and macOS installers must be built on those systems, for example in CI.
+- GitHub Actions builds the installers for Linux, Windows, and macOS (universal). `npm run desktop:build` makes them for the current OS only. The Windows and macOS builds are not code-signed yet.
 
 ## 11. Future work
 
 - User accounts: sign-in, owned sessions, invite links, roles (view or edit). Not designed yet.
 - Snapshots of the op log, so a large session loads fast
 - Baked raster tiles at coarse LODs, so a dense area renders fast at low zoom
-- Windows and macOS desktop builds in CI, with code signing
+- Code signing for the Windows and macOS installers
 - A spatial index for the markers, for documents with more than about 100 000 strokes
 - Coordinate rebasing, for zoom without the float64 limit (about 15 orders of magnitude around the work area)
 - Selection, transform, fill, and text tools
