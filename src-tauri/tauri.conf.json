@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Draw",
+  "version": "0.1.0",
+  "identifier": "xyz.bsums.draw",
+  "build": {
+    "frontendDist": "../dist/tauri",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build:tauri-client"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Draw",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 480,
+        "minHeight": 400,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "GraphicsAndDesign",
+    "shortDescription": "Shared infinite drawing canvas",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  }
+}

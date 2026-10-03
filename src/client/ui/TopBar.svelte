@@ -2,11 +2,12 @@
   import type { Engine } from '../engine/engine';
   import { ed, showToast } from '../state.svelte';
   import Icon from './Icon.svelte';
+  import { PUBLIC_ORIGIN } from '../config';
 
   let { engine, code, onLeave }: { engine: Engine | null; code: string; onLeave: () => void } = $props();
 
   async function copyLink() {
-    const url = `${location.origin}/s/${code}`;
+    const url = `${PUBLIC_ORIGIN}/s/${code}`;
     try {
       await navigator.clipboard.writeText(url);
       showToast('Link copied');

@@ -15,6 +15,13 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const STATIC_DIR = path.resolve(process.env.STATIC_DIR ?? path.join(here, '../client'));
 const UNLOAD_AFTER_MS = 5 * 60 * 1000;
 const CREATE_PER_MINUTE = 10;
+// Other origins that may call /api: the desktop app's webview (Tauri v2 on macOS/Linux, Windows).
+const CORS_ORIGINS = new Set(
+  (process.env.CORS_ORIGINS ?? 'tauri://localhost,http://tauri.localhost,https://tauri.localhost')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
+);
 
 const store = new Store(DB_PATH);
 const sessions = new Map<string, Session>();
@@ -135,6 +142,18 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://x');
   const p = url.pathname;
+
+  if (p.startsWith('/api/')) {
+    const origin = req.headers.origin;
+    if (origin && CORS_ORIGINS.has(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Max-Age', '86400');
+    }
+    if (req.method === 'OPTIONS') return void res.writeHead(204).end();
+  }
 
   if (p === '/api/sessions' && req.method === 'POST') {
     createSession(req, res).catch((e) => {

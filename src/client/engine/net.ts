@@ -1,4 +1,5 @@
 import type { ClientMsg, ServerMsg } from '../../shared/types';
+import { wsUrl } from '../config';
 
 export type NetStatus = 'connecting' | 'online' | 'offline';
 
@@ -22,8 +23,7 @@ export class Net {
   private connect(): void {
     if (this.closed) return;
     this.onStatus('connecting');
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws?code=${encodeURIComponent(this.code)}`);
+    const ws = new WebSocket(wsUrl(this.code));
     this.ws = ws;
     ws.onopen = () => {
       this.retry = 0;

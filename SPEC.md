@@ -96,44 +96,41 @@ The dab walker is one shared module (`src/shared/brush.ts`). The worker and the 
 
 ## 6. Rendering pipeline
 
+The client has two renderers with one interface (`src/client/engine/renderer.ts`):
+
+| Renderer | Used when | Buffers | Blend modes |
+|---|---|---|---|
+| WebGL2 (`gl/glRenderer.ts`) | WebGL2 is available | RGBA16F (half float). RGBA8 if the GPU cannot render to float. | Shader, W3C formulas |
+| Canvas 2D (`compositor.ts` + tile worker) | No WebGL2 | RGBA8 | Canvas 2D composite operations |
+
+`?renderer=2d` in the URL forces the Canvas 2D renderer, for comparison. The status bar shows the renderer and its bits per channel. Both renderers use the same dab walker and the same stroke index (`strokeIndex.ts`), so they give the same image. Only the precision is different: with 100 overlapping dabs at 1% flow, the WebGL2 result is within 1 level of the exact value, and the 8-bit result is 8 levels off.
+
 ### 6.1 Tiles and level of detail
 
 - A tile is 256 × 256 device pixels for one layer.
 - The level of detail (LOD) is an integer. A tile at LOD `L` covers `256 × 2^L` world units.
 - The client selects `L` from the device scale (zoom × devicePixelRatio). The range is −45 to 40. Negative `L` gives sharp tiles at high zoom. This is the benefit of vector storage.
-- If a full stroke is smaller than 2 pixels at a tile's LOD, the worker draws it as one dot. Thus a far zoomed-out view stays fast.
+- If a full stroke is smaller than 2 pixels at a tile's LOD, the renderer draws it as one dot. Thus a far zoomed-out view stays fast.
 - The tile key is `layerId | L | tx | ty`.
 
-### 6.2 Tile worker
+### 6.2 WebGL2 renderer
 
-The worker holds a copy of all confirmed strokes. It does not keep tile pixels.
+- **Dabs:** one instanced draw call for each stroke and tile. The CPU computes each dab position relative to the target in double precision and sends small float32 numbers to the GPU. Thus deep zoom stays exact. A dab with a radius over 10^6 px gets a closer virtual center with the same edge. The fragment shader uses the same profile as the Canvas 2D stamp: a solid core, a cosine falloff, and one pixel of edge antialiasing.
+- **Tiles:** each tile is a float texture. The renderer updates tiles on the main thread in slices of about 6 ms per frame, from the center of the view out. A new stroke on top of a tile draws over the existing pixels. A removed or restored stroke makes the tile render again. A stale tile stays on screen until the new one is ready.
+- **Strokes in progress:** each one has a screen-size float buffer. New dabs draw into it as points arrive. After a pan or zoom, the buffer draws again from its dabs.
+- **Compositing:** the layers stack in a float buffer that starts with the paper color. A normal layer without a stroke in progress goes straight onto the stack with hardware blending. Other layers go into a layer buffer first, and a blend shader combines that buffer with the stack (two buffers in turn). The blend shader uses the W3C Compositing and Blending formulas, which include hue, saturation, color, and luminosity.
+- **Output:** the stack goes to the 8-bit canvas with a small triangular dither, so gradients do not show bands.
+- **Context loss:** a phone or a PWA in the background can lose the GPU context. The renderer then makes all GPU resources again and renders the tiles again.
 
-- The main thread sends the view (LOD, tile range, visible layers).
-- The worker renders each tile in the view that the main thread does not have, or that is stale. It renders from the center of the view out, in time slices of about 10 ms. Between slices, it reads new messages, so a new view cancels old work.
-- A tile render draws every stroke that touches the tile, in `seq` order, each through its own stroke buffer (section 5).
-- A tile with no strokes goes back as `null`, without a render.
-- The worker sends each tile as an `ImageBitmap` with zero-copy transfer.
-- When a stroke is added or removed, the worker marks the affected tiles as stale. The main thread keeps a stale tile on screen until the new tile arrives. Thus the canvas does not flash.
-- When no stale tile stays in the view, the worker sends `rendered(seq)`.
+### 6.3 Canvas 2D renderer (fallback)
 
-### 6.3 Compositor (main thread)
+A worker holds a copy of all confirmed strokes and renders tiles with OffscreenCanvas. It sends each tile to the main thread as an `ImageBitmap` with zero-copy transfer. The main thread composites the tiles with Canvas 2D blend modes. Strokes in progress draw on the main thread with the same brush code.
 
-On each animation frame that has a change, the compositor does these steps:
+### 6.4 Strokes in progress and the handoff
 
-1. Fill the view with the paper color.
-2. For each visible layer, from the bottom up, draw its tiles with the layer opacity and the blend mode. Tile edges snap to whole device pixels, so tiles do not show seams.
-3. If a layer has a stroke in progress, compose that layer in a scratch canvas first. Then composite the scratch canvas onto the view.
-
-If a tile is missing, the compositor draws the parent tile (up to three LODs coarser) or the four child tiles, scaled. Thus zoom never shows holes.
-
-Canvas 2D gives all blend modes: normal, multiply, screen, overlay, darken, lighten, color dodge, color burn, hard light, soft light, difference, exclusion, hue, saturation, color, luminosity, and add.
-
-### 6.4 Strokes in progress
-
-- The local stroke draws into a screen-size buffer at the time of the pointer event. The input uses `getCoalescedEvents()` for full pen rate.
+- The local stroke draws at once. The input uses `getCoalescedEvents()` for full pen rate.
 - Remote strokes in progress arrive as `live` messages every 40 ms. Each one draws into its own buffer.
-- After a pan or zoom, the client draws each buffer again from its points.
-- At pointer up, the client sends `stroke.add`. The buffer stays on screen until the worker sends `rendered(seq)` for that stroke. Then the client removes the buffer.
+- At pointer up, the client sends `stroke.add`. The buffer stays on screen until the tiles show the stroke. Then the client removes the buffer.
 
 ## 7. Sync protocol
 
@@ -214,16 +211,24 @@ Shortcuts: `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardn
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).
+- Deploy: `npm run deploy` builds, copies the build to `~/draw` on the server, installs the runtime packages, and reloads pm2.
 - Run: pm2 with `ecosystem.config.cjs`. The server listens on `127.0.0.1:${PORT}` (default 3210).
 - nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. TLS comes from the existing certbot setup.
 - Data: `DB_PATH` (default `./data/canvas.db`). Back up this one file.
+
+Desktop app (Tauri v2, `src-tauri/`):
+
+- The app is the same web client in a native window. `vite build --mode tauri` reads `.env.tauri` and sets `VITE_SERVER_ORIGIN=https://draw.bsums.xyz`. Thus the app uses the hosted server, and share links point to the public site.
+- The server sends CORS headers on `/api` only to the Tauri origins (`tauri://localhost`, `http(s)://tauri.localhost`). `CORS_ORIGINS` can change the list.
+- The app has no service worker. "Export PNG" uses the native save dialog (dialog and fs plugins).
+- `npm run desktop:build` makes the installers for the current OS. Linux gives an `.rpm` and an AppImage. Windows and macOS installers must be built on those systems, for example in CI.
 
 ## 11. Future work
 
 - User accounts: sign-in, owned sessions, invite links, roles (view or edit). Not designed yet.
 - Snapshots of the op log, so a large session loads fast
 - Baked raster tiles at coarse LODs, so a dense area renders fast at low zoom
-- WebGL compositor, if Canvas 2D becomes the bottleneck
+- Windows and macOS desktop builds in CI, with code signing
 - Coordinate rebasing, for zoom without the float64 limit (about 15 orders of magnitude around the work area)
 - Selection, transform, fill, and text tools
 - Export of a region at a chosen resolution, and PSD export

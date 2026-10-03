@@ -13,7 +13,7 @@ Open http://localhost:5173. The dev script starts the API and WebSocket server o
 
 `npm run check` runs the type checks for the client and the server.
 
-In the browser console, `__draw.ed` is the editor state and `__draw.engine` is the engine.
+In the browser console, `__draw.ed` is the editor state and `__draw.engine` is the engine. Add `?renderer=2d` to a canvas URL to use the Canvas 2D renderer in place of WebGL2.
 
 ## Build and run
 
@@ -41,11 +41,23 @@ The nginx site is `deploy/draw.bsums.xyz.conf`. It uses the `*.bsums.xyz` wildca
 2. Link it into `/etc/nginx/sites-enabled/`.
 3. Run `sudo nginx -t`, then `sudo systemctl reload nginx`.
 
+## Desktop app (Tauri)
+
+Needs Rust and the Tauri system packages (on Fedora: `webkit2gtk4.1-devel`, `openssl-devel`, `libappindicator-gtk3-devel`, `librsvg2-devel`).
+
+```bash
+npm run desktop:dev     # native window on the local dev server
+npm run desktop:build   # installers in src-tauri/target/release/bundle/
+```
+
+The release app connects to `https://draw.bsums.xyz` (set in `.env.tauri`).
+
 ## Layout
 
 ```
 src/shared/   types, protocol, brush dab walker, validation (client + server)
 src/server/   HTTP + WebSocket server, sessions, SQLite store
 src/client/   Svelte UI (ui/), engine (engine/): compositor, tile worker, sync
+src-tauri/    desktop app (Tauri v2)
 deploy/       nginx server block
 ```

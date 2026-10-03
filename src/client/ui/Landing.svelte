@@ -1,6 +1,7 @@
 <script lang="ts">
   import { normalizeName } from '../../shared/types';
   import { loadRecent, removeRecent, type Recent } from '../recent';
+  import { API_BASE, PUBLIC_ORIGIN } from '../config';
 
   let { onOpen }: { onOpen: (key: string) => void } = $props();
   let name = $state('');
@@ -17,7 +18,7 @@
     error = '';
     taken = null;
     try {
-      const res = await fetch('/api/sessions', {
+      const res = await fetch(`${API_BASE}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(withName ? { name } : {}),
@@ -43,7 +44,7 @@
     busy = true;
     error = '';
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(join.trim())}`);
+      const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(join.trim())}`);
       const body = await res.json();
       if (!body.exists) throw new Error(`No canvas has the code or name “${join.trim()}”.`);
       onOpen(body.key);
@@ -84,7 +85,7 @@
     </form>
     {#if name.trim()}
       <p class="hint">
-        {#if preview}<span class="mono">{location.host}/s/{preview}</span> · anyone who guesses the name can join{:else}Use 3 to 40 letters, digits or dashes.{/if}
+        {#if preview}<span class="mono">{new URL(PUBLIC_ORIGIN).host}/s/{preview}</span> · anyone who guesses the name can join{:else}Use 3 to 40 letters, digits or dashes.{/if}
       </p>
     {/if}
     {#if taken}

@@ -7,6 +7,7 @@ import { ed, save, showToast, type Tool } from '../state.svelte';
 import { createRenderer } from './createRenderer';
 import type { Renderer } from './renderer';
 import { Doc } from './doc';
+import { IS_TAURI } from '../config';
 import { Net } from './net';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
@@ -818,9 +819,20 @@ export class Engine {
   async exportPng(): Promise<void> {
     const blob = await this.comp.exportPng();
     if (!blob) return;
+    const name = `draw-${this.code}.png`;
+    if (IS_TAURI) {
+      // Webviews do not handle <a download>: ask for a path and write the file natively.
+      const [{ save }, { writeFile }] = await Promise.all([import('@tauri-apps/plugin-dialog'), import('@tauri-apps/plugin-fs')]);
+      const path = await save({ defaultPath: name, filters: [{ name: 'PNG image', extensions: ['png'] }] });
+      if (path) {
+        await writeFile(path, new Uint8Array(await blob.arrayBuffer()));
+        showToast('Saved');
+      }
+      return;
+    }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `draw-${this.code}.png`;
+    a.download = name;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }

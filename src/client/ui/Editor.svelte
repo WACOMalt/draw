@@ -3,6 +3,7 @@
   import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
   import { addRecent, removeRecent } from '../recent';
+  import { API_BASE } from '../config';
   import TopBar from './TopBar.svelte';
   import OptionsBar from './OptionsBar.svelte';
   import Toolbar from './Toolbar.svelte';
@@ -41,7 +42,7 @@
   onMount(() => {
     let e: Engine | null = null;
     let dead = false;
-    fetch(`/api/sessions/${code}`)
+    fetch(`${API_BASE}/api/sessions/${encodeURIComponent(code)}`)
       .then((r) => r.json())
       .then((body) => {
         if (dead) return;
