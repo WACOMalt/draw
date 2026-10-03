@@ -3,6 +3,7 @@
 
 import { DabWalker } from '../../shared/brush';
 import type { BlendMode, Brush, Layer, Stroke } from '../../shared/types';
+import type { Renderer, ViewState } from './renderer';
 import { DabPainter, StampCache } from './stamp';
 import TileWorker from './tile.worker?worker';
 import {
@@ -67,13 +68,9 @@ interface Live {
   started: number;
 }
 
-export interface ViewState {
-  x: number; // world coordinate at the left edge of the canvas
-  y: number;
-  zoom: number; // CSS px per world unit
-}
-
-export class Compositor {
+export class Canvas2DRenderer implements Renderer {
+  readonly kind = 'canvas2d';
+  readonly precision = 8;
   readonly view: ViewState = { x: 0, y: 0, zoom: 1 };
   private ctx: CanvasRenderingContext2D;
   private dpr = 1;
@@ -96,8 +93,8 @@ export class Compositor {
   paper = '#ffffff';
   onFrame: (() => void) | null = null;
 
-  constructor(private canvas: HTMLCanvasElement) {
-    this.ctx = canvas.getContext('2d', { alpha: false })!;
+  constructor(private canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
+    this.ctx = ctx;
     this.scratch = new OffscreenCanvas(1, 1);
     this.scratchCtx = this.scratch.getContext('2d')!;
     this.worker = new TileWorker();

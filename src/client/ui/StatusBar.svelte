@@ -15,6 +15,7 @@
   <span class="dim">{ed.cursor ? `${ed.cursor.x.toFixed(decimals)}, ${ed.cursor.y.toFixed(decimals)}` : '—'}</span>
   <span class="dim">{ed.strokeCount} strokes</span>
   <span class="grow"></span>
+  <span class="dim" title="Renderer and bits per channel of its buffers">{ed.renderer}</span>
   <span class="dim">{ed.peers.length + 1} {ed.peers.length ? 'people' : 'person'} here</span>
   <span class="state {ed.status}">{ed.status}</span>
 </footer>

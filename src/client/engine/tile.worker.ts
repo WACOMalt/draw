@@ -1,20 +1,10 @@
 /// <reference lib="webworker" />
 // Rasterizes committed strokes into 256×256 layer tiles. Holds vector data only, no tile pixels.
 
-import { computeDabs, DAB_CHUNK, type DabList } from '../../shared/brush';
-import type { Stroke } from '../../shared/types';
+import { DAB_CHUNK } from '../../shared/brush';
 import { DabPainter, StampCache } from './stamp';
+import { StrokeIndex, strokeDabs, type StrokeRec as Rec } from './strokeIndex';
 import { TILE, tileKey, tileWorld, type FromWorker, type TileView, type ToWorker } from './tiles';
-
-interface Rec {
-  stroke: Stroke;
-  /** World bbox from the points, grown by the max radius. Cheap, so culling never needs dabs. */
-  x0: number;
-  y0: number;
-  x1: number;
-  y1: number;
-  dabs: DabList | null;
-}
 
 interface TileRef {
   layer: string;
@@ -26,8 +16,7 @@ interface TileRef {
 const post = (msg: FromWorker, transfer: Transferable[] = []) =>
   (self as unknown as DedicatedWorkerGlobalScope).postMessage(msg, transfer);
 
-const recs = new Map<string, Rec>();
-const byLayer = new Map<string, Rec[]>(); // sorted by seq
+const index = new StrokeIndex();
 /** Tiles the main thread holds. */
 const delivered = new Map<string, TileRef>();
 /** Delivered tiles whose content is out of date. */
@@ -44,41 +33,6 @@ const tileCanvas = new OffscreenCanvas(TILE, TILE);
 const tileCtx = tileCanvas.getContext('2d')!;
 const strokeCanvas = new OffscreenCanvas(TILE, TILE);
 const strokeCtx = strokeCanvas.getContext('2d')!;
-
-function makeRec(stroke: Stroke): Rec {
-  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  const p = stroke.pts;
-  for (let i = 0; i < p.length; i += 3) {
-    if (p[i] < x0) x0 = p[i];
-    if (p[i] > x1) x1 = p[i];
-    if (p[i + 1] < y0) y0 = p[i + 1];
-    if (p[i + 1] > y1) y1 = p[i + 1];
-  }
-  const r = stroke.brush.size * 0.51; // max radius plus a margin, relative so it works at any zoom
-  return { stroke, x0: x0 - r, y0: y0 - r, x1: x1 + r, y1: y1 + r, dabs: null };
-}
-
-function insertRec(rec: Rec): void {
-  recs.set(rec.stroke.id, rec);
-  let list = byLayer.get(rec.stroke.layerId);
-  if (!list) byLayer.set(rec.stroke.layerId, (list = []));
-  // Usually an append. Restored strokes go back to their original z position.
-  let i = list.length;
-  while (i > 0 && list[i - 1].stroke.seq > rec.stroke.seq) i--;
-  list.splice(i, 0, rec);
-}
-
-function removeRec(id: string): Rec | null {
-  const rec = recs.get(id);
-  if (!rec) return null;
-  recs.delete(id);
-  const list = byLayer.get(rec.stroke.layerId);
-  if (list) {
-    const i = list.indexOf(rec);
-    if (i >= 0) list.splice(i, 1);
-  }
-  return rec;
-}
 
 function tileBounds(lod: number, tx: number, ty: number): [number, number, number, number] {
   const tw = tileWorld(lod);
@@ -103,7 +57,7 @@ function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: numbe
     painter.dab((rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2, 1);
     return;
   }
-  const dl = (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts));
+  const dl = strokeDabs(rec);
   const { dabs, chunks, count } = dl;
   for (let c = 0; c * DAB_CHUNK < count; c++) {
     const co = c * 4;
@@ -119,7 +73,7 @@ function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: numbe
 }
 
 function renderTile(t: TileRef): ImageBitmap | null {
-  const list = byLayer.get(t.layer);
+  const list = index.byLayer.get(t.layer);
   if (!list || list.length === 0) return null;
   const [wx0, wy0, wx1, wy1] = tileBounds(t.lod, t.tx, t.ty);
   const scale = TILE / (wx1 - wx0);
@@ -194,22 +148,18 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
   const m = e.data;
   switch (m.t) {
     case 'reset':
-      recs.clear();
-      byLayer.clear();
-      for (const s of m.strokes) insertRec(makeRec(s));
+      index.clear();
+      for (const s of m.strokes) index.add(s);
       for (const key of delivered.keys()) stale.add(key);
       appliedSeq = m.seq;
       break;
     case 'add': {
-      removeRec(m.stroke.id);
-      const rec = makeRec(m.stroke);
-      insertRec(rec);
-      invalidate(rec);
+      invalidate(index.add(m.stroke));
       appliedSeq = m.seq;
       break;
     }
     case 'remove': {
-      const rec = removeRec(m.id);
+      const rec = index.remove(m.id);
       if (rec) invalidate(rec);
       appliedSeq = m.seq;
       break;

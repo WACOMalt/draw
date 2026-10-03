@@ -4,7 +4,8 @@ import { pointDecimals, quantizePoint } from '../../shared/brush';
 import { newId } from '../../shared/ids';
 import { LIMITS, type Brush, type Layer, type LayerProps, type Op, type ServerMsg } from '../../shared/types';
 import { ed, save, showToast, type Tool } from '../state.svelte';
-import { Compositor } from './compositor';
+import { createRenderer } from './createRenderer';
+import type { Renderer } from './renderer';
 import { Doc } from './doc';
 import { Net } from './net';
 
@@ -60,7 +61,7 @@ interface ActiveStroke {
 }
 
 export class Engine {
-  readonly comp: Compositor;
+  readonly comp: Renderer;
   private doc = new Doc();
   private net: Net;
   private undoStack: UndoEntry[] = [];
@@ -89,7 +90,8 @@ export class Engine {
     private canvas: HTMLCanvasElement,
     private brushCursor: HTMLElement,
   ) {
-    this.comp = new Compositor(canvas);
+    this.comp = createRenderer(canvas);
+    ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit`;
     this.rect = canvas.getBoundingClientRect();
     this.restoreView();
 

@@ -72,6 +72,7 @@ class EditorState {
   canUndo = $state(false);
   canRedo = $state(false);
   toast = $state<string | null>(null);
+  renderer = $state('');
 
   /** Settings of the tool that paints now (brush or eraser). */
   get activeBrush(): BrushSettings {
