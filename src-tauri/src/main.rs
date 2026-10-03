@@ -2,12 +2,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    // WebKitGTK's DMA-BUF renderer crashes on Wayland with NVIDIA drivers
-    // ("Error 71 (Protocol error) dispatching to Wayland display"). The fallback path works
-    // everywhere. Users can still override it by setting the variable themselves.
+    // NVIDIA's explicit sync on Wayland crashes WebKitGTK's DMA-BUF renderer
+    // ("Error 71 (Protocol error) dispatching to Wayland display"). Turning off explicit sync
+    // keeps the fast DMA-BUF path; disabling DMA-BUF instead delays every frame by one.
+    // Has no effect on other GPUs. Users can still override both variables.
     #[cfg(target_os = "linux")]
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    if std::env::var_os("__NV_DISABLE_EXPLICIT_SYNC").is_none() {
+        std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
     }
     draw_lib::run()
 }

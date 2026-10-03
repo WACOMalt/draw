@@ -57,6 +57,11 @@ const TILE_BUDGET_MS = 6;
 /** Radius in px above which dabs are virtualized to keep float32 exact. */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
+/**
+ * WebKit (the Linux desktop app, Safari) can show a canvas frame only at the next compositor
+ * update. After the view settles, a few identical frames push the last real one to the screen.
+ */
+const TAIL_FRAMES = /AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent) ? 2 : 0;
 
 function hexToRgb(hex: string): [number, number, number] {
   const n = parseInt(hex.slice(1), 16);
@@ -98,6 +103,8 @@ export class GLRenderer implements Renderer {
   private frame = 0;
   private viewVersion = 0;
   private raf = 0;
+  private dirty = false;
+  private tail = 0;
   private lost = false;
   private maxTiles: number;
   private cleanup: (() => void)[] = [];
@@ -265,6 +272,7 @@ export class GLRenderer implements Renderer {
   }
 
   invalidate(): void {
+    this.dirty = true;
     if (!this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
 
@@ -621,6 +629,10 @@ export class GLRenderer implements Renderer {
 
   private render(): void {
     this.raf = 0;
+    if (this.dirty) {
+      this.dirty = false;
+      this.tail = TAIL_FRAMES;
+    } else this.tail--;
     if (this.lost || this.gl.isContextLost()) return;
     this.frame++;
     const gl = this.gl;
@@ -731,6 +743,7 @@ export class GLRenderer implements Renderer {
     gl.flush();
     this.evictTiles();
     if (pending) this.invalidate();
+    else if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
 
   private drawLayerTiles(

@@ -236,6 +236,8 @@ Desktop app (Tauri v2, `src-tauri/`):
 - The app is the same web client in a native window. `vite build --mode tauri` reads `.env.tauri` and sets `VITE_SERVER_ORIGIN=https://draw.bsums.xyz`. Thus the app uses the hosted server, and share links point to the public site.
 - The server sends CORS headers on `/api` only to the Tauri origins (`tauri://localhost`, `http(s)://tauri.localhost`). `CORS_ORIGINS` can change the list.
 - The app has no service worker. "Export PNG" uses the native save dialog (dialog and fs plugins).
+- On Linux, the app sets `__NV_DISABLE_EXPLICIT_SYNC=1`. NVIDIA explicit sync on Wayland crashes the WebKitGTK GPU path. Disabling the GPU path instead makes every frame one frame late.
+- In WebKit (the Linux app, Safari), both renderers draw two more identical frames after the view stops changing. Thus the last frame always shows.
 - `npm run desktop:build` makes the installers for the current OS. Linux gives an `.rpm` and an AppImage. Windows and macOS installers must be built on those systems, for example in CI.
 
 ## 11. Future work

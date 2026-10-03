@@ -41,6 +41,11 @@ const MAX_BITMAPS = 700;
 const KEEP_BITMAPS = 500;
 const MAX_ENTRIES = 8000;
 const PREFETCH = 1;
+/**
+ * WebKit (the Linux desktop app, Safari) can show a canvas frame only at the next compositor
+ * update. After the view settles, a few identical frames push the last real one to the screen.
+ */
+const TAIL_FRAMES = /AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent) ? 2 : 0;
 
 interface TileEntry {
   bmp: ImageBitmap | null;
@@ -88,6 +93,8 @@ export class Canvas2DRenderer implements Renderer {
   private frame = 0;
   private viewVersion = 0;
   private raf = 0;
+  private dirty = false;
+  private tail = 0;
   private lastViewMsg = '';
   private current: TileView | null = null;
   paper = '#ffffff';
@@ -317,11 +324,16 @@ export class Canvas2DRenderer implements Renderer {
   // --- drawing ----------------------------------------------------------------------------
 
   invalidate(): void {
+    this.dirty = true;
     if (!this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
 
   private render(): void {
     this.raf = 0;
+    if (this.dirty) {
+      this.dirty = false;
+      this.tail = TAIL_FRAMES;
+    } else this.tail--;
     this.frame++;
     const ctx = this.ctx;
     const ds = this.view.zoom * this.dpr;
@@ -396,6 +408,7 @@ export class Canvas2DRenderer implements Renderer {
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
     this.onFrame?.();
+    if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
 
   private drawTile(c: Ctx, layer: string, lod: number, tx: number, ty: number, dx: number, dy: number, dw: number, dh: number): void {
