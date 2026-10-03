@@ -227,6 +227,7 @@ Shortcuts: `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hi
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).
 - Deploy: `npm run deploy` builds, copies the build to `~/draw` on the server, installs the runtime packages, and reloads pm2.
+- Release: `npm run release` bumps the version (patch by default) in every file that holds it, checks, commits, builds the desktop installers, deploys, and tags `vX.Y.Z`. Each release has a new version, so `dnf upgrade` works. The client shows the version, and `/api/health` reports the version of the server.
 - Run: pm2 with `ecosystem.config.cjs`. The server listens on `127.0.0.1:${PORT}` (default 3210).
 - nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. TLS comes from the existing certbot setup.
 - Data: `DB_PATH` (default `./data/canvas.db`). Back up this one file.

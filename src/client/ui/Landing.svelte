@@ -117,6 +117,7 @@
       </ul>
     {/if}
   </div>
+  <p class="version">v{__APP_VERSION__}</p>
 </main>
 
 <style>
@@ -236,6 +237,14 @@
   .when {
     color: var(--text-faint);
     font-size: 11px;
+  }
+  .version {
+    position: fixed;
+    right: 12px;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    margin: 0;
+    font-size: 11px;
+    color: var(--text-faint);
   }
   .x {
     font-size: 16px;

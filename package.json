@@ -16,7 +16,8 @@
     "build:tauri-client": "vite build --mode tauri --outDir dist/tauri",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",

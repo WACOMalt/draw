@@ -31,6 +31,16 @@ npm start
 | `DB_PATH` | `./data/canvas.db` | SQLite file. Back up this file. |
 | `STATIC_DIR` | `dist/client` | Built client files |
 
+## Release
+
+```bash
+npm run release              # 0.1.0 -> 0.1.1 (also: -- minor, -- major)
+```
+
+One command per release. It refuses to run with uncommitted changes. It bumps the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `Cargo.lock`, runs the type checks, and commits. Then it builds the desktop installers, deploys web and mobile, and tags `vX.Y.Z`. Install the new desktop build with the `sudo dnf upgrade` command it prints. Use `--no-desktop` or `--no-deploy` to skip a step.
+
+The version shows in the status bar, on the home page, and in `/api/health`.
+
 ## Deploy (draw.bsums.xyz)
 
 `npm run deploy` builds locally, copies `dist/` and the package files to `~/draw` on `potato-vps1.bsums.xyz`, installs the runtime dependencies there, and reloads the pm2 app `draw`. The database in `~/draw/data` stays in place.

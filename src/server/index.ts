@@ -23,6 +23,15 @@ const CORS_ORIGINS = new Set(
     .filter(Boolean),
 );
 
+/** package.json sits next to dist/ in development and on the server (the deploy copies it). */
+const VERSION: string = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(here, '../../package.json'), 'utf8')).version;
+  } catch {
+    return 'unknown';
+  }
+})();
+
 const store = new Store(DB_PATH);
 const sessions = new Map<string, Session>();
 
@@ -176,7 +185,7 @@ const server = http.createServer((req, res) => {
     return json(res, 200, { exists: key !== null, key });
   }
 
-  if (p === '/api/health') return json(res, 200, { ok: true, sessions: sessions.size });
+  if (p === '/api/health') return json(res, 200, { ok: true, version: VERSION, sessions: sessions.size });
   if (p.startsWith('/api/')) return json(res, 404, { error: 'not_found' });
   if (req.method !== 'GET' && req.method !== 'HEAD') return void res.writeHead(405).end();
   serveStatic(req, res, p);
@@ -235,7 +244,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`draw server on http://${HOST}:${PORT} (db ${DB_PATH}, static ${STATIC_DIR})`);
+  console.log(`draw ${VERSION} on http://${HOST}:${PORT} (db ${DB_PATH}, static ${STATIC_DIR})`);
 });
 
 function shutdown() {
