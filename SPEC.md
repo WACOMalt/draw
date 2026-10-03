@@ -203,14 +203,14 @@ Canvases:
 
 - Only accounts can make named canvases. Thus a name cannot expire and then point to another person's canvas.
 - Each browser keeps a random anonymous secret. A temporary canvas stores the sha256 of the creator's secret. Only that browser sees "Log in to keep it", and the claim needs a login.
-- After a claim, the plain `/s/CODE` link stays the edit link, so the people on the canvas stay in. A reset or a disable of the edit link ends that.
+- On an owned canvas, the plain `/s/CODE` link is the view link. Every link contains the code, thus the code alone never gives edit access. After a claim or an adoption, old links to the canvas give view access only. The people on the canvas become viewers until the owner gives them the edit link.
 - An hourly job deletes expired temporary canvases. It tells connected people that the canvas expired, then disconnects them.
 
 Roles: owner, editor, viewer. The best of these wins:
 
 1. Owner.
 2. Member role. The owner adds a member by the email of a confirmed account.
-3. Link role. `?k=` with the edit token gives editor. `?k=` with the view token gives viewer.
+3. Link role. `?k=` with the edit token gives editor. The plain code gives viewer. When the owner resets the view link, the plain code gives nothing and `?k=` with the new view token gives viewer. A wrong token gives only what the plain code gives. Link tokens are 128 random bits (22 characters).
 
 The owner can turn each link on or off, or reset it. The owner can also set a join password for link users. Members never need it. After one correct password, the client keeps a signed grant (HMAC of the canvas and the password hash). A new password makes old grants invalid. A change to sharing re-checks all connected clients at once: a lost role disconnects them, and a changed role updates their UI. The server rejects ops from viewers. The owner can transfer ownership (the old owner becomes an editor) or delete the canvas.
 

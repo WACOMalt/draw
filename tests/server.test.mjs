@@ -127,7 +127,9 @@ try {
   const fAccess = await fConn.next((m) => m.t === 'access');
   check(fAccess?.canvas.owned === true && fAccess.canvas.expiresAt === null && fAccess.canvas.canClaim === false, 'connected creator sees it owned, no expiry');
   const bAccess = await bConn.next((m) => m.t === 'access');
-  check(bAccess?.role === 'editor', 'others stay in as editors after the claim (plain code link)');
+  check(bAccess?.role === 'viewer', 'after the claim the code is a view link: others become viewers');
+  const tempShare = (await funky.api('GET', `/api/canvases/${temp}/sharing`)).data;
+  check(tempShare.viewLink.endsWith(`/s/${temp}`) && new URL(tempShare.editLink).searchParams.get('k')?.length === 22, 'claimed canvas: short view link, token edit link');
   check((await funky.api('POST', `/api/canvases/${temp}/claim`, { anon: funky.anon })).status === 403, 'cannot claim twice');
 
   // --- owned canvas, links and roles --------------------------------------------------------------
@@ -135,15 +137,14 @@ try {
   check(own.status === 201 && own.data.key === 'friday-jam', 'account creates a named canvas');
   const share = (await funky.api('GET', '/api/canvases/friday-jam/sharing')).data;
   const editTok = new URL(share.editLink).searchParams.get('k');
-  const viewTok = new URL(share.viewLink).searchParams.get('k');
-  check(editTok && viewTok && editTok !== viewTok, 'separate edit and view links');
+  check(share.viewLink === `${BASE}/s/friday-jam` && editTok?.length === 22, 'view link is the plain code, edit link has a token');
 
   const stranger = new Browser();
-  const sDenied = await first(await stranger.join('friday-jam'));
-  check(sDenied?.t === 'denied' && sDenied.reason === 'login_required', 'no link, no account: denied');
-  const viewer = await stranger.join('friday-jam', { link: viewTok });
+  const viewer = await stranger.join('friday-jam');
   const vWelcome = await first(viewer);
-  check(vWelcome?.role === 'viewer', 'view link gives viewer');
+  check(vWelcome?.role === 'viewer', 'plain code gives viewer');
+  const guess = await first(await new Browser().join('friday-jam', { link: 'friday-jam' }));
+  check(guess?.role === 'viewer', 'a wrong token never gives more than the plain code');
   viewer.send(strokeOp(layerId(vWelcome)));
   const rej = await viewer.next((m) => m.t === 'reject');
   check(rej?.reason === 'view only', 'viewer cannot draw');
@@ -155,22 +156,29 @@ try {
 
   // Reset the edit link: the editor who came by the old link loses access at once.
   await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'edit', action: 'reset' });
-  const kicked = await editor.next((m) => m.t === 'denied');
-  check(kicked?.reason === 'login_required', 'reset edit link removes old-link editors');
+  const demoted = await editor.next((m) => m.t === 'access' || m.t === 'denied');
+  check(demoted?.t === 'access' && demoted.role === 'viewer', 'reset edit link drops old-link editors to view only');
 
   // --- join password ------------------------------------------------------------------------------
   await funky.api('POST', '/api/canvases/friday-jam/password', { password: 'sesame' });
   const kickedViewer = await viewer.next((m) => m.t === 'denied');
   check(kickedViewer?.reason === 'password_required', 'new password re-asks connected link users');
-  const pw = await new Browser().join('friday-jam', { link: viewTok });
+  const pw = await new Browser().join('friday-jam');
   check((await first(pw))?.reason === 'password_required', 'link user must enter the password');
-  pw.send({ t: 'hello', name: 'x', color: '#000000', link: viewTok, password: 'wrong' });
+  pw.send({ t: 'hello', name: 'x', color: '#000000', password: 'wrong' });
   check(!!(await pw.next((m) => m.t === 'denied' && m.reason === 'password_wrong')), 'wrong password refused');
-  pw.send({ t: 'hello', name: 'x', color: '#000000', link: viewTok, password: 'sesame' });
+  pw.send({ t: 'hello', name: 'x', color: '#000000', password: 'sesame' });
   const pwWelcome = await pw.next((m) => m.t === 'welcome');
   check(pwWelcome?.role === 'viewer' && !!pwWelcome.grant, 'right password lets in, with a grant');
-  const again = await new Browser().join('friday-jam', { link: viewTok, grant: pwWelcome.grant });
+  const again = await new Browser().join('friday-jam', { grant: pwWelcome.grant });
   check((await first(again))?.role === 'viewer', 'grant skips the password next time');
+
+  // Reset the view link: the plain code stops working, the new token works.
+  const vr = (await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'view', action: 'reset' })).data;
+  const viewTok = new URL(vr.viewLink).searchParams.get('k');
+  check(viewTok?.length === 22, 'reset view link gives a token link');
+  check((await first(await new Browser().join('friday-jam')))?.reason === 'login_required', 'after a view reset the plain code gives nothing');
+  check((await first(await new Browser().join('friday-jam', { link: viewTok, grant: pwWelcome.grant })))?.role === 'viewer', 'new view token works');
 
   // --- members ------------------------------------------------------------------------------------
   const vee = new Browser();
@@ -212,6 +220,9 @@ try {
   await account(admin, 'admin@example.com', 'Admin');
   const adminList = (await admin.api('GET', '/api/canvases')).data;
   check(adminList.owned.some((c) => c.key === 'QWRT-ZXCV'), 'admin gets the legacy canvas at first login');
+  check((await first(await new Browser().join('QWRT-ZXCV')))?.role === 'viewer', 'old plain links to an adopted canvas are view only');
+  const legacyEdit = new URL((await admin.api('GET', '/api/canvases/QWRT-ZXCV/sharing')).data.editLink).searchParams.get('k');
+  check((await first(await new Browser().join('QWRT-ZXCV', { link: legacyEdit })))?.role === 'editor', 'adopted canvas has an edit token link');
 
   const shortLived = (await new Browser().api('POST', '/api/sessions', {})).data.key;
   const watcher = await new Browser().join(shortLived);

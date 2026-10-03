@@ -3,9 +3,10 @@
 // Temporary canvas (no owner): anyone with the code edits. Only the creating browser may claim.
 // Owned canvas, best role wins:
 //   owner  > member role (added by email) > link role
-//   link role: ?k=<edit token> -> editor, ?k=<view token> -> viewer,
-//              plain /s/CODE    -> editor while code_role = 'editor' (claimed canvases keep their
-//                                  old link working until the owner resets or turns off the edit link)
+//   link role: ?k=<edit token> -> editor
+//              plain /s/CODE    -> viewer while code_role = 'viewer' (the default view link)
+//              ?k=<view token>  -> viewer (after the owner resets the view link)
+//   The code is in every link, so it never gives edit access on an owned canvas.
 // A join password applies to link access only. After one correct entry the client keeps a
 // signed grant, which stops working as soon as the owner changes or removes the password.
 
@@ -54,7 +55,7 @@ function grantFor(store: Store, c: CanvasRow): string {
 function linkRole(c: CanvasRow, link: string | undefined): Role | null {
   if (safeEqual(link, c.edit_token)) return 'editor';
   if (safeEqual(link, c.view_token)) return 'viewer';
-  if (c.code_role === 'editor') return 'editor';
+  if (c.code_role === 'viewer') return 'viewer';
   return null;
 }
 

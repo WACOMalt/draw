@@ -22,7 +22,7 @@ import {
   userFromToken,
   verifyPassword,
 } from './auth';
-import { sha256, type CanvasRow, type MemberRole, type Store, type UserRow } from './db';
+import { linkToken, sha256, type CanvasRow, type MemberRole, type Store, type UserRow } from './db';
 import { actionMail, type Mailer } from './mailer';
 
 export interface ApiContext {
@@ -261,9 +261,9 @@ const createCanvas: Handler = async (ctx, req) => {
   if (!limits.create.allow(req.ip)) return err(429, 'rate_limited');
   const anon = typeof req.body.anon === 'string' && req.body.anon.length <= 100 ? req.body.anon : null;
   const owned = !!req.user;
-  // Accounts get fresh link tokens. A temporary canvas is open to anyone with its code.
+  // Owned: the plain code is the view link, editing needs the token. Temporary: the code edits.
   const init: Partial<CanvasRow> = owned
-    ? { owner_id: req.user!.id, code_role: 'none', edit_token: newToken().token, view_token: newToken().token }
+    ? { owner_id: req.user!.id, code_role: 'viewer', edit_token: linkToken(), view_token: null }
     : { creator_anon: anon ? sha256(anon) : null, code_role: 'editor' };
 
   if (typeof req.body.name === 'string' && req.body.name.trim()) {
@@ -309,9 +309,9 @@ function sharing(ctx: ApiContext, c: CanvasRow) {
   return {
     key: c.code,
     members: ctx.store.members(c.code).map((m) => ({ id: m.user_id, email: m.email, name: m.name, role: m.role })),
-    // The plain code link counts as the edit link while code_role is 'editor' (claimed canvases).
-    editLink: c.edit_token ? `${base}?k=${c.edit_token}` : c.code_role === 'editor' ? base : null,
-    viewLink: c.view_token ? `${base}?k=${c.view_token}` : null,
+    editLink: c.edit_token ? `${base}?k=${c.edit_token}` : null,
+    // The plain code is the view link until the owner resets it to a token.
+    viewLink: c.view_token ? `${base}?k=${c.view_token}` : c.code_role === 'viewer' ? base : null,
     password: !!c.join_password,
   };
 }
@@ -328,8 +328,9 @@ const claim: Handler = async (ctx, req) => {
   if (!c) return err(404, 'not_found');
   const anon = typeof req.body.anon === 'string' ? req.body.anon : '';
   if (!isTemporary(c) || !canClaim(c, anon ? sha256(anon) : undefined)) return err(403, 'cannot_claim');
-  // Keep the plain code working as the edit link, so people already drawing stay in.
-  ctx.store.updateCanvas(c.code, { owner_id: req.user.id, code_role: 'editor', view_token: newToken().token });
+  // The code everyone already has becomes the view link. People drawing now become viewers
+  // until the owner gives them the edit link or adds them.
+  ctx.store.updateCanvas(c.code, { owner_id: req.user.id, code_role: 'viewer', edit_token: linkToken(), view_token: null });
   ctx.refreshCanvas(c.code);
   return ok({ key: c.code });
 };
@@ -369,10 +370,10 @@ const updateLink: Handler = async (ctx, req) => {
   const action = req.body.action;
   if (!kind || !['enable', 'disable', 'reset'].includes(action as string)) return err(400, 'bad_request');
   const field = kind === 'edit' ? 'edit_token' : 'view_token';
-  // Any change to the edit link retires the plain code link.
-  const extra = kind === 'edit' ? { code_role: 'none' as const } : {};
+  // A code cannot be reset: any change to the view link retires the plain code link.
+  const extra = kind === 'view' ? { code_role: 'none' as const } : {};
   if (action === 'disable') ctx.store.updateCanvas(r.c.code, { [field]: null, ...extra });
-  else if (action === 'reset' || !r.c[field]) ctx.store.updateCanvas(r.c.code, { [field]: newToken().token, ...extra });
+  else if (action === 'reset' || !r.c[field]) ctx.store.updateCanvas(r.c.code, { [field]: linkToken(), ...extra });
   ctx.refreshCanvas(r.c.code);
   return ok(sharing(ctx, ctx.store.canvas(r.c.code)!));
 };

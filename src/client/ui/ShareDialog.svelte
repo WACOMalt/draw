@@ -118,7 +118,7 @@
 
     <section>
       <h3>Links</h3>
-      {#each [{ kind: 'edit', label: 'Edit link', url: s.editLink, note: 'Anyone with it can draw.' }, { kind: 'view', label: 'View link', url: s.viewLink, note: 'Anyone with it can look, not draw.' }] as l (l.kind)}
+      {#each [{ kind: 'edit', label: 'Edit link', url: s.editLink, note: 'Anyone with it can draw.' }, { kind: 'view', label: 'View link', url: s.viewLink, note: s.viewLink?.includes('?k=') ? 'Anyone with it can look, not draw.' : 'Anyone with the canvas code can look, not draw.' }] as l (l.kind)}
         <div class="link">
           <div class="head">
             <b>{l.label}</b>
@@ -132,7 +132,7 @@
           {/if}
           <div class="row tight">
             <button class="small" disabled={busy} onclick={() => call('POST', '/links', { kind: l.kind, action: l.url ? 'disable' : 'enable' })}>{l.url ? 'Turn off' : 'Turn on'}</button>
-            {#if l.url}<button class="small" disabled={busy} title="The old link stops working" onclick={() => call('POST', '/links', { kind: l.kind, action: 'reset' })}>Reset link</button>{/if}
+            {#if l.url}<button class="small" disabled={busy} title={l.kind === 'view' && !l.url.includes('?k=') ? 'The plain code stops working. A new, longer link replaces it.' : 'The old link stops working'} onclick={() => call('POST', '/links', { kind: l.kind, action: 'reset' })}>Reset link</button>{/if}
           </div>
         </div>
       {/each}

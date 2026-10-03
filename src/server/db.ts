@@ -25,7 +25,8 @@ export interface CanvasRow {
   /** Created before accounts existed: never expires, goes to the admin at first admin login. */
   legacy: number;
   /** What the plain /s/CODE link grants to people without other access: 'editor' or 'none'. */
-  code_role: 'editor' | 'none';
+  /** What the plain /s/CODE link gives on an owned canvas. 'editor' only on rows from schema 2. */
+  code_role: 'editor' | 'viewer' | 'none';
   /** Secret tokens for the share links (?k=TOKEN). NULL: link turned off. */
   edit_token: string | null;
   view_token: string | null;
@@ -50,6 +51,9 @@ export interface MemberRow {
 }
 
 export const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
+
+/** Share-link token: 128 random bits (22 characters), too many to guess. */
+export const linkToken = () => crypto.randomBytes(16).toString('base64url');
 
 export class Store {
   private db: Database.Database;
@@ -150,6 +154,17 @@ export class Store {
         this.setSetting('schema', '2');
       })();
     }
+    if (version < 3) {
+      // The plain code link was an edit link on claimed and adopted canvases, and every view link
+      // contains the code. Owned canvases now treat the plain code as their view link, and edit
+      // needs a token that cannot be derived from it.
+      db.transaction(() => {
+        const rows = db.prepare<[], { code: string; edit_token: string | null }>('SELECT code, edit_token FROM sessions WHERE owner_id IS NOT NULL OR legacy = 1').all();
+        const upd = db.prepare("UPDATE sessions SET code_role = 'viewer', view_token = NULL, edit_token = ? WHERE code = ?");
+        for (const r of rows) upd.run(r.edit_token ?? linkToken(), r.code);
+        this.setSetting('schema', '3');
+      })();
+    }
   }
 
   setting(key: string): string | undefined {
@@ -223,7 +238,12 @@ export class Store {
 
   /** Gives every legacy canvas to a user (the admin). Returns how many. */
   adoptLegacy(userId: string): number {
-    return this.db.prepare("UPDATE sessions SET owner_id = ?, legacy = 0 WHERE legacy = 1 AND owner_id IS NULL").run(userId).changes;
+    const rows = this.db.prepare<[], { code: string; edit_token: string | null }>('SELECT code, edit_token FROM sessions WHERE legacy = 1 AND owner_id IS NULL').all();
+    const upd = this.db.prepare("UPDATE sessions SET owner_id = ?, legacy = 0, code_role = 'viewer', view_token = NULL, edit_token = ? WHERE code = ?");
+    this.transaction(() => {
+      for (const r of rows) upd.run(userId, r.edit_token ?? linkToken(), r.code);
+    });
+    return rows.length;
   }
 
   canvasesOwnedBy(userId: string): CanvasRow[] {
