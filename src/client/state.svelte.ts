@@ -3,6 +3,7 @@
 import { DEFAULT_BRUSH } from '../shared/brush';
 import type { Brush, Layer } from '../shared/types';
 import type { NetStatus } from './engine/net';
+import type { Marker } from './engine/navigator';
 
 export type Tool = 'brush' | 'eraser' | 'eyedropper' | 'hand';
 export type BrushSettings = Omit<Brush, 'tool' | 'color'>;
@@ -45,6 +46,7 @@ const prefs = load('draw.prefs', {
   brush: brushDefaults as BrushSettings,
   eraser: { ...brushDefaults, hardness: 0.6, size: 40, pressureSize: false } as BrushSettings,
   smoothing: 0.25,
+  showMarkers: true,
   fg: '#1e1e1e',
   bg: '#ffffff',
   swatches: [] as string[],
@@ -55,6 +57,8 @@ class EditorState {
   brush = $state<BrushSettings>({ ...brushDefaults, ...prefs.brush });
   eraser = $state<BrushSettings>({ ...brushDefaults, ...prefs.eraser });
   smoothing = $state(prefs.smoothing);
+  showMarkers = $state(prefs.showMarkers);
+  markers = $state<Marker[]>([]);
   fg = $state(prefs.fg);
   bg = $state(prefs.bg);
   swatches = $state<string[]>(prefs.swatches);
@@ -86,6 +90,7 @@ class EditorState {
       brush: $state.snapshot(this.brush),
       eraser: $state.snapshot(this.eraser),
       smoothing: this.smoothing,
+      showMarkers: this.showMarkers,
       fg: this.fg,
       bg: this.bg,
       swatches: $state.snapshot(this.swatches),

@@ -67,7 +67,7 @@
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
@@ -101,6 +101,18 @@
     <div class="stage">
       <canvas bind:this={canvas}></canvas>
       <div class="brush-cursor" bind:this={brushCursor}></div>
+      {#each ed.markers as m (m.key)}
+        <button
+          class="marker {m.kind}"
+          style:transform="translate({m.x}px, {m.y}px)"
+          title={m.kind === 'edge' ? `${m.count} stroke${m.count === 1 ? '' : 's'} this way` : `${m.count} small stroke${m.count === 1 ? '' : 's'} here`}
+          aria-label={m.kind === 'edge' ? `Go to ${m.count} strokes off screen` : `Zoom to ${m.count} small strokes`}
+          onclick={() => engine?.flyTo(m.target)}
+        >
+          {#if m.kind === 'edge'}<svg viewBox="0 0 12 12" style:transform="rotate({m.angle}rad)"><path d="M2 3l7 3-7 3z" /></svg>{/if}
+          <span>{m.count > 999 ? `${Math.round(m.count / 100) / 10}k` : m.count}</span>
+        </button>
+      {/each}
       {#each peerCursors as p (p.id)}
         <div class="peer" style:transform="translate({p.sx}px, {p.sy}px)" style:--c={p.color}>
           <svg viewBox="0 0 12 12"><path d="M0 0L11 4.5 6 6 4.5 11z" /></svg>
@@ -199,6 +211,69 @@
     box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
     pointer-events: none;
     mix-blend-mode: difference;
+  }
+  .marker {
+    position: absolute;
+    left: 0;
+    top: 0;
+    z-index: 4;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 0 7px;
+    height: 24px;
+    min-width: 24px;
+    margin: -12px 0 0 -12px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
+    background: rgba(25, 113, 194, 0.88);
+    border: 2px solid rgba(255, 255, 255, 0.9);
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+    justify-content: center;
+  }
+  .marker.here::after {
+    content: '';
+    position: absolute;
+    inset: -6px;
+    border-radius: 18px;
+    border: 2px solid rgba(49, 168, 255, 0.55);
+    animation: ping 1.8s ease-out infinite;
+    pointer-events: none;
+  }
+  @keyframes ping {
+    from {
+      opacity: 0.9;
+      transform: scale(0.8);
+    }
+    to {
+      opacity: 0;
+      transform: scale(1.5);
+    }
+  }
+  .marker.edge {
+    background: rgba(40, 40, 40, 0.85);
+    border-color: rgba(255, 255, 255, 0.35);
+    color: var(--text);
+  }
+  .marker svg {
+    width: 11px;
+    height: 11px;
+    fill: currentColor;
+  }
+  .marker:hover {
+    filter: brightness(1.15);
+  }
+  @media (pointer: coarse) {
+    .marker {
+      height: 32px;
+      min-width: 32px;
+      margin: -16px 0 0 -16px;
+      border-radius: 16px;
+      font-size: 12px;
+    }
   }
   .peer {
     position: absolute;

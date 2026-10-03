@@ -728,6 +728,7 @@ export class GLRenderer implements Renderer {
     gl.uniform1f(p.u.uDither, this.precision === 16 ? 1 : 0);
     this.quad(p, null, [0, 0, this.canvas.width, this.canvas.height]);
 
+    gl.flush();
     this.evictTiles();
     if (pending) this.invalidate();
   }

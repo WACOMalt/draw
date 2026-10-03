@@ -21,7 +21,8 @@ export function createRenderer(canvas: HTMLCanvasElement): Renderer {
       stencil: false,
       premultipliedAlpha: true,
       preserveDrawingBuffer: false,
-      desynchronized: true,
+      // No `desynchronized`: it can leave the last frame of a pan or zoom unpresented
+      // until the next input event.
       powerPreference: 'high-performance',
     });
     if (gl) {

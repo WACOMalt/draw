@@ -6,7 +6,8 @@ import { LIMITS, type Brush, type Layer, type LayerProps, type Op, type ServerMs
 import { ed, save, showToast, type Tool } from '../state.svelte';
 import { createRenderer } from './createRenderer';
 import type { Renderer } from './renderer';
-import { Doc } from './doc';
+import { Doc, type Bounds } from './doc';
+import { computeMarkers, unionAll } from './navigator';
 import { IS_TAURI } from '../config';
 import { Net } from './net';
 
@@ -17,6 +18,7 @@ const MAX_ZOOM = 1e11;
 const LIVE_FLUSH_MS = 40;
 const BUILDUP_MS = 30;
 const CURSOR_MS = 50;
+const MARKERS_MS = 120;
 /** A second finger within this time after the first cancels the first finger's stroke. */
 const GESTURE_GRACE_MS = 300;
 /** Max duration and movement of a two/three-finger tap (undo/redo). */
@@ -85,6 +87,12 @@ export class Engine {
   private touchLock = false;
   /** Once a pen is used, a finger navigates instead of drawing (palm rejection). */
   private penSeen = false;
+  /** Increments to cancel a running fly-to animation. */
+  private flight = 0;
+  private markersAt = 0;
+  private markersCost = 0;
+  private markersTimer: number | undefined;
+  private flying = false;
 
   constructor(
     private code: string,
@@ -164,6 +172,7 @@ export class Engine {
     const v = this.comp.view;
     ed.view = { x: v.x, y: v.y, zoom: v.zoom };
     this.updateBrushCursor();
+    this.scheduleMarkers();
     window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => save(`draw.view.${this.code}`, ed.view), 300);
   }
@@ -188,6 +197,106 @@ export class Engine {
     const { w, h } = this.comp.size;
     const [wx, wy] = this.comp.toWorld(w / 2, h / 2);
     this.setView(wx - w / 2, wy - h / 2, 1);
+  }
+
+  // --- finding content ---------------------------------------------------------------------
+
+  private visibleLayerIds(): Set<string> {
+    return new Set(ed.layers.filter((l) => l.visible).map((l) => l.id));
+  }
+
+  /**
+   * Recomputes markers, throttled, with a trailing update after motion stops. The interval
+   * grows with the cost of the last run (big documents), so panning stays smooth. During a
+   * fly-to only the final position counts.
+   */
+  scheduleMarkers(): void {
+    window.clearTimeout(this.markersTimer);
+    if (this.flying) return;
+    const run = () => {
+      const t0 = performance.now();
+      this.markersAt = t0;
+      if (!ed.showMarkers) {
+        if (ed.markers.length) ed.markers = [];
+        return;
+      }
+      const { w, h } = this.comp.size;
+      ed.markers = computeMarkers(this.doc, this.visibleLayerIds(), this.comp.view, w, h);
+      this.markersCost = performance.now() - t0;
+    };
+    const interval = Math.max(MARKERS_MS, this.markersCost * 10);
+    const wait = interval - (performance.now() - this.markersAt);
+    if (wait <= 0) run();
+    this.markersTimer = window.setTimeout(run, Math.max(wait, interval));
+  }
+
+  private stopFlight(): void {
+    this.flight++;
+    if (this.flying) {
+      this.flying = false;
+      this.scheduleMarkers();
+    }
+  }
+
+  /** Zooms out (or in) to show everything on the visible layers. */
+  fitAll(): void {
+    const all = unionAll(this.doc, this.visibleLayerIds());
+    if (!all) return showToast('Nothing drawn yet');
+    this.flyTo(all, 0.85);
+  }
+
+  /**
+   * Animates the view to show `b`. Long trips zoom out, travel, then zoom in, so you can see
+   * where you go. Zoom moves in log space, so a 1e9x change takes about as long as a 10x one.
+   */
+  flyTo(b: Bounds, fill = 0.6): void {
+    const { w, h } = this.comp.size;
+    const v = this.comp.view;
+    const bw = Math.max(b.x1 - b.x0, 1e-300);
+    const bh = Math.max(b.y1 - b.y0, 1e-300);
+    const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min((w * fill) / bw, (h * fill) / bh)));
+    type Key = { cx: number; cy: number; span: number }; // span = world width of the view
+    const from: Key = { cx: v.x + w / 2 / v.zoom, cy: v.y + h / 2 / v.zoom, span: w / v.zoom };
+    const to: Key = { cx: (b.x0 + b.x1) / 2, cy: (b.y0 + b.y1) / 2, span: w / zoom };
+    const dist = Math.hypot(to.cx - from.cx, to.cy - from.cy);
+    const legs: [Key, Key][] = [];
+    if (dist > 1.5 * Math.max(from.span, to.span)) {
+      const mid: Key = { cx: (from.cx + to.cx) / 2, cy: (from.cy + to.cy) / 2, span: dist * 1.3 };
+      legs.push([from, mid], [mid, to]);
+    } else legs.push([from, to]);
+
+    const token = ++this.flight;
+    this.flying = true;
+    ed.markers = [];
+    const done = () => {
+      if (token !== this.flight) return;
+      this.flying = false;
+      this.scheduleMarkers();
+    };
+    const ease = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
+    const runLeg = (i: number) => {
+      if (i >= legs.length || token !== this.flight) return done();
+      const [a, c] = legs[i];
+      const ratio = Math.abs(Math.log2(c.span / a.span));
+      const duration = Math.min(900, 220 + ratio * 45 + (ratio < 0.5 ? 200 : 0));
+      const start = performance.now();
+      const step = () => {
+        if (token !== this.flight) return;
+        const t = Math.min(1, (performance.now() - start) / duration);
+        const e = ease(t);
+        const span = a.span * (c.span / a.span) ** e;
+        // Move the center in step with the zoom: early when zooming in, late when zooming out.
+        const f = Math.abs(a.span - c.span) > a.span * 1e-9 ? (a.span - span) / (a.span - c.span) : e;
+        const cx = a.cx + (c.cx - a.cx) * f;
+        const cy = a.cy + (c.cy - a.cy) * f;
+        const z = w / span;
+        this.setView(cx - w / 2 / z, cy - h / 2 / z, z);
+        if (t < 1) requestAnimationFrame(step);
+        else runLeg(i + 1);
+      };
+      requestAnimationFrame(step);
+    };
+    runLeg(0);
   }
 
   // --- tools and cursor ---------------------------------------------------------------------
@@ -226,6 +335,7 @@ export class Engine {
 
   private onPointerDown(e: PointerEvent): void {
     const [x, y] = this.local(e);
+    this.stopFlight(); // any touch stops a fly-to
     if (e.pointerType === 'pen') this.penSeen = true;
     if (e.pointerType === 'touch' && this.onTouchDown(e, x, y)) return;
     if (this.stroke || this.pan || this.picking !== null) return;
@@ -399,6 +509,7 @@ export class Engine {
 
   private onWheel(e: WheelEvent): void {
     e.preventDefault();
+    this.stopFlight();
     const [x, y] = this.local(e);
     let dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
     if (e.ctrlKey) dy *= 4; // trackpad pinch reports small deltas
@@ -593,6 +704,7 @@ export class Engine {
     ed.layers = layers;
     this.comp.setLayers(layers);
     if (!layers.some((l) => l.id === ed.activeLayerId)) ed.activeLayerId = layers.at(-1)?.id ?? null;
+    this.scheduleMarkers();
   }
 
   addLayer(): void {
@@ -697,6 +809,7 @@ export class Engine {
           this.refreshLayers();
         }
         ed.strokeCount = this.doc.strokes.size;
+        if (op.type.startsWith('stroke.')) this.scheduleMarkers();
         break;
       }
       case 'reject': {
@@ -783,6 +896,9 @@ export class Engine {
         this.zoomBy(0.8);
       } else if (key === '0') {
         e.preventDefault();
+        this.fitAll();
+      } else if (key === '1') {
+        e.preventDefault();
         this.resetView();
       }
       return;
@@ -810,6 +926,11 @@ export class Engine {
       this.updateCursor();
     } else if (key === 'x') {
       [ed.fg, ed.bg] = [ed.bg, ed.fg];
+    } else if (key === 'm') {
+      ed.showMarkers = !ed.showMarkers;
+      this.scheduleMarkers();
+    } else if (e.key === 'Home') {
+      this.fitAll();
     } else if (key === 'd') {
       ed.fg = '#000000';
       ed.bg = '#ffffff';

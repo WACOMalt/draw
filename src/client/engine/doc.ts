@@ -33,16 +33,43 @@ export function sortLayers(a: Layer, b: Layer): number {
   return a.order - b.order || (a.id < b.id ? -1 : 1);
 }
 
+/** World bounding box of a stroke, including its brush radius. */
+export interface Bounds {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export function strokeBounds(s: Stroke): Bounds {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const p = s.pts;
+  for (let i = 0; i < p.length; i += 3) {
+    if (p[i] < x0) x0 = p[i];
+    if (p[i] > x1) x1 = p[i];
+    if (p[i + 1] < y0) y0 = p[i + 1];
+    if (p[i + 1] > y1) y1 = p[i + 1];
+  }
+  const r = s.brush.size / 2;
+  return { x0: x0 - r, y0: y0 - r, x1: x1 + r, y1: y1 + r };
+}
+
 export class Doc {
   seq = 0;
   layers = new Map<string, Layer>();
   strokes = new Map<string, Stroke>();
+  /** Bounds of each confirmed stroke, kept in step with `strokes`. */
+  bounds = new Map<string, Bounds>();
+  /** Increments when strokes change; consumers cache against it. */
+  version = 0;
   pending: PendingOp[] = [];
 
   reset(seq: number, layers: Layer[], strokes: Stroke[]): void {
     this.seq = seq;
     this.layers = new Map(layers.map((l) => [l.id, l]));
     this.strokes = new Map(strokes.map((s) => [s.id, s]));
+    this.bounds = new Map(strokes.map((s) => [s.id, strokeBounds(s)]));
+    this.version++;
   }
 
   addPending(opId: string, op: Op): void {
@@ -62,9 +89,13 @@ export class Doc {
       case 'stroke.add':
       case 'stroke.restore':
         this.strokes.set(op.stroke.id, { ...op.stroke, deleted: false });
+        this.bounds.set(op.stroke.id, strokeBounds(op.stroke));
+        this.version++;
         break;
       case 'stroke.remove':
         this.strokes.delete(op.id);
+        this.bounds.delete(op.id);
+        this.version++;
         break;
       default:
         applyLayerOp(this.layers, op);

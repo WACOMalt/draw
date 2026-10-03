@@ -189,6 +189,21 @@ The layout is close to Photoshop, but simpler, with a dark theme.
 - Right panels: Color, Layers
 - Status bar: zoom, cursor position in world units, stroke count
 
+Finding content on the canvas (`engine/navigator.ts`). A drawing can be off screen, or too small to see at the current zoom. Thus every stroke on a visible layer is in exactly one of three states:
+
+| State | What the user sees |
+|---|---|
+| On screen, 10 px or larger | The stroke |
+| On screen, smaller than 10 px | A pin with a count. Near pins merge. A group that is big and dense on screen reads as a shape and gets no pin. |
+| Off screen | One of 8 edge arrows, one for each direction, with a count |
+
+- The visible-shape test uses the true screen area of the strokes. Sub-pixel dust never counts as a shape, so it always keeps a pin.
+- If there are more than 20 pins, the grouping grid doubles (48, 96, 192 px, and so on). Thus the view never gets dense.
+- A click on a pin or an arrow flies to that content. The pins then split into smaller groups.
+- **Fit all** (`Ctrl+0`, `Home`, or the top-bar button) shows the content of all visible layers. `Ctrl+1` goes to 100%. `M` turns the markers on and off.
+- A fly-to moves the zoom in log space. A long trip zooms out, travels, and then zooms in. Any input stops it.
+- The client computes the markers from a cache of stroke bounds, at most every 120 ms. The interval grows with the cost of the last computation (about 30 ms for 20 000 strokes). During a fly-to, the client computes the markers only at the end.
+
 Phone layout (width under 760 px, or a short touch screen): the canvas fills the screen. A bottom bar holds the tools and three buttons that open bottom sheets: brush settings, color, and layers. A zoom label at the top left resets the zoom to 100%.
 
 Touch gestures:
@@ -206,7 +221,7 @@ PWA: the app has a web manifest, icons (also maskable), and a service worker. Th
 
 The landing page keeps a list of recent sessions in local storage on each device.
 
-Shortcuts: `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor.
+Shortcuts: `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hides the markers. `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor.
 
 ## 10. Deployment
 
@@ -229,6 +244,7 @@ Desktop app (Tauri v2, `src-tauri/`):
 - Snapshots of the op log, so a large session loads fast
 - Baked raster tiles at coarse LODs, so a dense area renders fast at low zoom
 - Windows and macOS desktop builds in CI, with code signing
+- A spatial index for the markers, for documents with more than about 100 000 strokes
 - Coordinate rebasing, for zoom without the float64 limit (about 15 orders of magnitude around the work area)
 - Selection, transform, fill, and text tools
 - Export of a region at a chosen resolution, and PSD export
