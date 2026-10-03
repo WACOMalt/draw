@@ -35,18 +35,6 @@
   <button class="icon" title="Undo (Ctrl+Z)" disabled={!ed.canUndo} onclick={() => engine?.undo()}><Icon name="undo" /></button>
   <button class="icon" title="Redo (Ctrl+Shift+Z)" disabled={!ed.canRedo} onclick={() => engine?.redo()}><Icon name="redo" /></button>
 
-  <div class="sep"></div>
-  <button class="icon" title="Fit everything (Ctrl+0)" aria-label="Fit everything" onclick={() => engine?.fitAll()}><Icon name="fit" /></button>
-  <button
-    class="icon"
-    class:on={ed.showMarkers}
-    title="Markers for small and off-screen drawings (M)"
-    aria-label="Toggle markers"
-    onclick={() => {
-      ed.showMarkers = !ed.showMarkers;
-      engine?.scheduleMarkers();
-    }}><Icon name="pin" /></button>
-
   <div class="grow"></div>
 
   <div class="peers">

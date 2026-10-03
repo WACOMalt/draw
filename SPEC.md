@@ -200,7 +200,7 @@ Finding content on the canvas (`engine/navigator.ts`). A drawing can be off scre
 - The visible-shape test uses the true screen area of the strokes. Sub-pixel dust never counts as a shape, so it always keeps a pin.
 - If there are more than 20 pins, the grouping grid doubles (48, 96, 192 px, and so on). Thus the view never gets dense.
 - A click on a pin or an arrow flies to that content. The pins then split into smaller groups.
-- **Fit all** (`Ctrl+0`, `Home`, or the top-bar button) shows the content of all visible layers. `Ctrl+1` goes to 100%. `M` turns the markers on and off.
+- Two round buttons at the bottom right of the canvas turn the markers on and off (also `M`) and fit all content (also `Ctrl+0` or `Home`). Fit all shows the content of all visible layers. `Ctrl+1` goes to 100%. Edge arrows move out of that corner, so they never go under the buttons.
 - A fly-to moves the zoom in log space. A long trip zooms out, travels, and then zooms in. Any input stops it.
 - The client computes the markers from a cache of stroke bounds, at most every 120 ms. The interval grows with the cost of the last computation (about 30 ms for 20 000 strokes). During a fly-to, the client computes the markers only at the end.
 

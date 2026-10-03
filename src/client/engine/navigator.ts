@@ -34,6 +34,9 @@ const VISIBLE_GROUP = 36;
 const VISIBLE_COVERAGE = 0.05;
 /** Edge markers sit this far inside the canvas edge (px). */
 const EDGE_INSET = 30;
+/** Bottom-right corner kept free for the viewport buttons (px, coarse pointers included). */
+const CONTROLS_W = 68;
+const CONTROLS_H = 120;
 
 interface Tiny {
   b: Bounds; // world
@@ -119,7 +122,13 @@ export function computeMarkers(doc: Doc, visibleLayers: Set<string>, view: ViewS
     const angle = Math.atan2(ty, tx);
     const c = Math.cos(angle), s = Math.sin(angle);
     const reach = Math.min((w / 2 - EDGE_INSET) / Math.max(Math.abs(c), 1e-9), (h / 2 - EDGE_INSET) / Math.max(Math.abs(s), 1e-9));
-    markers.push({ key: `e${i}`, kind: 'edge', x: w / 2 + c * reach, y: h / 2 + s * reach, angle, count: sec.n, target: t });
+    let x = w / 2 + c * reach, y = h / 2 + s * reach;
+    if (x > w - CONTROLS_W && y > h - CONTROLS_H) {
+      // Slide out of the button corner, along whichever edge the arrow sits on.
+      if (y >= h - EDGE_INSET - 1) x = w - CONTROLS_W - 16;
+      else y = h - CONTROLS_H - 16;
+    }
+    markers.push({ key: `e${i}`, kind: 'edge', x, y, angle, count: sec.n, target: t });
   });
   return markers;
 }

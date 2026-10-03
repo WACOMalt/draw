@@ -12,6 +12,7 @@
   import StatusBar from './StatusBar.svelte';
   import MobileBar, { type SheetName } from './MobileBar.svelte';
   import Sheet from './Sheet.svelte';
+  import Icon from './Icon.svelte';
 
   let { code, onLeave }: { code: string; onLeave: () => void } = $props();
 
@@ -123,6 +124,18 @@
         <div class="conn">{ed.status === 'connecting' ? 'Connecting…' : 'Offline, reconnecting…'}</div>
       {/if}
       {#if ed.toast}<div class="toast">{ed.toast}</div>{/if}
+      <div class="viewctl">
+        <button
+          class:on={ed.showMarkers}
+          title={ed.showMarkers ? 'Hide markers (M)' : 'Show markers for small and off-screen drawings (M)'}
+          aria-label={ed.showMarkers ? 'Hide markers' : 'Show markers'}
+          aria-pressed={ed.showMarkers}
+          onclick={() => {
+            ed.showMarkers = !ed.showMarkers;
+            engine?.scheduleMarkers();
+          }}><Icon name="pin" /></button>
+        <button title="Fit everything (Ctrl+0)" aria-label="Fit everything" onclick={() => engine?.fitAll()}><Icon name="fit" /></button>
+      </div>
       {#if narrow}
         <button class="zoom" title="Reset to 100%" onclick={() => engine?.resetView()}>{zoomLabel}</button>
         {#if sheet === 'brush'}
@@ -166,6 +179,47 @@
       'top'
       'stage'
       'bottom';
+  }
+  /* Viewport controls, bottom right. navigator.ts keeps edge arrows out of this corner. */
+  .viewctl {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .viewctl button {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border-radius: 50%;
+    color: var(--text-dim);
+    background: rgba(30, 30, 30, 0.85);
+    border: 1px solid var(--line);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+  .viewctl button:hover {
+    color: var(--text);
+    background: rgba(50, 50, 50, 0.92);
+  }
+  .viewctl button.on {
+    color: #fff;
+    background: rgba(25, 113, 194, 0.92);
+    border-color: rgba(255, 255, 255, 0.6);
+  }
+  .viewctl :global(svg.i) {
+    width: 18px;
+    height: 18px;
+  }
+  @media (pointer: coarse) {
+    .viewctl button {
+      width: 44px;
+      height: 44px;
+    }
   }
   .zoom {
     position: absolute;
