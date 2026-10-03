@@ -3,11 +3,16 @@
   import { ed, showToast } from '../state.svelte';
   import Icon from './Icon.svelte';
   import { PUBLIC_ORIGIN } from '../config';
+  import { links } from '../identity';
+  import AccountButton from './AccountButton.svelte';
 
   let { engine, code, onLeave }: { engine: Engine | null; code: string; onLeave: () => void } = $props();
+  const narrow = matchMedia('(max-width: 760px)').matches;
 
+  /** Copies the link this person came with (owners use the Share dialog instead). */
   async function copyLink() {
-    const url = `${PUBLIC_ORIGIN}/s/${code}`;
+    const k = links.get(code);
+    const url = `${PUBLIC_ORIGIN}/s/${code}${k ? `?k=${encodeURIComponent(k)}` : ''}`;
     try {
       await navigator.clipboard.writeText(url);
       showToast('Link copied');
@@ -27,13 +32,19 @@
 
 <header>
   <div class="brand"><span class="dot"></span>Draw</div>
-  <button class="code" title="Copy the share link" onclick={copyLink}>
-    <Icon name="link" /><span>{code}</span>
-  </button>
+  {#if ed.role === 'owner'}
+    <button class="code share" title="Share: people, links, password" onclick={() => (ed.shareOpen = true)}>
+      <Icon name="link" /><span>Share {code}</span>
+    </button>
+  {:else}
+    <button class="code" title="Copy the link you opened this canvas with" onclick={copyLink}>
+      <Icon name="link" /><span>{code}</span>
+    </button>
+  {/if}
 
   <div class="sep"></div>
-  <button class="icon" title="Undo (Ctrl+Z)" disabled={!ed.canUndo} onclick={() => engine?.undo()}><Icon name="undo" /></button>
-  <button class="icon" title="Redo (Ctrl+Shift+Z)" disabled={!ed.canRedo} onclick={() => engine?.redo()}><Icon name="redo" /></button>
+  <button class="icon" title="Undo (Ctrl+Z)" disabled={!ed.canUndo || !ed.canEdit} onclick={() => engine?.undo()}><Icon name="undo" /></button>
+  <button class="icon" title="Redo (Ctrl+Shift+Z)" disabled={!ed.canRedo || !ed.canEdit} onclick={() => engine?.redo()}><Icon name="redo" /></button>
 
   <div class="grow"></div>
 
@@ -41,11 +52,14 @@
     {#each ed.peers as p (p.id)}
       <span class="avatar" style:background={p.color} title={p.name}>{initials(p.name)}</span>
     {/each}
-    <label class="me" title="Your name, as other people see it">
-      <span class="avatar" style:background={ed.color}>{initials(ed.name)}</span>
-      <input type="text" maxlength="32" bind:value={ed.name} />
-    </label>
+    {#if !ed.user}
+      <label class="me" title="Your name, as other people see it">
+        <span class="avatar" style:background={ed.color}>{initials(ed.name)}</span>
+        <input type="text" maxlength="32" bind:value={ed.name} />
+      </label>
+    {/if}
   </div>
+  <AccountButton compact={narrow} onHome={onLeave} />
 
   <button class="icon" title="Export the view as PNG" onclick={() => engine?.exportPng()}><Icon name="download" /></button>
   <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
@@ -84,6 +98,10 @@
     font-family: ui-monospace, monospace;
     letter-spacing: 1px;
     padding: 3px 8px;
+  }
+  .share {
+    color: var(--text);
+    border-color: var(--accent-dim);
   }
   .sep {
     width: 1px;

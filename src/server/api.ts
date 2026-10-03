@@ -104,7 +104,13 @@ async function sendVerify(ctx: ApiContext, user: UserRow): Promise<void> {
 
 // --- auth handlers -------------------------------------------------------------------------------
 
+/** In production without SMTP nobody could confirm an account: say so instead of pretending. */
+function mailDown(ctx: ApiContext): boolean {
+  return ctx.mailer.mode === 'dev' && process.env.NODE_ENV === 'production';
+}
+
 const register: Handler = async (ctx, req) => {
+  if (mailDown(ctx)) return err(503, 'mail_unavailable');
   if (!limits.register.allow(req.ip)) return err(429, 'rate_limited');
   const email = normalizeEmail(req.body.email);
   const name = str(req.body.name, 40);
@@ -176,6 +182,7 @@ const logout: Handler = async (ctx, req) => {
 const me: Handler = async (ctx, req) => ok({ user: req.user ? publicUser(req.user, ctx.adminEmails) : null });
 
 const forgot: Handler = async (ctx, req) => {
+  if (mailDown(ctx)) return err(503, 'mail_unavailable');
   const email = normalizeEmail(req.body.email);
   const user = email ? ctx.store.userByEmail(email) : undefined;
   if (user && limits.mail.allow(user.email)) {

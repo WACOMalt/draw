@@ -1,58 +1,69 @@
 <script lang="ts">
   import { normalizeName } from '../../shared/types';
   import { loadRecent, removeRecent, type Recent } from '../recent';
-  import { API_BASE, PUBLIC_ORIGIN } from '../config';
+  import { PUBLIC_ORIGIN } from '../config';
+  import { api, errorText } from '../api';
+  import { anonSecret, links } from '../identity';
+  import { ed } from '../state.svelte';
+  import AccountButton from './AccountButton.svelte';
 
-  let { onOpen }: { onOpen: (key: string) => void } = $props();
+  interface Summary {
+    key: string;
+    role: string;
+    lastActiveAt: number;
+    owner: string | null;
+  }
+
+  let { onOpen }: { onOpen: (key: string, link?: string) => void } = $props();
   let name = $state('');
   let join = $state('');
   let error = $state('');
   let taken = $state<string | null>(null);
   let busy = $state(false);
   let recent = $state<Recent[]>(loadRecent());
+  let mine = $state<{ owned: Summary[]; shared: Summary[] } | null>(null);
 
   const preview = $derived(name.trim() ? normalizeName(name) : null);
+
+  // The account's canvases, whenever someone logs in.
+  $effect(() => {
+    if (!ed.user) return void (mine = null);
+    void api<{ owned: Summary[]; shared: Summary[] }>('GET', '/api/canvases').then((r) => (mine = r.ok ? r.data : null));
+  });
 
   async function create(withName: boolean) {
     busy = true;
     error = '';
     taken = null;
-    try {
-      const res = await fetch(`${API_BASE}/api/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(withName ? { name } : {}),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (res.status === 409) {
-        taken = body.key;
-        return;
-      }
-      if (res.status === 429) throw new Error('Too many new canvases. Wait a minute and try again.');
-      if (res.status === 400) throw new Error('Use 3 to 40 letters, digits or dashes for the name.');
-      if (!res.ok) throw new Error(`Server error (${res.status})`);
-      onOpen(body.key);
-    } catch (e) {
-      error = (e as Error).message;
-    } finally {
-      busy = false;
-    }
+    // The anonymous secret marks this browser as the creator, so it alone may claim the canvas.
+    const r = await api<{ key: string }>('POST', '/api/sessions', withName ? { name, anon: anonSecret() } : { anon: anonSecret() });
+    busy = false;
+    if (r.status === 409) return void (taken = (r.data as { key?: string }).key ?? null);
+    if (r.status === 400) return void (error = 'Use 3 to 40 letters, digits or dashes for the name.');
+    if (r.status === 401) return void (ed.auth = 'login');
+    if (!r.ok) return void (error = r.status === 429 ? 'Too many new canvases. Wait a minute and try again.' : errorText(r.data.error));
+    onOpen(r.data.key);
   }
 
   async function onJoin(e: SubmitEvent) {
     e.preventDefault();
-    busy = true;
     error = '';
+    // Accept a pasted share link as well as a code or name.
+    let input = join.trim();
+    let link: string | undefined;
     try {
-      const res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(join.trim())}`);
-      const body = await res.json();
-      if (!body.exists) throw new Error(`No canvas has the code or name “${join.trim()}”.`);
-      onOpen(body.key);
-    } catch (e) {
-      error = (e as Error).message;
-    } finally {
-      busy = false;
+      const u = new URL(input);
+      link = u.searchParams.get('k') ?? undefined;
+      input = decodeURIComponent(u.pathname.replace(/^\/s\//, ''));
+    } catch {
+      // not a URL
     }
+    busy = true;
+    const r = await api<{ exists: boolean; key: string | null }>('GET', `/api/sessions/${encodeURIComponent(input)}`);
+    busy = false;
+    if (!r.ok || !r.data.exists || !r.data.key) return void (error = `No canvas has the code or name "${input}".`);
+    if (link) links.set(r.data.key, link);
+    onOpen(r.data.key, link);
   }
 
   function ago(t: number): string {
@@ -70,46 +81,77 @@
 </script>
 
 <main>
+  <div class="top"><AccountButton /></div>
   <div class="card">
     <h1><span class="dot"></span>Draw</h1>
     <p class="sub">An infinite canvas you share with a link.</p>
 
-    <button class="primary big" disabled={busy} onclick={() => create(false)}>New private canvas</button>
-    <p class="hint">Gets a random code. Only people with the link can find it.</p>
+    <button class="primary big" disabled={busy} onclick={() => create(false)}>New canvas</button>
+    <p class="hint">
+      {#if ed.user}
+        Saved to your account. Gets a random code; you choose who can open it.
+      {:else}
+        Temporary: deleted after 5 days unless you log in and keep it. Only this browser can keep it.
+      {/if}
+    </p>
 
     <div class="or"><span>or give it a name</span></div>
 
-    <form onsubmit={(e) => (e.preventDefault(), create(true))}>
-      <input type="text" placeholder="friday-jam" maxlength="60" autocomplete="off" spellcheck="false" bind:value={name} />
-      <button type="submit" disabled={busy || !preview}>Create</button>
-    </form>
-    {#if name.trim()}
-      <p class="hint">
-        {#if preview}<span class="mono">{new URL(PUBLIC_ORIGIN).host}/s/{preview}</span> · anyone who guesses the name can join{:else}Use 3 to 40 letters, digits or dashes.{/if}
-      </p>
-    {/if}
-    {#if taken}
-      <p class="taken">
-        <span class="mono">{taken}</span> already exists.
-        <button onclick={() => onOpen(taken!)}>Open it</button>
-      </p>
+    {#if ed.user}
+      <form onsubmit={(e) => (e.preventDefault(), create(true))}>
+        <input type="text" placeholder="friday-jam" maxlength="60" autocomplete="off" spellcheck="false" bind:value={name} />
+        <button type="submit" disabled={busy || !preview}>Create</button>
+      </form>
+      {#if name.trim()}
+        <p class="hint">
+          {#if preview}<span class="mono">{new URL(PUBLIC_ORIGIN).host}/s/{preview}</span> · private until you share it{:else}Use 3 to 40 letters, digits or dashes.{/if}
+        </p>
+      {/if}
+      {#if taken}
+        <p class="taken"><span class="mono">{taken}</span> is taken.</p>
+      {/if}
+    {:else}
+      <p class="hint">Named canvases need an account. <button class="linklike" onclick={() => (ed.auth = 'login')}>Log in</button> or <button class="linklike" onclick={() => (ed.auth = 'register')}>create one</button>.</p>
     {/if}
 
     <div class="or"><span>or join one</span></div>
 
     <form onsubmit={onJoin}>
-      <input type="text" placeholder="Code or name" maxlength="60" autocomplete="off" spellcheck="false" bind:value={join} />
+      <input type="text" placeholder="Code, name or link" maxlength="300" autocomplete="off" spellcheck="false" bind:value={join} />
       <button type="submit" disabled={busy || !join.trim()}>Join</button>
     </form>
 
     {#if error}<p class="error">{error}</p>{/if}
+
+    {#if mine?.owned.length}
+      <div class="or"><span>your canvases</span></div>
+      <ul class="recent">
+        {#each mine.owned as c (c.key)}
+          <li>
+            <a href="/s/{c.key}" onclick={(e) => (e.preventDefault(), onOpen(c.key))}><span class="mono">{c.key}</span></a>
+            <span class="when">{ago(c.lastActiveAt)}</span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    {#if mine?.shared.length}
+      <div class="or"><span>shared with you</span></div>
+      <ul class="recent">
+        {#each mine.shared as c (c.key)}
+          <li>
+            <a href="/s/{c.key}" onclick={(e) => (e.preventDefault(), onOpen(c.key))}><span class="mono">{c.key}</span></a>
+            <span class="when">{c.role === 'viewer' ? 'view' : 'edit'} · {c.owner}</span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
 
     {#if recent.length}
       <div class="or"><span>recent on this device</span></div>
       <ul class="recent">
         {#each recent as r (r.key)}
           <li>
-            <a href="/s/{r.key}" onclick={(e) => (e.preventDefault(), onOpen(r.key))}><span class="mono">{r.key}</span></a>
+            <a href="/s/{r.key}" onclick={(e) => (e.preventDefault(), onOpen(r.key, links.get(r.key)))}><span class="mono">{r.key}</span></a>
             <span class="when">{ago(r.t)}</span>
             <button class="icon x" title="Remove from this list" aria-label="Remove {r.key}" onclick={() => forget(r.key)}>×</button>
           </li>
@@ -237,6 +279,19 @@
   .when {
     color: var(--text-faint);
     font-size: 11px;
+  }
+  .top {
+    position: fixed;
+    top: max(10px, env(safe-area-inset-top));
+    right: 12px;
+    z-index: 10;
+  }
+  .linklike {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent);
+    cursor: pointer;
   }
   .version {
     position: fixed;

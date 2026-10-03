@@ -9,6 +9,7 @@ import type { Renderer } from './renderer';
 import { Doc, type Bounds } from './doc';
 import { computeMarkers, unionAll } from './navigator';
 import { IS_TAURI } from '../config';
+import { anonSecret, desktopToken, grants, links } from '../identity';
 import { Net } from './net';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
@@ -99,6 +100,9 @@ export class Engine {
     private canvas: HTMLCanvasElement,
     private brushCursor: HTMLElement,
   ) {
+    const k = new URLSearchParams(location.search).get('k');
+    if (k) links.set(code, k);
+    this.link = k ?? links.get(code);
     this.comp = createRenderer(canvas);
     ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit`;
     this.rect = canvas.getBoundingClientRect();
@@ -113,7 +117,7 @@ export class Engine {
       code,
       (m) => this.onServer(m),
       (s) => (ed.status = s),
-      () => this.net.send({ t: 'hello', name: ed.name, color: ed.color }),
+      () => this.hello(),
     );
 
     this.listen(canvas, 'pointerdown', (e) => this.onPointerDown(e as PointerEvent));
@@ -131,6 +135,33 @@ export class Engine {
     });
     const sweep = window.setInterval(() => this.comp.sweepLive(), 1000);
     this.cleanup.push(() => window.clearInterval(sweep));
+  }
+
+  /** Share-link token: from the URL (?k=), else the one this canvas was opened with before. */
+  private link: string | undefined;
+
+  private hello(password?: string): void {
+    this.net.send({
+      t: 'hello',
+      name: ed.name,
+      color: ed.color,
+      anon: anonSecret(),
+      token: desktopToken.get() ?? undefined,
+      link: this.link,
+      grant: grants.get(this.code),
+      password,
+    });
+  }
+
+  /** Answer to a join-password prompt. The socket is still open; the server waits for it. */
+  submitPassword(password: string): void {
+    this.hello(password);
+  }
+
+  /** Reconnects with the current identity (after login, logout, or to retry access). */
+  reconnect(): void {
+    ed.denied = null;
+    this.net.reconnect();
   }
 
   destroy(): void {
@@ -542,6 +573,7 @@ export class Engine {
   // --- strokes --------------------------------------------------------------------------------
 
   private beginStroke(e: PointerEvent, x: number, y: number): void {
+    if (!ed.canEdit) return showToast('View only: you can look around but not draw');
     const layer = this.activeLayer();
     if (!layer) return showToast('Add a layer first');
     if (!layer.visible) return showToast('The active layer is hidden');
@@ -676,6 +708,7 @@ export class Engine {
   }
 
   undo(): void {
+    if (!ed.canEdit) return;
     if (this.stroke) return;
     const e = this.undoStack.pop();
     if (!e) return;
@@ -685,6 +718,7 @@ export class Engine {
   }
 
   redo(): void {
+    if (!ed.canEdit) return;
     if (this.stroke) return;
     const e = this.redoStack.pop();
     if (!e) return;
@@ -708,6 +742,7 @@ export class Engine {
   }
 
   addLayer(): void {
+    if (!ed.canEdit) return;
     const layers = this.doc.displayLayers();
     const i = layers.findIndex((l) => l.id === ed.activeLayerId);
     const active = layers[i];
@@ -728,6 +763,7 @@ export class Engine {
   }
 
   deleteLayer(id: string): void {
+    if (!ed.canEdit) return;
     const layers = this.doc.displayLayers();
     if (layers.length <= 1) return showToast('A canvas needs at least one layer');
     const i = layers.findIndex((l) => l.id === id);
@@ -739,6 +775,7 @@ export class Engine {
 
   /** Sets layer properties. Calls with the same `key` within 2 s merge into one undo step. */
   updateLayer(id: string, props: Partial<LayerProps>, key?: string): void {
+    if (!ed.canEdit) return;
     const old = this.doc.layer(id);
     if (!old) return;
     const oldProps: Partial<LayerProps> = {};
@@ -765,6 +802,7 @@ export class Engine {
 
   /** dir +1 moves the layer up (toward the top), -1 moves it down. */
   moveLayer(id: string, dir: 1 | -1): void {
+    if (!ed.canEdit) return;
     const layers = this.doc.displayLayers();
     const i = layers.findIndex((l) => l.id === id);
     const neighbor = layers[i + dir];
@@ -785,6 +823,11 @@ export class Engine {
     switch (m.t) {
       case 'welcome': {
         ed.clientId = m.clientId;
+        // A server from before accounts sends no role: everyone there could edit.
+        ed.role = m.role ?? 'editor';
+        ed.canvas = m.canvas ?? null;
+        ed.denied = null;
+        if (m.grant) grants.set(this.code, m.grant);
         this.doc.reset(m.seq, m.layers, m.strokes);
         this.comp.resetStrokes(m.strokes, m.seq);
         ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
@@ -851,6 +894,16 @@ export class Engine {
         ed.peers = ed.peers.filter((p) => p.id !== m.id);
         for (const id of this.livesByPeer.get(m.id) ?? []) this.comp.liveEnd(id);
         this.livesByPeer.delete(m.id);
+        break;
+      case 'access':
+        if (m.role !== ed.role) showToast(m.role === 'viewer' ? 'You can now only view this canvas' : m.role === 'owner' ? 'You own this canvas now' : 'You can now edit this canvas');
+        ed.role = m.role;
+        ed.canvas = m.canvas;
+        break;
+      case 'denied':
+        ed.denied = m.reason;
+        // A password prompt keeps the socket open; anything else ends this connection.
+        if (m.reason !== 'password_required' && m.reason !== 'password_wrong') this.net.close();
         break;
       case 'error':
         showToast(m.message);

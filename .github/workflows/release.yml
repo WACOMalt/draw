@@ -4,7 +4,7 @@
 # Version: MAJOR.MINOR from package.json, PATCH = this workflow's run number. Bump MAJOR/MINOR
 # in package.json by hand (node scripts/set-version.mjs 0.3.0) when you want to.
 #
-# The server updates itself from the latest release: bash ~/draw/update-server.sh
+# The server updates itself from the latest release: bash /opt/draw/update-server.sh
 name: Release
 
 on:
@@ -46,6 +46,8 @@ jobs:
       - run: node scripts/set-version.mjs ${{ steps.version.outputs.version }}
       - run: npm run check
       - run: npm run build
+      - name: Server integration test (accounts, access, expiry)
+        run: node tests/server.test.mjs
 
       - name: Package the web/server bundle
         run: |
@@ -71,7 +73,7 @@ jobs:
           | Windows | \`Draw_${VERSION}_x64-setup.exe\` or \`.msi\`. Not signed yet: in SmartScreen, select **More info**, then **Run anyway**. |
           | macOS (Intel and Apple silicon) | \`Draw_${VERSION}_universal.dmg\`. Not signed yet: right-click the app, then **Open**. |
 
-          **Server** (draw.bsums.xyz): \`bash ~/draw/update-server.sh\`
+          **Server** (draw.bsums.xyz): \`bash /opt/draw/update-server.sh\`
 
           EOF
           gh release create "v$VERSION" draw-web.tar.gz \

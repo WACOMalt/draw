@@ -1,0 +1,84 @@
+<script lang="ts">
+  import { api, errorText } from '../api';
+  import { anonSecret } from '../identity';
+  import { ed, showToast } from '../state.svelte';
+
+  let { code }: { code: string } = $props();
+  let now = $state(Date.now());
+  let busy = $state(false);
+
+  $effect(() => {
+    const t = setInterval(() => (now = Date.now()), 30_000);
+    return () => clearInterval(t);
+  });
+
+  const left = $derived.by(() => {
+    const ms = (ed.canvas?.expiresAt ?? 0) - now;
+    if (ms <= 0) return 'soon';
+    const h = Math.floor(ms / 3600_000);
+    return h >= 24 ? `${Math.floor(h / 24)} d ${h % 24} h` : h >= 1 ? `${h} h` : `${Math.max(1, Math.round(ms / 60_000))} min`;
+  });
+
+  async function claim() {
+    busy = true;
+    const r = await api('POST', `/api/canvases/${encodeURIComponent(code)}/claim`, { anon: anonSecret() });
+    busy = false;
+    if (r.ok) showToast('Saved to your account. It will not expire.');
+    else showToast(r.data.error === 'cannot_claim' ? 'Only the browser that created this canvas can keep it' : errorText(r.data.error));
+  }
+</script>
+
+{#if ed.canvas?.expiresAt}
+  <div class="banner" class:creator={ed.canvas.canClaim}>
+    <span>Temporary canvas · deleted in {left}</span>
+    {#if ed.canvas.canClaim}
+      {#if ed.user}
+        <button class="primary" disabled={busy} onclick={claim}>Keep this canvas</button>
+      {:else}
+        <button class="primary" onclick={() => (ed.auth = 'login')}>Log in to keep it</button>
+      {/if}
+    {/if}
+  </div>
+{:else if ed.role === 'viewer'}
+  <div class="banner view">View only</div>
+{/if}
+
+<style>
+  .banner {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: calc(100% - 120px);
+    padding: 4px 6px 4px 12px;
+    border-radius: 16px;
+    font-size: 12px;
+    white-space: nowrap;
+    background: rgba(30, 30, 30, 0.88);
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+  }
+  .banner span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .banner.creator {
+    color: var(--text);
+    border-color: rgba(49, 168, 255, 0.5);
+  }
+  .banner.view {
+    padding: 4px 12px;
+  }
+  .banner:not(:has(button)) {
+    padding-right: 12px;
+  }
+  button {
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+  }
+</style>

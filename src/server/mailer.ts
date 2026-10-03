@@ -34,16 +34,23 @@ export class Mailer {
   constructor() {
     const dir = process.env.CREDENTIALS_DIRECTORY;
     const file = dir ? path.join(dir, 'smtp') : null;
+    let cfg: Partial<SmtpConfig> = {};
     if (file && fs.existsSync(file)) {
-      const cfg = JSON.parse(fs.readFileSync(file, 'utf8')) as SmtpConfig;
+      try {
+        cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch {
+        console.error('mail: the smtp credential is not valid JSON');
+      }
+    }
+    if (cfg.host && cfg.user && cfg.pass && cfg.port) {
       this.transport = nodemailer.createTransport({
         host: cfg.host,
         port: cfg.port,
-        secure: cfg.secure,
+        secure: !!cfg.secure,
         auth: { user: cfg.user, pass: cfg.pass },
         requireTLS: !cfg.secure, // never send the password in clear text
       });
-      this.from = cfg.from;
+      this.from = cfg.from ?? `Draw <${cfg.user}>`;
       this.mode = 'smtp';
     } else {
       this.mode = 'dev';

@@ -13,6 +13,9 @@
   import MobileBar, { type SheetName } from './MobileBar.svelte';
   import Sheet from './Sheet.svelte';
   import Icon from './Icon.svelte';
+  import CanvasBanner from './CanvasBanner.svelte';
+  import AccessScreen from './AccessScreen.svelte';
+  import ShareDialog from './ShareDialog.svelte';
 
   let { code, onLeave }: { code: string; onLeave: () => void } = $props();
 
@@ -60,9 +63,17 @@
       .catch(() => {
         if (!dead) e = engine = new Engine(code, canvas, brushCursor);
       });
+    // Log in or out while here: reconnect so the server sees the new identity.
+    const reauth = () => engine?.reconnect();
+    window.addEventListener('draw:auth', reauth);
     return () => {
       dead = true;
+      window.removeEventListener('draw:auth', reauth);
       e?.destroy();
+      ed.role = null;
+      ed.canvas = null;
+      ed.denied = null;
+      ed.shareOpen = false;
     };
   });
 
@@ -71,6 +82,11 @@
     JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
+  });
+
+  // Only owners manage sharing: close the dialog if ownership goes (logout, transfer).
+  $effect(() => {
+    if (ed.role !== 'owner' && ed.shareOpen) ed.shareOpen = false;
   });
 
   // The brush outline follows size changes from the options bar and shortcuts.
@@ -123,7 +139,8 @@
       {#if ed.status !== 'online'}
         <div class="conn">{ed.status === 'connecting' ? 'Connecting…' : 'Offline, reconnecting…'}</div>
       {/if}
-      {#if ed.toast}<div class="toast">{ed.toast}</div>{/if}
+      <CanvasBanner {code} />
+      {#if ed.denied}<AccessScreen {engine} {onLeave} />{/if}
       <div class="viewctl">
         <button
           class:on={ed.showMarkers}
@@ -147,6 +164,7 @@
         {/if}
       {/if}
     </div>
+    {#if ed.shareOpen}<ShareDialog {code} onDeleted={onLeave} />{/if}
     {#if narrow}
       <MobileBar {engine} bind:sheet />
     {:else}
@@ -356,8 +374,7 @@
     border-radius: 8px;
     white-space: nowrap;
   }
-  .conn,
-  .toast {
+  .conn {
     position: absolute;
     left: 50%;
     transform: translateX(-50%);
@@ -370,9 +387,6 @@
   .conn {
     top: 12px;
     color: #ffd43b;
-  }
-  .toast {
-    bottom: 16px;
   }
   .missing {
     height: 100%;

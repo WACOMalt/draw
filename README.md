@@ -11,7 +11,7 @@ npm run dev
 
 Open http://localhost:5173. The dev script starts the API and WebSocket server on port 3210 (`tsx watch`) and the Vite dev server, which proxies `/api` and `/ws` to it.
 
-`npm run check` runs the type checks for the client and the server.
+`npm run check` runs the type checks for the client and the server. `npm run test:server` runs the server integration test (accounts, sharing, expiry).
 
 In the browser console, `__draw.ed` is the editor state and `__draw.engine` is the engine. Add `?renderer=2d` to a canvas URL to use the Canvas 2D renderer in place of WebGL2.
 
@@ -43,10 +43,20 @@ Then it publishes all of them as a GitHub Release, `vMAJOR.MINOR.RUN`. MAJOR.MIN
 Update the server (on the SSH host):
 
 ```bash
-bash ~/draw/update-server.sh
+bash /opt/draw/update-server.sh
 ```
 
-The first time, run it from GitHub: `curl -fsSL https://raw.githubusercontent.com/WACOMalt/draw/main/scripts/update-server.sh | bash`. Give a tag to install a specific release, or to roll back: `bash ~/draw/update-server.sh v0.2.7`. The script never touches `~/draw/data`.
+Give a tag to install a specific release, or to roll back: `bash /opt/draw/update-server.sh v0.2.7`. The script never touches the database.
+
+## Server setup (one time)
+
+The server runs Draw as a hardened systemd service with an encrypted SMTP credential. Run this on the server as your normal user. It asks for sudo once and for the SMTP details:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/WACOMalt/draw/main/deploy/setup-systemd.sh -o setup-systemd.sh && less setup-systemd.sh && bash setup-systemd.sh
+```
+
+It moves the database from `~/draw/data` to `/var/lib/draw`, installs the app in `/opt/draw`, and prints the rollback command. For local development, mail goes to the console (set `DEV_MAIL_DIR` to also write each email to a folder).
 
 The version shows in the status bar, on the home page, and in `/api/health`.
 

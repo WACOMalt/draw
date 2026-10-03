@@ -1,10 +1,10 @@
 # Multiplayer Canvas — Technical Spec
 
-Version 0.2, 2026-10-02. Target host: `draw.bsums.xyz`.
+Version 0.3, 2026-10-03. Target host: `draw.bsums.xyz`.
 
 ## 1. Goal
 
-The app is an infinite drawing canvas in the browser. Many people can paint in one session at the same time. A person joins a session with a share code. There are no user accounts in v1.
+The app is an infinite drawing canvas in the browser. Many people can paint in one session at the same time. A person joins a session with a share code or a share link. Without an account, a canvas is temporary. An account keeps canvases and controls who can open them.
 
 ## 2. Scope of v1
 
@@ -23,8 +23,9 @@ In scope:
 - Sessions with a random code or with a name that a person selects
 - Phone and tablet use: touch gestures and a phone layout
 - Installation as a Progressive Web App (PWA)
+- Accounts with email verification, temporary canvases, claiming, and sharing with roles (section 8.1)
 
-Out of scope for v1: selections, transforms, text, shapes, fill, PSD export. User accounts are future work (section 11).
+Out of scope for v1: selections, transforms, text, shapes, fill, PSD export, sign-in with other providers (section 11).
 
 ## 3. Architecture
 
@@ -138,7 +139,10 @@ Transport: JSON over WebSocket at `/ws?code=XXXX-XXXX`, with permessage-deflate.
 
 | Direction | Message | Persisted | Purpose |
 |---|---|---|---|
-| S→C | `welcome` | — | Client id, peers, full document, current `seq` |
+| C→S | `hello` | — | Display name, anonymous secret, desktop token, link token, join password or grant |
+| S→C | `welcome` | — | Client id, peers, full document, current `seq`, role, canvas info, grant |
+| S→C | `access` | — | The role or the canvas info changed (claim, sharing change) |
+| S→C | `denied` | — | No access, password needed or wrong, expired, deleted |
 | C→S | `op` | yes | One document op (table below) |
 | S→C | `op` | — | The op with its `seq` and author, to all clients |
 | C→S→C | `live` | no | Points of a stroke in progress |
@@ -176,6 +180,39 @@ sessions(code TEXT PRIMARY KEY, created_at INTEGER, last_active_at INTEGER, seq 
 ops(code TEXT, seq INTEGER, client_id TEXT, type TEXT, data TEXT, created_at INTEGER,
     PRIMARY KEY (code, seq))
 ```
+
+### 8.1 Accounts and access
+
+Accounts:
+
+- Email and password. The server stores the password as a scrypt hash (random salt, N = 2^15). A new account must open the confirmation link (valid 48 hours) before it can log in. The server deletes accounts that stay unconfirmed for 48 hours.
+- Password reset by email (link valid 2 hours, one use). A reset logs out all other sessions.
+- The web app uses an httpOnly, Secure, SameSite=Lax session cookie (30 days, sliding). The desktop app uses a bearer token, because its page has another origin.
+- Session, email, and device tokens are 256 random bits. The database keeps only their sha256.
+- The `identities` table (provider, subject, user) is ready for sign-in through Authentik, Google, GitHub, Discord, or Facebook later.
+- Register, forgot, and resend never tell if an email has an account. Login runs scrypt also for unknown emails, so its time tells nothing.
+- State-changing API calls need a JSON body and an allowed Origin (CSRF protection). Rate limits apply to register, login, email sending, canvas creation, and sharing.
+
+Canvases:
+
+| Kind | Made by | Expires | Who can open it |
+|---|---|---|---|
+| Temporary | Anyone without an account | 5 days after creation | Anyone with the code (editor) |
+| Owned | An account, or a temporary canvas after a claim | Never | The owner, members, link users |
+| Legacy | Made before accounts | Never | Anyone with the code. The first login of `ADMIN_EMAILS` adopts it. |
+
+- Only accounts can make named canvases. Thus a name cannot expire and then point to another person's canvas.
+- Each browser keeps a random anonymous secret. A temporary canvas stores the sha256 of the creator's secret. Only that browser sees "Log in to keep it", and the claim needs a login.
+- After a claim, the plain `/s/CODE` link stays the edit link, so the people on the canvas stay in. A reset or a disable of the edit link ends that.
+- An hourly job deletes expired temporary canvases. It tells connected people that the canvas expired, then disconnects them.
+
+Roles: owner, editor, viewer. The best of these wins:
+
+1. Owner.
+2. Member role. The owner adds a member by the email of a confirmed account.
+3. Link role. `?k=` with the edit token gives editor. `?k=` with the view token gives viewer.
+
+The owner can turn each link on or off, or reset it. The owner can also set a join password for link users. Members never need it. After one correct password, the client keeps a signed grant (HMAC of the canvas and the password hash). A new password makes old grants invalid. A change to sharing re-checks all connected clients at once: a lost role disconnects them, and a changed role updates their UI. The server rejects ops from viewers. The owner can transfer ownership (the old owner becomes an editor) or delete the canvas.
 
 At load, the server replays the op log to build the document. Limits: 4 MB per message, 20 000 points per stroke, 100 layers per session, 10 new sessions per minute per IP address. The server checks each op for type, range, and size before it accepts the op.
 
@@ -228,10 +265,12 @@ Shortcuts: `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hi
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).
 - Deploy: `npm run deploy` builds, copies the build to `~/draw` on the server, installs the runtime packages, and reloads pm2.
 - Release: every push to `main` runs `.github/workflows/release.yml` on GitHub-hosted runners. It type-checks, builds the web/server bundle and the desktop installers (Linux, Windows, macOS universal), and publishes them as a GitHub Release `vMAJOR.MINOR.RUN`. MAJOR.MINOR come from `package.json`. The patch is the run number, so each push has a new version and `dnf upgrade` works. The client shows the version, and `/api/health` reports the version of the server.
-- Server update: `bash ~/draw/update-server.sh` downloads `draw-web.tar.gz` from the latest release (or a given tag), installs the runtime packages, swaps `dist/` only after the install succeeds, and reloads pm2. It never touches `data/`. GitHub has no access to the server.
-- Run: pm2 with `ecosystem.config.cjs`. The server listens on `127.0.0.1:${PORT}` (default 3210).
+- Server update: `bash /opt/draw/update-server.sh` downloads `draw-web.tar.gz` from the latest release (or a given tag), installs the runtime packages, swaps `dist/` only after the install succeeds, and restarts the service. It never touches the database. GitHub has no access to the server.
+- Run: the systemd service `draw.service` (made by `deploy/setup-systemd.sh`). It runs as the system user `draw`, with a read-only system, no access to `/home`, and no capabilities. The app is in `/opt/draw`, and the database is in `/var/lib/draw`. The server listens on `127.0.0.1:3210`. A sudo rule lets the deploy user restart the service and read its status and logs, and nothing else.
+- SMTP: the password is in `/etc/draw/smtp.cred`, encrypted with `systemd-creds` and the host key (root only). systemd decrypts it only into the private RAM folder of the service when it starts. It is never in an environment variable, a plain file, or the repository. Without SMTP in production, register and reset refuse with `mail_unavailable`.
 - nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. TLS comes from the existing certbot setup.
-- Data: `DB_PATH` (default `./data/canvas.db`). Back up this one file.
+- Data: `DB_PATH` (`/var/lib/draw/canvas.db` on the server). Back up this one file.
+- Settings: `PUBLIC_URL` (links in emails), `ADMIN_EMAILS` (adopt legacy canvases), `TEMP_TTL_MS` and `CLEANUP_EVERY_MS` (expiry, for tests).
 
 Desktop app (Tauri v2, `src-tauri/`):
 
@@ -244,7 +283,9 @@ Desktop app (Tauri v2, `src-tauri/`):
 
 ## 11. Future work
 
-- User accounts: sign-in, owned sessions, invite links, roles (view or edit). Not designed yet.
+- Sign-in with Authentik (OIDC), Google, GitHub, Discord, and Facebook, through the `identities` table
+- Email invites for people without an account, and "request access"
+- Account settings: change email or name, delete the account
 - Snapshots of the op log, so a large session loads fast
 - Baked raster tiles at coarse LODs, so a dense area renders fast at low zoom
 - Code signing for the Windows and macOS installers
@@ -252,7 +293,6 @@ Desktop app (Tauri v2, `src-tauri/`):
 - Coordinate rebasing, for zoom without the float64 limit (about 15 orders of magnitude around the work area)
 - Selection, transform, fill, and text tools
 - Export of a region at a chosen resolution, and PSD export
-- A cleanup policy for sessions that nobody uses
 
 ## 12. Risks
 

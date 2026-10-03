@@ -60,6 +60,18 @@ export class Net {
     return true;
   }
 
+  /** Drops the socket and connects again at once (new identity after login or logout). */
+  reconnect(): void {
+    this.closed = false;
+    this.retry = 0;
+    window.clearTimeout(this.timer);
+    window.clearInterval(this.pingTimer);
+    const old = this.ws;
+    this.ws = null;
+    old?.close();
+    this.connect();
+  }
+
   close(): void {
     this.closed = true;
     window.clearTimeout(this.timer);

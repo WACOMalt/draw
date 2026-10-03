@@ -1,12 +1,22 @@
 // Reactive editor state shared by the Svelte UI and the engine.
 
 import { DEFAULT_BRUSH } from '../shared/brush';
-import type { Brush, Layer } from '../shared/types';
+import type { Brush, CanvasInfo, DeniedReason, Layer, Role } from '../shared/types';
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
 export type Tool = 'brush' | 'eraser' | 'eyedropper' | 'hand';
 export type BrushSettings = Omit<Brush, 'tool' | 'color'>;
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  admin: boolean;
+}
+
+/** Which account dialog is open. */
+export type AuthView = 'login' | 'register' | 'forgot' | 'reset' | 'sent';
 
 export interface PeerView {
   id: string;
@@ -77,6 +87,26 @@ class EditorState {
   canRedo = $state(false);
   toast = $state<string | null>(null);
   renderer = $state('');
+
+  /** Logged-in account, or null. Undefined until the first /api/auth/me answers. */
+  user = $state<User | null | undefined>(undefined);
+  auth = $state<AuthView | null>(null);
+  /** Email the last verification or reset mail went to (for the "check your email" view). */
+  authEmail = $state('');
+  resetToken = $state('');
+  /** This client's role and what it knows about the open canvas. */
+  role = $state<Role | null>(null);
+  canvas = $state<CanvasInfo | null>(null);
+  /** Why the canvas cannot be shown (no access, password, expired, ...), or null. */
+  denied = $state<DeniedReason | null>(null);
+  shareOpen = $state(false);
+
+  get canEdit(): boolean {
+    return this.role === 'owner' || this.role === 'editor';
+  }
+  get displayName(): string {
+    return this.user?.name ?? this.name;
+  }
 
   /** Settings of the tool that paints now (brush or eraser). */
   get activeBrush(): BrushSettings {

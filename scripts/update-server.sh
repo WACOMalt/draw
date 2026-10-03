@@ -7,11 +7,16 @@
 #     bash ~/draw/update-server.sh            # latest release
 #     bash ~/draw/update-server.sh v0.2.7     # a specific release (also a rollback)
 #
-# Never touches ~/draw/data (the database). Settings: DRAW_DIR, DRAW_REPO, DRAW_URL, PORT.
+# Two layouts, found automatically:
+#   systemd (after deploy/setup-systemd.sh): app in /opt/draw, data in /var/lib/draw, restart
+#            through a sudo rule that allows only that restart (no password prompt)
+#   pm2:     app and data in ~/draw
+# Never touches the database. Settings: DRAW_DIR, DRAW_REPO, DRAW_URL, PORT.
 set -euo pipefail
 
 REPO="${DRAW_REPO:-WACOMalt/draw}"
-DIR="${DRAW_DIR:-$HOME/draw}"
+if [ -f /etc/systemd/system/draw.service ]; then MODE=systemd; else MODE=pm2; fi
+if [ "$MODE" = systemd ]; then DIR="${DRAW_DIR:-/opt/draw}"; else DIR="${DRAW_DIR:-$HOME/draw}"; fi
 TAG="${1:-latest}"
 if [ -n "${DRAW_URL:-}" ]; then
   URL="$DRAW_URL" # a bundle from elsewhere (testing, mirrors)
@@ -25,7 +30,9 @@ fi
 export NVM_DIR="$HOME/.nvm"
 # shellcheck disable=SC1091
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null
-for cmd in curl tar node npm pm2; do
+NEED="curl tar node npm"
+[ "$MODE" = pm2 ] && NEED="$NEED pm2"
+for cmd in $NEED; do
   command -v "$cmd" >/dev/null || { echo "error: $cmd not found" >&2; exit 1; }
 done
 
@@ -37,9 +44,9 @@ curl -fL --retry 3 --progress-bar -o "$TMP/web.tgz" "$URL"
 tar -xzf "$TMP/web.tgz" -C "$TMP"
 NEW="$(node -p "require('$TMP/draw/package.json').version")"
 OLD="$( [ -f "$DIR/package.json" ] && node -p "require('$DIR/package.json').version" || echo none )"
-echo "Installed: $OLD   Release: $NEW"
+echo "Installed: $OLD   Release: $NEW   ($MODE, $DIR)"
 
-mkdir -p "$DIR/data"
+[ "$MODE" = pm2 ] && mkdir -p "$DIR/data"
 cp "$TMP/draw/package.json" "$TMP/draw/package-lock.json" "$TMP/draw/ecosystem.config.cjs" "$TMP/draw/update-server.sh" "$DIR/"
 cd "$DIR"
 # npm runs install scripts with every parent node_modules/.bin first on PATH, which can pick up
@@ -52,7 +59,16 @@ rm -rf dist.old
 mv "$TMP/draw/dist" dist
 rm -rf dist.old
 
-pm2 startOrReload ecosystem.config.cjs
-pm2 save >/dev/null
+if [ "$MODE" = systemd ]; then
+  # The service runs the Node binary in the app folder (it cannot read ~/.nvm). Keep it the same
+  # Node that just built the native modules.
+  mkdir -p bin
+  NODE_BIN="$(readlink -f "$(command -v node)")"
+  cmp -s "$NODE_BIN" bin/node || install -m 755 "$NODE_BIN" bin/node
+  sudo -n /usr/bin/systemctl restart draw.service
+else
+  pm2 startOrReload ecosystem.config.cjs
+  pm2 save >/dev/null
+fi
 sleep 2
 echo "Health: $(curl -fsS "http://127.0.0.1:${PORT:-3210}/api/health")"
