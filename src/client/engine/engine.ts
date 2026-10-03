@@ -15,6 +15,11 @@ const MAX_ZOOM = 1e11;
 const LIVE_FLUSH_MS = 40;
 const BUILDUP_MS = 30;
 const CURSOR_MS = 50;
+/** A second finger within this time after the first cancels the first finger's stroke. */
+const GESTURE_GRACE_MS = 300;
+/** Max duration and movement of a two/three-finger tap (undo/redo). */
+const TAP_MS = 300;
+const TAP_SLOP = 12;
 
 interface UndoEntry {
   undo: Op[];
@@ -23,11 +28,24 @@ interface UndoEntry {
   t: number;
 }
 
+interface Gesture {
+  count: number; // fingers at the last rebase
+  maxTouches: number;
+  mid0: [number, number];
+  dist0: number;
+  zoom0: number;
+  world0: [number, number];
+  t0: number;
+  moved: boolean;
+}
+
 interface ActiveStroke {
   id: string;
   layerId: string;
   brush: Brush;
   pointerId: number;
+  pointerType: string;
+  startedAt: number;
   count: number;
   pts: number[];
   unsent: number[];
@@ -57,6 +75,14 @@ export class Engine {
   private livesByPeer = new Map<string, Set<string>>();
   private cleanup: (() => void)[] = [];
   private pointer: { x: number; y: number } | null = null;
+  private touches = new Map<number, [number, number]>();
+  /** Extra fingers that landed during a stroke and must not do anything. */
+  private ignoredTouches = new Set<number>();
+  private gesture: Gesture | null = null;
+  /** After a gesture, fingers do nothing until all of them are lifted. */
+  private touchLock = false;
+  /** Once a pen is used, a finger navigates instead of drawing (palm rejection). */
+  private penSeen = false;
 
   constructor(
     private code: string,
@@ -196,8 +222,10 @@ export class Engine {
   // --- pointer --------------------------------------------------------------------------------
 
   private onPointerDown(e: PointerEvent): void {
-    if (this.stroke || this.pan || this.picking !== null) return;
     const [x, y] = this.local(e);
+    if (e.pointerType === 'pen') this.penSeen = true;
+    if (e.pointerType === 'touch' && this.onTouchDown(e, x, y)) return;
+    if (this.stroke || this.pan || this.picking !== null) return;
     try {
       this.canvas.setPointerCapture(e.pointerId);
     } catch {
@@ -221,7 +249,13 @@ export class Engine {
 
   private onPointerMove(e: PointerEvent): void {
     const [x, y] = this.local(e);
-    this.pointer = { x, y };
+    if (e.pointerType === 'touch' && this.touches.has(e.pointerId)) {
+      this.touches.set(e.pointerId, [x, y]);
+      if (this.gesture) return this.updateGesture();
+      if (this.ignoredTouches.has(e.pointerId) || this.touchLock) return;
+    }
+    // Only a hovering mouse or pen shows the brush outline.
+    this.pointer = e.pointerType === 'touch' ? null : { x, y };
     const [wx, wy] = this.comp.toWorld(x, y);
     ed.cursor = { x: wx, y: wy };
     this.updateBrushCursor();
@@ -246,6 +280,15 @@ export class Engine {
   }
 
   private onPointerUp(e: PointerEvent): void {
+    if (e.pointerType === 'touch') {
+      this.touches.delete(e.pointerId);
+      this.ignoredTouches.delete(e.pointerId);
+      if (this.gesture) {
+        if (this.touches.size === 0) this.endGesture();
+        return;
+      }
+      if (this.touches.size === 0) this.touchLock = false;
+    }
     if (this.pan && e.pointerId === this.pan.pointerId) {
       this.pan = null;
       this.updateCursor();
@@ -263,6 +306,92 @@ export class Engine {
     ed.cursor = null;
     this.updateBrushCursor();
     this.net.send({ t: 'cursor', x: null, y: null, layerId: ed.activeLayerId });
+  }
+
+  // --- touch gestures ----------------------------------------------------------------------
+
+  /** Returns true when the touch is used for navigation and must not draw. */
+  private onTouchDown(e: PointerEvent, x: number, y: number): boolean {
+    this.touches.set(e.pointerId, [x, y]);
+    if (this.gesture) {
+      this.startGesture(); // another finger joins: new baseline, finger count goes up
+      return true;
+    }
+    if (this.touchLock) return true;
+    if (this.touches.size >= 2) {
+      const st = this.stroke;
+      if (st && st.pointerType === 'touch') {
+        if (performance.now() - st.startedAt > GESTURE_GRACE_MS) {
+          // A real stroke is in progress: a resting finger must not interrupt it.
+          this.ignoredTouches.add(e.pointerId);
+          return true;
+        }
+        this.cancelStroke();
+      }
+      if (this.stroke) {
+        this.ignoredTouches.add(e.pointerId); // pen is drawing; ignore the hand
+        return true;
+      }
+      this.pan = null;
+      this.picking = null;
+      this.startGesture();
+      return true;
+    }
+    if (this.penSeen && !this.stroke && !this.pan) {
+      this.pan = { pointerId: e.pointerId, x, y };
+      return true;
+    }
+    return false;
+  }
+
+  private startGesture(): void {
+    const pts = [...this.touches.values()];
+    const mid: [number, number] = [pts.reduce((a, p) => a + p[0], 0) / pts.length, pts.reduce((a, p) => a + p[1], 0) / pts.length];
+    const dist = Math.max(1, Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]));
+    const prev = this.gesture;
+    this.gesture = {
+      count: pts.length,
+      maxTouches: Math.max(prev?.maxTouches ?? 0, pts.length),
+      mid0: mid,
+      dist0: dist,
+      zoom0: this.comp.view.zoom,
+      world0: this.comp.toWorld(mid[0], mid[1]),
+      t0: prev?.t0 ?? performance.now(),
+      moved: prev?.moved ?? false,
+    };
+    this.touchLock = true;
+  }
+
+  private updateGesture(): void {
+    const g = this.gesture!;
+    if (this.touches.size < 2) return;
+    if (this.touches.size !== g.count) return this.startGesture(); // finger added: new baseline
+    const pts = [...this.touches.values()];
+    const mx = pts.reduce((a, p) => a + p[0], 0) / pts.length;
+    const my = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    const dist = Math.max(1, Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]));
+    if (Math.hypot(mx - g.mid0[0], my - g.mid0[1]) > TAP_SLOP || Math.abs(dist - g.dist0) > TAP_SLOP) g.moved = true;
+    const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (g.zoom0 * dist) / g.dist0));
+    this.setView(g.world0[0] - mx / z, g.world0[1] - my / z, z);
+  }
+
+  private endGesture(): void {
+    const g = this.gesture!;
+    this.gesture = null;
+    this.touchLock = false;
+    if (g.moved || performance.now() - g.t0 > TAP_MS) return;
+    if (g.maxTouches === 2) this.undo();
+    else if (g.maxTouches === 3) this.redo();
+  }
+
+  /** Drops the stroke in progress without committing it. */
+  private cancelStroke(): void {
+    const st = this.stroke;
+    if (!st) return;
+    this.stroke = null;
+    st.timers.forEach((t) => window.clearInterval(t));
+    this.comp.liveCancel(st.id);
+    if (st.started) this.net.send({ t: 'live.end', id: st.id });
   }
 
   private onWheel(e: WheelEvent): void {
@@ -317,6 +446,8 @@ export class Engine {
       layerId: layer.id,
       brush,
       pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      startedAt: performance.now(),
       count: 0,
       pts: [],
       unsent: [],

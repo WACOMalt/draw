@@ -3,19 +3,20 @@
   import { ed } from '../state.svelte';
   import Slider from './Slider.svelte';
 
+  let { stacked = false }: { stacked?: boolean } = $props();
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
   const b = $derived(ed.activeBrush);
 </script>
 
-<div class="opts">
+<div class="opts" class:stacked>
   <span class="tool">{ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'brush' ? 'Brush' : ed.tool === 'eyedropper' ? 'Eyedropper' : 'Hand'}</span>
   {#if painting}
-    <Slider label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushPx} log width={110} title="Screen pixels at the current zoom. [ and ]" />
-    <Slider label="Opacity" bind:value={b.opacity} min={0.01} max={1} step={0.01} percent title="Keys 1–0. Caps the whole stroke." />
-    <Slider label="Flow" bind:value={b.flow} min={0.01} max={1} step={0.01} percent title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
-    <Slider label="Hardness" bind:value={b.hardness} min={0} max={1} step={0.01} percent title="Shift+[ and Shift+]" />
-    <Slider label="Spacing" bind:value={b.spacing} min={0.01} max={2} step={0.01} percent width={70} title="Distance between dabs, as a percent of the diameter" />
-    <Slider label="Smoothing" bind:value={ed.smoothing} min={0} max={0.95} step={0.01} percent width={60} />
+    <Slider wide={stacked} label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushPx} log width={110} title="Screen pixels at the current zoom. [ and ]" />
+    <Slider wide={stacked} label="Opacity" bind:value={b.opacity} min={0.01} max={1} step={0.01} percent title="Keys 1–0. Caps the whole stroke." />
+    <Slider wide={stacked} label="Flow" bind:value={b.flow} min={0.01} max={1} step={0.01} percent title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
+    <Slider wide={stacked} label="Hardness" bind:value={b.hardness} min={0} max={1} step={0.01} percent title="Shift+[ and Shift+]" />
+    <Slider wide={stacked} label="Spacing" bind:value={b.spacing} min={0.01} max={2} step={0.01} percent width={70} title="Distance between dabs, as a percent of the diameter" />
+    <Slider wide={stacked} label="Smoothing" bind:value={ed.smoothing} min={0} max={0.95} step={0.01} percent width={60} />
     <div class="toggles">
       <button class="icon wide" class:on={b.pressureSize} title="Pen pressure controls size" onclick={() => (b.pressureSize = !b.pressureSize)}>
         P·size
@@ -49,6 +50,26 @@
   .tool {
     font-weight: 600;
     min-width: 66px;
+  }
+  .stacked {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    padding: 4px 16px 12px;
+    border: none;
+    overflow: visible;
+    background: none;
+  }
+  .stacked .tool {
+    display: none;
+  }
+  .stacked .toggles {
+    margin-top: 6px;
+  }
+  .stacked .wide {
+    flex: 1;
+    height: 36px;
+    font-size: 12px;
   }
   .toggles {
     display: flex;

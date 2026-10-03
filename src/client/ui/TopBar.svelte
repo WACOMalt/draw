@@ -53,6 +53,8 @@
 <style>
   header {
     grid-area: top;
+    min-height: 36px;
+    padding-top: env(safe-area-inset-top);
     display: flex;
     align-items: center;
     gap: 6px;
@@ -121,5 +123,39 @@
   }
   .me input:hover {
     border-color: var(--line);
+  }
+  @media (max-width: 760px), (max-height: 520px) and (pointer: coarse) {
+    header {
+      min-height: 46px;
+      gap: 2px;
+      padding-left: max(8px, env(safe-area-inset-left));
+      padding-right: max(8px, env(safe-area-inset-right));
+    }
+    .brand span:not(.dot),
+    .brand {
+      font-size: 0;
+      margin-right: 2px;
+    }
+    .me input,
+    .sep {
+      display: none;
+    }
+    header :global(button.icon) {
+      width: 36px;
+      height: 36px;
+    }
+    .code {
+      min-width: 0;
+      overflow: hidden;
+      max-width: 42vw;
+    }
+    .code span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .peers .avatar:nth-child(n + 4):not(.me .avatar) {
+      display: none;
+    }
   }
 </style>

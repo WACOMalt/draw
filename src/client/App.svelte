@@ -1,12 +1,17 @@
 <script lang="ts">
-  import { normalizeCode } from '../shared/types';
+  import { parseKey } from '../shared/types';
   import Landing from './ui/Landing.svelte';
   import Editor from './ui/Editor.svelte';
 
   let path = $state(location.pathname);
   const code = $derived.by(() => {
     const m = /^\/s\/([^/]+)\/?$/.exec(path);
-    return m ? normalizeCode(m[1]) : null;
+    if (!m) return null;
+    try {
+      return parseKey(decodeURIComponent(m[1]));
+    } catch {
+      return null;
+    }
   });
 
   function go(to: string) {

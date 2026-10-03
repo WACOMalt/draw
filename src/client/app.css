@@ -29,6 +29,9 @@ body,
 }
 
 body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
   background: var(--bg-0);
   color: var(--text);
   font: 12px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -44,6 +47,7 @@ select {
 }
 
 button {
+  touch-action: manipulation;
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: var(--radius);

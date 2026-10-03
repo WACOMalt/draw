@@ -2,12 +2,15 @@
   import { onMount } from 'svelte';
   import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
+  import { addRecent, removeRecent } from '../recent';
   import TopBar from './TopBar.svelte';
   import OptionsBar from './OptionsBar.svelte';
   import Toolbar from './Toolbar.svelte';
   import ColorPanel from './ColorPanel.svelte';
   import LayersPanel from './LayersPanel.svelte';
   import StatusBar from './StatusBar.svelte';
+  import MobileBar, { type SheetName } from './MobileBar.svelte';
+  import Sheet from './Sheet.svelte';
 
   let { code, onLeave }: { code: string; onLeave: () => void } = $props();
 
@@ -16,6 +19,25 @@
   let engine = $state<Engine | null>(null);
   let missing = $state(false);
 
+  // Phone layout: full-screen canvas, bottom tool bar, settings in bottom sheets.
+  const NARROW = '(max-width: 760px), (max-height: 520px) and (pointer: coarse)';
+  let narrow = $state(matchMedia(NARROW).matches);
+  let sheet = $state<SheetName | null>(null);
+  $effect(() => {
+    const mq = matchMedia(NARROW);
+    const on = () => {
+      narrow = mq.matches;
+      if (!narrow) sheet = null;
+    };
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  });
+  const zoomLabel = $derived.by(() => {
+    const z = ed.view.zoom;
+    if (z >= 100 || z < 0.01) return `×${z.toExponential(0).replace('e+', 'e')}`;
+    return `${Math.round(z * 100)}%`;
+  });
+
   onMount(() => {
     let e: Engine | null = null;
     let dead = false;
@@ -23,7 +45,11 @@
       .then((r) => r.json())
       .then((body) => {
         if (dead) return;
-        if (!body.exists) return void (missing = true);
+        if (!body.exists || body.key !== code) {
+          removeRecent(code);
+          return void (missing = true);
+        }
+        addRecent(code);
         e = engine = new Engine(code, canvas, brushCursor);
         e.updateCursor();
         // Console handle for debugging: __draw.ed (state), __draw.engine.
@@ -61,14 +87,16 @@
 
 {#if missing}
   <div class="missing">
-    <p>No canvas has the code <b>{code}</b>.</p>
+    <p>No canvas is called <b>{code}</b>.</p>
     <button class="primary" onclick={onLeave}>Back</button>
   </div>
 {:else}
-  <div class="editor">
+  <div class="editor" class:narrow>
     <TopBar {engine} {code} {onLeave} />
-    <OptionsBar />
-    <Toolbar {engine} />
+    {#if !narrow}
+      <OptionsBar />
+      <Toolbar {engine} />
+    {/if}
     <div class="stage">
       <canvas bind:this={canvas}></canvas>
       <div class="brush-cursor" bind:this={brushCursor}></div>
@@ -82,18 +110,33 @@
         <div class="conn">{ed.status === 'connecting' ? 'Connecting…' : 'Offline, reconnecting…'}</div>
       {/if}
       {#if ed.toast}<div class="toast">{ed.toast}</div>{/if}
+      {#if narrow}
+        <button class="zoom" title="Reset to 100%" onclick={() => engine?.resetView()}>{zoomLabel}</button>
+        {#if sheet === 'brush'}
+          <Sheet title={ed.tool === 'eraser' ? 'Eraser' : 'Brush'} onClose={() => (sheet = null)}><OptionsBar stacked /></Sheet>
+        {:else if sheet === 'color'}
+          <Sheet title="Color" onClose={() => (sheet = null)}><ColorPanel {engine} /></Sheet>
+        {:else if sheet === 'layers'}
+          <Sheet title="Layers" tall onClose={() => (sheet = null)}><LayersPanel {engine} /></Sheet>
+        {/if}
+      {/if}
     </div>
-    <aside>
-      <ColorPanel {engine} />
-      <LayersPanel {engine} />
-    </aside>
-    <StatusBar />
+    {#if narrow}
+      <MobileBar {engine} bind:sheet />
+    {:else}
+      <aside>
+        <ColorPanel {engine} />
+        <LayersPanel {engine} />
+      </aside>
+      <StatusBar />
+    {/if}
   </div>
 {/if}
 
 <style>
   .editor {
     height: 100%;
+    height: 100dvh;
     display: grid;
     grid-template-rows: 36px 38px 1fr 24px;
     grid-template-columns: 44px 1fr 264px;
@@ -102,6 +145,26 @@
       'opts opts opts'
       'tools stage panels'
       'status status status';
+  }
+  .editor.narrow {
+    grid-template-rows: auto 1fr auto;
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      'top'
+      'stage'
+      'bottom';
+  }
+  .zoom {
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    z-index: 5;
+    padding: 3px 9px;
+    border-radius: 12px;
+    font-size: 11px;
+    background: rgba(30, 30, 30, 0.85);
+    border-color: var(--line);
+    font-variant-numeric: tabular-nums;
   }
   .stage {
     grid-area: stage;

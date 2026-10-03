@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { newSessionCode } from '../shared/ids';
-import { LIMITS, normalizeCode, type ClientMsg } from '../shared/types';
+import { LIMITS, candidateKeys, normalizeName, parseKey, type ClientMsg } from '../shared/types';
 import { Store } from './db';
 import { Session, newClient } from './session';
 
@@ -58,11 +58,17 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.ico': 'image/x-icon',
   '.json': 'application/json',
+  '.webmanifest': 'application/manifest+json',
   '.woff2': 'font/woff2',
 };
 
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string): void {
-  let rel = decodeURIComponent(pathname);
+  let rel: string;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    return void res.writeHead(400).end('bad request');
+  }
   if (rel === '/' || rel.startsWith('/s/')) rel = '/index.html';
   const file = path.join(STATIC_DIR, path.normalize(rel));
   if (!file.startsWith(STATIC_DIR + path.sep)) return void res.writeHead(403).end();
@@ -83,6 +89,43 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
   });
 }
 
+function readJson(req: http.IncomingMessage, limit = 2048): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > limit) return req.destroy();
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        const v = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+        resolve(typeof v === 'object' && v !== null ? v : {});
+      } catch {
+        resolve({});
+      }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+async function createSession(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  if (!allowCreate(clientIp(req))) return json(res, 429, { error: 'rate_limited' });
+  const body = await readJson(req);
+  if (typeof body.name === 'string' && body.name.trim()) {
+    const name = normalizeName(body.name);
+    if (!name) return json(res, 400, { error: 'bad_name' });
+    if (!store.createSession(name)) return json(res, 409, { error: 'name_taken', key: name });
+    return json(res, 201, { key: name });
+  }
+  for (let i = 0; i < 5; i++) {
+    const code = newSessionCode();
+    if (store.createSession(code)) return json(res, 201, { key: code });
+  }
+  return json(res, 500, { error: 'code_collision' });
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -94,18 +137,24 @@ const server = http.createServer((req, res) => {
   const p = url.pathname;
 
   if (p === '/api/sessions' && req.method === 'POST') {
-    if (!allowCreate(clientIp(req))) return json(res, 429, { error: 'rate_limited' });
-    for (let i = 0; i < 5; i++) {
-      const code = newSessionCode();
-      if (store.createSession(code)) return json(res, 201, { code });
-    }
-    return json(res, 500, { error: 'code_collision' });
+    createSession(req, res).catch((e) => {
+      console.error('create session', e);
+      if (!res.headersSent) json(res, 500, { error: 'internal' });
+    });
+    return;
   }
 
+  // Resolves what someone typed (a code, with or without the dash, or a name) to a session.
   const m = /^\/api\/sessions\/([^/]+)$/.exec(p);
   if (m && req.method === 'GET') {
-    const code = normalizeCode(m[1]);
-    return json(res, 200, { exists: code !== null && store.sessionExists(code), code });
+    let raw = '';
+    try {
+      raw = decodeURIComponent(m[1]);
+    } catch {
+      // keep empty
+    }
+    const key = candidateKeys(raw).find((k) => store.sessionExists(k)) ?? null;
+    return json(res, 200, { exists: key !== null, key });
   }
 
   if (p === '/api/health') return json(res, 200, { ok: true, sessions: sessions.size });
@@ -123,7 +172,7 @@ const wss = new WebSocketServer({
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://x');
-  const code = url.pathname === '/ws' ? normalizeCode(url.searchParams.get('code') ?? '') : null;
+  const code = url.pathname === '/ws' ? parseKey(url.searchParams.get('code') ?? '') : null;
   const session = code ? getSession(code) : null;
   if (!session) {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');

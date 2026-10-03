@@ -10,6 +10,7 @@
     log = false,
     width = 90,
     title = '',
+    wide = false,
     oninput,
   }: {
     label: string;
@@ -21,6 +22,8 @@
     log?: boolean;
     width?: number;
     title?: string;
+    /** Stretch the range to the available width (sheet layout). */
+    wide?: boolean;
     oninput?: (v: number) => void;
   } = $props();
 
@@ -38,11 +41,11 @@
   }
 </script>
 
-<label class="slider" {title}>
+<label class="slider" class:wide {title}>
   <span class="lbl">{label}</span>
   <input
     type="range"
-    style:width="{width}px"
+    style:width={wide ? null : `${width}px`}
     min={log ? 0 : min}
     max={log ? 1000 : max}
     step={log ? 1 : step}
@@ -68,6 +71,24 @@
   }
   .lbl {
     color: var(--text-dim);
+  }
+  .wide {
+    display: flex;
+    width: 100%;
+    gap: 10px;
+  }
+  .wide .lbl {
+    width: 76px;
+    flex: none;
+  }
+  .wide input[type='range'] {
+    flex: 1;
+    min-width: 0;
+    height: 32px;
+  }
+  .wide input[type='number'] {
+    width: 54px;
+    padding: 6px 4px;
   }
   input[type='number'] {
     width: 44px;

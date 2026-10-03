@@ -1,6 +1,6 @@
 # Multiplayer Canvas — Technical Spec
 
-Version 0.1, 2026-10-02. Target host: `draw.bsums.xyz`.
+Version 0.2, 2026-10-02. Target host: `draw.bsums.xyz`.
 
 ## 1. Goal
 
@@ -10,7 +10,7 @@ The app is an infinite drawing canvas in the browser. Many people can paint in o
 
 In scope:
 
-- Infinite canvas with pan and zoom
+- Infinite canvas with pan and deep zoom (1e-9× to 1e11×)
 - Brush and eraser with size, opacity, flow, hardness, and spacing
 - Pen pressure for size and flow
 - Airbrush build-up: paint builds up while the pen stays still
@@ -20,6 +20,9 @@ In scope:
 - Live view of the strokes and cursors of other users
 - Sessions that stay after a server restart
 - Export of the current view as PNG
+- Sessions with a random code or with a name that a person selects
+- Phone and tablet use: touch gestures and a phone layout
+- Installation as a Progressive Web App (PWA)
 
 Out of scope for v1: selections, transforms, text, shapes, fill, PSD export. User accounts are future work (section 11).
 
@@ -57,6 +60,8 @@ Brush  { tool: 'paint' | 'erase', color: '#rrggbb', size, opacity, flow,
 ```
 
 - `pts` is a flat array of `x, y, pressure` triples in world units. One world unit is one CSS pixel at 100% zoom.
+- `brush.size` is in world units. The client sets it from the brush size in screen pixels, divided by the zoom at the start of the stroke. Thus a 24 px brush draws a 24 px line at any zoom.
+- The client rounds each point to about 0.1 device pixel at the zoom of the stroke. The precision follows the zoom, so a stroke at 1e6× keeps its detail.
 - `order` is a fractional index. A move sets `order` to the midpoint of the two neighbor layers. Thus a reorder is one property write, and two users can reorder at the same time without a conflict.
 - Delete is a tombstone (`deleted: true`). A tombstone makes undo of a delete possible.
 - A stroke keeps the `seq` of its creation. If a user restores a stroke, it goes back to its original position in the z-order.
@@ -67,7 +72,7 @@ A stroke is a sequence of dabs. A dab is one stamp of the brush tip.
 
 | Parameter | Range | Effect |
 |---|---|---|
-| size | 1–1000 | Diameter of the dab in world units |
+| size | 1–1000 px | Diameter of the dab in screen pixels at the zoom of the stroke |
 | opacity | 0–1 | Maximum alpha of the full stroke |
 | flow | 0–1 | Alpha of one dab. Overlapping dabs build up toward `opacity` |
 | hardness | 0–1 | Size of the solid core. 0 gives a soft falloff, 1 gives a hard edge |
@@ -95,7 +100,8 @@ The dab walker is one shared module (`src/shared/brush.ts`). The worker and the 
 
 - A tile is 256 × 256 device pixels for one layer.
 - The level of detail (LOD) is an integer. A tile at LOD `L` covers `256 × 2^L` world units.
-- The client selects `L` from the device scale (zoom × devicePixelRatio). Negative `L` gives sharp tiles at high zoom. This is the benefit of vector storage.
+- The client selects `L` from the device scale (zoom × devicePixelRatio). The range is −45 to 40. Negative `L` gives sharp tiles at high zoom. This is the benefit of vector storage.
+- If a full stroke is smaller than 2 pixels at a tile's LOD, the worker draws it as one dot. Thus a far zoomed-out view stays fast.
 - The tile key is `layerId | L | tx | ty`.
 
 ### 6.2 Tile worker
@@ -159,7 +165,11 @@ Undo and redo are local to each user. Each user has a stack of their own actions
 - Node 20 or later, `ws`, `better-sqlite3`, no framework.
 - `POST /api/sessions` makes a session and gives back its code. `GET /api/sessions/:code` tells if a session exists.
 - All other paths give the static client. `/s/:code` gives `index.html`.
-- A session code has 8 characters from a 31-character set with no look-alike characters (format `XXXX-XXXX`, about 8 × 10^11 codes). The code is the only access control. Thus it must be hard to guess.
+- A session key is a code or a name:
+  - A code has 8 characters from a 31-character set with no look-alike characters (format `XXXX-XXXX`, about 8 × 10^11 codes). The code is the only access control. Thus it must be hard to guess.
+  - A name has 3 to 40 lowercase letters, digits, and single dashes (`friday-jam`). The server makes a name from the input ("Friday Jam!" becomes `friday-jam`). A name in code format is not permitted. A name is easy to guess, so the UI tells the user that anyone who guesses it can join.
+- `POST /api/sessions` with `{"name": "..."}` makes a named session. If the name exists, the server sends 409 with the key.
+- `GET /api/sessions/:input` accepts a code (with or without the dash) or a name, and gives back the key of the session that exists.
 - The server loads a session into memory at the first join. It unloads the session 5 minutes after the last client leaves.
 
 SQLite schema:
@@ -182,6 +192,23 @@ The layout is close to Photoshop, but simpler, with a dark theme.
 - Right panels: Color, Layers
 - Status bar: zoom, cursor position in world units, stroke count
 
+Phone layout (width under 760 px, or a short touch screen): the canvas fills the screen. A bottom bar holds the tools and three buttons that open bottom sheets: brush settings, color, and layers. A zoom label at the top left resets the zoom to 100%.
+
+Touch gestures:
+
+| Gesture | Action |
+|---|---|
+| One finger | Draw. After a pen was used, one finger pans (palm rejection). |
+| Two fingers, move | Pan and pinch zoom |
+| Two-finger tap | Undo |
+| Three-finger tap | Redo |
+
+A second finger within 300 ms of the first cancels the stroke of the first finger. A later finger does not interrupt a stroke.
+
+PWA: the app has a web manifest, icons (also maskable), and a service worker. The service worker caches the app shell. It loads pages from the network first, so a deploy shows at once. It never caches `/api` or `/ws`. Chrome, Edge, and Firefox for Android can install the app. Desktop Firefox has no general PWA install.
+
+The landing page keeps a list of recent sessions in local storage on each device.
+
 Shortcuts: `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor.
 
 ## 10. Deployment
@@ -197,7 +224,7 @@ Shortcuts: `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardn
 - Snapshots of the op log, so a large session loads fast
 - Baked raster tiles at coarse LODs, so a dense area renders fast at low zoom
 - WebGL compositor, if Canvas 2D becomes the bottleneck
-- Touch gestures: two-finger pan and pinch zoom
+- Coordinate rebasing, for zoom without the float64 limit (about 15 orders of magnitude around the work area)
 - Selection, transform, fill, and text tools
 - Export of a region at a chosen resolution, and PSD export
 - A cleanup policy for sessions that nobody uses

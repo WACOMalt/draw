@@ -225,4 +225,13 @@
   .grow {
     flex: 1;
   }
+  @media (pointer: coarse) {
+    li {
+      height: 46px;
+    }
+    .footer :global(button.icon) {
+      width: 40px;
+      height: 40px;
+    }
+  }
 </style>
