@@ -10,7 +10,7 @@
 <div class="opts">
   <span class="tool">{ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'brush' ? 'Brush' : ed.tool === 'eyedropper' ? 'Eyedropper' : 'Hand'}</span>
   {#if painting}
-    <Slider label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushSize} log width={110} title="[ and ]" />
+    <Slider label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushPx} log width={110} title="Screen pixels at the current zoom. [ and ]" />
     <Slider label="Opacity" bind:value={b.opacity} min={0.01} max={1} step={0.01} percent title="Keys 1–0. Caps the whole stroke." />
     <Slider label="Flow" bind:value={b.flow} min={0.01} max={1} step={0.01} percent title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
     <Slider label="Hardness" bind:value={b.hardness} min={0} max={1} step={0.01} percent title="Shift+[ and Shift+]" />

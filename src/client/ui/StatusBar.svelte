@@ -1,12 +1,18 @@
 <script lang="ts">
   import { ed } from '../state.svelte';
 
-  const zoom = $derived(ed.view.zoom >= 0.1 ? `${Math.round(ed.view.zoom * 100)}%` : `${(ed.view.zoom * 100).toFixed(1)}%`);
+  const zoom = $derived.by(() => {
+    const z = ed.view.zoom;
+    if (z >= 100 || z < 0.001) return `×${z.toExponential(1).replace('e+', 'e')}`;
+    return z >= 0.1 ? `${Math.round(z * 100)}%` : `${(z * 100).toFixed(1)}%`;
+  });
+  // Show enough decimals that the coordinates still move at deep zoom.
+  const decimals = $derived(Math.max(0, Math.min(12, Math.ceil(Math.log10(ed.view.zoom)))));
 </script>
 
 <footer>
   <span>{zoom}</span>
-  <span class="dim">{ed.cursor ? `${Math.round(ed.cursor.x)}, ${Math.round(ed.cursor.y)}` : '—'}</span>
+  <span class="dim">{ed.cursor ? `${ed.cursor.x.toFixed(decimals)}, ${ed.cursor.y.toFixed(decimals)}` : '—'}</span>
   <span class="dim">{ed.strokeCount} strokes</span>
   <span class="grow"></span>
   <span class="dim">{ed.peers.length + 1} {ed.peers.length ? 'people' : 'person'} here</span>

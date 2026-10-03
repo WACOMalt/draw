@@ -1,6 +1,6 @@
 // Glue between input, the document, the network and the compositor.
 
-import { quantizePoint } from '../../shared/brush';
+import { pointDecimals, quantizePoint } from '../../shared/brush';
 import { newId } from '../../shared/ids';
 import { LIMITS, type Brush, type Layer, type LayerProps, type Op, type ServerMsg } from '../../shared/types';
 import { ed, save, showToast, type Tool } from '../state.svelte';
@@ -8,8 +8,10 @@ import { Compositor } from './compositor';
 import { Doc } from './doc';
 import { Net } from './net';
 
-const MIN_ZOOM = 1 / 128;
-const MAX_ZOOM = 64;
+// Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
+// This range stays precise for drawings within about 1e4 world units of where you work.
+const MIN_ZOOM = 1e-9;
+const MAX_ZOOM = 1e11;
 const LIVE_FLUSH_MS = 40;
 const BUILDUP_MS = 30;
 const CURSOR_MS = 50;
@@ -34,6 +36,7 @@ interface ActiveStroke {
   sy: number;
   last: [number, number, number] | null; // last quantized point
   raw: [number, number, number];
+  decimals: number; // point precision, fixed for the stroke from the zoom at its start
   lastMove: number;
   timers: number[];
 }
@@ -180,7 +183,7 @@ export class Engine {
       el.style.display = 'none';
       return;
     }
-    const d = Math.max(3, ed.activeBrush.size * this.comp.view.zoom);
+    const d = Math.max(3, ed.activeBrush.size);
     el.style.display = 'block';
     el.style.width = el.style.height = `${d}px`;
     el.style.transform = `translate(${this.pointer.x - d / 2}px, ${this.pointer.y - d / 2}px)`;
@@ -280,7 +283,9 @@ export class Engine {
     const now = performance.now();
     if (now - this.lastCursorSent < CURSOR_MS) return;
     this.lastCursorSent = now;
-    this.net.send({ t: 'cursor', x: Math.round(wx), y: Math.round(wy), layerId: ed.activeLayerId });
+    const d = pointDecimals(this.comp.view.zoom);
+    const [qx, qy] = quantizePoint(wx, wy, 0, d);
+    this.net.send({ t: 'cursor', x: qx, y: qy, layerId: ed.activeLayerId });
   }
 
   private pick(x: number, y: number): void {
@@ -299,7 +304,14 @@ export class Engine {
     if (!layer.visible) return showToast('The active layer is hidden');
     const tool = this.effectiveTool();
     const settings = tool === 'eraser' ? ed.eraser : ed.brush;
-    const brush: Brush = { ...settings, tool: tool === 'eraser' ? 'erase' : 'paint', color: ed.fg };
+    // Size is in screen pixels: what you see is what you draw, at any zoom.
+    const zoom = this.comp.view.zoom;
+    const brush: Brush = {
+      ...settings,
+      size: Math.min(LIMITS.maxBrushWorld, Math.max(LIMITS.minBrushWorld, settings.size / zoom)),
+      tool: tool === 'eraser' ? 'erase' : 'paint',
+      color: ed.fg,
+    };
     const st: ActiveStroke = {
       id: newId(),
       layerId: layer.id,
@@ -313,6 +325,7 @@ export class Engine {
       sy: y,
       last: null,
       raw: [x, y, this.pressure(e)],
+      decimals: pointDecimals(zoom * (window.devicePixelRatio || 1)),
       lastMove: performance.now(),
       timers: [],
     };
@@ -342,7 +355,7 @@ export class Engine {
       st.sy += (y - st.sy) * k;
     }
     const [wx, wy] = this.comp.toWorld(st.sx, st.sy);
-    const q = quantizePoint(wx, wy, p);
+    const q = quantizePoint(wx, wy, p, st.decimals);
     if (st.last) {
       // Skip moves under about a third of a device pixel.
       const minDist = 0.35 / (this.comp.view.zoom * (window.devicePixelRatio || 1));
@@ -380,7 +393,7 @@ export class Engine {
     if (ed.smoothing > 0 && st.count > 1) {
       const [x, y, p] = st.raw;
       const [wx, wy] = this.comp.toWorld(x, y);
-      const q = quantizePoint(wx, wy, p);
+      const q = quantizePoint(wx, wy, p, st.decimals);
       if (!st.last || q[0] !== st.last[0] || q[1] !== st.last[1]) this.pushPoint(st, q, false);
     }
     if (st.unsent.length) {
@@ -646,7 +659,7 @@ export class Engine {
       case 'BracketRight': {
         const dir = e.code === 'BracketRight' ? 1 : -1;
         if (e.shiftKey) b.hardness = Math.round(Math.min(1, Math.max(0, b.hardness + dir * 0.1)) * 100) / 100;
-        else b.size = Math.round(Math.min(LIMITS.maxBrushSize, Math.max(1, b.size * (dir > 0 ? 1.15 : 1 / 1.15) + dir)));
+        else b.size = Math.round(Math.min(LIMITS.maxBrushPx, Math.max(1, b.size * (dir > 0 ? 1.15 : 1 / 1.15) + dir)));
         this.updateBrushCursor();
         return;
       }

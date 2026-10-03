@@ -16,22 +16,38 @@ export const DEFAULT_BRUSH: Brush = {
   buildup: false,
 };
 
-/** Smallest dab step in world units. Keeps tiny brushes with tiny spacing from exploding. */
-const MIN_STEP = 0.05;
+/** Smallest dab step as a fraction of the diameter. Everything is relative to the brush size,
+ *  so strokes behave the same at any zoom. */
+const MIN_STEP = 0.005;
 const MIN_PRESSURE = 0.02;
 
 export function dabRadius(brush: Brush, p: number): number {
-  const s = brush.pressureSize ? brush.size * Math.max(MIN_PRESSURE, p) : brush.size;
-  return Math.max(0.25, s / 2);
+  return (brush.pressureSize ? brush.size * Math.max(MIN_PRESSURE, p) : brush.size) / 2;
 }
 
 export function dabAlpha(brush: Brush, p: number): number {
   return brush.pressureFlow ? brush.flow * Math.max(MIN_PRESSURE, p) : brush.flow;
 }
 
-/** Round a point to the precision that goes over the wire, so local and remote dabs match. */
-export function quantizePoint(x: number, y: number, p: number): [number, number, number] {
-  return [Math.round(x * 100) / 100, Math.round(y * 100) / 100, Math.round(p * 1000) / 1000];
+/** Decimal places that keep about 0.1 device pixel of precision at this device scale
+ *  (device px per world unit). Negative means rounding to tens, hundreds, ... */
+export function pointDecimals(deviceScale: number): number {
+  return Math.max(-15, Math.min(15, Math.ceil(Math.log10(deviceScale * 10))));
+}
+
+function roundTo(v: number, decimals: number): number {
+  if (decimals >= 0) {
+    const f = 10 ** decimals;
+    return Math.round(v * f) / f;
+  }
+  const f = 10 ** -decimals;
+  return Math.round(v / f) * f;
+}
+
+/** Rounds a point to the precision that goes over the wire. Only the payload size depends on
+ *  this: local and remote renders both use the exact same rounded numbers. */
+export function quantizePoint(x: number, y: number, p: number, decimals: number): [number, number, number] {
+  return [roundTo(x, decimals), roundTo(y, decimals), Math.round(p * 1000) / 1000];
 }
 
 export type DabSink = (x: number, y: number, r: number, a: number) => void;
@@ -53,7 +69,7 @@ export class DabWalker {
   constructor(private brush: Brush) {}
 
   private step(): number {
-    return Math.max(MIN_STEP, this.brush.spacing * dabRadius(this.brush, this.dabP) * 2);
+    return Math.max(MIN_STEP, this.brush.spacing) * dabRadius(this.brush, this.dabP) * 2;
   }
 
   push(x: number, y: number, p: number, emit: DabSink): void {

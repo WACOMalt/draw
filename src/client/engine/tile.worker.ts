@@ -54,7 +54,7 @@ function makeRec(stroke: Stroke): Rec {
     if (p[i + 1] < y0) y0 = p[i + 1];
     if (p[i + 1] > y1) y1 = p[i + 1];
   }
-  const r = stroke.brush.size / 2 + 1;
+  const r = stroke.brush.size * 0.51; // max radius plus a margin, relative so it works at any zoom
   return { stroke, x0: x0 - r, y0: y0 - r, x1: x1 + r, y1: y1 + r, dabs: null };
 }
 
@@ -94,8 +94,16 @@ function invalidate(rec: Rec): void {
 }
 
 function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: number, wy0: number, wx1: number, wy1: number, scale: number): void {
-  const dl = (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts));
   const painter = new DabPainter(ctx, stamps, rec.stroke.brush, wx0, wy0, scale);
+  const w = (rec.x1 - rec.x0) * scale;
+  const h = (rec.y1 - rec.y0) * scale;
+  if (w < 2 && h < 2) {
+    // The whole stroke covers about one pixel at this zoom: one dot instead of every dab.
+    // This keeps far zoomed-out views fast with any number of strokes.
+    painter.dab((rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2, 1);
+    return;
+  }
+  const dl = (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts));
   const { dabs, chunks, count } = dl;
   for (let c = 0; c * DAB_CHUNK < count; c++) {
     const co = c * 4;

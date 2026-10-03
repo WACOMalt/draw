@@ -2,8 +2,9 @@ import type { Stroke } from '../../shared/types';
 
 /** Tile side in device pixels. */
 export const TILE = 256;
-export const MIN_LOD = -6;
-export const MAX_LOD = 12;
+// Wide enough for the engine's zoom range (1e-9 .. 1e11 with devicePixelRatio up to 4).
+export const MIN_LOD = -45;
+export const MAX_LOD = 40;
 
 /** LOD for a device scale (device px per world unit). Biased so tiles are mostly drawn at or below 1:1. */
 export function lodFor(deviceScale: number): number {

@@ -49,7 +49,7 @@ export function validateBrush(v: unknown): Brush {
   return {
     tool: b.tool,
     color: validateColor(b.color),
-    size: num(b.size, 0.5, LIMITS.maxBrushSize, 'brush.size'),
+    size: num(b.size, LIMITS.minBrushWorld, LIMITS.maxBrushWorld, 'brush.size'),
     opacity: num(b.opacity, 0, 1, 'brush.opacity'),
     flow: num(b.flow, 0.001, 1, 'brush.flow'),
     hardness: num(b.hardness, 0, 1, 'brush.hardness'),

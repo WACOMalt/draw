@@ -24,7 +24,7 @@ export type BlendMode = (typeof BLEND_MODES)[number];
 export interface Brush {
   tool: 'paint' | 'erase';
   color: string; // #rrggbb
-  size: number; // diameter, world units
+  size: number; // diameter in world units (screen px / zoom when the stroke started)
   opacity: number; // 0..1, cap for the whole stroke
   flow: number; // 0..1, alpha of a single dab
   hardness: number; // 0..1
@@ -111,13 +111,46 @@ export const LIMITS = {
   maxLayers: 100,
   maxLayerName: 64,
   maxPeerName: 32,
-  maxBrushSize: 1000,
-  maxCoord: 1e8,
+  /** Brush size in the UI, in screen pixels. */
+  maxBrushPx: 1000,
+  /** Stroke brush sizes in world units: the screen size divided by the zoom. */
+  minBrushWorld: 1e-12,
+  maxBrushWorld: 1e15,
+  maxCoord: 1e15,
 } as const;
 
 /** Unambiguous alphabet for session codes: no 0/O, 1/I/L. */
 export const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 export const CODE_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{4}$/;
+
+/** Named sessions: lowercase letters, digits and single dashes, 3 to 40 characters. */
+export const NAME_RE = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,39}$/;
+
+/** Turns user input like "Friday Jam!" into a session name ("friday-jam"), or null. */
+export function normalizeName(input: string): string | null {
+  const name = input
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_.]+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  // A name in code format would be confusing, and codes are reserved for random sessions.
+  if (!NAME_RE.test(name) || CODE_RE.test(name.toUpperCase())) return null;
+  return name;
+}
+
+/** Strict parse of a session key from a URL or the WebSocket query: a code (XXXX-XXXX) or a name. */
+export function parseKey(raw: string): string | null {
+  const upper = raw.toUpperCase();
+  if (CODE_RE.test(upper)) return upper;
+  return NAME_RE.test(raw) ? raw : null;
+}
+
+/** Loose parse of what a person typed into a join field: every key it could mean, codes first. */
+export function candidateKeys(input: string): string[] {
+  return [normalizeCode(input), normalizeName(input)].filter((k): k is string => k !== null);
+}
 
 export function normalizeCode(input: string): string | null {
   const raw = input.toUpperCase().replace(/[^A-Z0-9]/g, '');
