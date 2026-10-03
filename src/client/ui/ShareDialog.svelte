@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, errorText } from '../api';
+  import { followRename } from '../identity';
   import { ed, showToast } from '../state.svelte';
   import Modal from './Modal.svelte';
 
@@ -14,6 +15,8 @@
   interface Sharing {
     key: string;
     members: Member[];
+    codeLink: string;
+    codeRole: 'editor' | 'viewer' | 'none';
     editLink: string | null;
     viewLink: string | null;
     password: boolean;
@@ -25,6 +28,7 @@
   let role = $state<'editor' | 'viewer'>('editor');
   let newPassword = $state('');
   let transferTo = $state('');
+  let newName = $state('');
   let busy = $state(false);
 
   const path = $derived(`/api/canvases/${encodeURIComponent(code)}`);
@@ -67,6 +71,22 @@
       newPassword = '';
       showToast('Join password set');
     }
+  }
+
+  async function rename(body: { name: string } | { random: true }) {
+    if (!confirm('Links that use the old address stop working. Private links keep working. Continue?')) return;
+    busy = true;
+    error = '';
+    const r = await api<Sharing>('POST', `${path}/rename`, body);
+    busy = false;
+    if (!r.ok) {
+      error = r.data.error === 'name_taken' ? 'That name is taken.' : r.data.error === 'bad_name' ? 'Use 3 to 40 letters, digits or dashes.' : errorText(r.data.error);
+      return;
+    }
+    s = r.data;
+    newName = '';
+    showToast(`Moved to /s/${r.data.key}`);
+    followRename(code, r.data.key);
   }
 
   async function transfer(e: SubmitEvent) {
@@ -118,7 +138,24 @@
 
     <section>
       <h3>Links</h3>
-      {#each [{ kind: 'edit', label: 'Edit link', url: s.editLink, note: 'Anyone with it can draw.' }, { kind: 'view', label: 'View link', url: s.viewLink, note: s.viewLink?.includes('?k=') ? 'Anyone with it can look, not draw.' : 'Anyone with the canvas code can look, not draw.' }] as l (l.kind)}
+      <div class="link">
+        <div class="head">
+          <b>Canvas link</b>
+          <select value={s.codeRole} disabled={busy} onchange={(e) => call('POST', '/links', { kind: 'code', role: e.currentTarget.value })}>
+            <option value="editor">Anyone with it can draw (public)</option>
+            <option value="viewer">Anyone with it can view</option>
+            <option value="none">Off: only people and private links</option>
+          </select>
+        </div>
+        {#if s.codeRole !== 'none'}
+          <div class="row">
+            <input type="text" readonly value={s.codeLink} onfocus={(e) => e.currentTarget.select()} />
+            <button onclick={() => copy(s!.codeLink)}>Copy</button>
+          </div>
+        {/if}
+        <p class="muted note">This link is just the canvas code, and the code is part of every link.</p>
+      </div>
+      {#each [{ kind: 'edit', label: 'Private edit link', url: s.editLink, note: 'Anyone with it can draw. It cannot be guessed from the canvas link.' }, { kind: 'view', label: 'Private view link', url: s.viewLink, note: s.codeRole === 'editor' ? 'The canvas is public, so this link can draw too.' : 'Anyone with it can look, not draw. Useful when the canvas link is off.' }] as l (l.kind)}
         <div class="link">
           <div class="head">
             <b>{l.label}</b>
@@ -132,7 +169,7 @@
           {/if}
           <div class="row tight">
             <button class="small" disabled={busy} onclick={() => call('POST', '/links', { kind: l.kind, action: l.url ? 'disable' : 'enable' })}>{l.url ? 'Turn off' : 'Turn on'}</button>
-            {#if l.url}<button class="small" disabled={busy} title={l.kind === 'view' && !l.url.includes('?k=') ? 'The plain code stops working. A new, longer link replaces it.' : 'The old link stops working'} onclick={() => call('POST', '/links', { kind: l.kind, action: 'reset' })}>Reset link</button>{/if}
+            {#if l.url}<button class="small" disabled={busy} title="The old link stops working" onclick={() => call('POST', '/links', { kind: l.kind, action: 'reset' })}>Reset link</button>{/if}
           </div>
         </div>
       {/each}
@@ -151,7 +188,12 @@
     {#if error}<p class="error">{error}</p>{/if}
 
     <details>
-      <summary>Ownership and deletion</summary>
+      <summary>Address, ownership and deletion</summary>
+      <form class="row" onsubmit={(e) => (e.preventDefault(), rename({ name: newName }))}>
+        <input type="text" placeholder="New name, like friday-jam" maxlength="40" bind:value={newName} required />
+        <button type="submit" disabled={busy}>Rename</button>
+        <button type="button" disabled={busy} onclick={() => rename({ random: true })}>New random code</button>
+      </form>
       <form class="row" onsubmit={transfer}>
         <input type="email" placeholder="New owner's email" bind:value={transferTo} required />
         <button type="submit" disabled={busy}>Transfer</button>
@@ -211,6 +253,16 @@
     display: flex;
     gap: 8px;
     align-items: baseline;
+  }
+  .note {
+    margin: 4px 0 0;
+    font-size: 11px;
+  }
+  .head b {
+    white-space: nowrap;
+  }
+  .head select {
+    margin-left: auto;
   }
   .small {
     padding: 2px 8px;

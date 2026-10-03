@@ -203,14 +203,16 @@ Canvases:
 
 - Only accounts can make named canvases. Thus a name cannot expire and then point to another person's canvas.
 - Each browser keeps a random anonymous secret. A temporary canvas stores the sha256 of the creator's secret. Only that browser sees "Log in to keep it", and the claim needs a login.
-- On an owned canvas, the plain `/s/CODE` link is the view link. Every link contains the code, thus the code alone never gives edit access. After a claim or an adoption, old links to the canvas give view access only. The people on the canvas become viewers until the owner gives them the edit link.
+- On an owned canvas, the owner sets what the canvas link (the plain `/s/CODE`) gives: draw (public), view (the default), or nothing (private). Every link contains the code, thus the code gives edit access only on a public canvas. After an adoption, old links give view access only.
+- The claim dialog asks two things. Who can open the link: public (the default, as before the claim), view only, or private. The address: keep the code, a new random code, or a name. A taken name stops the claim before it changes anything.
+- The owner can rename a canvas at any time (Share, then Address). The op log, members, and private link tokens move with it. Links with the old address stop working. Connected people who keep their access follow the canvas to the new address; the others are disconnected.
 - An hourly job deletes expired temporary canvases. It tells connected people that the canvas expired, then disconnects them.
 
 Roles: owner, editor, viewer. The best of these wins:
 
 1. Owner.
 2. Member role. The owner adds a member by the email of a confirmed account.
-3. Link role. `?k=` with the edit token gives editor. The plain code gives viewer. When the owner resets the view link, the plain code gives nothing and `?k=` with the new view token gives viewer. A wrong token gives only what the plain code gives. Link tokens are 128 random bits (22 characters).
+3. Link role: the best of the token and the canvas link. `?k=` with the private edit token gives editor. `?k=` with the private view token gives viewer. The plain code gives what the owner set for the canvas link. A wrong token gives only what the plain code gives. Link tokens are 128 random bits (22 characters).
 
 The owner can turn each link on or off, or reset it. The owner can also set a join password for link users. Members never need it. After one correct password, the client keeps a signed grant (HMAC of the canvas and the password hash). A new password makes old grants invalid. A change to sharing re-checks all connected clients at once: a lost role disconnects them, and a changed role updates their UI. The server rejects ops from viewers. The owner can transfer ownership (the old owner becomes an editor) or delete the canvas.
 

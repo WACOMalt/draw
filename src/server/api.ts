@@ -33,6 +33,8 @@ export interface ApiContext {
   allowedOrigins: Set<string>;
   /** Re-checks connected clients of a canvas after a change (claim, sharing, delete). */
   refreshCanvas(code: string): void;
+  /** After a rename: moves the live session to the new code and re-checks everyone. */
+  moveCanvas(from: string, to: string): void;
 }
 
 type Handler = (ctx: ApiContext, req: Req) => Promise<Res>;
@@ -309,9 +311,12 @@ function sharing(ctx: ApiContext, c: CanvasRow) {
   return {
     key: c.code,
     members: ctx.store.members(c.code).map((m) => ({ id: m.user_id, email: m.email, name: m.name, role: m.role })),
+    // The canvas link (plain code): the owner picks what anyone with it can do.
+    codeLink: base,
+    codeRole: c.code_role,
+    // Private links: tokens that cannot be derived from the code.
     editLink: c.edit_token ? `${base}?k=${c.edit_token}` : null,
-    // The plain code is the view link until the owner resets it to a token.
-    viewLink: c.view_token ? `${base}?k=${c.view_token}` : c.code_role === 'viewer' ? base : null,
+    viewLink: c.view_token ? `${base}?k=${c.view_token}` : null,
     password: !!c.join_password,
   };
 }
@@ -321,6 +326,45 @@ const getSharing: Handler = async (ctx, req) => {
   return 'res' in r ? r.res : ok(sharing(ctx, r.c));
 };
 
+/**
+ * The new key a rename asks for: { random: true } or { name }. Null: keep the code.
+ * Checked before anything changes, so a taken name leaves the canvas as it was.
+ */
+function newKeyFor(ctx: ApiContext, body: Record<string, unknown>): { key: string | null } | { res: Res } {
+  if (body.random === true) {
+    for (let i = 0; i < 5; i++) {
+      const code = newSessionCode();
+      if (!ctx.store.sessionExists(code)) return { key: code };
+    }
+    return { res: err(500, 'code_collision') };
+  }
+  if (typeof body.name === 'string' && body.name.trim()) {
+    const name = normalizeName(body.name);
+    if (!name) return { res: err(400, 'bad_name') };
+    if (ctx.store.sessionExists(name)) return { res: err(409, 'name_taken', { key: name }) };
+    return { key: name };
+  }
+  return { key: null };
+}
+
+function applyRename(ctx: ApiContext, from: string, to: string | null): Res | null {
+  if (!to || to === from) return null;
+  if (!ctx.store.renameCanvas(from, to)) return err(409, 'name_taken', { key: to });
+  return null;
+}
+
+const rename: Handler = async (ctx, req) => {
+  const r = ownedCanvas(ctx, req);
+  if ('res' in r) return r.res;
+  const next = newKeyFor(ctx, req.body);
+  if ('res' in next) return next.res;
+  if (!next.key) return err(400, 'bad_request');
+  const failed = applyRename(ctx, r.c.code, next.key);
+  if (failed) return failed;
+  ctx.moveCanvas(r.c.code, next.key);
+  return ok(sharing(ctx, ctx.store.canvas(next.key)!));
+};
+
 const claim: Handler = async (ctx, req) => {
   if (!req.user) return err(401, 'login_required');
   const key = parseKey(req.params[0]);
@@ -328,11 +372,20 @@ const claim: Handler = async (ctx, req) => {
   if (!c) return err(404, 'not_found');
   const anon = typeof req.body.anon === 'string' ? req.body.anon : '';
   if (!isTemporary(c) || !canClaim(c, anon ? sha256(anon) : undefined)) return err(403, 'cannot_claim');
-  // The code everyone already has becomes the view link. People drawing now become viewers
-  // until the owner gives them the edit link or adds them.
-  ctx.store.updateCanvas(c.code, { owner_id: req.user.id, code_role: 'viewer', edit_token: linkToken(), view_token: null });
-  ctx.refreshCanvas(c.code);
-  return ok({ key: c.code });
+  // The claimer picks who the canvas link lets in: public (draw), view only (the default for
+  // older clients), or private. Optionally a new random code or a name at the same time.
+  const access = req.body.access === 'editor' || req.body.access === 'none' ? req.body.access : 'viewer';
+  const next = newKeyFor(ctx, req.body);
+  if ('res' in next) return next.res;
+  ctx.store.updateCanvas(c.code, { owner_id: req.user.id, code_role: access, edit_token: linkToken(), view_token: null });
+  const failed = applyRename(ctx, c.code, next.key);
+  if (failed) {
+    ctx.refreshCanvas(c.code); // claimed, but under the old code
+    return failed;
+  }
+  if (next.key) ctx.moveCanvas(c.code, next.key);
+  else ctx.refreshCanvas(c.code);
+  return ok({ key: next.key ?? c.code });
 };
 
 const addMember: Handler = async (ctx, req) => {
@@ -366,14 +419,19 @@ const updateMember: Handler = async (ctx, req) => {
 const updateLink: Handler = async (ctx, req) => {
   const r = ownedCanvas(ctx, req);
   if ('res' in r) return r.res;
-  const kind = req.body.kind === 'edit' ? 'edit' : req.body.kind === 'view' ? 'view' : null;
-  const action = req.body.action;
-  if (!kind || !['enable', 'disable', 'reset'].includes(action as string)) return err(400, 'bad_request');
-  const field = kind === 'edit' ? 'edit_token' : 'view_token';
-  // A code cannot be reset: any change to the view link retires the plain code link.
-  const extra = kind === 'view' ? { code_role: 'none' as const } : {};
-  if (action === 'disable') ctx.store.updateCanvas(r.c.code, { [field]: null, ...extra });
-  else if (action === 'reset' || !r.c[field]) ctx.store.updateCanvas(r.c.code, { [field]: linkToken(), ...extra });
+  if (req.body.kind === 'code') {
+    // What anyone with the canvas code can do: 'editor' makes the canvas public.
+    const role = req.body.role;
+    if (role !== 'editor' && role !== 'viewer' && role !== 'none') return err(400, 'bad_request');
+    ctx.store.updateCanvas(r.c.code, { code_role: role });
+  } else {
+    const kind = req.body.kind === 'edit' ? 'edit' : req.body.kind === 'view' ? 'view' : null;
+    const action = req.body.action;
+    if (!kind || !['enable', 'disable', 'reset'].includes(action as string)) return err(400, 'bad_request');
+    const field = kind === 'edit' ? 'edit_token' : 'view_token';
+    if (action === 'disable') ctx.store.updateCanvas(r.c.code, { [field]: null });
+    else if (action === 'reset' || !r.c[field]) ctx.store.updateCanvas(r.c.code, { [field]: linkToken() });
+  }
   ctx.refreshCanvas(r.c.code);
   return ok(sharing(ctx, ctx.store.canvas(r.c.code)!));
 };
@@ -432,6 +490,7 @@ const ROUTES: [string, RegExp, Handler][] = [
   ['GET', /^\/api\/canvases$/, myCanvases],
   ['GET', /^\/api\/canvases\/([^/]+)\/sharing$/, getSharing],
   ['POST', /^\/api\/canvases\/([^/]+)\/claim$/, claim],
+  ['POST', /^\/api\/canvases\/([^/]+)\/rename$/, rename],
   ['POST', /^\/api\/canvases\/([^/]+)\/members$/, addMember],
   ['PATCH', /^\/api\/canvases\/([^/]+)\/members\/([A-Za-z0-9_-]+)$/, updateMember],
   ['DELETE', /^\/api\/canvases\/([^/]+)\/members\/([A-Za-z0-9_-]+)$/, updateMember],

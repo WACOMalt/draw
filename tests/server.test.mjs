@@ -44,11 +44,13 @@ for (let i = 0; i < 50 && !log.includes('draw '); i++) await sleep(100);
 class Browser {
   cookie = '';
   anon = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  // Each test browser is a different person behind the proxy (per-IP rate limits).
+  ip = `10.0.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250)}`;
   async api(method, p, body) {
     const res = await fetch(BASE + p, {
       method,
       redirect: 'manual',
-      headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(this.cookie ? { Cookie: this.cookie } : {}) },
+      headers: { 'X-Real-IP': this.ip, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(this.cookie ? { Cookie: this.cookie } : {}) },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     const set = res.headers.get('set-cookie');
@@ -129,15 +131,46 @@ try {
   const bAccess = await bConn.next((m) => m.t === 'access');
   check(bAccess?.role === 'viewer', 'after the claim the code is a view link: others become viewers');
   const tempShare = (await funky.api('GET', `/api/canvases/${temp}/sharing`)).data;
-  check(tempShare.viewLink.endsWith(`/s/${temp}`) && new URL(tempShare.editLink).searchParams.get('k')?.length === 22, 'claimed canvas: short view link, token edit link');
+  check(tempShare.codeRole === 'viewer' && tempShare.codeLink.endsWith(`/s/${temp}`) && new URL(tempShare.editLink).searchParams.get('k')?.length === 22, 'claimed canvas: short view link, token edit link');
   check((await funky.api('POST', `/api/canvases/${temp}/claim`, { anon: funky.anon })).status === 403, 'cannot claim twice');
+
+  // --- claim with options: a name and an access level; people on it follow the rename -----------
+  const gus = new Browser();
+  const gTemp = (await gus.api('POST', '/api/sessions', { anon: gus.anon })).data.key;
+  const gConn = await gus.join(gTemp);
+  const gWelcome = await first(gConn);
+  gConn.send(strokeOp(layerId(gWelcome), 7));
+  await gConn.next((m) => m.t === 'op');
+  const pal = await new Browser().join(gTemp);
+  await first(pal);
+  await account(gus, 'gus@example.com', 'Gus');
+  await funky.api('POST', '/api/sessions', { name: 'taken-name' });
+  check((await gus.api('POST', `/api/canvases/${gTemp}/claim`, { anon: gus.anon, access: 'editor', name: 'Taken Name' })).status === 409, 'claim with a taken name fails');
+  check((await gus.api('GET', `/api/sessions/${gTemp}`)).data.exists && !(await gus.api('GET', `/api/canvases/${gTemp}/sharing`)).data?.key, 'a failed claim changes nothing');
+  const gClaim = await gus.api('POST', `/api/canvases/${gTemp}/claim`, { anon: gus.anon, access: 'editor', name: 'Gus Room' });
+  check(gClaim.status === 200 && gClaim.data.key === 'gus-room', 'claim with a new name');
+  const palMoved = await pal.next((m) => m.t === 'access');
+  check(palMoved?.canvas.key === 'gus-room' && palMoved.role === 'editor', 'public claim: others keep drawing and learn the new name');
+  check(!(await gus.api('GET', `/api/sessions/${gTemp}`)).data.exists, 'the old code is gone');
+  const rejoin = await first(await new Browser().join('gus-room'));
+  check(rejoin?.role === 'editor' && rejoin.strokes.length === 1, 'renamed canvas keeps its strokes; public code draws');
+  const rnd = await gus.api('POST', '/api/canvases/gus-room/rename', { random: true });
+  check(rnd.status === 200 && /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(rnd.data.key), 'rename to a new random code');
+  check(!!(await pal.next((m) => m.t === 'access' && m.canvas.key === rnd.data.key)), 'connected people follow a second rename');
+  await gus.api('POST', `/api/canvases/${rnd.data.key}/links`, { kind: 'code', role: 'none' });
+  check((await pal.next((m) => m.t === 'denied'))?.reason === 'login_required', 'made private: link people are removed');
+  const solo = new Browser();
+  const sTemp = (await solo.api('POST', '/api/sessions', { anon: solo.anon })).data.key;
+  await account(solo, 'solo@example.com', 'Solo');
+  await solo.api('POST', `/api/canvases/${sTemp}/claim`, { anon: solo.anon, access: 'none' });
+  check((await first(await new Browser().join(sTemp)))?.reason === 'login_required', 'private claim: the code gives nothing');
 
   // --- owned canvas, links and roles --------------------------------------------------------------
   const own = await funky.api('POST', '/api/sessions', { name: 'Friday Jam' });
   check(own.status === 201 && own.data.key === 'friday-jam', 'account creates a named canvas');
   const share = (await funky.api('GET', '/api/canvases/friday-jam/sharing')).data;
   const editTok = new URL(share.editLink).searchParams.get('k');
-  check(share.viewLink === `${BASE}/s/friday-jam` && editTok?.length === 22, 'view link is the plain code, edit link has a token');
+  check(share.codeLink === `${BASE}/s/friday-jam` && share.codeRole === 'viewer' && share.viewLink === null && editTok?.length === 22, 'canvas link views by default, edit link has a token');
 
   const stranger = new Browser();
   const viewer = await stranger.join('friday-jam');
@@ -173,12 +206,23 @@ try {
   const again = await new Browser().join('friday-jam', { grant: pwWelcome.grant });
   check((await first(again))?.role === 'viewer', 'grant skips the password next time');
 
-  // Reset the view link: the plain code stops working, the new token works.
-  const vr = (await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'view', action: 'reset' })).data;
+  // Canvas link off: the plain code gives nothing; a private view link still works.
+  await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'code', role: 'none' });
+  check((await first(await new Browser().join('friday-jam')))?.reason === 'login_required', 'canvas link off: the plain code gives nothing');
+  const vr = (await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'view', action: 'enable' })).data;
   const viewTok = new URL(vr.viewLink).searchParams.get('k');
-  check(viewTok?.length === 22, 'reset view link gives a token link');
-  check((await first(await new Browser().join('friday-jam')))?.reason === 'login_required', 'after a view reset the plain code gives nothing');
-  check((await first(await new Browser().join('friday-jam', { link: viewTok, grant: pwWelcome.grant })))?.role === 'viewer', 'new view token works');
+  check(viewTok?.length === 22, 'private view link has a token');
+  check((await first(await new Browser().join('friday-jam', { link: viewTok, grant: pwWelcome.grant })))?.role === 'viewer', 'private view link gives viewer');
+
+  // Public: anyone with the code draws, connected viewers are upgraded live.
+  const pub = await new Browser().join('friday-jam', { link: viewTok, grant: pwWelcome.grant });
+  await first(pub);
+  await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'code', role: 'editor' });
+  check((await pub.next((m) => m.t === 'access'))?.role === 'editor', 'public canvas: connected viewers can draw at once');
+  check((await first(await new Browser().join('friday-jam', { grant: pwWelcome.grant })))?.role === 'editor', 'public canvas: the plain code draws');
+  check((await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'code', role: 'owner' })).status === 400, 'canvas link cannot give owner');
+  await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'code', role: 'viewer' });
+  check(!!(await pub.next((m) => m.t === 'access' && m.role === 'viewer')), 'public off: back to view only');
 
   // --- members ------------------------------------------------------------------------------------
   const vee = new Browser();

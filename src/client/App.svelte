@@ -28,6 +28,13 @@
   }
 
   onMount(() => {
+    // A rename moves the open canvas to its new address (replace: the old one is gone).
+    const navigate = (e: Event) => {
+      const to = (e as CustomEvent<string>).detail;
+      history.replaceState(null, '', to);
+      path = location.pathname;
+    };
+    window.addEventListener('draw:navigate', navigate);
     void loadMe();
     watchAuth();
     // Links from emails and the desktop app arrive as query parameters. Handle, then tidy the URL.
@@ -51,6 +58,7 @@
     for (const k of ['verify', 'reset', 'forgot', 'device']) q.delete(k);
     const rest = q.toString();
     history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : ''));
+    return () => window.removeEventListener('draw:navigate', navigate);
   });
 
   async function approveDevice() {

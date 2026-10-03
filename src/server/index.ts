@@ -63,6 +63,17 @@ function refreshCanvas(code: string, gone: 'deleted' | 'expired' = 'deleted'): v
     });
 }
 
+/** After a rename: the live session moves to the new code, then everyone is re-checked. */
+function moveCanvas(from: string, to: string): void {
+  const s = sessions.get(from);
+  if (s) {
+    sessions.delete(from);
+    s.code = to;
+    sessions.set(to, s);
+  }
+  refreshCanvas(to);
+}
+
 const api: ApiContext = {
   store,
   mailer,
@@ -70,6 +81,7 @@ const api: ApiContext = {
   adminEmails: ADMIN_EMAILS,
   allowedOrigins: CORS_ORIGINS,
   refreshCanvas,
+  moveCanvas,
 };
 
 setInterval(() => {

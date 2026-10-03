@@ -25,7 +25,7 @@ export interface CanvasRow {
   /** Created before accounts existed: never expires, goes to the admin at first admin login. */
   legacy: number;
   /** What the plain /s/CODE link grants to people without other access: 'editor' or 'none'. */
-  /** What the plain /s/CODE link gives on an owned canvas. 'editor' only on rows from schema 2. */
+  /** What the plain /s/CODE link gives on an owned canvas. 'editor': a public canvas. */
   code_role: 'editor' | 'viewer' | 'none';
   /** Secret tokens for the share links (?k=TOKEN). NULL: link turned off. */
   edit_token: string | null;
@@ -200,6 +200,25 @@ export class Store {
            VALUES (?, ?, ?, 0, ?, ?, 0, ?, ?, ?)`,
         )
         .run(code, now, now, init.owner_id ?? null, init.creator_anon ?? null, init.code_role ?? 'editor', init.edit_token ?? null, init.view_token ?? null);
+      return true;
+    } catch (e) {
+      if ((e as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return false;
+      throw e;
+    }
+  }
+
+  /** Gives a canvas a new code or name, with its ops and members. False if `to` is taken. */
+  renameCanvas(from: string, to: string): boolean {
+    const cols = this.db.prepare<[], { name: string }>('PRAGMA table_info(sessions)').all().map((c) => c.name).filter((n) => n !== 'code');
+    const list = cols.join(', ');
+    try {
+      this.transaction(() => {
+        // The new row first: members has a foreign key to sessions.code.
+        this.db.prepare(`INSERT INTO sessions (code, ${list}) SELECT ?, ${list} FROM sessions WHERE code = ?`).run(to, from);
+        this.db.prepare('UPDATE ops SET code = ? WHERE code = ?').run(to, from);
+        this.db.prepare('UPDATE members SET code = ? WHERE code = ?').run(to, from);
+        this.db.prepare('DELETE FROM sessions WHERE code = ?').run(from);
+      });
       return true;
     } catch (e) {
       if ((e as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return false;

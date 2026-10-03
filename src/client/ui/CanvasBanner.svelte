@@ -1,11 +1,10 @@
 <script lang="ts">
-  import { api, errorText } from '../api';
-  import { anonSecret } from '../identity';
-  import { ed, showToast } from '../state.svelte';
+  import { ed } from '../state.svelte';
+  import ClaimDialog from './ClaimDialog.svelte';
 
   let { code }: { code: string } = $props();
   let now = $state(Date.now());
-  let busy = $state(false);
+  let claiming = $state(false);
 
   $effect(() => {
     const t = setInterval(() => (now = Date.now()), 30_000);
@@ -19,13 +18,6 @@
     return h >= 24 ? `${Math.floor(h / 24)} d ${h % 24} h` : h >= 1 ? `${h} h` : `${Math.max(1, Math.round(ms / 60_000))} min`;
   });
 
-  async function claim() {
-    busy = true;
-    const r = await api('POST', `/api/canvases/${encodeURIComponent(code)}/claim`, { anon: anonSecret() });
-    busy = false;
-    if (r.ok) showToast('Saved to your account. It will not expire.');
-    else showToast(r.data.error === 'cannot_claim' ? 'Only the browser that created this canvas can keep it' : errorText(r.data.error));
-  }
 </script>
 
 {#if ed.canvas?.expiresAt}
@@ -33,7 +25,7 @@
     <span>Temporary canvas · deleted in {left}</span>
     {#if ed.canvas.canClaim}
       {#if ed.user}
-        <button class="primary" disabled={busy} onclick={claim}>Keep this canvas</button>
+        <button class="primary" onclick={() => (claiming = true)}>Keep this canvas</button>
       {:else}
         <button class="primary" onclick={() => (ed.auth = 'login')}>Log in to keep it</button>
       {/if}
@@ -42,6 +34,8 @@
 {:else if ed.role === 'viewer'}
   <div class="banner view">View only</div>
 {/if}
+
+{#if claiming && ed.canvas?.canClaim}<ClaimDialog {code} onClose={() => (claiming = false)} />{/if}
 
 <style>
   .banner {

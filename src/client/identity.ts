@@ -48,3 +48,14 @@ export const links = {
   get: (key: string) => get(`draw.link.${key}`) ?? undefined,
   set: (key: string, k: string | null) => set(`draw.link.${key}`, k),
 };
+
+/**
+ * The canvas got a new code or name: keep its link token (tokens survive a rename) and open it
+ * under the new key. App listens for draw:navigate.
+ */
+export function followRename(from: string, to: string): void {
+  if (from === to) return;
+  const k = links.get(from);
+  if (k) links.set(to, k);
+  window.dispatchEvent(new CustomEvent('draw:navigate', { detail: `/s/${encodeURIComponent(to)}${k ? `?k=${encodeURIComponent(k)}` : ''}` }));
+}

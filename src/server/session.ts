@@ -80,7 +80,7 @@ export class Session {
   unloadTimer: NodeJS.Timeout | null = null;
 
   constructor(
-    readonly code: string,
+    public code: string, // changes when the owner renames the canvas
     private store: Store,
     public row: CanvasRow,
   ) {}

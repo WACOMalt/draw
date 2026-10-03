@@ -9,7 +9,7 @@ import type { Renderer } from './renderer';
 import { Doc, type Bounds } from './doc';
 import { computeMarkers, unionAll } from './navigator';
 import { IS_TAURI } from '../config';
-import { anonSecret, desktopToken, grants, links } from '../identity';
+import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
@@ -899,6 +899,7 @@ export class Engine {
         if (m.role !== ed.role) showToast(m.role === 'viewer' ? 'You can now only view this canvas' : m.role === 'owner' ? 'You own this canvas now' : 'You can now edit this canvas');
         ed.role = m.role;
         ed.canvas = m.canvas;
+        if (m.canvas.key !== this.code) followRename(this.code, m.canvas.key);
         break;
       case 'denied':
         ed.denied = m.reason;
