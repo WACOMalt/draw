@@ -20,7 +20,10 @@ import {
   validatePoints,
   validateString,
 } from '../shared/validate';
-import type { Store } from './db';
+import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
+import { userFromToken } from './auth';
+import { sha256, type CanvasRow, type Store, type UserRow } from './db';
+import type { CanvasInfo, DeniedReason, Role } from '../shared/types';
 
 class Bucket {
   private tokens: number;
@@ -41,17 +44,26 @@ class Bucket {
 export interface Client {
   id: string;
   ws: WebSocket;
-  peer: Peer | null; // null until hello
+  peer: Peer | null; // null until a hello is accepted
+  /** Access inputs from the upgrade request and the hello; kept for re-checks. */
+  access: AccessInput;
+  role: Role | null;
+  joining: boolean;
+  passwordTries: number;
   ops: Bucket;
   live: Bucket;
   cursor: Bucket;
 }
 
-export function newClient(ws: WebSocket): Client {
+export function newClient(ws: WebSocket, user: UserRow | undefined): Client {
   return {
     id: newId(),
     ws,
     peer: null,
+    access: { user },
+    role: null,
+    joining: false,
+    passwordTries: 0,
     ops: new Bucket(200, 60),
     live: new Bucket(120, 60),
     cursor: new Bucket(40, 30),
@@ -67,10 +79,16 @@ export class Session {
   clients = new Map<string, Client>();
   unloadTimer: NodeJS.Timeout | null = null;
 
-  constructor(readonly code: string, private store: Store) {}
+  constructor(
+    readonly code: string,
+    private store: Store,
+    public row: CanvasRow,
+  ) {}
 
-  static load(store: Store, code: string): Session {
-    const s = new Session(code, store);
+  static load(store: Store, code: string): Session | null {
+    const row = store.canvas(code);
+    if (!row) return null;
+    const s = new Session(code, store, row);
     for (const row of store.loadOps(code)) {
       s.applyStored(JSON.parse(row.data) as AppliedOp, row.client_id, row.seq);
       s.seq = row.seq;
@@ -172,13 +190,14 @@ export class Session {
     if (client.peer) this.broadcast({ t: 'peer.leave', id: client.id });
   }
 
-  handle(client: Client, msg: ClientMsg): void {
+  async handle(client: Client, msg: ClientMsg): Promise<void> {
     if (msg.t === 'ping') return this.send(client, { t: 'pong' });
     if (msg.t === 'hello') return this.hello(client, msg);
     if (!client.peer) return;
     switch (msg.t) {
       case 'op': {
         const opId = typeof msg.opId === 'string' ? msg.opId.slice(0, 40) : '';
+        if (!atLeast(client.role, 'editor')) return this.send(client, { t: 'reject', opId, reason: 'view only' });
         if (!client.ops.take()) return this.send(client, { t: 'reject', opId, reason: 'rate limited' });
         try {
           this.commit(validateOp(msg.op), client.id, opId);
@@ -190,7 +209,7 @@ export class Session {
         return;
       }
       case 'live': {
-        if (!client.live.take()) return;
+        if (!atLeast(client.role, 'editor') || !client.live.take()) return;
         try {
           this.broadcast(
             {
@@ -235,29 +254,105 @@ export class Session {
     }
   }
 
-  private hello(client: Client, msg: Extract<ClientMsg, { t: 'hello' }>): void {
-    if (client.peer) return;
-    let name = 'Guest';
-    let color = '#31a8ff';
+  private async hello(client: Client, msg: Extract<ClientMsg, { t: 'hello' }>): Promise<void> {
+    if (client.peer || client.joining) return;
+    client.joining = true;
     try {
-      name = validateString(msg.name, LIMITS.maxPeerName, 'name').trim() || name;
-      color = validateColor(msg.color);
-    } catch {
-      // fall back to defaults
+      const str = (v: unknown, max = 200) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : undefined);
+      // The web app authenticates with its cookie at the upgrade; the desktop app sends a token.
+      client.access.user ??= userFromToken(this.store, str(msg.token));
+      const anon = str(msg.anon);
+      client.access.anonHash = anon ? sha256(anon) : undefined;
+      client.access.link = str(msg.link);
+      client.access.grant = str(msg.grant);
+      const password = typeof msg.password === 'string' ? msg.password.slice(0, 200) : undefined;
+      if (password !== undefined && ++client.passwordTries > 5) return this.kick(client, 'password_wrong');
+
+      const row = this.store.canvas(this.code);
+      if (!row) return this.kick(client, 'deleted');
+      this.row = row;
+      const access = await resolveAccess(this.store, row, { ...client.access, password });
+      if (!access.ok) {
+        // A password prompt keeps the socket open: the client sends another hello.
+        if (access.reason === 'password_required' || access.reason === 'password_wrong') {
+          return this.send(client, { t: 'denied', reason: access.reason });
+        }
+        return this.kick(client, access.reason);
+      }
+      if (access.grant) client.access.grant = access.grant;
+      client.role = access.role;
+
+      let name = 'Guest';
+      let color = '#31a8ff';
+      try {
+        name = validateString(msg.name, LIMITS.maxPeerName, 'name').trim() || name;
+        color = validateColor(msg.color);
+      } catch {
+        // fall back to defaults
+      }
+      if (client.access.user) name = client.access.user.name.slice(0, LIMITS.maxPeerName);
+      client.peer = { id: client.id, name, color };
+      const peers: Peer[] = [];
+      for (const c of this.clients.values()) if (c.peer && c !== client) peers.push(c.peer);
+      this.send(client, {
+        t: 'welcome',
+        clientId: client.id,
+        code: this.code,
+        seq: this.seq,
+        layers: [...this.layers.values()],
+        strokes: [...this.strokes.values()].filter((s) => !s.deleted),
+        peers,
+        role: client.role,
+        canvas: this.info(client),
+        grant: access.grant,
+      });
+      this.broadcast({ t: 'peer.join', peer: client.peer }, client);
+    } finally {
+      client.joining = false;
     }
-    client.peer = { id: client.id, name, color };
-    const peers: Peer[] = [];
-    for (const c of this.clients.values()) if (c.peer && c !== client) peers.push(c.peer);
-    this.send(client, {
-      t: 'welcome',
-      clientId: client.id,
-      code: this.code,
-      seq: this.seq,
-      layers: [...this.layers.values()],
-      strokes: [...this.strokes.values()].filter((s) => !s.deleted),
-      peers,
-    });
-    this.broadcast({ t: 'peer.join', peer: client.peer }, client);
+  }
+
+  /** What this client may know about the canvas. */
+  info(client: Client): CanvasInfo {
+    const r = this.row;
+    return {
+      key: this.code,
+      owned: !!r.owner_id,
+      ownerName: r.owner_id ? (this.store.userById(r.owner_id)?.name ?? null) : null,
+      expiresAt: isTemporary(r) ? r.created_at + TEMP_TTL_MS : null,
+      canClaim: canClaim(r, client.access.anonHash),
+    };
+  }
+
+  /**
+   * Re-reads the canvas row and re-checks every client (after a claim or a sharing change).
+   * Clients that lost access are told why and disconnected; the others get their new role.
+   */
+  async refresh(gone: DeniedReason = 'deleted'): Promise<void> {
+    const row = this.store.canvas(this.code);
+    if (!row) {
+      for (const c of [...this.clients.values()]) this.kick(c, gone);
+      return;
+    }
+    this.row = row;
+    for (const c of [...this.clients.values()]) {
+      if (!c.peer) continue;
+      // The owner's user row may have changed name; reload it.
+      if (c.access.user) c.access.user = this.store.userById(c.access.user.id);
+      const access = await recheckAccess(this.store, row, c.access);
+      if (!access.ok) {
+        this.kick(c, access.reason);
+        continue;
+      }
+      c.role = access.role;
+      this.send(c, { t: 'access', role: access.role, canvas: this.info(c) });
+    }
+  }
+
+  /** Tells the client why, then closes its socket. */
+  kick(client: Client, reason: DeniedReason): void {
+    this.send(client, { t: 'denied', reason });
+    setTimeout(() => client.ws.close(4003, reason), 50);
   }
 
   send(client: Client, msg: ServerMsg): void {

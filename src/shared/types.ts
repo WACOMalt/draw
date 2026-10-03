@@ -77,8 +77,37 @@ export interface Peer {
   color: string;
 }
 
+export type Role = 'owner' | 'editor' | 'viewer';
+
+/** What a client knows about the canvas it joined. */
+export interface CanvasInfo {
+  key: string;
+  /** Owned by an account. False: temporary (deleted at expiresAt) or created before accounts. */
+  owned: boolean;
+  ownerName: string | null;
+  /** Epoch ms when a temporary canvas is deleted. Null for owned and legacy canvases. */
+  expiresAt: number | null;
+  /** This browser created the temporary canvas and may claim it by logging in. */
+  canClaim: boolean;
+}
+
+export type DeniedReason = 'no_access' | 'login_required' | 'password_required' | 'password_wrong' | 'expired' | 'deleted';
+
 export type ClientMsg =
-  | { t: 'hello'; name: string; color: string }
+  | {
+      t: 'hello';
+      name: string;
+      color: string;
+      /** Anonymous secret of this browser: proves who created a temporary canvas. */
+      anon?: string;
+      /** Bearer session token (desktop app; the web app uses its cookie). */
+      token?: string;
+      /** Share link token (?k=). */
+      link?: string;
+      password?: string;
+      /** Proof of an earlier correct join password, from welcome.grant. */
+      grant?: string;
+    }
   | { t: 'op'; opId: string; op: Op }
   | { t: 'live'; id: string; layerId: string; brush: Brush; pts: number[]; start: boolean }
   | { t: 'live.end'; id: string }
@@ -94,7 +123,15 @@ export type ServerMsg =
       layers: Layer[];
       strokes: Stroke[];
       peers: Peer[];
+      role: Role;
+      canvas: CanvasInfo;
+      /** Present after a correct join password: send it as hello.grant next time. */
+      grant?: string;
     }
+  /** Role or canvas state changed while connected (claimed, sharing edited). */
+  | { t: 'access'; role: Role; canvas: CanvasInfo }
+  /** Join refused or access lost. The server closes the socket after this unless it asks for a password. */
+  | { t: 'denied'; reason: DeniedReason }
   | { t: 'op'; seq: number; by: string; opId: string; op: AppliedOp }
   | { t: 'reject'; opId: string; reason: string }
   | { t: 'live'; by: string; id: string; layerId: string; brush: Brush; pts: number[]; start: boolean }

@@ -3,9 +3,12 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import { newSessionCode } from '../shared/ids';
-import { LIMITS, candidateKeys, normalizeName, parseKey, type ClientMsg } from '../shared/types';
+import { LIMITS, parseKey, type ClientMsg } from '../shared/types';
+import { handleApi, type ApiContext } from './api';
+import { readCookie, SESSION_COOKIE, userFromToken } from './auth';
+import { cleanup } from './cleanup';
 import { Store } from './db';
+import { Mailer } from './mailer';
 import { Session, newClient } from './session';
 
 const PORT = Number(process.env.PORT ?? 3210);
@@ -14,7 +17,11 @@ const DB_PATH = process.env.DB_PATH ?? './data/canvas.db';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const STATIC_DIR = path.resolve(process.env.STATIC_DIR ?? path.join(here, '../client'));
 const UNLOAD_AFTER_MS = 5 * 60 * 1000;
-const CREATE_PER_MINUTE = 10;
+const CLEANUP_EVERY_MS = Number(process.env.CLEANUP_EVERY_MS ?? 3600_000);
+/** Base URL in emails and share links. */
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/+$/, '');
+/** Accounts that receive the canvases from before accounts existed, at their first login. */
+const ADMIN_EMAILS = new Set((process.env.ADMIN_EMAILS ?? '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean));
 // Other origins that may call /api: the desktop app's webview (Tauri v2 on macOS/Linux, Windows).
 const CORS_ORIGINS = new Set(
   (process.env.CORS_ORIGINS ?? 'tauri://localhost,http://tauri.localhost,https://tauri.localhost')
@@ -33,31 +40,45 @@ const VERSION: string = (() => {
 })();
 
 const store = new Store(DB_PATH);
+const mailer = new Mailer();
 const sessions = new Map<string, Session>();
 
 function getSession(code: string): Session | null {
   let s = sessions.get(code);
   if (s) return s;
-  if (!store.sessionExists(code)) return null;
-  s = Session.load(store, code);
+  s = Session.load(store, code) ?? undefined;
+  if (!s) return null;
   sessions.set(code, s);
   return s;
 }
 
-// --- rate limit for session creation, per client IP ---------------------------------------
-const createLog = new Map<string, number[]>();
-function allowCreate(ip: string): boolean {
-  const now = Date.now();
-  const recent = (createLog.get(ip) ?? []).filter((t) => now - t < 60_000);
-  if (recent.length >= CREATE_PER_MINUTE) return false;
-  recent.push(now);
-  createLog.set(ip, recent);
-  return true;
+/** After a claim, a sharing change or a delete: re-check everyone on that canvas. */
+function refreshCanvas(code: string, gone: 'deleted' | 'expired' = 'deleted'): void {
+  const s = sessions.get(code);
+  if (!s) return;
+  s.refresh(gone)
+    .catch((e) => console.error(`[${code}] refresh`, e))
+    .finally(() => {
+      if (!store.sessionExists(code)) sessions.delete(code);
+    });
 }
+
+const api: ApiContext = {
+  store,
+  mailer,
+  publicUrl: PUBLIC_URL,
+  adminEmails: ADMIN_EMAILS,
+  allowedOrigins: CORS_ORIGINS,
+  refreshCanvas,
+};
+
 setInterval(() => {
-  const now = Date.now();
-  for (const [ip, ts] of createLog) if (ts.every((t) => now - t >= 60_000)) createLog.delete(ip);
-}, 60_000).unref();
+  try {
+    cleanup(store, (code) => refreshCanvas(code, 'expired'));
+  } catch (e) {
+    console.error('cleanup', e);
+  }
+}, CLEANUP_EVERY_MS).unref();
 
 function clientIp(req: http.IncomingMessage): string {
   // nginx sets X-Real-IP. The server binds to localhost, so only the proxy can set it.
@@ -105,43 +126,6 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
   });
 }
 
-function readJson(req: http.IncomingMessage, limit = 2048): Promise<Record<string, unknown>> {
-  return new Promise((resolve) => {
-    let size = 0;
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => {
-      size += c.length;
-      if (size > limit) return req.destroy();
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      try {
-        const v = JSON.parse(Buffer.concat(chunks).toString() || '{}');
-        resolve(typeof v === 'object' && v !== null ? v : {});
-      } catch {
-        resolve({});
-      }
-    });
-    req.on('error', () => resolve({}));
-  });
-}
-
-async function createSession(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  if (!allowCreate(clientIp(req))) return json(res, 429, { error: 'rate_limited' });
-  const body = await readJson(req);
-  if (typeof body.name === 'string' && body.name.trim()) {
-    const name = normalizeName(body.name);
-    if (!name) return json(res, 400, { error: 'bad_name' });
-    if (!store.createSession(name)) return json(res, 409, { error: 'name_taken', key: name });
-    return json(res, 201, { key: name });
-  }
-  for (let i = 0; i < 5; i++) {
-    const code = newSessionCode();
-    if (store.createSession(code)) return json(res, 201, { key: code });
-  }
-  return json(res, 500, { error: 'code_collision' });
-}
-
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -157,36 +141,25 @@ const server = http.createServer((req, res) => {
     if (origin && CORS_ORIGINS.has(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
       res.setHeader('Access-Control-Max-Age', '86400');
     }
     if (req.method === 'OPTIONS') return void res.writeHead(204).end();
   }
 
-  if (p === '/api/sessions' && req.method === 'POST') {
-    createSession(req, res).catch((e) => {
-      console.error('create session', e);
-      if (!res.headersSent) json(res, 500, { error: 'internal' });
-    });
+  if (p === '/api/health') return json(res, 200, { ok: true, version: VERSION, sessions: sessions.size, mail: mailer.mode });
+  if (p.startsWith('/api/')) {
+    handleApi(api, req, res, url, clientIp(req))
+      .then((handled) => {
+        if (!handled && !res.headersSent) json(res, 404, { error: 'not_found' });
+      })
+      .catch((e) => {
+        console.error('api', e);
+        if (!res.headersSent) json(res, 500, { error: 'internal' });
+      });
     return;
   }
-
-  // Resolves what someone typed (a code, with or without the dash, or a name) to a session.
-  const m = /^\/api\/sessions\/([^/]+)$/.exec(p);
-  if (m && req.method === 'GET') {
-    let raw = '';
-    try {
-      raw = decodeURIComponent(m[1]);
-    } catch {
-      // keep empty
-    }
-    const key = candidateKeys(raw).find((k) => store.sessionExists(k)) ?? null;
-    return json(res, 200, { exists: key !== null, key });
-  }
-
-  if (p === '/api/health') return json(res, 200, { ok: true, version: VERSION, sessions: sessions.size });
-  if (p.startsWith('/api/')) return json(res, 404, { error: 'not_found' });
   if (req.method !== 'GET' && req.method !== 'HEAD') return void res.writeHead(405).end();
   serveStatic(req, res, p);
 });
@@ -206,8 +179,11 @@ server.on('upgrade', (req, socket, head) => {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
+  // The web app's session cookie comes with the upgrade (same origin). The desktop app sends
+  // its token in the hello instead.
+  const user = userFromToken(store, readCookie(req, SESSION_COOKIE));
   wss.handleUpgrade(req, socket, head, (ws) => {
-    const client = newClient(ws);
+    const client = newClient(ws, user);
     let alive = true;
     session.join(client);
     ws.on('pong', () => (alive = true));
@@ -225,11 +201,7 @@ server.on('upgrade', (req, socket, head) => {
         return;
       }
       if (typeof msg !== 'object' || msg === null) return;
-      try {
-        session.handle(client, msg);
-      } catch (e) {
-        console.error(`[${session.code}] handler error`, e);
-      }
+      session.handle(client, msg).catch((e) => console.error(`[${session.code}] handler error`, e));
     });
     ws.on('close', () => {
       clearInterval(beat);
@@ -244,7 +216,10 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`draw ${VERSION} on http://${HOST}:${PORT} (db ${DB_PATH}, static ${STATIC_DIR})`);
+  console.log(`draw ${VERSION} on http://${HOST}:${PORT} (db ${DB_PATH}, public ${PUBLIC_URL}, mail ${mailer.mode})`);
+  if (!ADMIN_EMAILS.size) console.log('accounts: no ADMIN_EMAILS set; legacy canvases stay unassigned');
+  void mailer.verify();
+  cleanup(store, (code) => refreshCanvas(code, 'expired'));
 });
 
 function shutdown() {
