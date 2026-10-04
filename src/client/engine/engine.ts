@@ -13,7 +13,7 @@ import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
 import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
-import { nativePenFor } from './nativePen';
+import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
 // This range stays precise for drawings within about 1e4 world units of where you work.
@@ -65,6 +65,11 @@ interface ActiveStroke {
   decimals: number; // point precision, fixed for the stroke from the zoom at its start
   lastMove: number;
   timers: number[];
+  /**
+   * Desktop app with a native pen (nativePen.ts): points come from the native samples. dx, dy
+   * map sample positions to client coordinates; trail keeps the last few for a sanity check.
+   */
+  native: { dx: number; dy: number; trail: [number, number][] } | null;
 }
 
 export class Engine {
@@ -420,6 +425,7 @@ export class Engine {
     if (this.picking === e.pointerId) return this.pick(x, y);
     const st = this.stroke;
     if (st && e.pointerId === st.pointerId) {
+      if (st.native && this.addNativeSamples(st, e)) return;
       const events = e.getCoalescedEvents?.() ?? [];
       for (const ce of events.length ? events : [e]) {
         const [cx, cy] = this.local(ce);
@@ -446,7 +452,11 @@ export class Engine {
       this.picking = null;
       this.addSwatch(ed.fg);
     }
-    if (this.stroke && e.pointerId === this.stroke.pointerId) this.endStroke();
+    if (this.stroke && e.pointerId === this.stroke.pointerId) {
+      // The last pen samples before the release (the release itself has no pressure).
+      if (this.stroke.native) this.addNativeSamples(this.stroke, null);
+      this.endStroke();
+    }
   }
 
   private onPointerLeave(): void {
@@ -618,6 +628,7 @@ export class Engine {
       decimals: pointDecimals(zoom * (window.devicePixelRatio || 1)),
       lastMove: performance.now(),
       timers: [],
+      native: this.nativeStart(e),
     };
     this.stroke = st;
     this.comp.liveBegin(st.id, st.layerId, brush, false);
@@ -630,6 +641,40 @@ export class Engine {
         }, BUILDUP_MS),
       );
     }
+  }
+
+  /** A stroke from a native pen starts here: the press sample gives the offset to client coordinates. */
+  private nativeStart(e: PointerEvent): ActiveStroke['native'] {
+    if (!nativePenFor(e)) return null;
+    const samples = takePenSamples(); // hover samples before the press are not part of the stroke
+    // The last press sample, else the newest sample.
+    let down: PenSample | undefined = samples[samples.length - 1];
+    for (const s of samples) if (s.kind === 1) down = s;
+    if (!down) return null;
+    return { dx: e.clientX - down.x, dy: e.clientY - down.y, trail: [[e.clientX, e.clientY]] };
+  }
+
+  /**
+   * Adds the native pen samples that arrived since the last event. Returns true when the event
+   * is handled (also when no new sample arrived: the samples run ahead of the engine's merged
+   * pointer moves). Returns false, and stops using samples for this stroke, when the event does
+   * not lie on the sampled path: then the positions do not match and pointer events take over.
+   */
+  private addNativeSamples(st: ActiveStroke, e: PointerEvent | null): boolean {
+    const n = st.native!;
+    const moves = takePenSamples().filter((s) => s.kind === 0);
+    for (const s of moves) {
+      const cx = s.x + n.dx;
+      const cy = s.y + n.dy;
+      n.trail.push([cx, cy]);
+      this.addPoint(cx - this.rect.left, cy - this.rect.top, s.pressure);
+    }
+    if (n.trail.length > 512) n.trail.splice(0, n.trail.length - 512);
+    if (e && !n.trail.some(([x, y]) => Math.hypot(x - e.clientX, y - e.clientY) <= 24)) {
+      st.native = null;
+      return false;
+    }
+    return true;
   }
 
   private addPoint(x: number, y: number, p: number): void {
