@@ -20,6 +20,7 @@ In scope:
 - Live view of the strokes and cursors of other users
 - Sessions that stay after a server restart
 - Export of the current view as PNG
+- Save a canvas to a `.bdraw` file, and open a `.bdraw` file as a new online canvas (section 9.1)
 - Sessions with a random code or with a name that a person selects
 - Phone and tablet use: touch gestures and a phone layout
 - Installation as a Progressive Web App (PWA)
@@ -258,9 +259,18 @@ A second finger within 300 ms of the first cancels the stroke of the first finge
 
 PWA: the app has a web manifest, icons (also maskable), and a service worker. The service worker caches the app shell. It loads pages from the network first, so a deploy shows at once. It never caches `/api` or `/ws`. Chrome, Edge, and Firefox for Android can install the app. Desktop Firefox has no general PWA install.
 
-The landing page keeps a list of recent sessions in local storage on each device.
+The landing page keeps a list of recent sessions in local storage on each device. With an account, it shows a name field (empty: "Random code") and two buttons, "Create private canvas" and "Create public canvas". Without an account, it shows "New canvas" (temporary). In the web app (not the desktop app), a "Download app" button opens the latest GitHub release.
 
-Shortcuts: `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hides the markers. `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor.
+### 9.1 Files (.bdraw)
+
+- Content: the document as the server sends it in `welcome` (`layers`: Layer[], `strokes`: Stroke[]), plus a header: `format: "bdraw"`, `version: 1`, the app version, the save time, and the source canvas (information only). Deleted layers and erased strokes are not in the file. Type: `src/shared/bdraw.ts`.
+- Encoding: gzip-compressed JSON. Plain JSON is also valid. A browser without `CompressionStream` writes plain JSON.
+- Save: the save button or `Ctrl+S` writes the confirmed state of the client. A viewer can save too, because a viewer can see the full canvas.
+- Open: the open button, `Ctrl+O`, a file dropped on the window, the file manager (desktop app), or the installed PWA (Chromium `file_handlers`). The app always opens the file as a new online canvas with the same create form as the landing page. It never changes the canvas that the file came from.
+- Server: `POST /api/import`. The body is the raw file (at most 32 MB, at most 256 MB after gunzip). The create options are URI-encoded JSON in the `X-Draw-Options` header. A cross-site page cannot send this header without a CORS preflight. The server reads and checks the whole file before it makes the canvas. Then it replays each layer and each stroke (in `seq` order) as `layer.add` and `stroke.add` ops, through the same checks as live ops. It skips entries that fail and returns the number it skipped. Strokes keep their IDs and their author.
+- Desktop app: the installers register `.bdraw` (`application/x-bdraw`). The Linux packages install a shared-mime-info file. The app gets the path as an argument (Windows, Linux) or as `RunEvent::Opened` (macOS). It reads the file with a command that reads only the files the system opened the app with.
+
+Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hides the markers. `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor.
 
 ## 10. Deployment
 
@@ -270,7 +280,7 @@ Shortcuts: `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hi
 - Server update: `bash /opt/draw/update-server.sh` downloads `draw-web.tar.gz` from the latest release (or a given tag), installs the runtime packages, swaps `dist/` only after the install succeeds, and restarts the service. It never touches the database. GitHub has no access to the server.
 - Run: the systemd service `draw.service` (made by `deploy/setup-systemd.sh`). It runs as the system user `draw`, with a read-only system, no access to `/home`, and no capabilities. The app is in `/opt/draw`, and the database is in `/var/lib/draw`. The server listens on `127.0.0.1:3210`. A sudo rule lets the deploy user restart the service and read its status and logs, and nothing else.
 - SMTP: the password is in `/etc/draw/smtp.cred`, encrypted with `systemd-creds` and the host key (root only). systemd decrypts it only into the private RAM folder of the service when it starts. It is never in an environment variable, a plain file, or the repository. Without SMTP in production, register and reset refuse with `mail_unavailable`.
-- nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. TLS comes from the existing certbot setup.
+- nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. `/api/import` allows 33 MB bodies (the nginx default is 1 MB). TLS comes from the existing certbot setup.
 - Data: `DB_PATH` (`/var/lib/draw/canvas.db` on the server). Back up this one file.
 - Settings: `PUBLIC_URL` (links in emails), `ADMIN_EMAILS` (adopt legacy canvases), `TEMP_TTL_MS` and `CLEANUP_EVERY_MS` (expiry, for tests).
 
@@ -278,7 +288,7 @@ Desktop app (Tauri v2, `src-tauri/`):
 
 - The app is the same web client in a native window. `vite build --mode tauri` reads `.env.tauri` and sets `VITE_SERVER_ORIGIN=https://draw.bsums.xyz`. Thus the app uses the hosted server, and share links point to the public site.
 - The server sends CORS headers on `/api` only to the Tauri origins (`tauri://localhost`, `http(s)://tauri.localhost`). `CORS_ORIGINS` can change the list.
-- The app has no service worker. "Export PNG" uses the native save dialog (dialog and fs plugins).
+- The app has no service worker. "Export PNG" and "Save .bdraw" use the native save dialog (dialog and fs plugins).
 - On Linux, the app sets `__NV_DISABLE_EXPLICIT_SYNC=1`. NVIDIA explicit sync on Wayland crashes the WebKitGTK GPU path. Disabling the GPU path instead makes every frame one frame late.
 - In WebKit (the Linux app, Safari), both renderers draw two more identical frames after the view stops changing. Thus the last frame always shows.
 - GitHub Actions builds the installers for Linux, Windows, and macOS (universal). `npm run desktop:build` makes them for the current OS only. The Windows and macOS builds are not code-signed yet.

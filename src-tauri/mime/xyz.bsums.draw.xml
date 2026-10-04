@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Teaches Linux desktops the .bdraw type, so file managers open it with Draw.
+     Installed to /usr/share/mime/packages by the .deb and .rpm packages. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-bdraw">
+    <comment>Draw canvas</comment>
+    <sub-class-of type="application/gzip"/>
+    <glob pattern="*.bdraw" weight="60"/>
+  </mime-type>
+</mime-info>

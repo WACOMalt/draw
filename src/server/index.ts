@@ -82,6 +82,7 @@ const api: ApiContext = {
   allowedOrigins: CORS_ORIGINS,
   refreshCanvas,
   moveCanvas,
+  importDoc: (row, layers, strokes) => Session.importDoc(store, row, layers, strokes),
 };
 
 setInterval(() => {
@@ -154,7 +155,7 @@ const server = http.createServer((req, res) => {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Draw-Options');
       res.setHeader('Access-Control-Max-Age', '86400');
     }
     if (req.method === 'OPTIONS') return void res.writeHead(204).end();

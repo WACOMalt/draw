@@ -5,6 +5,7 @@
   import { PUBLIC_ORIGIN } from '../config';
   import { links } from '../identity';
   import AccountButton from './AccountButton.svelte';
+  import { pickFile } from '../files';
 
   let { engine, code, onLeave }: { engine: Engine | null; code: string; onLeave: () => void } = $props();
   const narrow = matchMedia('(max-width: 760px)').matches;
@@ -61,6 +62,8 @@
   </div>
   <AccountButton compact={narrow} onHome={onLeave} />
 
+  {#if !narrow}<button class="icon" title="Open a .bdraw file as a new canvas (Ctrl+O)" onclick={pickFile}><Icon name="open" /></button>{/if}
+  <button class="icon" title="Save to a .bdraw file (Ctrl+S)" onclick={() => engine?.saveBdraw()}><Icon name="save" /></button>
   <button class="icon" title="Export the view as PNG" onclick={() => engine?.exportPng()}><Icon name="download" /></button>
   <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
 </header>

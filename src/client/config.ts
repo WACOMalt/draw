@@ -11,6 +11,9 @@ export const PUBLIC_ORIGIN = env || location.origin;
 
 export const IS_TAURI = '__TAURI_INTERNALS__' in window;
 
+/** Desktop installers: the newest GitHub release. */
+export const DOWNLOAD_URL = 'https://github.com/WACOMalt/draw/releases/latest';
+
 export function wsUrl(key: string): string {
   const base = env || location.origin;
   return `${base.replace(/^http/, 'ws')}/ws?code=${encodeURIComponent(key)}`;

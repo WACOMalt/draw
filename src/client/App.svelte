@@ -7,6 +7,8 @@
   import Editor from './ui/Editor.svelte';
   import AuthDialog from './ui/AuthDialog.svelte';
   import Modal from './ui/Modal.svelte';
+  import OpenFileDialog from './ui/OpenFileDialog.svelte';
+  import { isBdrawName, offerFile, watchOpenedFiles } from './files';
 
   let path = $state(location.pathname);
   const code = $derived.by(() => {
@@ -36,6 +38,7 @@
     };
     window.addEventListener('draw:navigate', navigate);
     void loadMe();
+    watchOpenedFiles();
     watchAuth();
     // Links from emails and the desktop app arrive as query parameters. Handle, then tidy the URL.
     const q = new URLSearchParams(location.search);
@@ -68,7 +71,19 @@
   }
 </script>
 
-<svelte:window onpopstate={() => (path = location.pathname)} />
+<svelte:window
+  onpopstate={() => (path = location.pathname)}
+  ondragover={(e) => {
+    // Accept a dropped .bdraw file anywhere in the window.
+    if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+  }}
+  ondrop={(e) => {
+    const f = e.dataTransfer?.files[0];
+    if (!f) return;
+    e.preventDefault();
+    if (isBdrawName(f.name)) offerFile(f.name, f);
+  }}
+/>
 
 {#if code}
   {#key code}
@@ -76,6 +91,10 @@
   {/key}
 {:else}
   <Landing onOpen={(c, k) => go(`/s/${c}${k ? `?k=${encodeURIComponent(k)}` : ''}`)} />
+{/if}
+
+{#if ed.openFile && !ed.auth}
+  {#key ed.openFile}<OpenFileDialog onOpen={(key) => go(`/s/${encodeURIComponent(key)}`)} />{/key}
 {/if}
 
 {#if ed.auth}<AuthDialog />{/if}

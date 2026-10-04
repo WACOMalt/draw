@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { normalizeName } from '../../shared/types';
   import { loadRecent, removeRecent, type Recent } from '../recent';
-  import { PUBLIC_ORIGIN } from '../config';
-  import { api, errorText } from '../api';
-  import { anonSecret, links } from '../identity';
+  import { DOWNLOAD_URL, IS_TAURI } from '../config';
+  import { api } from '../api';
+  import { pickFile } from '../files';
+  import { links } from '../identity';
   import { ed } from '../state.svelte';
   import AccountButton from './AccountButton.svelte';
+  import Icon from './Icon.svelte';
+  import NewCanvasForm from './NewCanvasForm.svelte';
 
   interface Summary {
     key: string;
@@ -15,35 +17,17 @@
   }
 
   let { onOpen }: { onOpen: (key: string, link?: string) => void } = $props();
-  let name = $state('');
   let join = $state('');
   let error = $state('');
-  let taken = $state<string | null>(null);
   let busy = $state(false);
   let recent = $state<Recent[]>(loadRecent());
   let mine = $state<{ owned: Summary[]; shared: Summary[] } | null>(null);
-
-  const preview = $derived(name.trim() ? normalizeName(name) : null);
 
   // The account's canvases, whenever someone logs in.
   $effect(() => {
     if (!ed.user) return void (mine = null);
     void api<{ owned: Summary[]; shared: Summary[] }>('GET', '/api/canvases').then((r) => (mine = r.ok ? r.data : null));
   });
-
-  async function create(withName: boolean) {
-    busy = true;
-    error = '';
-    taken = null;
-    // The anonymous secret marks this browser as the creator, so it alone may claim the canvas.
-    const r = await api<{ key: string }>('POST', '/api/sessions', withName ? { name, anon: anonSecret() } : { anon: anonSecret() });
-    busy = false;
-    if (r.status === 409) return void (taken = (r.data as { key?: string }).key ?? null);
-    if (r.status === 400) return void (error = 'Use 3 to 40 letters, digits or dashes for the name.');
-    if (r.status === 401) return void (ed.auth = 'login');
-    if (!r.ok) return void (error = r.status === 429 ? 'Too many new canvases. Wait a minute and try again.' : errorText(r.data.error));
-    onOpen(r.data.key);
-  }
 
   async function onJoin(e: SubmitEvent) {
     e.preventDefault();
@@ -81,38 +65,19 @@
 </script>
 
 <main>
-  <div class="top"><AccountButton /></div>
+  <div class="top">
+    {#if !IS_TAURI}
+      <a class="download" href={DOWNLOAD_URL} target="_blank" rel="noopener" title="Desktop app for Windows, macOS and Linux"><Icon name="download" /> Download app</a>
+    {/if}
+    <AccountButton />
+  </div>
   <div class="card">
     <h1><span class="dot"></span>Draw</h1>
     <p class="sub">An infinite canvas you share with a link.</p>
 
-    <button class="primary big" disabled={busy} onclick={() => create(false)}>New canvas</button>
-    <p class="hint">
-      {#if ed.user}
-        Saved to your account. Gets a random code; you choose who can open it.
-      {:else}
-        Temporary: deleted after 5 days unless you log in and keep it. Only this browser can keep it.
-      {/if}
-    </p>
+    <NewCanvasForm onCreated={(key) => onOpen(key)} />
 
-    <div class="or"><span>or give it a name</span></div>
-
-    {#if ed.user}
-      <form onsubmit={(e) => (e.preventDefault(), create(true))}>
-        <input type="text" placeholder="friday-jam" maxlength="60" autocomplete="off" spellcheck="false" bind:value={name} />
-        <button type="submit" disabled={busy || !preview}>Create</button>
-      </form>
-      {#if name.trim()}
-        <p class="hint">
-          {#if preview}<span class="mono">{new URL(PUBLIC_ORIGIN).host}/s/{preview}</span> · private until you share it{:else}Use 3 to 40 letters, digits or dashes.{/if}
-        </p>
-      {/if}
-      {#if taken}
-        <p class="taken"><span class="mono">{taken}</span> is taken.</p>
-      {/if}
-    {:else}
-      <p class="hint">Named canvases need an account. <button class="linklike" onclick={() => (ed.auth = 'login')}>Log in</button> or <button class="linklike" onclick={() => (ed.auth = 'register')}>create one</button>.</p>
-    {/if}
+    <button class="open" onclick={pickFile}><Icon name="open" /> Open a .bdraw file</button>
 
     <div class="or"><span>or join one</span></div>
 
@@ -201,16 +166,30 @@
     margin: 6px 0 20px;
     font-size: 13px;
   }
-  .big {
+  .open {
     width: 100%;
-    padding: 11px;
-    font-size: 14px;
+    margin-top: 12px;
+    padding: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
   }
-  .hint {
-    color: var(--text-faint);
-    margin: 6px 0 0;
-    font-size: 11.5px;
-    overflow-wrap: anywhere;
+  .download {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 12px;
+    background: var(--bg-2);
+  }
+  .download:hover {
+    color: var(--text);
+    border-color: var(--accent);
   }
   .mono {
     font-family: ui-monospace, monospace;
@@ -241,13 +220,6 @@
   }
   form button {
     padding: 0 14px;
-  }
-  .taken {
-    margin: 8px 0 0;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: #ffd43b;
   }
   .error {
     color: var(--danger);
@@ -281,17 +253,13 @@
     font-size: 11px;
   }
   .top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     position: fixed;
     top: max(10px, env(safe-area-inset-top));
     right: 12px;
     z-index: 10;
-  }
-  .linklike {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--accent);
-    cursor: pointer;
   }
   .version {
     position: fixed;

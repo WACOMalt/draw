@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
+import zlib from 'node:zlib';
 
 const PORT = 3400 + Math.floor(Math.random() * 500);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -60,6 +61,15 @@ class Browser {
       data = await res.json();
     } catch {}
     return { status: res.status, data, location: res.headers.get('location') };
+  }
+  /** POST /api/import: a .bdraw body with the create options in X-Draw-Options. */
+  async upload(bytes, opts, headers = {}) {
+    const res = await fetch(BASE + '/api/import', {
+      method: 'POST',
+      headers: { 'X-Real-IP': this.ip, 'Content-Type': 'application/octet-stream', 'X-Draw-Options': encodeURIComponent(JSON.stringify({ anon: this.anon, ...opts })), ...(this.cookie ? { Cookie: this.cookie } : {}), ...headers },
+      body: bytes,
+    });
+    return { status: res.status, data: await res.json().catch(() => null) };
   }
   join(key, extra = {}) {
     return new Promise((resolve) => {
@@ -240,6 +250,40 @@ try {
   check(list.shared.some((c) => c.key === 'friday-jam'), 'canvas appears under "shared with me"');
   await funky.api('DELETE', `/api/canvases/friday-jam/members/${veeId}`);
   check(!!(await vConn.next((m) => m.t === 'denied')), 'removed member is disconnected');
+
+  // --- .bdraw files ---------------------------------------------------------------------------------
+  const brush = { tool: 'paint', color: '#336699', size: 4, opacity: 1, flow: 1, hardness: 1, spacing: 0.1, pressureSize: false, pressureFlow: false, buildup: false };
+  const bfile = {
+    format: 'bdraw', version: 1, app: 'test', savedAt: new Date().toISOString(),
+    layers: [
+      { id: 'layerink01', name: 'Ink', order: 1, blend: 'multiply', opacity: 0.5, visible: true, deleted: false },
+      { id: 'layergone1', name: 'Gone', order: 2, blend: 'normal', opacity: 1, visible: true, deleted: true },
+    ],
+    strokes: [
+      { id: 'strokeb002', layerId: 'layerink01', seq: 9, author: 'someone', brush, pts: [5, 5, 1, 9, 9, 1] },
+      { id: 'strokea001', layerId: 'layerink01', seq: 3, author: 'someone', brush, pts: [0, 0, 1, 4, 4, 1] },
+      { id: 'strokec003', layerId: 'layergone1', seq: 4, author: 'x', brush, pts: [1, 1, 1] },
+      { id: 'strokebad4', layerId: 'layerink01', seq: 5, author: 'x', brush, pts: 'nope' },
+    ],
+  };
+  const gz = zlib.gzipSync(JSON.stringify(bfile));
+  const imp = await funky.upload(gz, { name: 'Imported Jam', access: 'editor' });
+  check(imp.status === 201 && imp.data.key === 'imported-jam' && imp.data.layers === 1 && imp.data.strokes === 2 && imp.data.skipped === 2, 'import a gzipped .bdraw as a named public canvas');
+  const iw = await first(await new Browser().join('imported-jam'));
+  const live = iw.layers.filter((l) => !l.deleted);
+  check(iw.role === 'editor' && live.length === 1 && live[0].blend === 'multiply' && live[0].opacity === 0.5, 'imported layer keeps its settings; public code draws');
+  check(iw.strokes.map((x) => x.id).join() === 'strokea001,strokeb002' && iw.strokes[0].author === 'someone', 'imported strokes keep draw order and author');
+  // Round trip: the welcome document is the file body.
+  const roundTrip = { format: 'bdraw', version: 1, app: 'test', savedAt: '', layers: iw.layers, strokes: iw.strokes };
+  const anonImp = await new Browser().upload(Buffer.from(JSON.stringify(roundTrip)), {});
+  check(anonImp.status === 201 && /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(anonImp.data.key) && anonImp.data.strokes === 2 && anonImp.data.skipped === 0, 'plain JSON file imports as a temporary canvas (round trip)');
+  check((await new Browser().upload(gz, { name: 'nope-name' })).status === 401, 'named import needs an account');
+  check((await funky.upload(Buffer.from('not a drawing'), {})).data?.error === 'bad_file', 'a file that is not .bdraw is refused');
+  check((await funky.upload(Buffer.from(JSON.stringify({ ...bfile, version: 2 })), {})).data?.error === 'file_too_new', 'a file from a newer version is refused');
+  const noHeader = await fetch(BASE + '/api/import', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: gz });
+  check(noHeader.status === 403, 'import without X-Draw-Options is refused (CSRF)');
+  check((await funky.upload(gz, {}, { Origin: 'https://evil.example' })).status === 403, 'import from a foreign Origin is refused');
+  check((await funky.upload(Buffer.alloc(33 * 1024 * 1024), {})).status === 413, 'a file over 32 MB is refused');
 
   // --- CSRF guard, password reset, device login ----------------------------------------------------
   const evil = await fetch(`${BASE}/api/canvases/friday-jam/password`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', Cookie: funky.cookie }, body: '{"password":null}' });

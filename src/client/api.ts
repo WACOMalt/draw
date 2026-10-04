@@ -11,16 +11,18 @@ export interface ApiResult<T> {
   data: T & { error?: string };
 }
 
-export async function api<T = Record<string, unknown>>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
-  const headers: Record<string, string> = {};
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
+/** A Blob body is sent raw (application/octet-stream); anything else as JSON. */
+export async function api<T = Record<string, unknown>>(method: string, path: string, body?: unknown, extraHeaders: Record<string, string> = {}): Promise<ApiResult<T>> {
+  const raw = body instanceof Blob;
+  const headers: Record<string, string> = { ...extraHeaders };
+  if (body !== undefined) headers['Content-Type'] = raw ? 'application/octet-stream' : 'application/json';
   const token = desktopToken.get();
   if (token) headers.Authorization = `Bearer ${token}`;
   try {
     const res = await fetch(`${API_BASE}${path}`, {
       method,
       headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: raw ? body : body !== undefined ? JSON.stringify(body) : undefined,
       credentials: IS_TAURI ? 'omit' : 'same-origin',
     });
     const data = (await res.json().catch(() => ({}))) as T & { error?: string };

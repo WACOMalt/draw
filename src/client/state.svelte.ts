@@ -100,6 +100,8 @@ class EditorState {
   /** Why the canvas cannot be shown (no access, password, expired, ...), or null. */
   denied = $state<DeniedReason | null>(null);
   shareOpen = $state(false);
+  /** A .bdraw file waiting for "open as a new canvas" (picker, drop, OS file association). */
+  openFile = $state<{ name: string; blob: Blob } | null>(null);
 
   get canEdit(): boolean {
     return this.role === 'owner' || this.role === 'editor';

@@ -7,6 +7,8 @@
 
 import crypto from 'node:crypto';
 import http from 'node:http';
+import zlib from 'node:zlib';
+import { isGzip } from '../shared/bdraw';
 import { newId, newSessionCode } from '../shared/ids';
 import { normalizeName, parseKey, candidateKeys } from '../shared/types';
 import { canClaim, isTemporary, TEMP_TTL_MS } from './access';
@@ -35,6 +37,8 @@ export interface ApiContext {
   refreshCanvas(code: string): void;
   /** After a rename: moves the live session to the new code and re-checks everyone. */
   moveCanvas(from: string, to: string): void;
+  /** Fills a new canvas from a .bdraw file (Session.importDoc). */
+  importDoc(row: CanvasRow, layers: unknown[], strokes: unknown[]): { layers: number; strokes: number; skipped: number };
 }
 
 type Handler = (ctx: ApiContext, req: Req) => Promise<Res>;
@@ -46,6 +50,8 @@ interface Req {
   user: UserRow | undefined;
   token: string | undefined;
   params: string[];
+  /** Raw request body, only for routes in RAW_ROUTES. */
+  bytes?: Buffer;
 }
 interface Res {
   status: number;
@@ -259,27 +265,83 @@ function canvasSummary(ctx: ApiContext, c: CanvasRow, role: string) {
   return { key: c.code, role, createdAt: c.created_at, lastActiveAt: c.last_active_at, owner: c.owner_id ? ctx.store.userById(c.owner_id)?.name ?? null : null };
 }
 
-const createCanvas: Handler = async (ctx, req) => {
-  if (!limits.create.allow(req.ip)) return err(429, 'rate_limited');
-  const anon = typeof req.body.anon === 'string' && req.body.anon.length <= 100 ? req.body.anon : null;
-  const owned = !!req.user;
-  // Owned: the plain code is the view link, editing needs the token. Temporary: the code edits.
-  const init: Partial<CanvasRow> = owned
-    ? { owner_id: req.user!.id, code_role: 'viewer', edit_token: linkToken(), view_token: null }
-    : { creator_anon: anon ? sha256(anon) : null, code_role: 'editor' };
+interface CreateOptions {
+  name?: unknown;
+  anon?: unknown;
+  /** Accounts only: what the canvas link gives. 'editor' public, 'none' private. Default 'viewer'. */
+  access?: unknown;
+}
 
-  if (typeof req.body.name === 'string' && req.body.name.trim()) {
-    if (!owned) return err(401, 'login_required');
-    const name = normalizeName(req.body.name);
-    if (!name) return err(400, 'bad_name');
-    if (!ctx.store.createCanvas(name, init)) return err(409, 'name_taken', { key: name });
-    return ok({ key: name, link: init.edit_token }, 201);
+/** Makes a canvas for a new-canvas or an import request. */
+function makeCanvas(ctx: ApiContext, req: Req, o: CreateOptions): { row: CanvasRow; link: string | null } | { res: Res } {
+  const anon = typeof o.anon === 'string' && o.anon.length <= 100 ? o.anon : null;
+  const owned = !!req.user;
+  const access = o.access === 'editor' || o.access === 'none' ? o.access : 'viewer';
+  // Owned: the owner picks what the plain code gives; editing also has a token link.
+  // Temporary: anyone with the code edits.
+  const init: Partial<CanvasRow> = owned
+    ? { owner_id: req.user!.id, code_role: access, edit_token: linkToken(), view_token: null }
+    : { creator_anon: anon ? sha256(anon) : null, code_role: 'editor' };
+  const made = (key: string) => ({ row: ctx.store.canvas(key)!, link: init.edit_token ?? null });
+
+  if (typeof o.name === 'string' && o.name.trim()) {
+    if (!owned) return { res: err(401, 'login_required') };
+    const name = normalizeName(o.name);
+    if (!name) return { res: err(400, 'bad_name') };
+    if (!ctx.store.createCanvas(name, init)) return { res: err(409, 'name_taken', { key: name }) };
+    return made(name);
   }
   for (let i = 0; i < 5; i++) {
     const code = newSessionCode();
-    if (ctx.store.createCanvas(code, init)) return ok({ key: code, link: init.edit_token ?? null }, 201);
+    if (ctx.store.createCanvas(code, init)) return made(code);
   }
-  return err(500, 'code_collision');
+  return { res: err(500, 'code_collision') };
+}
+
+const createCanvas: Handler = async (ctx, req) => {
+  if (!limits.create.allow(req.ip)) return err(429, 'rate_limited');
+  const r = makeCanvas(ctx, req, req.body);
+  return 'res' in r ? r.res : ok({ key: r.row.code, link: r.link }, 201);
+};
+
+/** Upload limits for .bdraw files: compressed, and after gunzip (stops zip bombs). */
+export const IMPORT_MAX_BYTES = 32 * 1024 * 1024;
+const IMPORT_MAX_INFLATED = 256 * 1024 * 1024;
+
+/**
+ * POST /api/import: a .bdraw file as the raw body (application/octet-stream), the create options
+ * as URI-encoded JSON in the X-Draw-Options header. Makes a new canvas with the file's content.
+ */
+const importCanvas: Handler = async (ctx, req) => {
+  if (!limits.create.allow(req.ip)) return err(429, 'rate_limited');
+  let opts: CreateOptions;
+  try {
+    opts = JSON.parse(decodeURIComponent(String(req.raw.headers['x-draw-options'] ?? '')));
+    if (!opts || typeof opts !== 'object') throw new Error();
+  } catch {
+    return err(400, 'bad_request');
+  }
+  // Read the whole file before anything is made, so a bad file leaves nothing behind.
+  let file: { format?: unknown; version?: unknown; layers?: unknown; strokes?: unknown };
+  try {
+    const bytes = req.bytes ?? Buffer.alloc(0);
+    const text = isGzip(bytes) ? zlib.gunzipSync(bytes, { maxOutputLength: IMPORT_MAX_INFLATED }).toString('utf8') : bytes.toString('utf8');
+    file = JSON.parse(text);
+  } catch {
+    return err(400, 'bad_file');
+  }
+  if (!file || file.format !== 'bdraw' || !Array.isArray(file.layers) || !Array.isArray(file.strokes)) return err(400, 'bad_file');
+  if (typeof file.version !== 'number' || file.version > 1) return err(400, 'file_too_new');
+
+  const r = makeCanvas(ctx, req, opts);
+  if ('res' in r) return r.res;
+  try {
+    const n = ctx.importDoc(r.row, file.layers, file.strokes);
+    return ok({ key: r.row.code, link: r.link, ...n }, 201);
+  } catch (e) {
+    ctx.store.deleteCanvas(r.row.code);
+    throw e;
+  }
 };
 
 /** Resolves what someone typed (a code with or without the dash, or a name). */
@@ -486,6 +548,7 @@ const ROUTES: [string, RegExp, Handler][] = [
   ['POST', /^\/api\/auth\/device\/approve$/, deviceApprove],
   ['POST', /^\/api\/auth\/device\/poll$/, devicePoll],
   ['POST', /^\/api\/sessions$/, createCanvas],
+  ['POST', /^\/api\/import$/, importCanvas],
   ['GET', /^\/api\/sessions\/([^/]+)$/, resolveCanvas],
   ['GET', /^\/api\/canvases$/, myCanvases],
   ['GET', /^\/api\/canvases\/([^/]+)\/sharing$/, getSharing],
@@ -499,6 +562,29 @@ const ROUTES: [string, RegExp, Handler][] = [
   ['POST', /^\/api\/canvases\/([^/]+)\/transfer$/, transfer],
   ['DELETE', /^\/api\/canvases\/([^/]+)$/, deleteCanvas],
 ];
+
+/** Routes that take a raw body instead of JSON. */
+const RAW_ROUTES = new Set<Handler>([importCanvas]);
+
+/** Reads a raw body. 'too_big' as soon as it passes the limit (the rest is drained, not kept). */
+function readRaw(req: http.IncomingMessage, limit: number): Promise<Buffer | 'too_big' | null> {
+  return new Promise((resolve) => {
+    if (Number(req.headers['content-length'] ?? 0) > limit) {
+      req.resume();
+      return resolve('too_big');
+    }
+    let size = 0;
+    let over = false;
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > limit) over = true;
+      else chunks.push(c);
+    });
+    req.on('end', () => resolve(over ? 'too_big' : Buffer.concat(chunks)));
+    req.on('error', () => resolve(null));
+  });
+}
 
 function readBody(req: http.IncomingMessage, limit = 4096): Promise<Record<string, unknown> | null> {
   return new Promise((resolve) => {
@@ -547,7 +633,23 @@ export async function handleApi(ctx: ApiContext, raw: http.IncomingMessage, res:
   };
 
   let body: Record<string, unknown> = {};
-  if (method !== 'GET') {
+  let bytes: Buffer | undefined;
+  if (method !== 'GET' && RAW_ROUTES.has(route[2])) {
+    // CSRF: the Origin must be ours, and the custom header cannot be sent cross-site without a
+    // preflight, which only allowed origins pass.
+    const origin = raw.headers.origin;
+    if ((origin && origin !== new URL(ctx.publicUrl).origin && !ctx.allowedOrigins.has(origin)) || !raw.headers['x-draw-options']) {
+      send(err(403, 'bad_origin'));
+      return true;
+    }
+    const got = await readRaw(raw, IMPORT_MAX_BYTES);
+    if (got === 'too_big') {
+      send(err(413, 'file_too_big'));
+      return true;
+    }
+    if (!got) return true;
+    bytes = got;
+  } else if (method !== 'GET') {
     // CSRF: other sites cannot send JSON without a preflight, and the Origin must be ours.
     const origin = raw.headers.origin;
     if (origin && origin !== new URL(ctx.publicUrl).origin && !ctx.allowedOrigins.has(origin)) {
@@ -567,7 +669,7 @@ export async function handleApi(ctx: ApiContext, raw: http.IncomingMessage, res:
   }
 
   const token = requestToken(raw);
-  const req: Req = { raw, url, ip, body, user: userFromToken(ctx.store, token), token, params };
+  const req: Req = { raw, url, ip, body, bytes, user: userFromToken(ctx.store, token), token, params };
   try {
     send(await route[2](ctx, req));
   } catch (e) {

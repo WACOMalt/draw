@@ -106,6 +106,40 @@ export class Session {
     return s;
   }
 
+  /**
+   * Fills a new, empty canvas from a .bdraw file: layer.add then stroke.add ops, each through
+   * the same checks as a live op. Entries that fail are skipped and counted.
+   */
+  static importDoc(store: Store, row: CanvasRow, layers: unknown[], strokes: unknown[]): { layers: number; strokes: number; skipped: number } {
+    const s = new Session(row.code, store, row);
+    const n = { layers: 0, strokes: 0, skipped: 0 };
+    const tryCommit = (op: () => Op, by: string, kind: 'layers' | 'strokes') => {
+      try {
+        s.commit(op(), by);
+        n[kind]++;
+      } catch (e) {
+        if (e instanceof ValidationError || e instanceof OpError) n.skipped++;
+        else throw e;
+      }
+    };
+    const field = (v: unknown, k: string) => (v && typeof v === 'object' ? (v as Record<string, unknown>)[k] : undefined);
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    store.transaction(() => {
+      for (const l of layers) {
+        if (field(l, 'deleted') === true) continue;
+        tryCommit(() => validateOp({ type: 'layer.add', layer: l }), 'import', 'layers');
+      }
+      const ordered = [...strokes].sort((a, b) => num(field(a, 'seq')) - num(field(b, 'seq')));
+      for (const st of ordered) {
+        if (field(st, 'deleted') === true) continue;
+        const author = field(st, 'author');
+        const by = typeof author === 'string' && /^[\w-]{1,40}$/.test(author) ? author : 'import';
+        tryCommit(() => validateOp({ type: 'stroke.add', stroke: st }), by, 'strokes');
+      }
+    });
+    return n;
+  }
+
   /** Replays a persisted op. No checks: the op passed them when it was first accepted. */
   private applyStored(op: AppliedOp, by: string, seq: number): void {
     try {

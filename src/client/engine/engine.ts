@@ -8,7 +8,9 @@ import { createRenderer } from './createRenderer';
 import type { Renderer } from './renderer';
 import { Doc, type Bounds } from './doc';
 import { computeMarkers, unionAll } from './navigator';
-import { IS_TAURI } from '../config';
+import { PUBLIC_ORIGIN } from '../config';
+import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
+import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
 
@@ -939,6 +941,12 @@ export class Engine {
         e.preventDefault();
         if (e.shiftKey) this.redo();
         else this.undo();
+      } else if (key === 's') {
+        e.preventDefault();
+        void this.saveBdraw();
+      } else if (key === 'o') {
+        e.preventDefault();
+        pickFile();
       } else if (key === 'y') {
         e.preventDefault();
         this.redo();
@@ -994,21 +1002,15 @@ export class Engine {
   async exportPng(): Promise<void> {
     const blob = await this.comp.exportPng();
     if (!blob) return;
-    const name = `draw-${this.code}.png`;
-    if (IS_TAURI) {
-      // Webviews do not handle <a download>: ask for a path and write the file natively.
-      const [{ save }, { writeFile }] = await Promise.all([import('@tauri-apps/plugin-dialog'), import('@tauri-apps/plugin-fs')]);
-      const path = await save({ defaultPath: name, filters: [{ name: 'PNG image', extensions: ['png'] }] });
-      if (path) {
-        await writeFile(path, new Uint8Array(await blob.arrayBuffer()));
-        showToast('Saved');
-      }
-      return;
-    }
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    await saveBlob(blob, `draw-${this.code}.png`, { name: 'PNG image', extensions: ['png'] });
+  }
+
+  /** Saves the canvas (confirmed state, as the server sent it) to a .bdraw file. */
+  async saveBdraw(): Promise<void> {
+    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, {
+      key: this.code,
+      url: `${PUBLIC_ORIGIN}/s/${this.code}`,
+    });
+    await saveBlob(await encodeBdraw(file), `${this.code}.${BDRAW_EXT}`, { name: 'Draw canvas', extensions: [BDRAW_EXT] });
   }
 }
