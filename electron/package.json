@@ -1,0 +1,12 @@
+{
+  "name": "draw",
+  "productName": "Draw",
+  "version": "0.2.0",
+  "description": "Draw: shared infinite canvas (Linux desktop app)",
+  "homepage": "https://draw.bsums.xyz",
+  "author": { "name": "bsums.xyz", "email": "ben@bsums.xyz" },
+  "license": "UNLICENSED",
+  "main": "main.cjs",
+  "desktopName": "draw.desktop",
+  "private": true
+}

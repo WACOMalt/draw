@@ -1,0 +1,43 @@
+# The Linux desktop app: Chromium (Electron) showing https://draw.bsums.xyz.
+# Build: npm run linux:build (from the repository root). Output: dist/electron.
+appId: xyz.bsums.draw
+productName: Draw
+executableName: draw
+electronVersion: 44.5.1
+directories:
+  output: ../dist/electron
+files:
+  - main.cjs
+  - preload.cjs
+  - offline.html
+  - package.json
+extraResources:
+  - from: ../src-tauri/mime/xyz.bsums.draw.xml
+    to: xyz.bsums.draw.xml
+  - from: ../src-tauri/icons/icon.png
+    to: icon.png
+npmRebuild: false
+fileAssociations:
+  - ext: bdraw
+    name: Draw canvas
+    description: Draw canvas file
+    mimeType: application/x-bdraw
+    role: Editor
+linux:
+  target: [AppImage, deb, rpm]
+  icon: ../src-tauri/icons/icon.png
+  category: Graphics
+  synopsis: Shared infinite drawing canvas
+  description: An infinite drawing canvas you share with a link.
+  maintainer: bsums.xyz <ben@bsums.xyz>
+  vendor: bsums.xyz
+  # The window's Wayland app_id / WM_CLASS matches draw.desktop: the taskbar shows the right icon.
+  syncDesktopName: true
+# Same file names as the Tauri builds, so Gear Lever's GitHub updater keeps finding the AppImage.
+appImage:
+  artifactName: Draw_${version}_amd64.${ext}
+deb:
+  artifactName: Draw_${version}_amd64.${ext}
+rpm:
+  artifactName: Draw-${version}-1.x86_64.${ext}
+publish: null

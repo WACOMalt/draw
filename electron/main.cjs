@@ -1,0 +1,171 @@
+// Draw for Linux: the web app in Chromium (Electron).
+//
+// The Tauri runtime on Linux is WebKitGTK: it gives web pages no pen pressure, and with the
+// NVIDIA driver its WebGL is much slower than a browser's. Chromium has neither problem. The
+// window shows the hosted site, so the app updates with the server. Windows (WebView2, also
+// Chromium) and macOS stay on Tauri (src-tauri/).
+//
+// Native parts: .bdraw files the system opens the app with (sent to the page through
+// preload.cjs), and the .bdraw MIME type for AppImages (Gear Lever does not install it).
+
+const { app, BrowserWindow, Menu, ipcMain, shell } = require('electron');
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const SITE = (process.env.DRAW_URL || 'https://draw.bsums.xyz').replace(/\/+$/, '');
+const ORIGIN = new URL(SITE).origin;
+const MAX_FILE = 64 * 1024 * 1024;
+
+// Native Wayland on a Wayland desktop, X11 elsewhere. On Wayland, Chromium reads the tablet
+// through zwp_tablet_v2 (pen type and pressure). Under XWayland with the NVIDIA driver the GPU
+// process crashes and WebGL is lost (tested: RTX 3090, KDE Plasma). DRAW_OZONE=x11 forces X11.
+if (process.env.DRAW_OZONE) app.commandLine.appendSwitch('ozone-platform', process.env.DRAW_OZONE);
+else app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+
+// One app instance: a .bdraw opened later goes to the window that is already open.
+if (!app.requestSingleInstanceLock()) app.quit();
+
+/** .bdraw paths from the command line (the file manager passes them), not yet sent to the page. */
+const pending = [];
+let pageReady = false;
+let win = null;
+
+function collect(argv) {
+  for (const arg of argv.slice(1)) {
+    if (/\.bdraw$/i.test(arg) && fs.existsSync(arg)) pending.push(path.resolve(arg));
+  }
+}
+
+function sendPending() {
+  if (!pageReady || !win) return;
+  for (const file of pending.splice(0)) {
+    try {
+      if (fs.statSync(file).size > MAX_FILE) continue;
+      win.webContents.send('open-file', { name: path.basename(file), bytes: fs.readFileSync(file) });
+    } catch (e) {
+      console.error(`draw: cannot read ${file}: ${e.message}`);
+    }
+  }
+}
+
+const isOurs = (url) => {
+  try {
+    return new URL(url).origin === ORIGIN;
+  } catch {
+    return false;
+  }
+};
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    minWidth: 480,
+    minHeight: 400,
+    title: 'Draw',
+    backgroundColor: '#1d1d1d',
+    icon: path.join(process.resourcesPath, 'icon.png'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  });
+  const wc = win.webContents;
+
+  // Only the site runs in the window. Everything else opens in the default browser.
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  wc.on('will-navigate', (e, url) => {
+    if (isOurs(url) || url.startsWith('file:')) return;
+    e.preventDefault();
+    if (/^https?:/i.test(url)) void shell.openExternal(url);
+  });
+  // A new page load (reload, navigation) asks for the files again.
+  wc.on('did-start-navigation', (details) => {
+    if (details.isMainFrame && !details.isSameDocument) pageReady = false;
+  });
+  // No connection: a small page with a retry button instead of Chromium's error page.
+  wc.on('did-fail-load', (_e, code, _desc, url, isMainFrame) => {
+    if (!isMainFrame || code === -3 /* aborted */ || !isOurs(url)) return;
+    void win.loadFile(path.join(__dirname, 'offline.html'), { query: { site: SITE } });
+  });
+
+  void win.loadURL(SITE);
+}
+
+// The page asks for the opened files when it is ready for them (files.ts watchOpenedFiles).
+ipcMain.on('opened-files-ready', (e) => {
+  if (!win || e.sender !== win.webContents || !isOurs(e.senderFrame?.url ?? '')) return;
+  pageReady = true;
+  sendPending();
+});
+
+app.on('second-instance', (_e, argv) => {
+  collect(argv);
+  sendPending();
+  if (win) {
+    if (win.isMinimized()) win.restore();
+    win.focus();
+  }
+});
+
+/**
+ * .deb and .rpm install the .bdraw MIME type for the system. An AppImage cannot, and Gear Lever
+ * does not do it on install, so the AppImage registers it for the user (~/.local/share/mime).
+ * Checks the built cache, so a failed run repairs itself on the next start.
+ */
+function registerMimeForAppImage() {
+  if (!process.env.APPIMAGE) return;
+  try {
+    const xml = fs.readFileSync(path.join(process.resourcesPath, 'xyz.bsums.draw.xml'), 'utf8');
+    const dataHome = process.env.XDG_DATA_HOME || path.join(app.getPath('home'), '.local/share');
+    const mimeDir = path.join(dataHome, 'mime');
+    const file = path.join(mimeDir, 'packages/xyz.bsums.draw.xml');
+    const read = (f) => {
+      try {
+        return fs.readFileSync(f, 'utf8');
+      } catch {
+        return '';
+      }
+    };
+    if (read(path.join(mimeDir, 'globs2')).includes(':application/x-bdraw:') && read(file) === xml) return;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, xml);
+    // System tools: run them without the AppImage's library path.
+    const env = { PATH: process.env.PATH || '/usr/bin:/bin', HOME: process.env.HOME || '' };
+    spawnSync('update-mime-database', [mimeDir], { env, stdio: 'ignore' });
+    const apps = path.join(dataHome, 'applications');
+    if (fs.existsSync(apps)) spawnSync('update-desktop-database', [apps], { env, stdio: 'ignore' });
+  } catch (e) {
+    console.error(`draw: MIME registration failed: ${e.message}`);
+  }
+}
+
+collect(process.argv);
+Menu.setApplicationMenu(null);
+
+app.whenReady().then(() => {
+  createWindow();
+  setTimeout(registerMimeForAppImage, 2000);
+  if (process.env.DRAW_GPU_INFO) {
+    // Diagnostics: DRAW_GPU_INFO=1 prints the WebGL renderer the page gets and the GPU status.
+    win.webContents.once('did-finish-load', () =>
+      setTimeout(async () => {
+        const renderer = await win.webContents.executeJavaScript(
+          `(() => { const gl = document.createElement('canvas').getContext('webgl2'); if (!gl) return 'no webgl2';
+            const d = gl.getExtension('WEBGL_debug_renderer_info'); return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); })()`,
+        );
+        console.log('draw: webgl2 renderer:', renderer);
+        const f = app.getGPUFeatureStatus();
+        console.log('draw: gpu compositing:', f.gpu_compositing, '| webgl2:', f.webgl2, '| rasterization:', f.rasterization);
+      }, 3000),
+    );
+  }
+});
+
+app.on('window-all-closed', () => app.quit());

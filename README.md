@@ -70,9 +70,19 @@ The nginx site is `deploy/draw.bsums.xyz.conf`. It uses the `*.bsums.xyz` wildca
 2. Link it into `/etc/nginx/sites-enabled/`.
 3. Run `sudo nginx -t`, then `sudo systemctl reload nginx`.
 
-## Desktop app (Tauri)
+## Desktop apps
 
-Needs Rust and the Tauri system packages (on Fedora: `webkit2gtk4.1-devel`, `openssl-devel`, `libappindicator-gtk3-devel`, `librsvg2-devel`).
+Linux: Electron (`electron/`). The window shows `https://draw.bsums.xyz` in Chromium, which has pen pressure and fast WebGL. WebKitGTK, the Tauri engine on Linux, has neither.
+
+```bash
+npm run linux:dev                                   # the app on the live site
+DRAW_URL=http://localhost:5173 npm run linux:dev    # on the local dev server
+npm run linux:build                                 # AppImage, .deb, .rpm in dist/electron/
+```
+
+Settings: `DRAW_OZONE=x11` forces X11 (default: native Wayland on a Wayland desktop), `DRAW_GPU_INFO=1` prints the WebGL renderer.
+
+Windows and macOS: Tauri (`src-tauri/`). Needs Rust and the Tauri system packages.
 
 ```bash
 npm run desktop:dev     # native window on the local dev server
@@ -87,6 +97,7 @@ The release app connects to `https://draw.bsums.xyz` (set in `.env.tauri`).
 src/shared/   types, protocol, brush dab walker, validation (client + server)
 src/server/   HTTP + WebSocket server, sessions, SQLite store
 src/client/   Svelte UI (ui/), engine (engine/): compositor, tile worker, sync
-src-tauri/    desktop app (Tauri v2)
+src-tauri/    desktop app for Windows and macOS (Tauri v2)
+electron/     desktop app for Linux (Electron)
 deploy/       nginx server block
 ```

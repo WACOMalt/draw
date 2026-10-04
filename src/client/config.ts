@@ -11,6 +11,16 @@ export const PUBLIC_ORIGIN = env || location.origin;
 
 export const IS_TAURI = '__TAURI_INTERNALS__' in window;
 
+/** The Linux desktop app: the hosted site in Electron (electron/preload.cjs). */
+export interface DrawDesktop {
+  kind: 'electron';
+  onOpenFile(callback: (name: string, bytes: Uint8Array) => void): void;
+}
+export const ELECTRON = (window as unknown as { drawDesktop?: DrawDesktop }).drawDesktop ?? null;
+
+/** Any desktop app (Tauri on Windows and macOS, Electron on Linux). */
+export const IS_DESKTOP = IS_TAURI || ELECTRON !== null;
+
 /** Desktop installers: the newest GitHub release. */
 export const DOWNLOAD_URL = 'https://github.com/WACOMalt/draw/releases/latest';
 

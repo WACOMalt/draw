@@ -297,7 +297,14 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 - Data: `DB_PATH` (`/var/lib/draw/canvas.db` on the server). Back up this one file.
 - Settings: `PUBLIC_URL` (links in emails), `ADMIN_EMAILS` (adopt legacy canvases), `TEMP_TTL_MS` and `CLEANUP_EVERY_MS` (expiry, for tests).
 
-Desktop app (Tauri v2, `src-tauri/`):
+Desktop app on Linux (Electron, `electron/`):
+
+- WebKitGTK (the Tauri engine on Linux) gives pages no pen pressure, merges pointer moves, and with the NVIDIA driver its WebGL is much slower than a browser's. Thus the Linux app is Chromium (Electron). The window shows `https://draw.bsums.xyz` (`DRAW_URL` changes it). Thus the app updates with the server. Only that origin runs in the window. Other links open in the default browser. Without a connection, a local page offers "Try again".
+- Pen input, pressure, and WebGL come from Chromium, as in a browser (section 9.1). On a Wayland desktop, the app uses native Wayland (pen through `zwp_tablet_v2`). Under XWayland with the NVIDIA driver, the GPU process crashed and WebGL was lost (RTX 3090, KDE Plasma). `DRAW_OZONE=x11` forces X11.
+- `.bdraw` files: the app is single-instance. Paths from the command line go to the page through the preload bridge (`window.drawDesktop.onOpenFile`). Downloads use the Chromium save dialog. The AppImage registers the MIME type for the user, as the Tauri AppImage did.
+- Packages: AppImage, `.deb`, `.rpm` from electron-builder, with the same file names as before. Thus updaters (Gear Lever) continue to work.
+
+Desktop app on Windows and macOS (Tauri v2, `src-tauri/`; the Linux parts of `src-tauri/` are kept for local builds):
 
 - The app is the same web client in a native window. `vite build --mode tauri` reads `.env.tauri` and sets `VITE_SERVER_ORIGIN=https://draw.bsums.xyz`. Thus the app uses the hosted server, and share links point to the public site.
 - The server sends CORS headers on `/api` only to the Tauri origins (`tauri://localhost`, `http(s)://tauri.localhost`). `CORS_ORIGINS` can change the list.

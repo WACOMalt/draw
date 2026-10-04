@@ -1,6 +1,6 @@
 <script lang="ts">
   import { loadRecent, removeRecent, type Recent } from '../recent';
-  import { DOWNLOAD_URL, IS_TAURI } from '../config';
+  import { DOWNLOAD_URL, IS_DESKTOP } from '../config';
   import { api } from '../api';
   import { pickFile } from '../files';
   import { links } from '../identity';
@@ -66,7 +66,7 @@
 
 <main>
   <div class="top">
-    {#if !IS_TAURI}
+    {#if !IS_DESKTOP}
       <a class="download" href={DOWNLOAD_URL} target="_blank" rel="noopener" title="Desktop app for Windows, macOS and Linux"><Icon name="download" /> Download app</a>
     {/if}
     <AccountButton />

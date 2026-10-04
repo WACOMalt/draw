@@ -3,7 +3,7 @@
 
 import { BDRAW_EXT, type BdrawFile } from '../shared/bdraw';
 import { api, errorText } from './api';
-import { IS_TAURI } from './config';
+import { ELECTRON, IS_TAURI } from './config';
 import { anonSecret } from './identity';
 import { ed, showToast } from './state.svelte';
 
@@ -89,10 +89,15 @@ export async function createCanvas(o: CreateOptions, file?: Blob): Promise<Creat
 }
 
 /**
- * Files the operating system gave the app: the desktop app's file association (Rust command,
- * macOS also sends an event while running), or an installed PWA's file handler (Chromium).
+ * Files the operating system gave the app: the desktop app's file association (Tauri: a Rust
+ * command, macOS also sends an event while running; Electron: the preload bridge), or an
+ * installed PWA's file handler (Chromium).
  */
 export function watchOpenedFiles(): void {
+  if (ELECTRON) {
+    ELECTRON.onOpenFile((name, bytes) => offerFile(name, new Blob([new Uint8Array(bytes)])));
+    return;
+  }
   if (IS_TAURI) {
     void (async () => {
       const [{ invoke }, { listen }] = await Promise.all([import('@tauri-apps/api/core'), import('@tauri-apps/api/event')]);

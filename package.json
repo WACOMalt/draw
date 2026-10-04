@@ -17,6 +17,8 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
+    "linux:dev": "electron electron",
+    "linux:build": "electron-builder --projectDir electron --linux",
     "test:server": "npm run build:server && node tests/server.test.mjs"
   },
   "dependencies": {
@@ -34,6 +36,8 @@
     "@types/node": "^26.6.4",
     "@types/nodemailer": "^8.0.2",
     "@types/ws": "^8.18.2",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "svelte": "^5.57.1",
     "svelte-check": "^4.7.6",

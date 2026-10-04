@@ -12,6 +12,7 @@ const FIELDS = [
   ['src-tauri/tauri.conf.json', /("version":\s*")[^"]+(")/],
   ['src-tauri/Cargo.toml', /^(version\s*=\s*")[^"]+(")/m],
   ['src-tauri/Cargo.lock', /(name = "draw"\r?\nversion = ")[^"]+(")/],
+  ['electron/package.json', /("version":\s*")[^"]+(")/],
 ];
 
 export function setVersion(version, root = '.') {
