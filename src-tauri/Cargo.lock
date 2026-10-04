@@ -673,6 +673,7 @@ version = "0.2.0"
 dependencies = [
  "block2",
  "gtk",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

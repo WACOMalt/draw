@@ -91,7 +91,10 @@ fn register_mime_for_appimage() {
         }
     };
     quiet("update-mime-database", mime_dir);
-    quiet("update-desktop-database", data_home.join("applications"));
+    let apps = data_home.join("applications");
+    if apps.is_dir() {
+        quiet("update-desktop-database", apps);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
