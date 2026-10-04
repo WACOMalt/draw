@@ -20,7 +20,9 @@
 
 </script>
 
-{#if ed.canvas?.expiresAt}
+{#if ed.outdated}
+  <div class="banner warn" role="alert">This canvas uses features from a newer Draw. Update the app to see it correctly.</div>
+{:else if ed.canvas?.expiresAt}
   <div class="banner" class:creator={ed.canvas.canClaim}>
     <span>Temporary canvas · deleted in {left}</span>
     {#if ed.canvas.canClaim}
@@ -38,6 +40,11 @@
 {#if claiming && ed.canvas?.canClaim}<ClaimDialog {code} onClose={() => (claiming = false)} />{/if}
 
 <style>
+  .banner.warn {
+    background: rgba(120, 80, 10, 0.92);
+    color: #fff;
+    padding: 4px 12px;
+  }
   .banner {
     position: absolute;
     top: 10px;

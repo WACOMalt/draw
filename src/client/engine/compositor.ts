@@ -1,10 +1,12 @@
 // Main-thread compositor: draws layer tiles from the worker plus strokes in progress, with
 // layer opacity and blend modes, onto the visible canvas.
 
-import { DabWalker } from '../../shared/brush';
+import { DabWalker, strokeSeed } from '../../shared/brush';
 import type { BlendMode, Brush, Layer, Stroke } from '../../shared/types';
+import { LUT_SIZE, hueSat, toneLut } from './adjust';
 import type { Renderer, ViewState } from './renderer';
 import { DabPainter, StampCache } from './stamp';
+import { maskKey } from './strokeIndex';
 import TileWorker from './tile.worker?worker';
 import {
   MAX_LOD,
@@ -89,6 +91,7 @@ export class Canvas2DRenderer implements Renderer {
   private pool: OffscreenCanvas[] = [];
   private scratch: OffscreenCanvas;
   private scratchCtx: OffscreenCanvasRenderingContext2D;
+  private buffers = new Map<string, { canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D }>();
   private stamps = new StampCache(32);
   private frame = 0;
   private viewVersion = 0;
@@ -205,7 +208,7 @@ export class Canvas2DRenderer implements Renderer {
       pts: [],
       canvas,
       ctx,
-      walker: new DabWalker(brush),
+      walker: new DabWalker(brush, strokeSeed(id)),
       painter: this.makePainter(ctx, brush),
       viewVersion: this.viewVersion,
       commitSeq: null,
@@ -228,7 +231,7 @@ export class Canvas2DRenderer implements Renderer {
     if (l.viewVersion !== this.viewVersion) {
       this.redrawLive(l);
     } else {
-      const sink = (x: number, y: number, r: number, a: number) => l.painter.dab(x, y, r, a);
+      const sink = (x: number, y: number, r: number, a: number, rot: number) => l.painter.dab(x, y, r, a, rot);
       for (let i = 0; i + 2 < pts.length; i += 3) l.walker.push(pts[i], pts[i + 1], pts[i + 2], sink);
     }
     this.invalidate();
@@ -237,10 +240,10 @@ export class Canvas2DRenderer implements Renderer {
   private redrawLive(l: Live): void {
     l.ctx.globalAlpha = 1;
     l.ctx.clearRect(0, 0, l.canvas.width, l.canvas.height);
-    l.walker = new DabWalker(l.brush);
+    l.walker = new DabWalker(l.brush, strokeSeed(l.id));
     l.painter = this.makePainter(l.ctx, l.brush);
     l.viewVersion = this.viewVersion;
-    const sink = (x: number, y: number, r: number, a: number) => l.painter.dab(x, y, r, a);
+    const sink = (x: number, y: number, r: number, a: number, rot: number) => l.painter.dab(x, y, r, a, rot);
     const p = l.pts;
     for (let i = 0; i + 2 < p.length; i += 3) l.walker.push(p[i], p[i + 1], p[i + 2], sink);
   }
@@ -353,8 +356,11 @@ export class Canvas2DRenderer implements Renderer {
       ty0: ty0 - PREFETCH,
       tx1: tx1 + PREFETCH,
       ty1: ty1 + PREFETCH,
-      // Topmost layers first: they are the most likely to be covering what is below.
-      layers: visible.map((l) => l.id).reverse(),
+      // Topmost layers first: they are the most likely to be covering what is below. Each paint
+      // layer, and each enabled layer mask.
+      layers: visible
+        .flatMap((l) => [...(l.kind !== 'adjust' ? [l.id] : []), ...(l.mask?.enabled ? [maskKey(l.id, l.mask.id)] : [])])
+        .reverse(),
     };
     const msg = JSON.stringify(this.current);
     if (msg !== this.lastViewMsg) {
@@ -371,44 +377,163 @@ export class Canvas2DRenderer implements Renderer {
     const X = (tx: number) => Math.round((tx * tw - vx) * ds);
     const Y = (ty: number) => Math.round((ty * tw - vy) * ds);
 
-    for (const layer of visible) {
-      const lives = [...this.live.values()]
-        .filter((l) => l.layerId === layer.id)
-        .sort((a, b) => (a.commitSeq ?? Infinity) - (b.commitSeq ?? Infinity) || a.started - b.started);
-      let target: Ctx = ctx;
-      if (lives.length) {
-        target = this.scratchCtx;
-        target.globalCompositeOperation = 'source-over';
-        target.globalAlpha = 1;
-        target.clearRect(0, 0, this.scratch.width, this.scratch.height);
+    const grid: Grid = { lod, tx0, ty0, tx1, ty1, X, Y };
+    // Same order and clipping groups as the WebGL2 renderer (gl/glRenderer.ts).
+    for (let i = 0; i < visible.length; ) {
+      const base = visible[i];
+      let j = i + 1;
+      while (j < visible.length && visible[j].clip) j++;
+      const clipped = visible.slice(i + 1, j);
+      if (clipped.length === 0 || base.kind === 'adjust') {
+        for (const l of [base, ...clipped]) this.drawLayerOnto(ctx, l, grid, false);
       } else {
-        ctx.globalAlpha = layer.opacity;
-        ctx.globalCompositeOperation = BLEND_OP[layer.blend] ?? 'source-over';
+        const g = this.buffer('group');
+        g.ctx.globalCompositeOperation = 'source-over';
+        g.ctx.globalAlpha = 1;
+        g.ctx.clearRect(0, 0, g.canvas.width, g.canvas.height);
+        this.renderLayer(base, grid);
+        g.ctx.drawImage(this.scratch, 0, 0);
+        // Clipped layers draw "atop" the base. Canvas 2D has no blend mode with atop: normal only.
+        for (const c of clipped) this.drawLayerOnto(g.ctx, c, grid, true);
+        ctx.globalAlpha = base.opacity;
+        ctx.globalCompositeOperation = BLEND_OP[base.blend] ?? 'source-over';
+        ctx.drawImage(g.canvas, 0, 0);
       }
-      for (let ty = ty0; ty <= ty1; ty++) {
-        const y0 = Y(ty), y1 = Y(ty + 1);
-        for (let tx = tx0; tx <= tx1; tx++) {
-          const x0 = X(tx), x1 = X(tx + 1);
-          this.drawTile(target, layer.id, lod, tx, ty, x0, y0, x1 - x0, y1 - y0);
-        }
-      }
-      if (lives.length) {
-        const s = this.scratchCtx;
-        for (const l of lives) {
-          if (l.viewVersion !== this.viewVersion) this.redrawLive(l);
-          s.globalAlpha = l.brush.opacity;
-          s.globalCompositeOperation = l.brush.tool === 'erase' ? 'destination-out' : 'source-over';
-          s.drawImage(l.canvas, 0, 0);
-        }
-        ctx.globalAlpha = layer.opacity;
-        ctx.globalCompositeOperation = BLEND_OP[layer.blend] ?? 'source-over';
-        ctx.drawImage(this.scratch, 0, 0);
-      }
+      i = j;
     }
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
     this.onFrame?.();
     if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
+  }
+
+  /** A screen-sized offscreen canvas that only some frames need. */
+  private buffer(name: 'group' | 'mask'): { canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } {
+    let b = this.buffers.get(name);
+    const w = this.canvas.width, h = this.canvas.height;
+    if (!b) {
+      const canvas = new OffscreenCanvas(w, h);
+      b = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: name === 'mask' })! };
+      this.buffers.set(name, b);
+    } else if (b.canvas.width !== w || b.canvas.height !== h) {
+      b.canvas.width = w;
+      b.canvas.height = h;
+    }
+    return b;
+  }
+
+  private livesFor(key: string): Live[] {
+    return [...this.live.values()]
+      .filter((l) => l.layerId === key)
+      .sort((a, b) => (a.commitSeq ?? Infinity) - (b.commitSeq ?? Infinity) || a.started - b.started);
+  }
+
+  private drawTiles(target: Ctx, key: string, g: Grid): void {
+    for (let ty = g.ty0; ty <= g.ty1; ty++) {
+      const y0 = g.Y(ty), y1 = g.Y(ty + 1);
+      for (let tx = g.tx0; tx <= g.tx1; tx++) {
+        const x0 = g.X(tx), x1 = g.X(tx + 1);
+        this.drawTile(target, key, g.lod, tx, ty, x0, y0, x1 - x0, y1 - y0);
+      }
+    }
+  }
+
+  private drawLives(target: Ctx, key: string): void {
+    for (const l of this.livesFor(key)) {
+      if (l.viewVersion !== this.viewVersion) this.redrawLive(l);
+      target.globalAlpha = l.brush.opacity;
+      target.globalCompositeOperation = l.brush.tool === 'erase' ? 'destination-out' : 'source-over';
+      target.drawImage(l.canvas, 0, 0);
+    }
+    target.globalAlpha = 1;
+    target.globalCompositeOperation = 'source-over';
+  }
+
+  /** Draws one layer onto `dst` (the visible canvas or the group buffer). */
+  private drawLayerOnto(dst: Ctx, layer: Layer, g: Grid, atop: boolean): void {
+    if (layer.kind === 'adjust') return this.applyAdjust(dst, layer, g);
+    if (!atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
+      dst.globalAlpha = layer.opacity;
+      dst.globalCompositeOperation = BLEND_OP[layer.blend] ?? 'source-over';
+      this.drawTiles(dst, layer.id, g);
+    } else {
+      this.renderLayer(layer, g);
+      dst.globalAlpha = layer.opacity;
+      dst.globalCompositeOperation = atop ? 'source-atop' : (BLEND_OP[layer.blend] ?? 'source-over');
+      dst.drawImage(this.scratch, 0, 0);
+    }
+    dst.globalAlpha = 1;
+    dst.globalCompositeOperation = 'source-over';
+  }
+
+  /** A layer's pixels, with its strokes in progress and its mask, into the scratch canvas. */
+  private renderLayer(layer: Layer, g: Grid): void {
+    const s = this.scratchCtx;
+    s.globalCompositeOperation = 'source-over';
+    s.globalAlpha = 1;
+    s.clearRect(0, 0, this.scratch.width, this.scratch.height);
+    this.drawTiles(s, layer.id, g);
+    this.drawLives(s, layer.id);
+    if (!layer.mask?.enabled) return;
+    const m = this.maskHidden(layer, g);
+    s.globalCompositeOperation = 'destination-out';
+    s.drawImage(m, 0, 0);
+    s.globalCompositeOperation = 'source-over';
+  }
+
+  /**
+   * The layer mask as "hidden" alpha: the grey paint over an implied white gives the visibility
+   * v = grey·a + (1 − a), and hidden = 1 − v = a·(1 − grey). On the CPU: this is the fallback.
+   */
+  private maskHidden(layer: Layer, g: Grid): OffscreenCanvas {
+    const m = this.buffer('mask');
+    const key = maskKey(layer.id, layer.mask!.id);
+    m.ctx.globalCompositeOperation = 'source-over';
+    m.ctx.globalAlpha = 1;
+    m.ctx.clearRect(0, 0, m.canvas.width, m.canvas.height);
+    this.drawTiles(m.ctx, key, g);
+    this.drawLives(m.ctx, key);
+    const img = m.ctx.getImageData(0, 0, m.canvas.width, m.canvas.height);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const grey = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+      d[i + 3] = Math.round(d[i + 3] * (1 - grey));
+      d[i] = d[i + 1] = d[i + 2] = 0;
+    }
+    m.ctx.putImageData(img, 0, 0);
+    return m.canvas;
+  }
+
+  /** An adjustment layer, on the CPU: changes every pixel of `dst` by opacity and mask. */
+  private applyAdjust(dst: Ctx, layer: Layer, g: Grid): void {
+    const a = layer.adjust;
+    if (!a || layer.opacity <= 0) return;
+    const w = dst.canvas.width, h = dst.canvas.height;
+    const hd = layer.mask?.enabled ? this.maskHidden(layer, g).getContext('2d')!.getImageData(0, 0, w, h).data : null;
+    const img = dst.getImageData(0, 0, w, h);
+    const d = img.data;
+    const lut = a.type === 'hueSat' ? null : toneLut(a);
+    const tone = (v: number) => lut![Math.round((v / 255) * (LUT_SIZE - 1))] * 255;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] === 0) continue;
+      const amount = layer.opacity * (hd ? 1 - hd[i + 3] / 255 : 1);
+      if (amount <= 0) continue;
+      let r: number, gg: number, b: number;
+      if (lut) {
+        r = tone(d[i]);
+        gg = tone(d[i + 1]);
+        b = tone(d[i + 2]);
+      } else {
+        const o = hueSat(a as Extract<typeof a, { type: 'hueSat' }>, d[i] / 255, d[i + 1] / 255, d[i + 2] / 255);
+        r = o[0] * 255;
+        gg = o[1] * 255;
+        b = o[2] * 255;
+      }
+      d[i] += (r - d[i]) * amount;
+      d[i + 1] += (gg - d[i + 1]) * amount;
+      d[i + 2] += (b - d[i + 2]) * amount;
+    }
+    dst.putImageData(img, 0, 0);
   }
 
   private drawTile(c: Ctx, layer: string, lod: number, tx: number, ty: number, dx: number, dy: number, dw: number, dh: number): void {
@@ -459,3 +584,13 @@ export class Canvas2DRenderer implements Renderer {
 }
 
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+
+interface Grid {
+  lod: number;
+  tx0: number;
+  ty0: number;
+  tx1: number;
+  ty1: number;
+  X: (tx: number) => number;
+  Y: (ty: number) => number;
+}

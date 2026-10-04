@@ -1,6 +1,8 @@
 // Brush tip stamps and dab drawing. Runs on the main thread and inside the tile worker.
 
-import type { Brush } from '../../shared/types';
+import { brushShape } from '../../shared/brush';
+import type { Brush, BrushTip } from '../../shared/types';
+import { TIP_SIZE, tipMask } from './tips';
 
 export type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -50,9 +52,52 @@ function makeStamp(color: string, hardness: number, size: number): OffscreenCanv
   return canvas;
 }
 
+/** A textured tip in one color at full TIP_SIZE resolution. */
+function makeTipBase(tip: BrushTip, color: string): OffscreenCanvas {
+  const N = TIP_SIZE;
+  const canvas = new OffscreenCanvas(N, N);
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.createImageData(N, N);
+  const [r, g, b] = hexToRgb(color);
+  const m = tipMask(tip);
+  for (let i = 0; i < N * N; i++) {
+    const o = i * 4;
+    img.data[o] = r;
+    img.data[o + 1] = g;
+    img.data[o + 2] = b;
+    img.data[o + 3] = m[i];
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
 export class StampCache {
   private map = new Map<string, OffscreenCanvas>();
   constructor(private max = 48) {}
+
+  /** A textured tip stamp of side `size`, scaled down from the full-size tip. */
+  getTip(tip: BrushTip, color: string, size: number): OffscreenCanvas {
+    const key = `tip|${tip}|${color}|${size}`;
+    let s = this.map.get(key);
+    if (s) {
+      this.map.delete(key);
+      this.map.set(key, s);
+      return s;
+    }
+    const baseKey = `tipbase|${tip}|${color}`;
+    let base = this.map.get(baseKey);
+    if (!base) this.map.set(baseKey, (base = makeTipBase(tip, color)));
+    if (size >= TIP_SIZE) s = base;
+    else {
+      s = new OffscreenCanvas(size, size);
+      const ctx = s.getContext('2d')!;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(base, 0, 0, size, size);
+    }
+    this.map.set(key, s);
+    while (this.map.size > this.max) this.map.delete(this.map.keys().next().value!);
+    return s;
+  }
 
   get(color: string, hardness: number, size: number): OffscreenCanvas {
     const h = Math.round(hardness * 100) / 100;
@@ -77,6 +122,8 @@ export class StampCache {
 export class DabPainter {
   private lastBucket = -1;
   private lastStamp: OffscreenCanvas | null = null;
+  private tip: BrushTip;
+  private roundness: number;
 
   constructor(
     private ctx: Ctx2D,
@@ -85,9 +132,14 @@ export class DabPainter {
     private ox: number,
     private oy: number,
     private scale: number,
-  ) {}
+  ) {
+    const shape = brushShape(brush);
+    this.tip = shape.tip;
+    this.roundness = shape.roundness;
+  }
 
-  dab(x: number, y: number, r: number, a: number): void {
+  /** `rot` is the tip rotation in radians. Grain is not drawn here (WebGL2 only). */
+  dab(x: number, y: number, r: number, a: number, rot = 0): void {
     let d = 2 * r * this.scale;
     if (d < 1) {
       // Sub-pixel dab: draw one pixel and scale alpha by the covered area.
@@ -98,10 +150,22 @@ export class DabPainter {
     const bucket = stampBucket(d);
     if (bucket !== this.lastBucket) {
       this.lastBucket = bucket;
-      this.lastStamp = this.stamps.get(this.brush.color, this.brush.hardness, bucket);
+      this.lastStamp =
+        this.tip === 'round'
+          ? this.stamps.get(this.brush.color, this.brush.hardness, bucket)
+          : this.stamps.getTip(this.tip, this.brush.color, bucket);
     }
     const ctx = this.ctx;
     ctx.globalAlpha = Math.min(1, a);
-    ctx.drawImage(this.lastStamp!, (x - this.ox) * this.scale - d / 2, (y - this.oy) * this.scale - d / 2, d, d);
+    const cx = (x - this.ox) * this.scale, cy = (y - this.oy) * this.scale;
+    if ((this.tip === 'round' && this.roundness >= 1) || d <= 1) {
+      ctx.drawImage(this.lastStamp!, cx - d / 2, cy - d / 2, d, d);
+      return;
+    }
+    // Rotate, then squash along the tip height.
+    const c = Math.cos(rot), s = Math.sin(rot), k = this.roundness;
+    ctx.setTransform(c, s, -s * k, c * k, cx, cy);
+    ctx.drawImage(this.lastStamp!, -d / 2, -d / 2, d, d);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 }

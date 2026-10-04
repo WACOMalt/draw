@@ -1,9 +1,9 @@
 /// <reference lib="webworker" />
 // Rasterizes committed strokes into 256×256 layer tiles. Holds vector data only, no tile pixels.
 
-import { DAB_CHUNK } from '../../shared/brush';
+import { DAB_CHUNK, DAB_STRIDE } from '../../shared/brush';
 import { DabPainter, StampCache } from './stamp';
-import { StrokeIndex, strokeDabs, type StrokeRec as Rec } from './strokeIndex';
+import { StrokeIndex, strokeDabs, strokeKey, type StrokeRec as Rec } from './strokeIndex';
 import { TILE, tileKey, tileWorld, type FromWorker, type TileView, type ToWorker } from './tiles';
 
 interface TileRef {
@@ -40,8 +40,9 @@ function tileBounds(lod: number, tx: number, ty: number): [number, number, numbe
 }
 
 function invalidate(rec: Rec): void {
+  const layer = strokeKey(rec.stroke);
   for (const [key, t] of delivered) {
-    if (t.layer !== rec.stroke.layerId) continue;
+    if (t.layer !== layer) continue;
     const [x0, y0, x1, y1] = tileBounds(t.lod, t.tx, t.ty);
     if (rec.x1 > x0 && rec.x0 < x1 && rec.y1 > y0 && rec.y0 < y1) stale.add(key);
   }
@@ -54,7 +55,8 @@ function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: numbe
   if (w < 2 && h < 2) {
     // The whole stroke covers about one pixel at this zoom: one dot instead of every dab.
     // This keeps far zoomed-out views fast with any number of strokes.
-    painter.dab((rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2, 1);
+    const dot = new DabPainter(ctx, stamps, { ...rec.stroke.brush, tip: undefined, roundness: undefined }, wx0, wy0, scale);
+    dot.dab((rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2, 1);
     return;
   }
   const dl = strokeDabs(rec);
@@ -64,10 +66,10 @@ function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: numbe
     if (chunks[co + 2] <= wx0 || chunks[co] >= wx1 || chunks[co + 3] <= wy0 || chunks[co + 1] >= wy1) continue;
     const end = Math.min(count, (c + 1) * DAB_CHUNK);
     for (let i = c * DAB_CHUNK; i < end; i++) {
-      const o = i * 4;
+      const o = i * DAB_STRIDE;
       const x = dabs[o], y = dabs[o + 1], r = dabs[o + 2];
       if (x + r <= wx0 || x - r >= wx1 || y + r <= wy0 || y - r >= wy1) continue;
-      painter.dab(x, y, r, dabs[o + 3]);
+      painter.dab(x, y, r, dabs[o + 3], dabs[o + 4]);
     }
   }
 }

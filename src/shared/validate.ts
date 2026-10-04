@@ -1,6 +1,18 @@
 // Shape and range checks for untrusted input. Each validator returns a clean copy or throws.
 
-import { BLEND_MODES, LIMITS, type BlendMode, type Brush, type LayerProps, type Op } from './types';
+import {
+  ADJUST_TYPES,
+  BLEND_MODES,
+  BRUSH_TIPS,
+  GRAINS,
+  LIMITS,
+  type Adjust,
+  type BlendMode,
+  type Brush,
+  type LayerMask,
+  type LayerProps,
+  type Op,
+} from './types';
 
 export class ValidationError extends Error {}
 
@@ -43,9 +55,27 @@ export function validateColor(v: unknown): string {
   return c;
 }
 
+function oneOf<T extends string>(v: unknown, list: readonly T[], what: string): T {
+  if (typeof v !== 'string' || !(list as readonly string[]).includes(v)) fail(`bad ${what}`);
+  return v as T;
+}
+
 export function validateBrush(v: unknown): Brush {
   const b = obj(v, 'brush');
   if (b.tool !== 'paint' && b.tool !== 'erase') fail('bad brush.tool');
+  // Tip and dynamics are optional, and only copied when present: old strokes stay unchanged.
+  const extra: Partial<Brush> = {};
+  if (b.tip !== undefined) extra.tip = oneOf(b.tip, BRUSH_TIPS, 'brush.tip');
+  if (b.angle !== undefined) extra.angle = num(b.angle, 0, 360, 'brush.angle');
+  if (b.roundness !== undefined) extra.roundness = num(b.roundness, 0.05, 1, 'brush.roundness');
+  if (b.followDirection !== undefined) extra.followDirection = bool(b.followDirection, 'brush.followDirection');
+  if (b.sizeJitter !== undefined) extra.sizeJitter = num(b.sizeJitter, 0, 1, 'brush.sizeJitter');
+  if (b.angleJitter !== undefined) extra.angleJitter = num(b.angleJitter, 0, 1, 'brush.angleJitter');
+  if (b.scatter !== undefined) extra.scatter = num(b.scatter, 0, 4, 'brush.scatter');
+  if (b.opacityJitter !== undefined) extra.opacityJitter = num(b.opacityJitter, 0, 1, 'brush.opacityJitter');
+  if (b.grain !== undefined) extra.grain = b.grain === null ? null : oneOf(b.grain, GRAINS, 'brush.grain');
+  if (b.grainScale !== undefined) extra.grainScale = num(b.grainScale, 0.1, 10, 'brush.grainScale');
+  if (b.grainStrength !== undefined) extra.grainStrength = num(b.grainStrength, 0, 1, 'brush.grainStrength');
   return {
     tool: b.tool,
     color: validateColor(b.color),
@@ -57,7 +87,53 @@ export function validateBrush(v: unknown): Brush {
     pressureSize: bool(b.pressureSize, 'brush.pressureSize'),
     pressureFlow: bool(b.pressureFlow, 'brush.pressureFlow'),
     buildup: bool(b.buildup, 'brush.buildup'),
+    ...extra,
   };
+}
+
+export function validateAdjust(v: unknown): Adjust {
+  const a = obj(v, 'adjust');
+  const type = oneOf(a.type, ADJUST_TYPES, 'adjust.type');
+  const unit = (x: unknown, what: string) => num(x, 0, 1, `adjust.${what}`);
+  const signed = (x: unknown, what: string) => num(x, -1, 1, `adjust.${what}`);
+  switch (type) {
+    case 'levels': {
+      const out = {
+        type,
+        inBlack: unit(a.inBlack, 'inBlack'),
+        inWhite: unit(a.inWhite, 'inWhite'),
+        gamma: num(a.gamma, 0.1, 10, 'adjust.gamma'),
+        outBlack: unit(a.outBlack, 'outBlack'),
+        outWhite: unit(a.outWhite, 'outWhite'),
+      };
+      if (out.inWhite - out.inBlack < 0.004) fail('bad adjust.inWhite');
+      return out;
+    }
+    case 'curves': {
+      if (!Array.isArray(a.points) || a.points.length < 2 || a.points.length > 16) fail('bad adjust.points');
+      const points = a.points.map((p): [number, number] => {
+        if (!Array.isArray(p) || p.length !== 2) fail('bad adjust.points');
+        return [unit(p[0], 'points'), unit(p[1], 'points')];
+      });
+      for (let i = 1; i < points.length; i++) if (points[i][0] <= points[i - 1][0]) fail('bad adjust.points order');
+      return { type, points };
+    }
+    case 'hueSat':
+      return {
+        type,
+        hue: num(a.hue, -180, 180, 'adjust.hue'),
+        saturation: signed(a.saturation, 'saturation'),
+        lightness: signed(a.lightness, 'lightness'),
+      };
+    case 'brightContrast':
+      return { type, brightness: signed(a.brightness, 'brightness'), contrast: signed(a.contrast, 'contrast') };
+  }
+}
+
+function layerMask(v: unknown): LayerMask | null {
+  if (v === null) return null;
+  const m = obj(v, 'mask');
+  return { id: id(m.id, 'mask.id'), enabled: bool(m.enabled, 'mask.enabled') };
 }
 
 export function validatePoints(v: unknown, minPoints = 1): number[] {
@@ -86,6 +162,10 @@ function layerProps(v: unknown, partial: boolean): Partial<LayerProps> {
   if (p.opacity !== undefined || !partial) out.opacity = num(p.opacity, 0, 1, 'opacity');
   if (p.visible !== undefined || !partial) out.visible = bool(p.visible, 'visible');
   if (p.order !== undefined || !partial) out.order = num(p.order, -1e12, 1e12, 'order');
+  // Optional for every layer, also at creation.
+  if (p.adjust !== undefined) out.adjust = validateAdjust(p.adjust);
+  if (p.clip !== undefined) out.clip = bool(p.clip, 'clip');
+  if (p.mask !== undefined) out.mask = layerMask(p.mask);
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -102,6 +182,7 @@ export function validateOp(v: unknown): Op {
           layerId: id(s.layerId, 'layerId'),
           brush: validateBrush(s.brush),
           pts: validatePoints(s.pts),
+          ...(s.mask !== undefined ? { mask: id(s.mask, 'mask') } : {}),
         },
       };
     }
@@ -112,7 +193,10 @@ export function validateOp(v: unknown): Op {
       return { type: o.type, id: id(o.id) };
     case 'layer.add': {
       const l = obj(o.layer, 'layer');
-      return { type: 'layer.add', layer: { id: id(l.id), ...(layerProps(l, false) as LayerProps) } };
+      const kind = l.kind === undefined ? undefined : oneOf(l.kind, ['paint', 'adjust'] as const, 'layer.kind');
+      const props = layerProps(l, false) as LayerProps;
+      if (kind === 'adjust' && !props.adjust) fail('adjustment layer without adjust');
+      return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
     }
     case 'layer.update':
       return { type: 'layer.update', id: id(o.id), props: layerProps(o.props, true) };

@@ -1,6 +1,6 @@
 # Roadmap: Photoshop-style features
 
-Status: items 1 to 4 are in progress. Items 5 to 8 are planned.
+Status: items 1 to 4 are done (release 0.2.15: see SPEC.md sections 4, 5, and 6). Items 5 to 8 are planned.
 
 Each item adds to the same parts of the code:
 
@@ -17,8 +17,8 @@ Effort: S (small), M, L, XL (changes the document model).
 Levels, curves, hue and saturation, brightness and contrast.
 
 - Data: `Layer.kind: 'paint' | 'adjust'` and `Layer.adjust: { type, params }`. The existing `layer.add` and `layer.update` ops carry them.
-- Render: an adjustment layer is one full-screen pass. It reads the composite of the layers below, applies the adjustment, and mixes the result by the layer opacity. The composite already alternates between two buffers for blend modes. Curves and levels use a 256-entry lookup texture.
-- Canvas 2D fallback: `ctx.filter` covers brightness, contrast, saturation, and hue rotation.
+- Render: an adjustment layer is one full-screen pass. It reads the composite of the layers below, applies the adjustment, and mixes the result by the layer opacity. The composite already alternates between two buffers for blend modes. Levels, curves, and brightness/contrast use a 1024-entry lookup texture. Hue/saturation uses HSL math.
+- Canvas 2D fallback (as built): the same formulas on the CPU (`getImageData`).
 - Cost: one screen pass for each adjustment layer, on each frame that draws.
 
 ## 2. Clipping masks (S)
@@ -30,10 +30,10 @@ Levels, curves, hue and saturation, brightness and contrast.
 
 ## 3. Layer masks (M)
 
-- Data: `Layer.mask: { enabled, inverted } | null`, and `Stroke.mask?: true`. Mask strokes are normal strokes. Black paint hides, white paint or the eraser reveals. Thus undo, sync, live strokes, and `.bdraw` files work with no new mechanism.
-- Tiles: mask strokes have their own index and tile set, with the key `<layerId>#mask`.
-- Render: one shader with two textures multiplies the layer tile by `1 - hidden` from the mask tile. A missing mask tile hides nothing.
-- UI: a mask thumbnail next to the layer. A click on it sends the brush to the mask.
+- Data (as built): `Layer.mask: { id, enabled } | null`, and `Stroke.mask?: <mask id>`. Mask strokes are normal strokes in grey on an implied white mask: black hides, white shows, the eraser goes back to white. A new mask gets a new id, so the strokes of a deleted mask stay out of a later mask. Thus undo, sync, live strokes, and `.bdraw` files work with no new mechanism.
+- Tiles: mask strokes have their own index and tile set, with the key `<layerId>#<maskId>`.
+- Render: the mask buffer holds the grey paint. A shader multiplies the layer by the visibility `grey + (1 - alpha)`.
+- UI: a mask chip in the layer row. A click on it sends the brush to the mask and sets the colors to black and white.
 - Compatibility: `.bdraw` version 2. The server sends a feature list, so an old client asks for an update and does not draw the canvas wrong.
 - Cost: one more tile set for each masked layer.
 
@@ -42,7 +42,7 @@ Levels, curves, hue and saturation, brightness and contrast.
 - Data (`Brush`): `tip` (an ID from a built-in set), `angle`, `roundness`, `followDirection`, jitter for size, angle, scatter and opacity, and `grain: { id, scale, strength }`. A tip ID never changes after a release, so old drawings do not change.
 - Determinism: each random value comes from a stateless hash of the stroke seed and the dab index, not from a running generator. A tile renders only a part of a stroke, so it must get the same values as all other tiles and clients. The seed comes from the stroke ID.
 - Shader: the dab vertex shader gets angle and roundness for each dab. The fragment shader samples the tip from a texture array with mipmaps, and selects the mip level from the dab radius. Grain is sampled in stroke space and scaled by the brush size, so it stays the same at all zoom levels.
-- Canvas 2D fallback: the tile worker stamps rotated tip images and multiplies by a grain pattern.
+- Canvas 2D fallback (as built): the tile worker stamps rotated tip images. It does not draw grain.
 - Cost: one texture read for each fragment.
 
 ## 5. Layer FX and live blur (L)

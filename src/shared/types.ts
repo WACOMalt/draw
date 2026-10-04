@@ -32,6 +32,55 @@ export interface Brush {
   pressureSize: boolean;
   pressureFlow: boolean;
   buildup: boolean; // airbrush: zero-length segments emit dabs
+  // Tip and dynamics. All optional: a stroke without them is a round, plain brush.
+  tip?: BrushTip; // default 'round'
+  angle?: number; // degrees, 0..360
+  roundness?: number; // 0.05..1: the tip squashed along its height
+  followDirection?: boolean; // the tip turns with the stroke direction (added to angle)
+  sizeJitter?: number; // 0..1: random size reduction per dab
+  angleJitter?: number; // 0..1: random turn per dab, as a fraction of 360°
+  scatter?: number; // 0..4: random offset across the stroke, in diameters
+  opacityJitter?: number; // 0..1: random flow reduction per dab
+  grain?: GrainId | null; // paper texture in stroke space
+  grainScale?: number; // 0.1..10: grain cell size, in brush diameters
+  grainStrength?: number; // 0..1
+}
+
+/** Built-in brush tips. Never change one after a release: old strokes would change. Add new IDs. */
+export const BRUSH_TIPS = ['round', 'square', 'chalk', 'charcoal', 'bristle', 'splatter', 'pencil'] as const;
+export type BrushTip = (typeof BRUSH_TIPS)[number];
+
+/** Built-in grain textures (same rule as BRUSH_TIPS). */
+export const GRAINS = ['paper', 'canvas', 'noise'] as const;
+export type GrainId = (typeof GRAINS)[number];
+
+export const ADJUST_TYPES = ['levels', 'curves', 'hueSat', 'brightContrast'] as const;
+export type AdjustType = (typeof ADJUST_TYPES)[number];
+
+/** The settings of an adjustment layer. All values work on 0..1 color channels. */
+export type Adjust =
+  | { type: 'levels'; inBlack: number; inWhite: number; gamma: number; outBlack: number; outWhite: number }
+  /** Master curve: 2 to 16 points [in, out], in ascending order of `in`. */
+  | { type: 'curves'; points: [number, number][] }
+  /** hue in degrees (-180..180), saturation and lightness -1..1. */
+  | { type: 'hueSat'; hue: number; saturation: number; lightness: number }
+  | { type: 'brightContrast'; brightness: number; contrast: number };
+
+export const DEFAULT_ADJUST: Record<AdjustType, Adjust> = {
+  levels: { type: 'levels', inBlack: 0, inWhite: 1, gamma: 1, outBlack: 0, outWhite: 1 },
+  curves: { type: 'curves', points: [[0, 0], [1, 1]] },
+  hueSat: { type: 'hueSat', hue: 0, saturation: 0, lightness: 0 },
+  brightContrast: { type: 'brightContrast', brightness: 0, contrast: 0 },
+};
+
+/**
+ * A layer mask: strokes with `mask: id` on the layer. They paint grey on a white mask: black
+ * hides the layer, white shows it. A new mask gets a new id, so the strokes of a deleted mask
+ * stay out of a later one, and undo of the delete brings them back.
+ */
+export interface LayerMask {
+  id: string;
+  enabled: boolean;
 }
 
 export interface Layer {
@@ -42,6 +91,12 @@ export interface Layer {
   opacity: number;
   visible: boolean;
   deleted: boolean;
+  /** 'adjust': no paint of its own; it changes everything below it. Set at creation. Default 'paint'. */
+  kind?: 'paint' | 'adjust';
+  adjust?: Adjust;
+  /** Clipped to the nearest layer below that is not clipped (the base of the clipping group). */
+  clip?: boolean;
+  mask?: LayerMask | null;
 }
 
 export interface Stroke {
@@ -52,15 +107,21 @@ export interface Stroke {
   brush: Brush;
   pts: number[]; // flat x, y, pressure triples in world units
   deleted?: boolean;
+  /** Set on a mask stroke: the id of the layer mask it paints (Layer.mask.id). */
+  mask?: string;
 }
 
-export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order'>;
+export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask'>;
+
+/** Document features a client must know to draw a canvas right. The server lists them in welcome. */
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips'] as const;
+export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
-  | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts'> }
+  | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts' | 'mask'> }
   | { type: 'stroke.remove'; id: string }
   | { type: 'stroke.restore'; id: string }
-  | { type: 'layer.add'; layer: Pick<Layer, 'id'> & LayerProps }
+  | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind'> & LayerProps }
   | { type: 'layer.update'; id: string; props: Partial<LayerProps> }
   | { type: 'layer.remove'; id: string }
   | { type: 'layer.restore'; id: string };
@@ -109,7 +170,7 @@ export type ClientMsg =
       grant?: string;
     }
   | { t: 'op'; opId: string; op: Op }
-  | { t: 'live'; id: string; layerId: string; brush: Brush; pts: number[]; start: boolean }
+  | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
   | { t: 'live.end'; id: string }
   | { t: 'cursor'; x: number | null; y: number | null; layerId: string | null }
   | { t: 'ping' };
@@ -127,6 +188,8 @@ export type ServerMsg =
       canvas: CanvasInfo;
       /** Present after a correct join password: send it as hello.grant next time. */
       grant?: string;
+      /** Features the document uses. A client that does not know one asks for an update. */
+      features?: string[];
     }
   /** Role or canvas state changed while connected (claimed, sharing edited). */
   | { t: 'access'; role: Role; canvas: CanvasInfo }
@@ -134,7 +197,7 @@ export type ServerMsg =
   | { t: 'denied'; reason: DeniedReason }
   | { t: 'op'; seq: number; by: string; opId: string; op: AppliedOp }
   | { t: 'reject'; opId: string; reason: string }
-  | { t: 'live'; by: string; id: string; layerId: string; brush: Brush; pts: number[]; start: boolean }
+  | { t: 'live'; by: string; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
   | { t: 'live.end'; by: string; id: string }
   | { t: 'cursor'; by: string; x: number | null; y: number | null; layerId: string | null }
   | { t: 'peer.join'; peer: Peer }

@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { BLEND_MODES, LIMITS, type BlendMode } from '../../shared/types';
-  import type { Engine } from '../engine/engine';
+  import { ADJUST_TYPES, BLEND_MODES, LIMITS, type BlendMode } from '../../shared/types';
+  import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
+  import AdjustPanel from './AdjustPanel.svelte';
   import Icon from './Icon.svelte';
   import Slider from './Slider.svelte';
 
@@ -12,6 +13,18 @@
   const index = $derived(ed.layers.findIndex((l) => l.id === ed.activeLayerId));
 
   let editing = $state<string | null>(null);
+  let adjustMenu = $state(false);
+
+  /** A layer is drawn clipped only when a layer that is not clipped lies somewhere below it. */
+  const clippedIds = $derived.by(() => {
+    const out = new Set<string>();
+    let base = false;
+    for (const l of ed.layers) {
+      if (l.clip && base) out.add(l.id);
+      else base = l.kind !== 'adjust';
+    }
+    return out;
+  });
 
   const BLEND_LABEL: Record<BlendMode, string> = {
     normal: 'Normal',
@@ -80,7 +93,16 @@
 
   <ul>
     {#each topDown as layer (layer.id)}
-      <li class:active={layer.id === ed.activeLayerId} onpointerdown={() => engine?.setActiveLayer(layer.id)}>
+      {@const isActive = layer.id === ed.activeLayerId}
+      <li
+        class:active={isActive}
+        class:clipped={clippedIds.has(layer.id)}
+        onpointerdown={() => {
+          engine?.setActiveLayer(layer.id);
+          engine?.setMaskTarget(false);
+        }}
+      >
+        {#if clippedIds.has(layer.id)}<span class="cliparrow" title="Clipped to the layer below">↳</span>{/if}
         <button
           class="icon eye"
           title={layer.visible ? 'Hide' : 'Show'}
@@ -101,9 +123,26 @@
             }}
           />
         {:else}
-          <span class="name" class:hidden={!layer.visible} role="button" tabindex="-1" ondblclick={() => (editing = layer.id)} title="Double-click to rename">
+          <span class="name" class:hidden={!layer.visible} class:target={isActive && !ed.maskTarget} role="button" tabindex="-1" ondblclick={() => (editing = layer.id)} title="Double-click to rename">
+            {#if layer.kind === 'adjust'}<span class="kind" title="Adjustment layer"><Icon name="adjust" /></span>{/if}
             {layer.name}
           </span>
+        {/if}
+        {#if layer.mask}
+          <button
+            class="icon maskchip"
+            class:target={isActive && ed.maskTarget}
+            class:off={!layer.mask.enabled}
+            title={layer.mask.enabled ? 'Layer mask: click to paint on it (black hides, white shows). Shift+click turns it off.' : 'Layer mask (off): Shift+click turns it on'}
+            onpointerdown={(e) => {
+              e.stopPropagation();
+              if (e.shiftKey) return engine?.setMaskEnabled(layer.id, !layer.mask!.enabled);
+              engine?.setActiveLayer(layer.id);
+              engine?.setMaskTarget(true);
+            }}
+          >
+            <Icon name="mask" />
+          </button>
         {/if}
         <span class="meta">
           {#each peersOn(layer.id) as p (p.id)}
@@ -116,8 +155,61 @@
     {/each}
   </ul>
 
+  {#if active && (active.kind === 'adjust' || active.mask)}
+    <div class="props">
+      {#if active.kind === 'adjust'}
+        <h3>{Engine.ADJUST_NAMES[active.adjust!.type]}</h3>
+        {#key active.id}<AdjustPanel {engine} layer={active} />{/key}
+      {/if}
+      {#if active.mask}
+        <div class="maskrow">
+          <span class="lbl">Mask</span>
+          <button class="small" class:on={!ed.maskTarget} title="Paint on the layer" disabled={active.kind === 'adjust'} onclick={() => engine?.setMaskTarget(false)}>Layer</button>
+          <button class="small" class:on={ed.maskTarget} title="Paint on the mask: black hides, white shows" onclick={() => engine?.setMaskTarget(true)}>Mask</button>
+          <label class="check" title="Turn the mask off without deleting it">
+            <input type="checkbox" checked={active.mask.enabled} onchange={(e) => engine?.setMaskEnabled(active.id, e.currentTarget.checked)} /> On
+          </label>
+        </div>
+      {/if}
+    </div>
+  {/if}
+
   <div class="footer">
     <button class="icon" title="New layer" onclick={() => engine?.addLayer()}><Icon name="plus" /></button>
+    <span class="menuwrap">
+      <button class="icon" title="New adjustment layer" onclick={() => (adjustMenu = !adjustMenu)}><Icon name="adjust" /></button>
+      {#if adjustMenu}
+        <div class="menu" role="menu">
+          {#each ADJUST_TYPES as t}
+            <button
+              role="menuitem"
+              onclick={() => {
+                adjustMenu = false;
+                engine?.addAdjustmentLayer(t);
+              }}>{Engine.ADJUST_NAMES[t]}</button
+            >
+          {/each}
+        </div>
+      {/if}
+    </span>
+    <button
+      class="icon"
+      title={active?.mask ? 'Delete the layer mask' : 'Add a layer mask'}
+      class:on={!!active?.mask}
+      disabled={!active}
+      onclick={() => active && (active.mask ? engine?.deleteMask(active.id) : engine?.addMask(active.id))}
+    >
+      <Icon name="mask" />
+    </button>
+    <button
+      class="icon"
+      title={active?.clip ? 'Release from the clipping mask' : 'Clip to the layer below (clipping mask)'}
+      class:on={!!active?.clip}
+      disabled={!active || index <= 0}
+      onclick={() => active && engine?.setClip(active.id, !active.clip)}
+    >
+      <Icon name="clip" />
+    </button>
     <button class="icon" title="Move up" disabled={!active || index >= ed.layers.length - 1} onclick={() => active && engine?.moveLayer(active.id, 1)}>
       <Icon name="up" />
     </button>
@@ -163,7 +255,7 @@
     padding: 0;
     flex: 1;
     overflow-y: auto;
-    min-height: 0;
+    min-height: 102px; /* three rows stay visible next to the properties */
   }
   li {
     display: flex;
@@ -213,6 +305,102 @@
     background: var(--bg-1);
     border-radius: 3px;
     padding: 0 4px;
+  }
+  li.clipped {
+    padding-left: 14px;
+  }
+  .cliparrow {
+    color: var(--text-dim);
+    margin-right: -4px;
+  }
+  .kind {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 4px;
+    color: var(--text-dim);
+  }
+  .name.target,
+  .maskchip.target {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
+  .maskchip {
+    width: 22px;
+    height: 22px;
+    flex: none;
+  }
+  .maskchip.off {
+    opacity: 0.4;
+  }
+  .props {
+    padding: 8px 10px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: none;
+    max-height: 55%;
+    overflow-y: auto;
+  }
+  h3 {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+  }
+  .maskrow {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .maskrow .lbl {
+    color: var(--text-dim);
+    margin-right: 4px;
+  }
+  .small {
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+  .small.on,
+  .footer .on {
+    color: var(--text);
+    border-color: var(--accent-dim);
+    background: #24394c;
+  }
+  .check {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .menuwrap {
+    position: relative;
+  }
+  .menu {
+    position: absolute;
+    bottom: 30px;
+    left: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 160px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+    padding: 4px;
+  }
+  .menu button {
+    text-align: left;
+    padding: 6px 10px;
+    background: none;
+    border: none;
+  }
+  .menu button:hover {
+    background: #2d3d4d;
   }
   .footer {
     display: flex;

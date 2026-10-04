@@ -9,7 +9,8 @@ import type { Layer, Stroke } from './types';
 
 export const BDRAW_EXT = 'bdraw';
 export const BDRAW_MIME = 'application/x-bdraw';
-export const BDRAW_VERSION = 1;
+/** 2: layers may have adjust, clip and mask; strokes may have mask and brush dynamics. */
+export const BDRAW_VERSION = 2;
 
 export interface BdrawFile {
   format: 'bdraw';

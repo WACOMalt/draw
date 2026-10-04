@@ -50,7 +50,7 @@ export function strokeBounds(s: Stroke): Bounds {
     if (p[i + 1] < y0) y0 = p[i + 1];
     if (p[i + 1] > y1) y1 = p[i + 1];
   }
-  const r = s.brush.size / 2;
+  const r = s.brush.size * (0.5 + (s.brush.scatter ?? 0));
   return { x0: x0 - r, y0: y0 - r, x1: x1 + r, y1: y1 + r };
 }
 

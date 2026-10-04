@@ -20,6 +20,7 @@ import {
   validatePoints,
   validateString,
 } from '../shared/validate';
+import { docFeatures } from '../shared/features';
 import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
 import { userFromToken } from './auth';
 import { sha256, type CanvasRow, type Store, type UserRow } from './db';
@@ -155,6 +156,7 @@ export class Session {
       case 'stroke.add': {
         const layer = this.layers.get(op.stroke.layerId);
         if (!layer || layer.deleted) throw new OpError('no such layer');
+        if (layer.kind === 'adjust' && !op.stroke.mask) throw new OpError('adjustment layers hold no paint');
         if (this.strokes.has(op.stroke.id)) throw new OpError('duplicate stroke');
         const stroke: Stroke = { ...op.stroke, seq, author: by };
         this.strokes.set(stroke.id, stroke);
@@ -251,6 +253,7 @@ export class Session {
               by: client.id,
               id: validateId(msg.id),
               layerId: validateId(msg.layerId, 'layerId'),
+              ...(msg.mask !== undefined ? { mask: validateId(msg.mask, 'mask') } : {}),
               brush: validateBrush(msg.brush),
               pts: validatePoints(msg.pts, 0),
               start: msg.start === true,
@@ -339,6 +342,7 @@ export class Session {
         role: client.role,
         canvas: this.info(client),
         grant: access.grant,
+        features: docFeatures(this.layers.values(), this.strokes.values()),
       });
       this.broadcast({ t: 'peer.join', peer: client.peer }, client);
     } finally {

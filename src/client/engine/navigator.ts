@@ -74,7 +74,7 @@ export function computeMarkers(doc: Doc, visibleLayers: Set<string>, view: ViewS
   const sectors = Array.from({ length: 8 }, () => ({ n: 0, nearest: Infinity, items: [] as Bounds[], dists: [] as number[] }));
 
   for (const [id, s] of doc.strokes) {
-    if (!visibleLayers.has(s.layerId)) continue;
+    if (s.mask || !visibleLayers.has(s.layerId)) continue;
     const b = doc.bounds.get(id);
     if (!b) continue;
     const sx0 = (b.x0 - view.x) * z, sx1 = (b.x1 - view.x) * z;
@@ -187,7 +187,7 @@ function groupTiny(tiny: Tiny[], cell: number, dropVisible: boolean): Group[] {
 export function unionAll(doc: Doc, visibleLayers: Set<string>): Bounds | null {
   let all: Bounds | null = null;
   for (const [id, s] of doc.strokes) {
-    if (!visibleLayers.has(s.layerId)) continue;
+    if (s.mask || !visibleLayers.has(s.layerId)) continue;
     const b = doc.bounds.get(id);
     if (b) all = all ? union(all, b) : b;
   }

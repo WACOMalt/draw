@@ -50,11 +50,51 @@ export function quantizePoint(x: number, y: number, p: number, decimals: number)
   return [roundTo(x, decimals), roundTo(y, decimals), Math.round(p * 1000) / 1000];
 }
 
-export type DabSink = (x: number, y: number, r: number, a: number) => void;
+/** One dab: center, radius, alpha, and the tip rotation in radians. */
+export type DabSink = (x: number, y: number, r: number, a: number, rot: number) => void;
+
+/** Seed for the random dynamics of a stroke, from its id: the same on every client and replay. */
+export function strokeSeed(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Random number in [0, 1) for dab `i`, channel `c`. Stateless: a tile that renders only a part
+ * of a stroke gets the same values as every other tile, client and replay.
+ */
+export function dabRandom(seed: number, i: number, c: number): number {
+  let h = (seed ^ Math.imul(i + 1, 0x9e3779b1) ^ Math.imul(c + 1, 0x85ebca77)) >>> 0;
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x7feb352d);
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x846ca68b);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+
+/** The brush tip and dynamics with their defaults filled in. */
+export function brushShape(b: Brush) {
+  return {
+    tip: b.tip ?? 'round',
+    angle: ((b.angle ?? 0) * Math.PI) / 180,
+    roundness: b.roundness ?? 1,
+    follow: b.followDirection ?? false,
+    sizeJitter: b.sizeJitter ?? 0,
+    angleJitter: b.angleJitter ?? 0,
+    scatter: b.scatter ?? 0,
+    opacityJitter: b.opacityJitter ?? 0,
+  };
+}
 
 /**
  * Walks a polyline and emits a dab each time the walked distance reaches spacing × diameter.
- * Feed points incrementally with push(); state carries across calls.
+ * Feed points incrementally with push(); state carries across calls. The dab positions along
+ * the path never depend on the random dynamics, which only change each emitted dab.
  */
 export class DabWalker {
   private lx = 0;
@@ -65,8 +105,40 @@ export class DabWalker {
   private carry = 0;
   /** Pressure at the last dab; it sets the step to the next dab. */
   private dabP = 0;
+  /** Dabs emitted so far: the index for the random dynamics. */
+  private n = 0;
+  /** Direction of the last segment, radians. */
+  private dir = 0;
+  private shape: ReturnType<typeof brushShape>;
+  private plain: boolean;
 
-  constructor(private brush: Brush) {}
+  constructor(
+    private brush: Brush,
+    private seed = 0,
+  ) {
+    this.shape = brushShape(brush);
+    const s = this.shape;
+    this.plain = !s.follow && !s.sizeJitter && !s.angleJitter && !s.scatter && !s.opacityJitter;
+  }
+
+  /** Applies the dynamics of dab n and emits it. */
+  private dab(x: number, y: number, r: number, a: number, emit: DabSink): void {
+    const s = this.shape;
+    const i = this.n++;
+    if (this.plain) return emit(x, y, r, a, s.angle);
+    const seed = this.seed;
+    let rot = s.angle + (s.follow ? this.dir : 0);
+    if (s.angleJitter) rot += (dabRandom(seed, i, 2) - 0.5) * 2 * Math.PI * s.angleJitter;
+    if (s.scatter) {
+      // Across the stroke direction, up to `scatter` diameters to each side.
+      const off = (dabRandom(seed, i, 3) * 2 - 1) * s.scatter * 2 * r;
+      x -= Math.sin(this.dir) * off;
+      y += Math.cos(this.dir) * off;
+    }
+    if (s.sizeJitter) r *= 1 - s.sizeJitter * dabRandom(seed, i, 0);
+    if (s.opacityJitter) a *= 1 - s.opacityJitter * dabRandom(seed, i, 1);
+    emit(x, y, r, a, rot);
+  }
 
   private step(): number {
     return Math.max(MIN_STEP, this.brush.spacing) * dabRadius(this.brush, this.dabP) * 2;
@@ -81,7 +153,7 @@ export class DabWalker {
       this.lp = p;
       this.dabP = p;
       this.carry = 0;
-      emit(x, y, dabRadius(b, p), dabAlpha(b, p));
+      this.dab(x, y, dabRadius(b, p), dabAlpha(b, p), emit);
       return;
     }
     const dx = x - this.lx;
@@ -91,11 +163,12 @@ export class DabWalker {
       if (b.buildup) {
         this.dabP = p;
         this.carry = 0;
-        emit(x, y, dabRadius(b, p), dabAlpha(b, p));
+        this.dab(x, y, dabRadius(b, p), dabAlpha(b, p), emit);
       }
       this.lp = p;
       return;
     }
+    this.dir = Math.atan2(dy, dx);
     let t = 0;
     for (;;) {
       const need = this.step() - this.carry;
@@ -108,7 +181,7 @@ export class DabWalker {
       const f = t / len;
       const pp = this.lp + (p - this.lp) * f;
       this.dabP = pp;
-      emit(this.lx + dx * f, this.ly + dy * f, dabRadius(b, pp), dabAlpha(b, pp));
+      this.dab(this.lx + dx * f, this.ly + dy * f, dabRadius(b, pp), dabAlpha(b, pp), emit);
     }
     this.lx = x;
     this.ly = y;
@@ -116,7 +189,10 @@ export class DabWalker {
   }
 }
 
-/** Dabs of a full stroke, packed as x, y, r, a, plus bounding boxes of 64-dab chunks for culling. */
+/** Floats per dab in a DabList: x, y, r, a, rot. */
+export const DAB_STRIDE = 5;
+
+/** Dabs of a full stroke, packed as x, y, r, a, rot, plus bounding boxes of 64-dab chunks for culling. */
 export interface DabList {
   dabs: Float64Array;
   count: number;
@@ -127,23 +203,25 @@ export interface DabList {
 
 export const DAB_CHUNK = 64;
 
-export function computeDabs(brush: Brush, pts: number[]): DabList {
+export function computeDabs(brush: Brush, pts: number[], seed = 0): DabList {
+  const S = DAB_STRIDE;
   let cap = 256;
-  let dabs = new Float64Array(cap * 4);
+  let dabs = new Float64Array(cap * S);
   let n = 0;
-  const walker = new DabWalker(brush);
-  const sink: DabSink = (x, y, r, a) => {
+  const walker = new DabWalker(brush, seed);
+  const sink: DabSink = (x, y, r, a, rot) => {
     if (n === cap) {
       cap *= 2;
-      const next = new Float64Array(cap * 4);
+      const next = new Float64Array(cap * S);
       next.set(dabs);
       dabs = next;
     }
-    const o = n * 4;
+    const o = n * S;
     dabs[o] = x;
     dabs[o + 1] = y;
     dabs[o + 2] = r;
     dabs[o + 3] = a;
+    dabs[o + 4] = rot;
     n++;
   };
   for (let i = 0; i + 2 < pts.length; i += 3) walker.push(pts[i], pts[i + 1], pts[i + 2], sink);
@@ -155,7 +233,7 @@ export function computeDabs(brush: Brush, pts: number[]): DabList {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     const end = Math.min(n, (c + 1) * DAB_CHUNK);
     for (let i = c * DAB_CHUNK; i < end; i++) {
-      const o = i * 4;
+      const o = i * S;
       const r = dabs[o + 2];
       x0 = Math.min(x0, dabs[o] - r);
       y0 = Math.min(y0, dabs[o + 1] - r);
@@ -168,5 +246,5 @@ export function computeDabs(brush: Brush, pts: number[]): DabList {
     bx1 = Math.max(bx1, x1);
     by1 = Math.max(by1, y1);
   }
-  return { dabs: dabs.subarray(0, n * 4), count: n, chunks, bbox: [bx0, by0, bx1, by1] };
+  return { dabs: dabs.subarray(0, n * S), count: n, chunks, bbox: [bx0, by0, bx1, by1] };
 }

@@ -1,8 +1,16 @@
 // Committed strokes grouped by layer in z-order, with cheap bounding boxes for culling.
 // Used by the WebGL renderer (main thread) and the Canvas 2D tile worker.
 
-import { computeDabs, type DabList } from '../../shared/brush';
+import { computeDabs, strokeSeed, type DabList } from '../../shared/brush';
 import type { Stroke } from '../../shared/types';
+
+/** Index and tile key of a stroke: its layer, or `layer#maskId` for a stroke on a layer mask. */
+export function strokeKey(s: Pick<Stroke, 'layerId' | 'mask'>): string {
+  return s.mask ? `${s.layerId}#${s.mask}` : s.layerId;
+}
+
+/** Tile key of a layer's mask content. */
+export const maskKey = (layerId: string, maskId: string) => `${layerId}#${maskId}`;
 
 export interface StrokeRec {
   stroke: Stroke;
@@ -15,12 +23,13 @@ export interface StrokeRec {
 }
 
 export function strokeDabs(rec: StrokeRec): DabList {
-  return (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts));
+  return (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts, strokeSeed(rec.stroke.id)));
 }
 
 export class StrokeIndex {
   readonly recs = new Map<string, StrokeRec>();
-  readonly byLayer = new Map<string, StrokeRec[]>(); // sorted by seq
+  /** By strokeKey (a layer, or a layer mask), sorted by seq. */
+  readonly byLayer = new Map<string, StrokeRec[]>();
 
   clear(): void {
     this.recs.clear();
@@ -36,7 +45,8 @@ export class StrokeIndex {
       if (p[i + 1] < y0) y0 = p[i + 1];
       if (p[i + 1] > y1) y1 = p[i + 1];
     }
-    const r = stroke.brush.size * 0.51; // max radius plus a margin, relative so it works at any zoom
+    // Max radius plus a margin (relative, so it works at any zoom), plus the scatter reach.
+    const r = stroke.brush.size * (0.51 + (stroke.brush.scatter ?? 0));
     return { stroke, x0: x0 - r, y0: y0 - r, x1: x1 + r, y1: y1 + r, dabs: null };
   }
 
@@ -45,8 +55,9 @@ export class StrokeIndex {
     this.remove(stroke.id);
     const rec = StrokeIndex.makeRec(stroke);
     this.recs.set(stroke.id, rec);
-    let list = this.byLayer.get(stroke.layerId);
-    if (!list) this.byLayer.set(stroke.layerId, (list = []));
+    const key = strokeKey(stroke);
+    let list = this.byLayer.get(key);
+    if (!list) this.byLayer.set(key, (list = []));
     // Usually an append. Restored strokes go back to their original z position.
     let i = list.length;
     while (i > 0 && list[i - 1].stroke.seq > stroke.seq) i--;
@@ -58,7 +69,7 @@ export class StrokeIndex {
     const rec = this.recs.get(id);
     if (!rec) return null;
     this.recs.delete(id);
-    const list = this.byLayer.get(rec.stroke.layerId);
+    const list = this.byLayer.get(strokeKey(rec.stroke));
     if (list) {
       const i = list.indexOf(rec);
       if (i >= 0) list.splice(i, 1);

@@ -2,12 +2,34 @@
 // half-float (RGBA16F) buffers when the device supports it, else RGBA8. Blend modes run in a
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
-import { DAB_CHUNK, DabWalker } from '../../../shared/brush';
-import { BLEND_MODES, type Brush, type Layer, type Stroke } from '../../../shared/types';
+import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, strokeSeed } from '../../../shared/brush';
+import { BLEND_MODES, BRUSH_TIPS, GRAINS, type BlendMode, type Brush, type Layer, type Stroke } from '../../../shared/types';
+import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
-import { StrokeIndex, intersects, strokeDabs, type StrokeRec } from '../strokeIndex';
+import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
+import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
 import { createPrograms, type Program, type Programs } from './programs';
+
+/** Two screen buffers: `a` holds the composite so far, `b` receives the next blend pass. */
+interface Pair {
+  a: Target;
+  b: Target;
+}
+
+/** The tile grid of the current frame. */
+interface Grid {
+  lod: number;
+  tx0: number;
+  ty0: number;
+  tx1: number;
+  ty1: number;
+  X: (tx: number) => number;
+  Y: (ty: number) => number;
+}
+
+/** Floats per dab instance on the GPU: cx, cy, rv, a, r, rot. */
+const INST = 6;
 
 interface Target {
   tex: WebGLTexture;
@@ -36,11 +58,15 @@ interface Tile {
 
 interface Live {
   id: string;
+  /** Layer id, or maskKey(layer, mask) for a stroke on a layer mask. */
   layerId: string;
   brush: Brush;
   walker: DabWalker;
-  /** All dabs so far, world units: x, y, r, a. */
+  /** All dabs so far, world units: x, y, r, a, rot (DAB_STRIDE). */
   dabs: number[];
+  /** First point of the stroke: the grain origin. */
+  ox: number | null;
+  oy: number | null;
   /** Dabs already drawn into the target at viewVersion. */
   drawn: number;
   viewVersion: number;
@@ -80,7 +106,7 @@ export class GLRenderer implements Renderer {
   private dabVao!: WebGLVertexArrayObject;
   private dabVbo!: WebGLBuffer;
   private dabCap = 0;
-  private inst = new Float32Array(5 * 4096);
+  private inst = new Float32Array(INST * 4096);
   private fmt!: { internal: number; format: number; type: number };
 
   private compA!: Target;
@@ -88,6 +114,14 @@ export class GLRenderer implements Renderer {
   private layerT!: Target;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
   private pickT!: Target;
+  /** Screen buffers made only when a frame needs them: layer masks and clipping groups. */
+  private extra = new Map<'mask' | 'groupA' | 'groupB', Target>();
+  private tipTex!: WebGLTexture;
+  private grainTex!: WebGLTexture;
+  private tipsReady = new Set<number>();
+  private grainsReady = new Set<number>();
+  /** Tone lookup textures of adjustment layers, by layer id. */
+  private luts = new Map<string, { key: string; tex: WebGLTexture }>();
   private tilePool: Target[] = [];
   private livePool: Target[] = [];
 
@@ -171,13 +205,24 @@ export class GLRenderer implements Renderer {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);
+    const stride = INST * 4;
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 20, 0);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0);
     gl.vertexAttribDivisor(1, 1);
     gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 20, 16);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, stride, 16);
     gl.vertexAttribDivisor(2, 1);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, stride, 20);
+    gl.vertexAttribDivisor(3, 1);
     gl.bindVertexArray(null);
+
+    // Tips and grains upload on first use (tips.ts generates them on the CPU).
+    this.tipTex = this.makeArray(TIP_SIZE, BRUSH_TIPS.length, false);
+    this.grainTex = this.makeArray(GRAIN_SIZE, GRAINS.length, true);
+    this.tipsReady.clear();
+    this.grainsReady.clear();
+    this.luts.clear();
 
     this.strokeT = this.makeTarget(TILE, TILE);
     this.pickT = this.makeTarget(1, 1, true);
@@ -208,6 +253,35 @@ export class GLRenderer implements Renderer {
     return { tex, fbo, w, h };
   }
 
+  /** A mipmapped single-channel texture array for tips or grains. */
+  private makeArray(size: number, layers: number, repeat: boolean): WebGLTexture {
+    const gl = this.gl;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, Math.log2(size) + 1, gl.R8, size, size, layers);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const wrap = repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, wrap);
+    return tex;
+  }
+
+  private uploadLayer(tex: WebGLTexture, size: number, layer: number, data: Uint8Array): void {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, size, size, 1, gl.RED, gl.UNSIGNED_BYTE, data);
+    gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  }
+
+  /** A screen-sized buffer that only some frames need, made on first use. */
+  private screen(name: 'mask' | 'groupA' | 'groupB'): Target {
+    let t = this.extra.get(name);
+    if (!t) this.extra.set(name, (t = this.makeTarget(this.canvas.width || 1, this.canvas.height || 1)));
+    return t;
+  }
+
   private freeTarget(t: Target): void {
     this.gl.deleteFramebuffer(t.fbo);
     this.gl.deleteTexture(t.tex);
@@ -217,6 +291,8 @@ export class GLRenderer implements Renderer {
     const w = this.canvas.width || 1;
     const h = this.canvas.height || 1;
     for (const t of [this.compA, this.compB, this.layerT]) if (t) this.freeTarget(t);
+    for (const t of this.extra.values()) this.freeTarget(t);
+    this.extra.clear();
     for (const t of this.livePool) this.freeTarget(t);
     this.livePool = [];
     this.compA = this.makeTarget(w, h);
@@ -280,6 +356,12 @@ export class GLRenderer implements Renderer {
 
   setLayers(layers: Layer[]): void {
     this.layers = layers;
+    for (const [id, l] of this.luts) {
+      if (!layers.some((x) => x.id === id && x.kind === 'adjust')) {
+        this.gl.deleteTexture(l.tex);
+        this.luts.delete(id);
+      }
+    }
     this.invalidate();
   }
 
@@ -296,8 +378,9 @@ export class GLRenderer implements Renderer {
 
   addStroke(stroke: Stroke, seq: number): void {
     const rec = this.index.add(stroke);
+    const key = strokeKey(stroke);
     for (const t of this.tiles.values()) {
-      if (t.layer !== stroke.layerId || t.stale) continue;
+      if (t.layer !== key || t.stale) continue;
       const [x0, y0, x1, y1] = this.tileBounds(t);
       if (!intersects(rec, x0, y0, x1, y1)) continue;
       // On top of everything the tile shows: draw it over the existing pixels.
@@ -314,8 +397,9 @@ export class GLRenderer implements Renderer {
   removeStroke(id: string, seq: number): void {
     const rec = this.index.remove(id);
     if (rec) {
+      const key = strokeKey(rec.stroke);
       for (const t of this.tiles.values()) {
-        if (t.layer !== rec.stroke.layerId) continue;
+        if (t.layer !== key) continue;
         const [x0, y0, x1, y1] = this.tileBounds(t);
         if (intersects(rec, x0, y0, x1, y1)) {
           t.stale = true;
@@ -341,8 +425,10 @@ export class GLRenderer implements Renderer {
       id,
       layerId,
       brush,
-      walker: new DabWalker(brush),
+      walker: new DabWalker(brush, strokeSeed(id)),
       dabs: [],
+      ox: null,
+      oy: null,
       drawn: 0,
       viewVersion: -1,
       target: null,
@@ -361,7 +447,11 @@ export class GLRenderer implements Renderer {
   liveAppend(id: string, pts: number[]): void {
     const l = this.live.get(id);
     if (!l) return;
-    const sink = (x: number, y: number, r: number, a: number) => l.dabs.push(x, y, r, a);
+    if (l.ox === null && pts.length >= 2) {
+      l.ox = pts[0];
+      l.oy = pts[1];
+    }
+    const sink = (x: number, y: number, r: number, a: number, rot: number) => l.dabs.push(x, y, r, a, rot);
     for (let i = 0; i + 2 < pts.length; i += 3) l.walker.push(pts[i], pts[i + 1], pts[i + 2], sink);
     l.updated = performance.now();
     this.invalidate();
@@ -407,9 +497,9 @@ export class GLRenderer implements Renderer {
 
   /** Ensures room for n instances in the CPU array. */
   private reserve(n: number): void {
-    if (this.inst.length >= n * 5) return;
+    if (this.inst.length >= n * INST) return;
     let cap = this.inst.length;
-    while (cap < n * 5) cap *= 2;
+    while (cap < n * INST) cap *= 2;
     const next = new Float32Array(cap);
     next.set(this.inst);
     this.inst = next;
@@ -420,7 +510,7 @@ export class GLRenderer implements Renderer {
    * All position math is double precision; only the small results go to float32.
    * Returns false when the dab is culled.
    */
-  private putDab(i: number, x: number, y: number, r: number, a: number, ox: number, oy: number, scale: number, w: number, h: number): boolean {
+  private putDab(i: number, x: number, y: number, r: number, a: number, rot: number, ox: number, oy: number, scale: number, w: number, h: number): boolean {
     let rp = r * scale;
     let cx = (x - ox) * scale;
     let cy = (y - oy) * scale;
@@ -443,18 +533,31 @@ export class GLRenderer implements Renderer {
       cx = tcx - ux * (rv - inside);
       cy = tcy - uy * (rv - inside);
     }
-    const o = i * 5;
+    const o = i * INST;
     const f = this.inst;
     f[o] = cx;
     f[o + 1] = cy;
     f[o + 2] = rv;
     f[o + 3] = Math.min(1, a);
     f[o + 4] = rp;
+    f[o + 5] = rot;
     return true;
   }
 
+  /**
+   * Grain placement in target pixels: the origin (the first point of the stroke, reduced modulo
+   * one period so the numbers stay small at any zoom) and the period. Null: no grain.
+   */
+  private grainFor(b: Brush, sx: number, sy: number, ox: number, oy: number, scale: number): [number, number, number] | null {
+    if (!b.grain || !(b.grainStrength ?? 0.5)) return null;
+    const period = b.size * (b.grainScale ?? 1) * scale;
+    if (!(period > 1e-6) || !Number.isFinite(period)) return null;
+    const m = (v: number) => ((v % period) + period) % period;
+    return [m((sx - ox) * scale), m((sy - oy) * scale), period];
+  }
+
   /** Draws n prepared instances into the bound target. The caller sets the blend state. */
-  private drawDabs(n: number, brush: Brush, w: number, h: number): void {
+  private drawDabs(n: number, brush: Brush, w: number, h: number, grain: [number, number, number] | null): void {
     if (n === 0) return;
     const gl = this.gl;
     const p = this.progs.dab;
@@ -463,13 +566,39 @@ export class GLRenderer implements Renderer {
     const [r, g, b] = hexToRgb(brush.color);
     gl.uniform3f(p.u.uColor, r, g, b);
     gl.uniform1f(p.u.uHardness, brush.hardness);
+    const shape = brushShape(brush);
+    const tip = shape.tip === 'round' ? -1 : tipIndex(shape.tip);
+    if (tip >= 0 && !this.tipsReady.has(tip)) {
+      this.uploadLayer(this.tipTex, TIP_SIZE, tip, tipMask(shape.tip));
+      this.tipsReady.add(tip);
+    }
+    gl.uniform1i(p.u.uTip, tip);
+    gl.uniform1f(p.u.uRoundness, shape.roundness);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.tipTex);
+    gl.uniform1i(p.u.uTips, 1);
+    const gi = grain && brush.grain ? grainIndex(brush.grain) : -1;
+    if (gi >= 0 && !this.grainsReady.has(gi)) {
+      this.uploadLayer(this.grainTex, GRAIN_SIZE, gi, grainMap(brush.grain!));
+      this.grainsReady.add(gi);
+    }
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.grainTex);
+    gl.uniform1i(p.u.uGrains, 2);
+    gl.uniform1i(p.u.uGrain, gi);
+    if (gi >= 0) {
+      gl.uniform1f(p.u.uGrainStrength, brush.grainStrength ?? 0.5);
+      gl.uniform2f(p.u.uGrainOrigin, grain![0], grain![1]);
+      gl.uniform1f(p.u.uGrainPx, grain![2]);
+    }
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);
-    const bytes = n * 20;
+    const bytes = n * INST * 4;
     if (bytes > this.dabCap) {
       this.dabCap = Math.max(bytes, this.dabCap * 2, 65536);
       gl.bufferData(gl.ARRAY_BUFFER, this.dabCap, gl.DYNAMIC_DRAW);
     }
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.inst, 0, n * 5);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.inst, 0, n * INST);
     gl.bindVertexArray(this.dabVao);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
     gl.bindVertexArray(null);
@@ -542,7 +671,7 @@ export class GLRenderer implements Renderer {
       // The whole stroke covers about one pixel here: one dot instead of every dab.
       this.reserve(1);
       const r = Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2;
-      if (this.putDab(0, (rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, r, 1, wx0, wy0, scale, w, h)) n = 1;
+      if (this.putDab(0, (rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, r, 1, 0, wx0, wy0, scale, w, h)) n = 1;
     } else {
       const { dabs, chunks, count } = strokeDabs(rec);
       const wx1 = wx0 + w / scale, wy1 = wy0 + h / scale;
@@ -552,24 +681,28 @@ export class GLRenderer implements Renderer {
         if (chunks[co + 2] <= wx0 || chunks[co] >= wx1 || chunks[co + 3] <= wy0 || chunks[co + 1] >= wy1) continue;
         const end = Math.min(count, (c + 1) * DAB_CHUNK);
         for (let i = c * DAB_CHUNK; i < end; i++) {
-          const o = i * 4;
-          if (this.putDab(n, dabs[o], dabs[o + 1], dabs[o + 2], dabs[o + 3], wx0, wy0, scale, w, h)) n++;
+          const o = i * DAB_STRIDE;
+          if (this.putDab(n, dabs[o], dabs[o + 1], dabs[o + 2], dabs[o + 3], dabs[o + 4], wx0, wy0, scale, w, h)) n++;
         }
       }
     }
     if (n === 0) return;
     const erase = b.tool === 'erase';
+    // The one-dot shortcut has no tip, rotation or grain: it stands for a whole tiny stroke.
+    const dot = sw < 2 && sh < 2;
+    const brush = dot ? { ...b, tip: undefined, roundness: undefined } : b;
+    const grain = dot ? null : this.grainFor(b, rec.stroke.pts[0], rec.stroke.pts[1], wx0, wy0, scale);
     if (b.opacity >= 1) {
       // Source-over and destination-out are associative: at full opacity the dabs can go
       // straight onto the tile with the same result as a separate stroke buffer.
       this.bindTarget(target);
       this.blendFor(erase);
-      this.drawDabs(n, b, w, h);
+      this.drawDabs(n, brush, w, h, grain);
     } else {
       this.bindTarget(this.strokeT);
       this.clear();
       this.blendFor(false);
-      this.drawDabs(n, b, w, h);
+      this.drawDabs(n, brush, w, h, grain);
       this.bindTarget(target);
       this.blendFor(erase);
       this.copy(this.strokeT.tex, target, [0, 0, w, h], b.opacity);
@@ -644,6 +777,13 @@ export class GLRenderer implements Renderer {
     const tx1 = Math.floor((vx + this.cssW / this.view.zoom) / tw);
     const ty1 = Math.floor((vy + this.cssH / this.view.zoom) / tw);
     const visible = this.layers.filter((l) => l.visible && !l.deleted);
+    // Tile sets to keep current, topmost first: each paint layer, and each enabled layer mask.
+    const keys: string[] = [];
+    for (let li = visible.length - 1; li >= 0; li--) {
+      const l = visible[li];
+      if (l.kind !== 'adjust') keys.push(l.id);
+      if (l.mask?.enabled) keys.push(maskKey(l.id, l.mask.id));
+    }
 
     // 1. Bring tiles up to date, center first, within a time budget.
     const start = performance.now();
@@ -654,8 +794,7 @@ export class GLRenderer implements Renderer {
       for (let tx = tx0 - PREFETCH; tx <= tx1 + PREFETCH; tx++) order.push([tx, ty]);
     order.sort((a, b) => Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy));
     outer: for (const [tx, ty] of order) {
-      for (let li = visible.length - 1; li >= 0; li--) {
-        const layer = visible[li].id;
+      for (const layer of keys) {
         const key = tileKey(layer, lod, tx, ty);
         let t = this.tiles.get(key);
         if (!this.needsWork(t)) continue;
@@ -679,55 +818,44 @@ export class GLRenderer implements Renderer {
     // 2. Update the buffers of strokes in progress.
     for (const l of this.live.values()) this.updateLive(l);
 
-    // 3. Composite the layers.
-    const X = (tx: number) => Math.round((tx * tw - vx) * ds);
-    const Y = (ty: number) => Math.round((ty * tw - vy) * ds);
-    this.bindTarget(this.compA);
+    // 3. Composite the layers, bottom to top. A layer with clipped layers right above it is the
+    //    base of a clipping group: the group draws in its own buffer, each clipped layer only where
+    //    the base has alpha ("atop"), then goes onto the composite with the base's blend and opacity.
+    const grid: Grid = {
+      lod,
+      tx0,
+      ty0,
+      tx1,
+      ty1,
+      X: (tx) => Math.round((tx * tw - vx) * ds),
+      Y: (ty) => Math.round((ty * tw - vy) * ds),
+    };
+    let main: Pair = { a: this.compA, b: this.compB };
+    this.bindTarget(main.a);
     const [pr, pg, pb] = hexToRgb(this.paper);
     this.clear(pr, pg, pb, 1);
-    for (const layer of visible) {
-      const lives = [...this.live.values()]
-        .filter((l) => l.layerId === layer.id && l.target)
-        .sort((a, b) => (a.commitSeq ?? Infinity) - (b.commitSeq ?? Infinity) || a.started - b.started);
-      const mode = BLEND_MODES.indexOf(layer.blend);
-      const direct = mode <= 0 && lives.length === 0;
-      if (direct) {
-        // Normal layer, nothing in progress: tiles go straight onto the composite.
-        this.bindTarget(this.compA);
-        this.blendFor(false);
-        this.drawLayerTiles(layer.id, lod, tx0, ty0, tx1, ty1, X, Y, this.compA, layer.opacity);
-        continue;
-      }
-      this.bindTarget(this.layerT);
-      this.clear();
-      gl.disable(gl.BLEND);
-      this.drawLayerTiles(layer.id, lod, tx0, ty0, tx1, ty1, X, Y, this.layerT, 1);
-      for (const l of lives) {
-        this.blendFor(l.brush.tool === 'erase');
-        this.copy(l.target!.tex, this.layerT, [0, 0, this.layerT.w, this.layerT.h], l.brush.opacity);
-      }
-      if (mode <= 0) {
-        this.bindTarget(this.compA);
-        this.blendFor(false);
-        this.copy(this.layerT.tex, this.compA, [0, 0, this.compA.w, this.compA.h], layer.opacity);
+    for (let i = 0; i < visible.length; ) {
+      const base = visible[i];
+      let j = i + 1;
+      while (j < visible.length && visible[j].clip) j++;
+      const clipped = visible.slice(i + 1, j);
+      if (clipped.length === 0 || base.kind === 'adjust') {
+        // Nothing clips to this layer, or it has no pixels to clip to: each layer on its own.
+        main = this.compositeLayer(base, main, grid, false);
+        for (const c of clipped) main = this.compositeLayer(c, main, grid, false);
       } else {
-        this.bindTarget(this.compB);
+        let group: Pair = { a: this.screen('groupA'), b: this.screen('groupB') };
+        this.renderLayer(base, grid);
+        this.bindTarget(group.a);
         gl.disable(gl.BLEND);
-        const p = this.progs.blend;
-        gl.useProgram(p.prog);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, this.compA.tex);
-        gl.uniform1i(p.u.uBack, 0);
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, this.layerT.tex);
-        gl.uniform1i(p.u.uLayer, 1);
-        gl.uniform1f(p.u.uOpacity, layer.opacity);
-        gl.uniform1i(p.u.uMode, mode);
-        this.quad(p, this.compB, [0, 0, this.compB.w, this.compB.h]);
-        gl.activeTexture(gl.TEXTURE0);
-        [this.compA, this.compB] = [this.compB, this.compA];
+        this.copy(this.layerT.tex, group.a, [0, 0, group.a.w, group.a.h]);
+        for (const c of clipped) group = this.compositeLayer(c, group, grid, true);
+        main = this.blendOnto(group.a, base.blend, base.opacity, main, false);
       }
+      i = j;
     }
+    this.compA = main.a;
+    this.compB = main.b;
 
     // 4. Present with dither.
     this.bindTarget(null);
@@ -744,6 +872,148 @@ export class GLRenderer implements Renderer {
     this.evictTiles();
     if (pending) this.invalidate();
     else if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
+  }
+
+  /** Strokes in progress on a layer (or on a layer mask key), in commit order. */
+  private livesFor(key: string): Live[] {
+    return [...this.live.values()]
+      .filter((l) => l.layerId === key && l.target)
+      .sort((a, b) => (a.commitSeq ?? Infinity) - (b.commitSeq ?? Infinity) || a.started - b.started);
+  }
+
+  /** Draws one layer onto `pair.a`. Returns the pair with the result in `a`. */
+  private compositeLayer(layer: Layer, pair: Pair, g: Grid, atop: boolean): Pair {
+    if (layer.kind === 'adjust') return this.applyAdjust(layer, pair, g);
+    const mode = BLEND_MODES.indexOf(layer.blend);
+    if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
+      // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
+      this.bindTarget(pair.a);
+      this.blendFor(false);
+      this.drawLayerTiles(layer.id, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, pair.a, layer.opacity);
+      return pair;
+    }
+    this.renderLayer(layer, g);
+    return this.blendOnto(this.layerT, layer.blend, layer.opacity, pair, atop);
+  }
+
+  /** Blends a screen-sized buffer onto `pair.a` with a blend mode and opacity. */
+  private blendOnto(src: Target, blend: BlendMode, opacity: number, pair: Pair, atop: boolean): Pair {
+    const gl = this.gl;
+    const mode = BLEND_MODES.indexOf(blend);
+    if (mode <= 0 && !atop) {
+      this.bindTarget(pair.a);
+      this.blendFor(false);
+      this.copy(src.tex, pair.a, [0, 0, pair.a.w, pair.a.h], opacity);
+      return pair;
+    }
+    this.bindTarget(pair.b);
+    gl.disable(gl.BLEND);
+    const p = this.progs.blend;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pair.a.tex);
+    gl.uniform1i(p.u.uBack, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(p.u.uLayer, 1);
+    gl.uniform1f(p.u.uOpacity, opacity);
+    gl.uniform1i(p.u.uMode, Math.max(0, mode));
+    gl.uniform1i(p.u.uAtop, atop ? 1 : 0);
+    this.quad(p, pair.b, [0, 0, pair.b.w, pair.b.h]);
+    gl.activeTexture(gl.TEXTURE0);
+    return { a: pair.b, b: pair.a };
+  }
+
+  /** A layer's pixels, with its strokes in progress and its mask, into layerT (opacity 1). */
+  private renderLayer(layer: Layer, g: Grid): void {
+    const gl = this.gl;
+    this.bindTarget(this.layerT);
+    this.clear();
+    gl.disable(gl.BLEND);
+    this.drawLayerTiles(layer.id, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, this.layerT, 1);
+    for (const l of this.livesFor(layer.id)) {
+      this.blendFor(l.brush.tool === 'erase');
+      this.copy(l.target!.tex, this.layerT, [0, 0, this.layerT.w, this.layerT.h], l.brush.opacity);
+    }
+    if (!layer.mask?.enabled) return;
+    const mask = this.renderMask(layer, g);
+    // Multiply the layer by the mask visibility: dst * (1 - src.a), src.a = 1 - visibility.
+    this.bindTarget(this.layerT);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
+    const p = this.progs.mask;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, mask.tex);
+    gl.uniform1i(p.u.uMask, 0);
+    this.quad(p, this.layerT, [0, 0, this.layerT.w, this.layerT.h]);
+  }
+
+  /** The grey mask paint of a layer (tiles and strokes in progress) in the mask buffer. */
+  private renderMask(layer: Layer, g: Grid): Target {
+    const gl = this.gl;
+    const key = maskKey(layer.id, layer.mask!.id);
+    const t = this.screen('mask');
+    this.bindTarget(t);
+    this.clear();
+    gl.disable(gl.BLEND);
+    this.drawLayerTiles(key, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, t, 1);
+    for (const l of this.livesFor(key)) {
+      this.blendFor(l.brush.tool === 'erase');
+      this.copy(l.target!.tex, t, [0, 0, t.w, t.h], l.brush.opacity);
+    }
+    return t;
+  }
+
+  /** Tone lookup texture of an adjustment layer, rebuilt when its settings change. */
+  private lutFor(layer: Layer): WebGLTexture {
+    const gl = this.gl;
+    const key = JSON.stringify(layer.adjust);
+    let e = this.luts.get(layer.id);
+    if (e?.key === key) return e.tex;
+    if (!e) {
+      const tex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      this.luts.set(layer.id, (e = { key: '', tex }));
+    }
+    gl.bindTexture(gl.TEXTURE_2D, e.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, LUT_SIZE, 1, 0, gl.RED, gl.FLOAT, toneLut(layer.adjust!));
+    e.key = key;
+    return e.tex;
+  }
+
+  /** An adjustment layer: changes everything in `pair.a`, by its opacity and mask. */
+  private applyAdjust(layer: Layer, pair: Pair, g: Grid): Pair {
+    const a = layer.adjust;
+    if (!a || layer.opacity <= 0) return pair;
+    const gl = this.gl;
+    const mask = layer.mask?.enabled ? this.renderMask(layer, g) : null;
+    const lut = a.type === 'hueSat' ? null : this.lutFor(layer);
+    this.bindTarget(pair.b);
+    gl.disable(gl.BLEND);
+    const p = this.progs.adjust;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pair.a.tex);
+    gl.uniform1i(p.u.uBack, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, lut ?? pair.a.tex);
+    gl.uniform1i(p.u.uLut, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, mask ? mask.tex : pair.a.tex);
+    gl.uniform1i(p.u.uMask, 2);
+    gl.uniform1i(p.u.uMaskOn, mask ? 1 : 0);
+    gl.uniform1i(p.u.uType, a.type === 'hueSat' ? 1 : 0);
+    if (a.type === 'hueSat') gl.uniform3f(p.u.uHsl, a.hue / 360, a.saturation, a.lightness);
+    gl.uniform1f(p.u.uOpacity, layer.opacity);
+    this.quad(p, pair.b, [0, 0, pair.b.w, pair.b.h]);
+    gl.activeTexture(gl.TEXTURE0);
+    return { a: pair.b, b: pair.a };
   }
 
   private drawLayerTiles(
@@ -813,19 +1083,21 @@ export class GLRenderer implements Renderer {
       l.drawn = 0;
       l.viewVersion = this.viewVersion;
     }
-    const total = l.dabs.length / 4;
+    const total = l.dabs.length / DAB_STRIDE;
     if (l.drawn >= total) return;
     const ds = this.view.zoom * this.dpr;
     this.reserve(total - l.drawn);
     let n = 0;
     for (let i = l.drawn; i < total; i++) {
-      const o = i * 4;
-      if (this.putDab(n, l.dabs[o], l.dabs[o + 1], l.dabs[o + 2], l.dabs[o + 3], this.view.x, this.view.y, ds, w, h)) n++;
+      const o = i * DAB_STRIDE;
+      const d = l.dabs;
+      if (this.putDab(n, d[o], d[o + 1], d[o + 2], d[o + 3], d[o + 4], this.view.x, this.view.y, ds, w, h)) n++;
     }
     l.drawn = total;
     this.bindTarget(l.target);
     this.blendFor(false); // erase strokes build a mask; the layer pass applies destination-out
-    this.drawDabs(n, l.brush, w, h);
+    const grain = l.ox === null ? null : this.grainFor(l.brush, l.ox, l.oy!, this.view.x, this.view.y, ds);
+    this.drawDabs(n, l.brush, w, h, grain);
   }
 
   // --- readback ------------------------------------------------------------------------------------

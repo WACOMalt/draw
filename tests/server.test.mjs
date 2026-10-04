@@ -279,11 +279,55 @@ try {
   check(anonImp.status === 201 && /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(anonImp.data.key) && anonImp.data.strokes === 2 && anonImp.data.skipped === 0, 'plain JSON file imports as a temporary canvas (round trip)');
   check((await new Browser().upload(gz, { name: 'nope-name' })).status === 401, 'named import needs an account');
   check((await funky.upload(Buffer.from('not a drawing'), {})).data?.error === 'bad_file', 'a file that is not .bdraw is refused');
-  check((await funky.upload(Buffer.from(JSON.stringify({ ...bfile, version: 2 })), {})).data?.error === 'file_too_new', 'a file from a newer version is refused');
+  check((await funky.upload(Buffer.from(JSON.stringify({ ...bfile, version: 3 })), {})).data?.error === 'file_too_new', 'a file from a newer version is refused');
   const noHeader = await fetch(BASE + '/api/import', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: gz });
   check(noHeader.status === 403, 'import without X-Draw-Options is refused (CSRF)');
   check((await funky.upload(gz, {}, { Origin: 'https://evil.example' })).status === 403, 'import from a foreign Origin is refused');
   check((await funky.upload(Buffer.alloc(33 * 1024 * 1024), {})).status === 413, 'a file over 32 MB is refused');
+
+  // --- adjustment layers, clipping, masks, brush dynamics -------------------------------------------
+  const art = new Browser();
+  const artKey = (await art.api('POST', '/api/sessions', { anon: art.anon })).data.key;
+  const aConn = await art.join(artKey);
+  const aWelcome = await first(aConn);
+  const base = layerId(aWelcome);
+  let opn = 0;
+  const op = async (o) => {
+    const opId = `ad${++opn}xxxxxx`;
+    aConn.send({ t: 'op', opId, op: o });
+    return aConn.next((m) => (m.t === 'op' && m.opId === opId) || (m.t === 'reject' && m.opId === opId));
+  };
+  const adjLayer = { id: 'adjlayer01', kind: 'adjust', name: 'Levels', order: 5, blend: 'normal', opacity: 1, visible: true, adjust: { type: 'levels', inBlack: 0.1, inWhite: 0.9, gamma: 1.2, outBlack: 0, outWhite: 1 } };
+  const adjAdded = await op({ type: 'layer.add', layer: adjLayer });
+  check(adjAdded?.t === 'op' && adjAdded.op.layer.kind === 'adjust' && adjAdded.op.layer.adjust.gamma === 1.2, 'add an adjustment layer');
+  check((await op({ type: 'layer.add', layer: { ...adjLayer, id: 'adjlayer02', adjust: undefined } }))?.t === 'reject', 'adjustment layer needs settings');
+  check((await op({ type: 'layer.update', id: 'adjlayer01', props: { adjust: { type: 'curves', points: [[0.5, 0.2], [0.2, 0.9]] } } }))?.t === 'reject', 'curve points must ascend');
+  check((await op({ type: 'layer.update', id: 'adjlayer01', props: { adjust: { type: 'curves', points: [[0, 0], [0.4, 0.6], [1, 1]] } } }))?.t === 'op', 'change to a curves adjustment');
+  const paintOnAdjust = await op({ type: 'stroke.add', stroke: { id: 'adjstroke1', layerId: 'adjlayer01', brush, pts: [0, 0, 1, 5, 5, 1] } });
+  check(paintOnAdjust?.t === 'reject' && /no paint/.test(paintOnAdjust.reason), 'an adjustment layer refuses plain paint');
+  check((await op({ type: 'layer.update', id: base, props: { mask: { id: 'maskid0001', enabled: true }, clip: false } }))?.t === 'op', 'add a layer mask');
+  check((await op({ type: 'stroke.add', stroke: { id: 'maskstrok1', layerId: base, mask: 'maskid0001', brush: { ...brush, color: '#000000' }, pts: [0, 0, 1, 9, 9, 1] } }))?.t === 'op', 'paint on the mask');
+  const dynBrush = { ...brush, tip: 'chalk', angle: 30, roundness: 0.5, followDirection: true, scatter: 1, sizeJitter: 0.3, grain: 'paper', grainScale: 2, grainStrength: 0.6 };
+  check((await op({ type: 'stroke.add', stroke: { id: 'dynstroke1', layerId: base, brush: dynBrush, pts: [0, 0, 1, 20, 4, 1] } }))?.t === 'op', 'stroke with tip and dynamics');
+  check((await op({ type: 'stroke.add', stroke: { id: 'badtip0001', layerId: base, brush: { ...brush, tip: 'banana' }, pts: [0, 0, 1] } }))?.t === 'reject', 'unknown tip is refused');
+  check((await op({ type: 'layer.update', id: 'adjlayer01', props: { clip: true } }))?.t === 'op', 'clip a layer');
+  const peer = await art.join(artKey);
+  const pWelcome = await first(peer);
+  const feats = new Set(pWelcome.features);
+  check(['adjust', 'clip', 'mask', 'tips'].every((f) => feats.has(f)), 'welcome lists the document features');
+  const ms = pWelcome.strokes.find((x) => x.id === 'maskstrok1');
+  const ds = pWelcome.strokes.find((x) => x.id === 'dynstroke1');
+  check(ms?.mask === 'maskid0001' && ds?.brush.tip === 'chalk' && ds.brush.grain === 'paper', 'mask and brush fields survive');
+  const plainOnly = await first(await new Browser().join((await new Browser().api('POST', '/api/sessions', {})).data.key));
+  check(Array.isArray(plainOnly.features) && plainOnly.features.length === 0, 'a plain canvas lists no features');
+  aConn.send({ t: 'live', id: 'livemask01', layerId: base, mask: 'maskid0001', brush, pts: [1, 1, 1], start: true });
+  check((await peer.next((m) => m.t === 'live' && m.id === 'livemask01'))?.mask === 'maskid0001', 'live strokes on a mask carry the mask id');
+  check((await op({ type: 'layer.update', id: base, props: { mask: null, clip: false } }))?.t === 'op', 'delete a mask (undo sends null and false)');
+  // .bdraw version 2 keeps all of it.
+  const v2 = { format: 'bdraw', version: 2, app: 'test', savedAt: '', layers: pWelcome.layers, strokes: pWelcome.strokes };
+  const v2imp = await new Browser().upload(Buffer.from(JSON.stringify(v2)), {});
+  const v2w = await first(await new Browser().join(v2imp.data.key));
+  check(v2imp.status === 201 && v2imp.data.skipped === 0 && v2w.layers.some((l) => l.kind === 'adjust' && l.clip) && v2w.strokes.some((x) => x.mask === 'maskid0001'), '.bdraw v2 keeps adjustment layers, clip and masks');
 
   // --- CSRF guard, password reset, device login ----------------------------------------------------
   const evil = await fetch(`${BASE}/api/canvases/friday-jam/password`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', Cookie: funky.cookie }, body: '{"password":null}' });

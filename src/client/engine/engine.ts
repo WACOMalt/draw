@@ -2,7 +2,19 @@
 
 import { pointDecimals, quantizePoint } from '../../shared/brush';
 import { newId } from '../../shared/ids';
-import { LIMITS, type Brush, type Layer, type LayerProps, type Op, type ServerMsg } from '../../shared/types';
+import {
+  DEFAULT_ADJUST,
+  DOC_FEATURES,
+  LIMITS,
+  type Adjust,
+  type AdjustType,
+  type Brush,
+  type Layer,
+  type LayerProps,
+  type Op,
+  type ServerMsg,
+} from '../../shared/types';
+import { maskKey } from './strokeIndex';
 import { ed, save, showToast, type Tool } from '../state.svelte';
 import { createRenderer } from './createRenderer';
 import type { Renderer } from './renderer';
@@ -70,7 +82,36 @@ interface ActiveStroke {
    * map sample positions to client coordinates; trail keeps the last few for a sanity check.
    */
   native: { dx: number; dy: number; trail: [number, number][] } | null;
+  /** Painting on a layer mask: its id. */
+  mask?: string;
 }
+
+/** Drops tip and dynamics fields that hold their default: plain strokes stay as small as before. */
+function cleanBrush(b: Brush): Brush {
+  const o = { ...b };
+  if (!o.tip || o.tip === 'round') delete o.tip;
+  if (o.roundness === undefined || o.roundness >= 1) delete o.roundness;
+  if (!o.angle || (!o.tip && o.roundness === undefined)) delete o.angle;
+  if (!o.followDirection) delete o.followDirection;
+  for (const k of ['sizeJitter', 'angleJitter', 'scatter', 'opacityJitter'] as const) if (!o[k]) delete o[k];
+  if (!o.grain) {
+    delete o.grain;
+    delete o.grainScale;
+    delete o.grainStrength;
+  }
+  return o;
+}
+
+/** A color as the grey of its luminance: what a layer mask stores. */
+function greyOf(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  const l = Math.round(0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255));
+  const h = l.toString(16).padStart(2, '0');
+  return `#${h}${h}${h}`;
+}
+
+/** What a layer property is when it is not set: undo must send a value, not undefined. */
+const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null };
 
 export class Engine {
   readonly comp: Renderer;
@@ -619,16 +660,21 @@ export class Engine {
     const layer = this.activeLayer();
     if (!layer) return showToast('Add a layer first');
     if (!layer.visible) return showToast('The active layer is hidden');
+    const mask = ed.maskTarget && layer.mask ? layer.mask : null;
+    if (layer.kind === 'adjust' && !mask) {
+      return showToast(layer.mask ? 'Select the mask to paint on an adjustment layer' : 'An adjustment layer has no paint. Add a mask to paint where it applies.');
+    }
     const tool = eraserEnd ? 'eraser' : this.effectiveTool();
     const settings = tool === 'eraser' ? ed.eraser : ed.brush;
     // Size is in screen pixels: what you see is what you draw, at any zoom.
     const zoom = this.comp.view.zoom;
-    const brush: Brush = {
+    const brush: Brush = cleanBrush({
       ...settings,
       size: Math.min(LIMITS.maxBrushWorld, Math.max(LIMITS.minBrushWorld, settings.size / zoom)),
       tool: tool === 'eraser' ? 'erase' : 'paint',
-      color: ed.fg,
-    };
+      // A mask stores grey: black hides, white shows.
+      color: mask ? greyOf(ed.fg) : ed.fg,
+    });
     const st: ActiveStroke = {
       id: newId(),
       layerId: layer.id,
@@ -648,9 +694,10 @@ export class Engine {
       lastMove: performance.now(),
       timers: [],
       native: this.nativeStart(e),
+      ...(mask ? { mask: mask.id } : {}),
     };
     this.stroke = st;
-    this.comp.liveBegin(st.id, st.layerId, brush, false);
+    this.comp.liveBegin(st.id, mask ? maskKey(layer.id, mask.id) : st.layerId, brush, false);
     this.addPoint(x, y, this.pressure(e));
     st.timers.push(window.setInterval(() => this.flushLive(), LIVE_FLUSH_MS));
     if (brush.buildup) {
@@ -732,7 +779,7 @@ export class Engine {
   private flushLive(): void {
     const st = this.stroke;
     if (!st || st.unsent.length === 0) return;
-    if (this.net.send({ t: 'live', id: st.id, layerId: st.layerId, brush: st.brush, pts: st.unsent, start: !st.started })) {
+    if (this.net.send({ t: 'live', id: st.id, layerId: st.layerId, mask: st.mask, brush: st.brush, pts: st.unsent, start: !st.started })) {
       st.started = true;
     }
     st.unsent = [];
@@ -751,16 +798,16 @@ export class Engine {
       if (!st.last || q[0] !== st.last[0] || q[1] !== st.last[1]) this.pushPoint(st, q, false);
     }
     if (st.unsent.length) {
-      this.net.send({ t: 'live', id: st.id, layerId: st.layerId, brush: st.brush, pts: st.unsent, start: !st.started });
+      this.net.send({ t: 'live', id: st.id, layerId: st.layerId, mask: st.mask, brush: st.brush, pts: st.unsent, start: !st.started });
       st.unsent = [];
     }
     if (st.pts.length === 0) {
       this.comp.liveCancel(st.id);
       return;
     }
-    this.sendOp({ type: 'stroke.add', stroke: { id: st.id, layerId: st.layerId, brush: st.brush, pts: st.pts } });
+    this.sendOp({ type: 'stroke.add', stroke: { id: st.id, layerId: st.layerId, brush: st.brush, pts: st.pts, ...(st.mask ? { mask: st.mask } : {}) } });
     this.pushUndo({ undo: [{ type: 'stroke.remove', id: st.id }], redo: [{ type: 'stroke.restore', id: st.id }] });
-    if (st.brush.tool === 'paint') this.addSwatch(st.brush.color);
+    if (st.brush.tool === 'paint' && !st.mask) this.addSwatch(st.brush.color);
   }
 
   // --- ops, undo ------------------------------------------------------------------------------
@@ -815,28 +862,120 @@ export class Engine {
     ed.layers = layers;
     this.comp.setLayers(layers);
     if (!layers.some((l) => l.id === ed.activeLayerId)) ed.activeLayerId = layers.at(-1)?.id ?? null;
+    if (ed.maskTarget && !layers.find((l) => l.id === ed.activeLayerId)?.mask) this.setMaskTarget(false);
     this.scheduleMarkers();
   }
 
-  addLayer(): void {
-    if (!ed.canEdit) return;
+  /** The order value for a new layer right above the active one. */
+  private newLayerOrder(): number {
     const layers = this.doc.displayLayers();
     const i = layers.findIndex((l) => l.id === ed.activeLayerId);
     const active = layers[i];
     const above = layers[i + 1];
-    const order = active ? (above ? (active.order + above.order) / 2 : active.order + 1) : 1;
+    return active ? (above ? (active.order + above.order) / 2 : active.order + 1) : 1;
+  }
+
+  private nextName(prefix: string): string {
     let n = 1;
+    const re = new RegExp(`^${prefix} (\\d+)$`);
     for (const l of this.doc.layers.values()) {
-      const m = /^Layer (\d+)$/.exec(l.name);
+      const m = re.exec(l.name);
       if (m) n = Math.max(n, +m[1] + 1);
     }
+    return `${prefix} ${n}`;
+  }
+
+  addLayer(): void {
+    if (!ed.canEdit) return;
     const id = newId();
     this.sendOp({
       type: 'layer.add',
-      layer: { id, name: `Layer ${n}`, order, blend: 'normal', opacity: 1, visible: true },
+      layer: { id, name: this.nextName('Layer'), order: this.newLayerOrder(), blend: 'normal', opacity: 1, visible: true },
     });
     this.pushUndo({ undo: [{ type: 'layer.remove', id }], redo: [{ type: 'layer.restore', id }] });
+    this.setMaskTarget(false);
     ed.activeLayerId = id;
+  }
+
+  static readonly ADJUST_NAMES: Record<AdjustType, string> = {
+    levels: 'Levels',
+    curves: 'Curves',
+    hueSat: 'Hue/Saturation',
+    brightContrast: 'Brightness/Contrast',
+  };
+
+  /** An adjustment layer above the active layer. It changes everything below it. */
+  addAdjustmentLayer(type: AdjustType): void {
+    if (!ed.canEdit) return;
+    const id = newId();
+    this.sendOp({
+      type: 'layer.add',
+      layer: {
+        id,
+        kind: 'adjust',
+        name: this.nextName(Engine.ADJUST_NAMES[type]),
+        order: this.newLayerOrder(),
+        blend: 'normal',
+        opacity: 1,
+        visible: true,
+        adjust: DEFAULT_ADJUST[type],
+      },
+    });
+    this.pushUndo({ undo: [{ type: 'layer.remove', id }], redo: [{ type: 'layer.restore', id }] });
+    this.setMaskTarget(false);
+    ed.activeLayerId = id;
+  }
+
+  /** Changes adjustment settings. Changes within 2 s merge into one undo step. */
+  setAdjust(id: string, adjust: Adjust): void {
+    this.updateLayer(id, { adjust }, 'adjust');
+  }
+
+  /** Adds an empty (all white) mask and selects it for painting. */
+  addMask(id: string): void {
+    const l = this.doc.layer(id);
+    if (!l || l.mask) return;
+    this.updateLayer(id, { mask: { id: newId(), enabled: true } });
+    this.refreshLayers();
+    this.setMaskTarget(true);
+  }
+
+  /** Removes the mask. Undo brings it back with its strokes. */
+  deleteMask(id: string): void {
+    if (!this.doc.layer(id)?.mask) return;
+    this.updateLayer(id, { mask: null });
+    this.setMaskTarget(false);
+  }
+
+  setMaskEnabled(id: string, enabled: boolean): void {
+    const m = this.doc.layer(id)?.mask;
+    if (m) this.updateLayer(id, { mask: { ...m, enabled } });
+  }
+
+  /** Clips the layer to the nearest unclipped layer below it, or releases it. */
+  setClip(id: string, clip: boolean): void {
+    this.updateLayer(id, { clip });
+  }
+
+  /** Colors from before the mask was selected: back when painting the layer again. */
+  private layerColors: [string, string] | null = null;
+
+  /**
+   * Paint on the active layer's mask (true) or on the layer itself (false). As in Photoshop, the
+   * colors become black and white for the mask, and come back for the layer.
+   */
+  setMaskTarget(on: boolean): void {
+    const next = on && !!this.activeLayer()?.mask;
+    if (next === ed.maskTarget) return;
+    ed.maskTarget = next;
+    if (next) {
+      this.layerColors = [ed.fg, ed.bg];
+      ed.fg = '#000000';
+      ed.bg = '#ffffff';
+    } else if (this.layerColors) {
+      [ed.fg, ed.bg] = this.layerColors;
+      this.layerColors = null;
+    }
   }
 
   deleteLayer(id: string): void {
@@ -858,7 +997,7 @@ export class Engine {
     const oldProps: Partial<LayerProps> = {};
     let changed = false;
     for (const k of Object.keys(props) as (keyof LayerProps)[]) {
-      (oldProps as Record<string, unknown>)[k] = old[k];
+      (oldProps as Record<string, unknown>)[k] = old[k] ?? PROP_DEFAULTS[k];
       if (old[k] !== props[k]) changed = true;
     }
     if (!changed) return;
@@ -891,6 +1030,7 @@ export class Engine {
   }
 
   setActiveLayer(id: string): void {
+    if (id !== ed.activeLayerId) this.setMaskTarget(false);
     ed.activeLayerId = id;
   }
 
@@ -905,6 +1045,7 @@ export class Engine {
         ed.canvas = m.canvas ?? null;
         ed.denied = null;
         if (m.grant) grants.set(this.code, m.grant);
+        ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
         this.doc.reset(m.seq, m.layers, m.strokes);
         this.comp.resetStrokes(m.strokes, m.seq);
         ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
@@ -944,7 +1085,7 @@ export class Engine {
       }
       case 'live': {
         if (!this.comp.hasLive(m.id)) {
-          this.comp.liveBegin(m.id, m.layerId, m.brush, true);
+          this.comp.liveBegin(m.id, m.mask ? maskKey(m.layerId, m.mask) : m.layerId, m.brush, true);
           let set = this.livesByPeer.get(m.by);
           if (!set) this.livesByPeer.set(m.by, (set = new Set()));
           set.add(m.id);

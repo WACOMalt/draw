@@ -8,7 +8,7 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
 import zlib from 'node:zlib';
-import { isGzip } from '../shared/bdraw';
+import { BDRAW_VERSION, isGzip } from '../shared/bdraw';
 import { newId, newSessionCode } from '../shared/ids';
 import { normalizeName, parseKey, candidateKeys } from '../shared/types';
 import { canClaim, isTemporary, TEMP_TTL_MS } from './access';
@@ -331,7 +331,7 @@ const importCanvas: Handler = async (ctx, req) => {
     return err(400, 'bad_file');
   }
   if (!file || file.format !== 'bdraw' || !Array.isArray(file.layers) || !Array.isArray(file.strokes)) return err(400, 'bad_file');
-  if (typeof file.version !== 'number' || file.version > 1) return err(400, 'file_too_new');
+  if (typeof file.version !== 'number' || file.version > BDRAW_VERSION) return err(400, 'file_too_new');
 
   const r = makeCanvas(ctx, req, opts);
   if ('res' in r) return r.res;

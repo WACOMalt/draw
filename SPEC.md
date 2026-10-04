@@ -55,11 +55,21 @@ Three rules drive the design:
 A document is a set of layers and a set of strokes. The server gives each accepted op a sequence number (`seq`). The `seq` sets one total order for all clients.
 
 ```ts
-Layer  { id, name, order: number, blend: BlendMode, opacity: 0..1, visible, deleted }
-Stroke { id, layerId, seq, author, brush: Brush, pts: number[], deleted }
+Layer  { id, name, order: number, blend: BlendMode, opacity: 0..1, visible, deleted,
+         kind?: 'paint' | 'adjust', adjust?: Adjust, clip?: boolean,
+         mask?: { id, enabled } | null }
+Stroke { id, layerId, seq, author, brush: Brush, pts: number[], deleted, mask?: maskId }
 Brush  { tool: 'paint' | 'erase', color: '#rrggbb', size, opacity, flow,
-         hardness, spacing, pressureSize, pressureFlow, buildup }
+         hardness, spacing, pressureSize, pressureFlow, buildup,
+         tip?, angle?, roundness?, followDirection?, sizeJitter?, angleJitter?,
+         scatter?, opacityJitter?, grain?, grainScale?, grainStrength? }
 ```
+
+All fields with `?` are optional. Older documents have none of them and stay valid without a migration.
+
+- **Adjustment layer** (`kind: 'adjust'`): it has no paint. It changes the composite of everything below it. `Adjust` is levels, curves (2 to 16 points), hue/saturation, or brightness/contrast. The server refuses a plain stroke on an adjustment layer. A mask stroke is permitted.
+- **Clipping mask** (`clip: true`): the layer shows only where the nearest layer below it that is not clipped (the base) has alpha. The base and its clipped layers are a clipping group.
+- **Layer mask** (`mask`): strokes with `mask: <mask id>` on the layer. They paint grey on an implied white mask: black hides the layer, white shows it, and the eraser goes back to white. A new mask gets a new id. Thus the strokes of a deleted mask stay out of a later mask, and undo of the delete brings them back. `enabled: false` turns the mask off and keeps it.
 
 - `pts` is a flat array of `x, y, pressure` triples in world units. One world unit is one CSS pixel at 100% zoom.
 - `brush.size` is in world units. The client sets it from the brush size in screen pixels, divided by the zoom at the start of the stroke. Thus a 24 px brush draws a 24 px line at any zoom.
@@ -90,7 +100,22 @@ Render steps for one stroke:
 
 This gives the Photoshop split between opacity and flow. Flow builds up inside a stroke. Opacity caps the stroke.
 
-The tip is a radial stamp. The alpha is 1 inside `hardness × radius`, then a cosine falloff goes to 0 at the radius. The outer edge has one pixel of antialiasing. A cache keeps stamps by color, hardness, and size bucket (power of two).
+The round tip is a radial stamp. The alpha is 1 inside `hardness × radius`, then a cosine falloff goes to 0 at the radius. The outer edge has one pixel of antialiasing. A cache keeps stamps by color, hardness, and size bucket (power of two).
+
+Other tips (square, chalk, charcoal, bristle, splatter, pencil) and the grains (paper, canvas, noise) come from code in `src/client/engine/tips.ts`, with no image files. Thus both renderers get the same pixels. Each tip lies inside the unit circle, so a rotated dab never grows past its radius. A tip or grain id never changes after a release: a new look gets a new id.
+
+| Parameter | Range | Effect |
+|---|---|---|
+| tip | id | Shape of the dab. Hardness applies to `round` only |
+| angle | 0–360° | Rotation of the tip |
+| roundness | 5–100% | Squashes the tip along its height |
+| followDirection | on/off | Adds the stroke direction to the angle |
+| sizeJitter, opacityJitter | 0–1 | Random reduction of the size or the flow of each dab |
+| angleJitter | 0–1 | Random turn of each dab, as a fraction of 360° |
+| scatter | 0–4 | Random offset across the stroke, in diameters |
+| grain, grainScale, grainStrength | id, 0.1–10, 0–1 | Paper texture in stroke space: the grain origin is the first point, and one grain tile is `grainScale` diameters. Thus the grain stays the same at any zoom |
+
+Determinism: the random values come from a stateless hash of the stroke seed (from the stroke id) and the dab index. Thus every tile, every client, and every replay get the same jitter. The dab positions along the path do not depend on the random values. The client sends only the fields that differ from the default, so a plain stroke stays as small as before.
 
 For airbrush build-up, the client adds a point at the same position every 30 ms while the pen stays still. When `buildup` is on, a zero-length segment gives one dab. The points carry the build-up, so a replay gives the same result.
 
@@ -120,13 +145,20 @@ The client has two renderers with one interface (`src/client/engine/renderer.ts`
 - **Dabs:** one instanced draw call for each stroke and tile. The CPU computes each dab position relative to the target in double precision and sends small float32 numbers to the GPU. Thus deep zoom stays exact. A dab with a radius over 10^6 px gets a closer virtual center with the same edge. The fragment shader uses the same profile as the Canvas 2D stamp: a solid core, a cosine falloff, and one pixel of edge antialiasing.
 - **Tiles:** each tile is a float texture. The renderer updates tiles on the main thread in slices of about 6 ms per frame, from the center of the view out. A new stroke on top of a tile draws over the existing pixels. A removed or restored stroke makes the tile render again. A stale tile stays on screen until the new one is ready.
 - **Strokes in progress:** each one has a screen-size float buffer. New dabs draw into it as points arrive. After a pan or zoom, the buffer draws again from its dabs.
-- **Compositing:** the layers stack in a float buffer that starts with the paper color. A normal layer without a stroke in progress goes straight onto the stack with hardware blending. Other layers go into a layer buffer first, and a blend shader combines that buffer with the stack (two buffers in turn). The blend shader uses the W3C Compositing and Blending formulas, which include hue, saturation, color, and luminosity.
+- **Dab shader:** each dab instance has a rotation. The fragment shader applies the rotation and the roundness, then uses the analytic round profile or samples the tip from a texture array with mipmaps (the GPU selects the mip level from the dab size). Grain multiplies the alpha with a tileable texture. The CPU reduces the grain origin modulo one grain tile, so the numbers stay small at any zoom.
+- **Compositing:** the layers stack in a float buffer that starts with the paper color. A normal layer without a stroke in progress or a mask goes straight onto the stack with hardware blending. Other layers go into a layer buffer first, and a blend shader combines that buffer with the stack (two buffers in turn). The blend shader uses the W3C Compositing and Blending formulas, which include hue, saturation, color, and luminosity.
+- **Layer masks:** mask strokes have their own tile set (key `<layer>#<mask id>`). The renderer draws the mask tiles and mask strokes in progress into a mask buffer. A shader turns the grey into visibility `v = grey + (1 − alpha)` and multiplies the layer buffer by `v`.
+- **Clipping groups:** the base draws into a group buffer. Each clipped layer then draws with its blend mode, but only where the base has alpha (source-atop: the group alpha does not change). The group then goes onto the stack with the blend mode and opacity of the base.
+- **Adjustment layers:** one full-screen pass reads the stack and writes the adjusted result, mixed by the layer opacity and the mask visibility. Levels, curves, and brightness/contrast use a 1024-entry tone lookup texture (`src/client/engine/adjust.ts`). Hue/saturation uses HSL math in the shader. Inside a clipping group, an adjustment layer changes only the group.
+- The mask and group buffers are made at the first frame that needs them.
 - **Output:** the stack goes to the 8-bit canvas with a small triangular dither, so gradients do not show bands.
 - **Context loss:** a phone or a PWA in the background can lose the GPU context. The renderer then makes all GPU resources again and renders the tiles again.
 
 ### 6.3 Canvas 2D renderer (fallback)
 
 A worker holds a copy of all confirmed strokes and renders tiles with OffscreenCanvas. It sends each tile to the main thread as an `ImageBitmap` with zero-copy transfer. The main thread composites the tiles with Canvas 2D blend modes. Strokes in progress draw on the main thread with the same brush code.
+
+The fallback draws tips, rotation, roundness, and jitter, but not grain. It applies layer masks and adjustment layers on the CPU (`getImageData`), with the same formulas as the shaders. A clipped layer uses `source-atop`, so its blend mode is not applied (Canvas 2D has no blend mode with atop).
 
 ### 6.4 Strokes in progress and the handoff
 
@@ -135,6 +167,8 @@ A worker holds a copy of all confirmed strokes and renders tiles with OffscreenC
 - At pointer up, the client sends `stroke.add`. The buffer stays on screen until the tiles show the stroke. Then the client removes the buffer.
 
 ## 7. Sync protocol
+
+Document features: `welcome.features` lists the newer features the document uses (`adjust`, `clip`, `mask`, `tips`, from `src/shared/features.ts`). A client that does not know a feature shows "This canvas uses features from a newer Draw" and does not draw the canvas silently wrong. A `live` message for a stroke on a mask carries `mask`.
 
 Transport: JSON over WebSocket at `/ws?code=XXXX-XXXX`, with permessage-deflate.
 
@@ -276,7 +310,7 @@ For WebKitGTK and WKWebView, the desktop app reads the pen in the native layer (
 
 ### 9.2 Files (.bdraw)
 
-- Content: the document as the server sends it in `welcome` (`layers`: Layer[], `strokes`: Stroke[]), plus a header: `format: "bdraw"`, `version: 1`, the app version, the save time, and the source canvas (information only). Deleted layers and erased strokes are not in the file. Type: `src/shared/bdraw.ts`.
+- Content: the document as the server sends it in `welcome` (`layers`: Layer[], `strokes`: Stroke[]), plus a header: `format: "bdraw"`, `version: 2` (version 2 can hold adjustment layers, clipping, masks, and brush dynamics; the server reads versions 1 and 2), the app version, the save time, and the source canvas (information only). Deleted layers and erased strokes are not in the file. Type: `src/shared/bdraw.ts`.
 - Encoding: gzip-compressed JSON. Plain JSON is also valid. A browser without `CompressionStream` writes plain JSON.
 - Save: the save button or `Ctrl+S` writes the confirmed state of the client. A viewer can save too, because a viewer can see the full canvas.
 - Open: the open button, `Ctrl+O`, a file dropped on the window, the file manager (desktop app), or the installed PWA (Chromium `file_handlers`). The app always opens the file as a new online canvas with the same create form as the landing page. It never changes the canvas that the file came from.
