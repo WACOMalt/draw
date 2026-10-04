@@ -316,6 +316,7 @@ Desktop app on Windows and macOS (Tauri v2, `src-tauri/`; the Linux parts of `sr
 
 ## 11. Future work
 
+- Photoshop-style features, ranked by effort with implementation notes: [docs/ROADMAP.md](docs/ROADMAP.md) (adjustment layers, clipping masks, layer masks, brush textures, layer FX and blur, blur brushes, liquify, smudge)
 - Sign-in with Authentik (OIDC), Google, GitHub, Discord, and Facebook, through the `identities` table
 - Email invites for people without an account, and "request access"
 - Account settings: change email or name, delete the account
