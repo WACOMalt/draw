@@ -42,8 +42,44 @@ fn read_opened_file(path: String, state: tauri::State<Opened>) -> Result<tauri::
     std::fs::read(&path).map(tauri::ipc::Response::new).map_err(|e| e.to_string())
 }
 
+/// The .deb and .rpm packages install the .bdraw MIME type for the whole system. An AppImage
+/// cannot, and Gear Lever does not do it on install, so the AppImage registers the type for
+/// the current user (~/.local/share/mime), the same way AppImageLauncher would. Without it,
+/// file managers see a .bdraw file as plain gzip and do not offer Draw.
+#[cfg(target_os = "linux")]
+fn register_mime_for_appimage() {
+    use std::process::{Command, Stdio};
+    const XML: &str = include_str!("../mime/xyz.bsums.draw.xml");
+    if std::env::var_os("APPIMAGE").is_none() {
+        return;
+    }
+    let data_home = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".local/share"),
+            None => return,
+        },
+    };
+    let mime_dir = data_home.join("mime");
+    let file = mime_dir.join("packages/xyz.bsums.draw.xml");
+    if std::fs::read_to_string(&file).is_ok_and(|old| old == XML) {
+        return; // already registered
+    }
+    if std::fs::create_dir_all(mime_dir.join("packages")).and_then(|_| std::fs::write(&file, XML)).is_err() {
+        return;
+    }
+    // Rebuild the user's MIME cache, and the desktop-file cache so the MimeType line counts.
+    let quiet = |cmd: &str, dir: PathBuf| {
+        let _ = Command::new(cmd).arg(dir).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    };
+    quiet("update-mime-database", mime_dir);
+    quiet("update-desktop-database", data_home.join("applications"));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(register_mime_for_appimage);
     let opened = Opened::default();
     opened.add(std::env::args_os().skip(1).map(PathBuf::from));
     tauri::Builder::default()
