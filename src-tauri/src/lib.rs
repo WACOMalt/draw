@@ -62,15 +62,30 @@ fn register_mime_for_appimage() {
     };
     let mime_dir = data_home.join("mime");
     let file = mime_dir.join("packages/xyz.bsums.draw.xml");
-    if std::fs::read_to_string(&file).is_ok_and(|old| old == XML) {
+    // Check the built cache, not only our XML: a failed rebuild then repairs itself next start.
+    let in_cache = std::fs::read_to_string(mime_dir.join("globs2")).is_ok_and(|g| g.contains(":application/x-bdraw:"));
+    if in_cache && std::fs::read_to_string(&file).is_ok_and(|old| old == XML) {
         return; // already registered
     }
     if std::fs::create_dir_all(mime_dir.join("packages")).and_then(|_| std::fs::write(&file, XML)).is_err() {
         return;
     }
     // Rebuild the user's MIME cache, and the desktop-file cache so the MimeType line counts.
+    // These are the system's tools: run them without the AppImage's environment. Its
+    // LD_LIBRARY_PATH points at the bundled (older) GLib, and the system tool then fails with
+    // "undefined symbol: g_string_free_and_steal".
     let quiet = |cmd: &str, dir: PathBuf| {
-        let _ = Command::new(cmd).arg(dir).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let mut c = Command::new(cmd);
+        c.env_clear().arg(dir).stdout(Stdio::null()).stderr(Stdio::null());
+        for key in ["PATH", "HOME"] {
+            if let Some(v) = std::env::var_os(key) {
+                c.env(key, v);
+            }
+        }
+        match c.status() {
+            Ok(st) if st.success() => {}
+            other => eprintln!("draw: {cmd} failed: {other:?}"),
+        }
     };
     quiet("update-mime-database", mime_dir);
     quiet("update-desktop-database", data_home.join("applications"));
