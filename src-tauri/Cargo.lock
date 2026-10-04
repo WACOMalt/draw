@@ -671,10 +671,17 @@ dependencies = [
 name = "draw"
 version = "0.2.0"
 dependencies = [
+ "block2",
+ "gtk",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-web-kit",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
+ "webkit2gtk",
 ]
 
 [[package]]

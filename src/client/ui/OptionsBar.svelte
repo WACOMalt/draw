@@ -39,19 +39,19 @@
   .opts {
     grid-area: opts;
     display: flex;
+    flex-wrap: wrap; /* never cut off controls: a narrow window gets a second row */
     align-items: center;
-    gap: 16px;
-    padding: 0 12px;
+    gap: 4px 16px;
+    padding: 4px 12px;
     background: var(--bg-2);
     border-bottom: 1px solid var(--border);
-    overflow-x: auto;
-    scrollbar-width: none;
   }
   .tool {
     font-weight: 600;
     min-width: 66px;
   }
   .stacked {
+    flex-wrap: nowrap;
     flex-direction: column;
     align-items: stretch;
     gap: 6px;

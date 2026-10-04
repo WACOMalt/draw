@@ -13,6 +13,7 @@ import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
 import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
+import { nativePenFor } from './nativePen';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
 // This range stays precise for drawings within about 1e4 world units of where you work.
@@ -369,7 +370,7 @@ export class Engine {
   private onPointerDown(e: PointerEvent): void {
     const [x, y] = this.local(e);
     this.stopFlight(); // any touch stops a fly-to
-    if (e.pointerType === 'pen') this.penSeen = true;
+    if (e.pointerType === 'pen' || nativePenFor(e)) this.penSeen = true;
     if (e.pointerType === 'touch' && this.onTouchDown(e, x, y)) return;
     if (this.stroke || this.pan || this.picking !== null) return;
     try {
@@ -384,13 +385,15 @@ export class Engine {
       this.updateCursor();
       return;
     }
-    if (e.button !== 0) return;
-    if (tool === 'eyedropper') {
+    // The eraser end of a pen erases, whatever tool is selected.
+    const eraserEnd = this.isEraserEnd(e);
+    if (e.button !== 0 && !eraserEnd) return;
+    if (tool === 'eyedropper' && !eraserEnd) {
       this.picking = e.pointerId;
       this.pick(x, y);
       return;
     }
-    this.beginStroke(e, x, y);
+    this.beginStroke(e, x, y, eraserEnd);
   }
 
   private onPointerMove(e: PointerEvent): void {
@@ -551,8 +554,16 @@ export class Engine {
   }
 
   private pressure(e: PointerEvent): number {
-    // Mice report 0.5 while pressed. Only pens give a real pressure.
-    return e.pointerType === 'pen' ? e.pressure : 1;
+    // Mice report 0.5 while pressed. Only pens give a real pressure: from the engine, or from
+    // the desktop app's native layer when the engine calls the pen a mouse (nativePen.ts).
+    if (e.pointerType === 'pen') return e.pressure;
+    return nativePenFor(e)?.pressure ?? 1;
+  }
+
+  /** Chromium and Firefox send the eraser end as button 5 (buttons bit 32); see also nativePen.ts. */
+  private isEraserEnd(e: PointerEvent): boolean {
+    if (e.pointerType === 'pen') return e.button === 5 || (e.buttons & 32) !== 0;
+    return !!nativePenFor(e)?.eraser;
   }
 
   private sendCursor(wx: number, wy: number): void {
@@ -574,12 +585,12 @@ export class Engine {
 
   // --- strokes --------------------------------------------------------------------------------
 
-  private beginStroke(e: PointerEvent, x: number, y: number): void {
+  private beginStroke(e: PointerEvent, x: number, y: number, eraserEnd = false): void {
     if (!ed.canEdit) return showToast('View only: you can look around but not draw');
     const layer = this.activeLayer();
     if (!layer) return showToast('Add a layer first');
     if (!layer.visible) return showToast('The active layer is hidden');
-    const tool = this.effectiveTool();
+    const tool = eraserEnd ? 'eraser' : this.effectiveTool();
     const settings = tool === 'eraser' ? ed.eraser : ed.brush;
     // Size is in screen pixels: what you see is what you draw, at any zoom.
     const zoom = this.comp.view.zoom;

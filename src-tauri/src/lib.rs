@@ -5,7 +5,10 @@
 // (Windows, Linux) or sends RunEvent::Opened (macOS). The page asks for those paths and reads
 // them through the two commands below, which only read files the system opened the app with.
 
+mod pen;
+
 use std::{collections::HashSet, path::PathBuf, sync::Mutex};
+use tauri::Manager;
 
 #[derive(Default)]
 struct Opened {
@@ -102,12 +105,22 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![take_opened_files, read_opened_file])
+        .setup(|app| {
+            // Pen pressure from the native layer (see pen.rs).
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(|webview| pen::attach(webview.inner()))?;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let _ = app;
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building the Draw app")
         .run(|_app, _event| {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if let tauri::RunEvent::Opened { urls } = _event {
-                use tauri::{Emitter, Manager};
+                use tauri::Emitter;
                 _app.state::<Opened>().add(urls.into_iter().filter_map(|u| u.to_file_path().ok()));
                 let _ = _app.emit("opened-files", ());
             }

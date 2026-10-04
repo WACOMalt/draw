@@ -182,7 +182,8 @@
     height: 100%;
     height: 100dvh;
     display: grid;
-    grid-template-rows: 36px 38px 1fr 24px;
+    /* The options bar wraps to more rows in a narrow window (minmax: one row of 38px). */
+    grid-template-rows: 36px minmax(38px, auto) 1fr 24px;
     grid-template-columns: 44px 1fr 264px;
     grid-template-areas:
       'top top top'

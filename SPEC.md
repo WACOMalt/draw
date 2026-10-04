@@ -20,7 +20,7 @@ In scope:
 - Live view of the strokes and cursors of other users
 - Sessions that stay after a server restart
 - Export of the current view as PNG
-- Save a canvas to a `.bdraw` file, and open a `.bdraw` file as a new online canvas (section 9.1)
+- Save a canvas to a `.bdraw` file, and open a `.bdraw` file as a new online canvas (section 9.2)
 - Sessions with a random code or with a name that a person selects
 - Phone and tablet use: touch gestures and a phone layout
 - Installation as a Progressive Web App (PWA)
@@ -224,7 +224,7 @@ At load, the server replays the op log to build the document. Limits: 4 MB per m
 The layout is close to Photoshop, but simpler, with a dark theme.
 
 - Top bar: app name, session code with a copy-link button, peer avatars, connection state
-- Options bar: the settings of the current tool (size, opacity, flow, hardness, spacing, pressure, build-up)
+- Options bar: the settings of the current tool (size, opacity, flow, hardness, spacing, pressure, build-up). In a narrow window, the bar wraps to a second row. It never cuts off a control.
 - Left toolbar: brush (B), eraser (E), eyedropper (I), hand (H), foreground and background colors
 - Right panels: Color, Layers
 - Status bar: zoom, cursor position in world units, stroke count
@@ -261,7 +261,20 @@ PWA: the app has a web manifest, icons (also maskable), and a service worker. Th
 
 The landing page keeps a list of recent sessions in local storage on each device. With an account, it shows a name field (empty: "Random code") and two buttons, "Create private canvas" and "Create public canvas". Without an account, it shows "New canvas" (temporary). In the web app (not the desktop app), a "Download app" button opens the latest GitHub release.
 
-### 9.1 Files (.bdraw)
+### 9.1 Pen input
+
+The client reads pens through Pointer Events: `pointerType` "pen", `pressure`, and `getCoalescedEvents()`. The eraser end of a pen (button 5, or bit 32 of `buttons`) always erases, whatever tool is selected.
+
+| Engine | Pen and pressure |
+|---|---|
+| Chromium (Chrome, Edge, WebView2 in the Windows app) | Yes. On Windows, a Wacom driver must have "Use Windows Ink" on. On Linux with native Wayland, tablet support is not reliable: `--ozone-platform=x11` is a workaround. |
+| Firefox | Yes, on Windows and macOS. On Linux, from Firefox 129 (X11 and Wayland). |
+| WebKitGTK (the Linux app) | No. Every pointer is a mouse with pressure 0 (WebKit bug 204115). |
+| WKWebView and Safari (the macOS app) | No. Pressure comes only from Force Touch trackpads, not from tablets. |
+
+For WebKitGTK and WKWebView, the desktop app reads the pen in the native layer (`src-tauri/src/pen.rs`). On Linux, it connects to the GTK motion and button signals of the WebKitWebView and reads the device source (pen or eraser) and the pressure axis. On macOS, an AppKit local event monitor reads tablet-point and tablet-proximity events. For each pen event, the native layer runs `window.__drawPen(pressure, eraser)` in the page before the engine forwards the same event. Thus the page has the pressure when its pointer event arrives. It runs `__drawPen(null)` when another device moves. The client (`engine/nativePen.ts`) uses these values only for pointer events that the engine reports as a mouse.
+
+### 9.2 Files (.bdraw)
 
 - Content: the document as the server sends it in `welcome` (`layers`: Layer[], `strokes`: Stroke[]), plus a header: `format: "bdraw"`, `version: 1`, the app version, the save time, and the source canvas (information only). Deleted layers and erased strokes are not in the file. Type: `src/shared/bdraw.ts`.
 - Encoding: gzip-compressed JSON. Plain JSON is also valid. A browser without `CompressionStream` writes plain JSON.
