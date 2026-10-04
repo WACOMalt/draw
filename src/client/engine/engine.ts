@@ -119,6 +119,7 @@ export class Engine {
     const ro = new ResizeObserver(() => this.resize());
     ro.observe(canvas);
     this.cleanup.push(() => ro.disconnect());
+    this.watchPixelRatio();
     this.resize();
 
     this.net = new Net(
@@ -188,8 +189,26 @@ export class Engine {
 
   private resize(): void {
     this.rect = this.canvas.getBoundingClientRect();
-    this.comp.resize(this.rect.width, this.rect.height, window.devicePixelRatio || 1);
+    const dpr = window.devicePixelRatio || 1;
+    this.comp.resize(this.rect.width, this.rect.height, dpr);
+    ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit · ${+dpr.toFixed(2)}×`;
     this.syncView();
+  }
+
+  /**
+   * Moving the window to a monitor with another scale (say 1 to 1.35) changes devicePixelRatio
+   * but often not the CSS size, so the ResizeObserver stays quiet and the canvas would keep
+   * the old resolution, stretched. A resolution media query reports the change.
+   */
+  private watchPixelRatio(): void {
+    const mq = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    const onChange = () => {
+      mq.removeEventListener('change', onChange);
+      this.resize();
+      this.watchPixelRatio();
+    };
+    mq.addEventListener('change', onChange);
+    this.cleanup.push(() => mq.removeEventListener('change', onChange));
   }
 
   private restoreView(): void {
