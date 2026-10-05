@@ -342,6 +342,17 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 - Apply: a click sets the brush (or the eraser, while it is the tool). Settings that the preset does not hold go back to their defaults.
 - API: `GET /api/presets`, `POST /api/presets` (`name`, `settings`, `anon`, `creatorName`), `POST /api/presets/<id>/delete` (`anon`). Limits: 30 saves per hour per IP address, 300 presets per creator, 5000 in total.
 
+### 9.4 Embeds
+
+An embed is a live, view-only copy of a canvas on another site, in an `<iframe>`.
+
+- Address: `/e/<code>?k=<token>&r=<x>,<y>,<w>,<h>`. `r` is the world rectangle to frame. `x` and `y` keep a precision of 1/10 000 of the width. `k` is present only when the canvas link is off (then it is the private view link token).
+- Get the code: Share dialog, section "Embed on a website" (owners only). The frame is the area on screen when the dialog opens. The section shows a live preview and the HTML to copy: full width (or a fixed width in pixels), with the aspect ratio of the view. If the canvas link is off and the private view link is off too, the section offers to turn on the private view link.
+- The page shows only the drawing. It fits the frame in the box, centered, and fits it again when the box changes size, until the viewer moves the view.
+- Controls: drag (or one finger) pans, two fingers pinch zoom. The wheel zooms only after a click inside the embed or with Ctrl. Before that, the wheel scrolls the page around the embed, and a hint says to click first. Buttons: zoom in, zoom out, back to the framed view, full screen, open in Draw.
+- Server: a `hello` with `embed: true` gets access from the link only. The server ignores the account and the anonymous secret, so the owner's own preview shows what visitors see. The role is at most viewer, also with an edit link. Other people do not see an embed (no `peer.join`, `peer.leave` or cursor), and the embed sees no people.
+- An embed cannot ask for a join password. It shows "This drawing needs a password". Rename, or turning off or resetting the link it uses, stops it.
+
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).

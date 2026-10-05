@@ -185,6 +185,11 @@ export type ClientMsg =
       password?: string;
       /** Proof of an earlier correct join password, from welcome.grant. */
       grant?: string;
+      /**
+       * An embed on another site (/e/CODE): access from the link alone (no account, no
+       * anonymous secret), at most view only, and not shown to other people.
+       */
+      embed?: boolean;
     }
   | { t: 'op'; opId: string; op: Op }
   | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }

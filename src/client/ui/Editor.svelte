@@ -164,7 +164,7 @@
         {/if}
       {/if}
     </div>
-    {#if ed.shareOpen}<ShareDialog {code} onDeleted={onLeave} />{/if}
+    {#if ed.shareOpen}<ShareDialog {code} {engine} onDeleted={onLeave} />{/if}
     {#if narrow}
       <MobileBar {engine} bind:sheet />
     {:else}

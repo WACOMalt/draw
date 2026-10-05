@@ -49,6 +49,8 @@ export interface Client {
   /** Access inputs from the upgrade request and the hello; kept for re-checks. */
   access: AccessInput;
   role: Role | null;
+  /** An embed: view only at most, not a peer that others see, sends no cursor. */
+  embed: boolean;
   joining: boolean;
   passwordTries: number;
   ops: Bucket;
@@ -63,6 +65,7 @@ export function newClient(ws: WebSocket, user: UserRow | undefined): Client {
     peer: null,
     access: { user },
     role: null,
+    embed: false,
     joining: false,
     passwordTries: 0,
     ops: new Bucket(200, 60),
@@ -223,7 +226,7 @@ export class Session {
 
   leave(client: Client): void {
     this.clients.delete(client.id);
-    if (client.peer) this.broadcast({ t: 'peer.leave', id: client.id });
+    if (client.peer && !client.embed) this.broadcast({ t: 'peer.leave', id: client.id });
   }
 
   async handle(client: Client, msg: ClientMsg): Promise<void> {
@@ -269,7 +272,7 @@ export class Session {
         if (typeof msg.id === 'string') this.broadcast({ t: 'live.end', by: client.id, id: msg.id }, client);
         return;
       case 'cursor': {
-        if (!client.cursor.take()) return;
+        if (client.embed || !client.cursor.take()) return;
         const coord = (v: unknown) =>
           v === null ? null : validateNumber(v, -LIMITS.maxCoord, LIMITS.maxCoord, 'cursor');
         try {
@@ -296,9 +299,13 @@ export class Session {
     client.joining = true;
     try {
       const str = (v: unknown, max = 200) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : undefined);
+      // An embed gets access from its link only, so the owner's own preview shows exactly what
+      // visitors of the other site see (their cookie does not reach a third-party frame).
+      client.embed = msg.embed === true;
+      if (client.embed) client.access.user = undefined;
       // The web app authenticates with its cookie at the upgrade; the desktop app sends a token.
-      client.access.user ??= userFromToken(this.store, str(msg.token));
-      const anon = str(msg.anon);
+      else client.access.user ??= userFromToken(this.store, str(msg.token));
+      const anon = client.embed ? undefined : str(msg.anon);
       client.access.anonHash = anon ? sha256(anon) : undefined;
       client.access.link = str(msg.link);
       client.access.grant = str(msg.grant);
@@ -317,7 +324,7 @@ export class Session {
         return this.kick(client, access.reason);
       }
       if (access.grant) client.access.grant = access.grant;
-      client.role = access.role;
+      client.role = client.embed ? 'viewer' : access.role;
 
       let name = 'Guest';
       let color = '#31a8ff';
@@ -330,7 +337,7 @@ export class Session {
       if (client.access.user) name = client.access.user.name.slice(0, LIMITS.maxPeerName);
       client.peer = { id: client.id, name, color };
       const peers: Peer[] = [];
-      for (const c of this.clients.values()) if (c.peer && c !== client) peers.push(c.peer);
+      if (!client.embed) for (const c of this.clients.values()) if (c.peer && c !== client && !c.embed) peers.push(c.peer);
       this.send(client, {
         t: 'welcome',
         clientId: client.id,
@@ -344,7 +351,7 @@ export class Session {
         grant: access.grant,
         features: docFeatures(this.layers.values(), this.strokes.values()),
       });
-      this.broadcast({ t: 'peer.join', peer: client.peer }, client);
+      if (!client.embed) this.broadcast({ t: 'peer.join', peer: client.peer }, client);
     } finally {
       client.joining = false;
     }
@@ -382,8 +389,8 @@ export class Session {
         this.kick(c, access.reason);
         continue;
       }
-      c.role = access.role;
-      this.send(c, { t: 'access', role: access.role, canvas: this.info(c) });
+      c.role = c.embed ? 'viewer' : access.role;
+      this.send(c, { t: 'access', role: c.role, canvas: this.info(c) });
     }
   }
 

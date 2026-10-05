@@ -1,10 +1,13 @@
 <script lang="ts">
   import { api, errorText } from '../api';
+  import { PUBLIC_ORIGIN } from '../config';
+  import { embedCode, embedUrl } from '../embed';
+  import type { Engine } from '../engine/engine';
   import { followRename } from '../identity';
   import { ed, showToast } from '../state.svelte';
   import Modal from './Modal.svelte';
 
-  let { code, onDeleted }: { code: string; onDeleted: () => void } = $props();
+  let { code, engine, onDeleted }: { code: string; engine: Engine | null; onDeleted: () => void } = $props();
 
   interface Member {
     id: string;
@@ -30,6 +33,28 @@
   let transferTo = $state('');
   let newName = $state('');
   let busy = $state(false);
+
+  // Embed: the area on screen when the dialog opened. The canvas link gives view access by
+  // itself unless it is off; then the embed needs the private view link's token.
+  // Read once, on purpose: moving the view under the open dialog does not change the frame.
+  const shot = (() => engine?.viewRect() ?? null)();
+  let embedOpen = $state(false);
+  let embedWidth = $state<number | null>(null);
+  const embedToken = $derived(
+    !s || s.codeRole !== 'none' ? null : s.viewLink ? new URL(s.viewLink).searchParams.get('k') : null,
+  );
+  const canEmbed = $derived(!!s && !!shot && (s.codeRole !== 'none' || !!embedToken));
+  const embedSrc = $derived(s && shot && canEmbed ? embedUrl(PUBLIC_ORIGIN, s.key, embedToken, shot.bounds) : '');
+  const embedHtml = $derived(embedSrc && shot ? embedCode(embedSrc, shot.w, shot.h, embedWidth && embedWidth > 0 ? Math.round(embedWidth) : null) : '');
+
+  async function copyEmbed() {
+    try {
+      await navigator.clipboard.writeText(embedHtml);
+      showToast('Embed code copied');
+    } catch {
+      showToast('Select the code and copy it');
+    }
+  }
 
   const path = $derived(`/api/canvases/${encodeURIComponent(code)}`);
 
@@ -187,6 +212,34 @@
 
     {#if error}<p class="error">{error}</p>{/if}
 
+    <details bind:open={embedOpen}>
+      <summary>Embed on a website</summary>
+      {#if !shot}
+        <p class="muted">Open the canvas first.</p>
+      {:else if !canEmbed}
+        <p class="muted">The canvas link is off, so an embed needs the private view link.</p>
+        <button class="small" disabled={busy} onclick={() => call('POST', '/links', { kind: 'view', action: 'enable' })}>Turn on the private view link</button>
+      {:else}
+        <p class="muted note">
+          A live, view-only copy of the area you see now. Visitors can pan and zoom, but not draw, and other people do not see them. To frame
+          another area, close this window, move the view, and open Share again.
+        </p>
+        {#if embedOpen}
+          <iframe class="preview" src={embedSrc} title="Embed preview" style:aspect-ratio="{shot.w} / {shot.h}" style:width="min(100%, {Math.round((200 * shot.w) / shot.h)}px)"></iframe>
+        {/if}
+        <div class="row">
+          <label class="width">Width <input type="number" min="100" max="4000" placeholder="Full" bind:value={embedWidth} /> px</label>
+          <span class="muted">{embedWidth ? 'Fixed width' : 'Full width of the page'}, height from the shape of your view</span>
+        </div>
+        <div class="row">
+          <textarea readonly rows="3" value={embedHtml} onfocus={(e) => e.currentTarget.select()}></textarea>
+          <button onclick={copyEmbed}>Copy</button>
+        </div>
+        {#if s.password}<p class="muted note">The canvas has a join password. An embed cannot ask for it, so it shows "This drawing needs a password".</p>{/if}
+        <p class="muted note">The embed stops working if you rename the canvas, or turn off or reset the link it uses ({embedToken ? 'the private view link' : 'the canvas link'}).</p>
+      {/if}
+    </details>
+
     <details>
       <summary>Address, ownership and deletion</summary>
       <form class="row" onsubmit={(e) => (e.preventDefault(), rename({ name: newName }))}>
@@ -286,5 +339,38 @@
   select {
     padding: 4px;
     max-width: 100%;
+  }
+  .preview {
+    display: block;
+    margin: 8px 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg-0);
+  }
+  textarea {
+    flex: 1;
+    min-width: 0;
+    resize: vertical;
+    font: 11px/1.4 ui-monospace, monospace;
+    padding: 6px 8px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    user-select: text;
+  }
+  .width {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    white-space: nowrap;
+  }
+  .width input {
+    width: 76px;
+  }
+  .row .muted {
+    align-self: center;
+    font-size: 11px;
   }
 </style>

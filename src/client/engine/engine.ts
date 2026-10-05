@@ -143,15 +143,28 @@ export class Engine {
   private markersCost = 0;
   private markersTimer: number | undefined;
   private flying = false;
+  /** Embed mode: the world rectangle the embed frames. Null in the editor. */
+  private frame: Bounds | null;
+  /** Embed: the viewer moved the view, so a resize keeps it (else it refits the frame). */
+  private moved = false;
+  /** Embed: the wheel zooms only after a click inside (or with Ctrl), so the page scrolls. */
+  private engaged = false;
+  private wheelHintAt = 0;
 
+  /**
+   * `frame` turns on embed mode: view only, no presence and no cursor, pan and zoom only, and
+   * the view starts on (and resets to) that rectangle. Nothing is saved in the browser.
+   */
   constructor(
     private code: string,
     private canvas: HTMLCanvasElement,
     private brushCursor: HTMLElement,
+    frame: Bounds | null = null,
   ) {
+    this.frame = frame;
     const k = new URLSearchParams(location.search).get('k');
-    if (k) links.set(code, k);
-    this.link = k ?? links.get(code);
+    if (k && !frame) links.set(code, k);
+    this.link = k ?? (frame ? undefined : links.get(code));
     this.comp = createRenderer(canvas);
     ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit`;
     this.rect = canvas.getBoundingClientRect();
@@ -177,20 +190,27 @@ export class Engine {
     this.listen(canvas, 'pointerleave', () => this.onPointerLeave());
     this.listen(canvas, 'wheel', (e) => this.onWheel(e as WheelEvent), { passive: false });
     this.listen(canvas, 'contextmenu', (e) => e.preventDefault());
-    this.listen(window, 'keydown', (e) => this.onKey(e as KeyboardEvent, true));
-    this.listen(window, 'keyup', (e) => this.onKey(e as KeyboardEvent, false));
+    if (!frame) {
+      this.listen(window, 'keydown', (e) => this.onKey(e as KeyboardEvent, true));
+      this.listen(window, 'keyup', (e) => this.onKey(e as KeyboardEvent, false));
+    }
     this.listen(window, 'blur', () => {
       this.spaceDown = this.altDown = false;
       this.updateCursor();
     });
     const sweep = window.setInterval(() => this.comp.sweepLive(), 1000);
     this.cleanup.push(() => window.clearInterval(sweep));
+    if (frame) this.updateCursor();
   }
 
   /** Share-link token: from the URL (?k=), else the one this canvas was opened with before. */
   private link: string | undefined;
 
   private hello(password?: string): void {
+    if (this.frame) {
+      this.net.send({ t: 'hello', name: '', color: '#000000', link: this.link, embed: true });
+      return;
+    }
     this.net.send({
       t: 'hello',
       name: ed.name,
@@ -233,6 +253,8 @@ export class Engine {
     const dpr = window.devicePixelRatio || 1;
     this.comp.resize(this.rect.width, this.rect.height, dpr);
     ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit · ${+dpr.toFixed(2)}×`;
+    // An embed keeps its frame filling the box until the viewer moves the view.
+    if (this.frame && !this.moved) return this.showFrame();
     this.syncView();
   }
 
@@ -253,6 +275,7 @@ export class Engine {
   }
 
   private restoreView(): void {
+    if (this.frame) return this.showFrame();
     try {
       const v = JSON.parse(localStorage.getItem(`draw.view.${this.code}`) ?? 'null');
       if (v && Number.isFinite(v.x) && Number.isFinite(v.y) && v.zoom > 0) {
@@ -270,6 +293,7 @@ export class Engine {
   private syncView(): void {
     const v = this.comp.view;
     ed.view = { x: v.x, y: v.y, zoom: v.zoom };
+    if (this.frame) return; // no markers, and nothing saved for an embed
     this.updateBrushCursor();
     this.scheduleMarkers();
     window.clearTimeout(this.saveTimer);
@@ -288,8 +312,32 @@ export class Engine {
   }
 
   zoomBy(factor: number): void {
+    this.moved = true;
     const { w, h } = this.comp.size;
     this.zoomAt(w / 2, h / 2, this.comp.view.zoom * factor);
+  }
+
+  /** Embed: scales the frame to fit the box, centered (no animation). */
+  private showFrame(): void {
+    const f = this.frame!;
+    const { w, h } = this.comp.size;
+    const fw = Math.max(f.x1 - f.x0, 1e-300), fh = Math.max(f.y1 - f.y0, 1e-300);
+    const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(w / fw, h / fh)));
+    this.setView((f.x0 + f.x1) / 2 - w / 2 / z, (f.y0 + f.y1) / 2 - h / 2 / z, z);
+  }
+
+  /** Embed: flies back to the framed view; a resize then refits it again. */
+  resetFrame(): void {
+    if (!this.frame) return;
+    this.moved = false;
+    this.flyTo(this.frame, 1);
+  }
+
+  /** The world rectangle on screen, and the screen size in CSS pixels (for an embed code). */
+  viewRect(): { bounds: Bounds; w: number; h: number } {
+    const { w, h } = this.comp.size;
+    const v = this.comp.view;
+    return { bounds: { x0: v.x, y0: v.y, x1: v.x + w / v.zoom, y1: v.y + h / v.zoom }, w, h };
   }
 
   resetView(): void {
@@ -311,7 +359,7 @@ export class Engine {
    */
   scheduleMarkers(): void {
     window.clearTimeout(this.markersTimer);
-    if (this.flying) return;
+    if (this.flying || this.frame) return;
     const run = () => {
       const t0 = performance.now();
       this.markersAt = t0;
@@ -401,7 +449,7 @@ export class Engine {
   // --- tools and cursor ---------------------------------------------------------------------
 
   private effectiveTool(): Tool {
-    if (this.spaceDown || this.pan) return 'hand';
+    if (this.frame || this.spaceDown || this.pan) return 'hand';
     if (this.altDown && (ed.tool === 'brush' || ed.tool === 'eraser')) return 'eyedropper';
     return ed.tool;
   }
@@ -438,6 +486,7 @@ export class Engine {
     if (e.pointerType === 'pen' || nativePenFor(e)) this.penSeen = true;
     if (e.pointerType === 'touch' && this.onTouchDown(e, x, y)) return;
     if (this.stroke || this.pan || this.picking !== null) return;
+    this.engaged = true;
     try {
       this.canvas.setPointerCapture(e.pointerId);
     } catch {
@@ -469,13 +518,16 @@ export class Engine {
       if (this.ignoredTouches.has(e.pointerId) || this.touchLock) return;
     }
     // Only a hovering mouse or pen shows the brush outline.
-    this.pointer = e.pointerType === 'touch' ? null : { x, y };
-    const [wx, wy] = this.comp.toWorld(x, y);
-    ed.cursor = { x: wx, y: wy };
-    this.updateBrushCursor();
-    this.sendCursor(wx, wy);
+    if (!this.frame) {
+      this.pointer = e.pointerType === 'touch' ? null : { x, y };
+      const [wx, wy] = this.comp.toWorld(x, y);
+      ed.cursor = { x: wx, y: wy };
+      this.updateBrushCursor();
+      this.sendCursor(wx, wy);
+    }
 
     if (this.pan && e.pointerId === this.pan.pointerId) {
+      this.moved = true;
       const v = this.comp.view;
       this.setView(v.x - (x - this.pan.x) / v.zoom, v.y - (y - this.pan.y) / v.zoom, v.zoom);
       this.pan.x = x;
@@ -520,6 +572,10 @@ export class Engine {
   }
 
   private onPointerLeave(): void {
+    if (this.frame) {
+      this.engaged = false; // back to page scrolling once the pointer is outside
+      return;
+    }
     if (this.stroke) return;
     this.pointer = null;
     ed.cursor = null;
@@ -591,6 +647,7 @@ export class Engine {
     const dist = Math.max(1, Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]));
     if (Math.hypot(mx - g.mid0[0], my - g.mid0[1]) > TAP_SLOP || Math.abs(dist - g.dist0) > TAP_SLOP) g.moved = true;
     const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (g.zoom0 * dist) / g.dist0));
+    this.moved = true;
     this.setView(g.world0[0] - mx / z, g.world0[1] - my / z, z);
   }
 
@@ -598,7 +655,7 @@ export class Engine {
     const g = this.gesture!;
     this.gesture = null;
     this.touchLock = false;
-    if (g.moved || performance.now() - g.t0 > TAP_MS) return;
+    if (this.frame || g.moved || performance.now() - g.t0 > TAP_MS) return;
     if (g.maxTouches === 2) this.undo();
     else if (g.maxTouches === 3) this.redo();
   }
@@ -614,6 +671,16 @@ export class Engine {
   }
 
   private onWheel(e: WheelEvent): void {
+    if (this.frame && !this.engaged && !e.ctrlKey && !e.metaKey) {
+      // The page scrolls past the embed. Trackpad pinch arrives with ctrlKey and still zooms.
+      const now = performance.now();
+      if (now - this.wheelHintAt > 4000) {
+        this.wheelHintAt = now;
+        showToast('Click the drawing first to zoom with the wheel');
+      }
+      return;
+    }
+    this.moved = true;
     e.preventDefault();
     this.stopFlight();
     const [x, y] = this.local(e);
@@ -1150,7 +1217,7 @@ export class Engine {
         if (m.role !== ed.role) showToast(m.role === 'viewer' ? 'You can now only view this canvas' : m.role === 'owner' ? 'You own this canvas now' : 'You can now edit this canvas');
         ed.role = m.role;
         ed.canvas = m.canvas;
-        if (m.canvas.key !== this.code) followRename(this.code, m.canvas.key);
+        if (m.canvas.key !== this.code && !this.frame) followRename(this.code, m.canvas.key);
         break;
       case 'denied':
         ed.denied = m.reason;

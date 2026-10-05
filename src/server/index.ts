@@ -119,7 +119,7 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
   } catch {
     return void res.writeHead(400).end('bad request');
   }
-  if (rel === '/' || rel.startsWith('/s/')) rel = '/index.html';
+  if (rel === '/' || rel.startsWith('/s/') || rel.startsWith('/e/')) rel = '/index.html';
   const file = path.join(STATIC_DIR, path.normalize(rel));
   if (!file.startsWith(STATIC_DIR + path.sep)) return void res.writeHead(403).end();
   fs.stat(file, (err, st) => {

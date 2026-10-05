@@ -373,6 +373,38 @@ try {
   check((await anonP.api('POST', `/api/presets/${vSaved.data.preset.id}/delete`, { anon: anonP.anon })).status === 403, 'an anonymous browser cannot delete an account preset');
   check((await admin.api('POST', `/api/presets/${vSaved.data.preset.id}/delete`, {})).status === 200, 'the admin deletes any preset');
 
+  // --- embeds -------------------------------------------------------------------------------------
+  const emb = (await funky.api('POST', '/api/sessions', { name: 'embed-test' })).data.key;
+  await funky.api('POST', `/api/canvases/${emb}/links`, { kind: 'code', role: 'editor' });
+  const embShare = (await funky.api('GET', `/api/canvases/${emb}/sharing`)).data;
+  const embEditTok = new URL(embShare.editLink).searchParams.get('k');
+  const ownerConn = await funky.join(emb);
+  const ownerWelcome = await first(ownerConn);
+  check(ownerWelcome?.role === 'owner', 'embed test: owner joins');
+  const embConn = await new Browser().join(emb, { embed: true });
+  const embWelcome = await first(embConn);
+  check(embWelcome?.role === 'viewer' && embWelcome.peers.length === 0, 'embed of a public canvas: view only, sees no people');
+  await sleep(200);
+  check(!ownerConn.msgs.some((m) => m.t === 'peer.join'), 'other people do not see an embed join');
+  embConn.send(strokeOp(layerId(embWelcome), 7));
+  check((await embConn.next((m) => m.t === 'reject'))?.reason === 'view only', 'an embed cannot draw');
+  embConn.send({ t: 'cursor', x: 1, y: 2, layerId: null });
+  await sleep(200);
+  check(!ownerConn.msgs.some((m) => m.t === 'cursor'), 'an embed sends no cursor');
+  ownerConn.send(strokeOp(layerId(ownerWelcome), 8));
+  check(!!(await embConn.next((m) => m.t === 'op' && m.op.type === 'stroke.add')), 'an embed gets new strokes live');
+  check((await first(await new Browser().join(emb, { embed: true, link: embEditTok })))?.role === 'viewer', 'an embed with the edit link is still view only');
+  await new Browser().join(emb);
+  check(!!(await ownerConn.next((m) => m.t === 'peer.join')), 'a normal visitor still shows up');
+  embConn.ws.close();
+  await sleep(200);
+  check(!ownerConn.msgs.some((m) => m.t === 'peer.leave' && m.id === embWelcome.clientId), 'an embed leaves without a trace');
+  await funky.api('POST', `/api/canvases/${emb}/links`, { kind: 'code', role: 'none' });
+  check((await first(await funky.join(emb, { embed: true })))?.reason === 'login_required', "an embed ignores the owner's login: a private canvas needs a link");
+  const embView = (await funky.api('POST', `/api/canvases/${emb}/links`, { kind: 'view', action: 'enable' })).data;
+  const embViewTok = new URL(embView.viewLink).searchParams.get('k');
+  check((await first(await new Browser().join(emb, { embed: true, link: embViewTok })))?.role === 'viewer', 'a private canvas embeds with the private view link');
+
   const shortLived = (await new Browser().api('POST', '/api/sessions', {})).data.key;
   const watcher = await new Browser().join(shortLived);
   await first(watcher);
