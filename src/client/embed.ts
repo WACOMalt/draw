@@ -26,5 +26,5 @@ export function embedUrl(origin: string, key: string, token: string | null, fram
 export function embedCode(url: string, w: number, h: number, width: number | null): string {
   const aw = Math.max(1, Math.round(w)), ah = Math.max(1, Math.round(h));
   const size = width ? `width:${width}px;max-width:100%` : 'width:100%';
-  return `<iframe src="${url}" title="Drawing on Draw" style="${size};aspect-ratio:${aw} / ${ah};border:0;border-radius:8px" loading="lazy" allow="fullscreen" allowfullscreen></iframe>`;
+  return `<iframe src="${url}" title="Drawing on Draw" style="${size};aspect-ratio:${aw} / ${ah};border:0;border-radius:8px" loading="lazy" allow="fullscreen"></iframe>`;
 }

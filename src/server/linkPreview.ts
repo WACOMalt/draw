@@ -186,7 +186,7 @@ export async function oembed(ctx: LinkPreviewContext, search: URLSearchParams): 
       provider_url: ctx.publicUrl,
       title: card.title,
       ...(card.author ? { author_name: card.author } : {}),
-      html: `<iframe src="${esc(src)}" title="${esc(`${card.title} on Draw`)}" width="${width}" height="${height}" style="border:0;border-radius:8px" loading="lazy" allow="fullscreen" allowfullscreen></iframe>`,
+      html: `<iframe src="${esc(src)}" title="${esc(`${card.title} on Draw`)}" width="${width}" height="${height}" style="border:0;border-radius:8px" loading="lazy" allow="fullscreen"></iframe>`,
       width,
       height,
       ...(card.image ? { thumbnail_url: card.image.url, thumbnail_width: card.image.width, thumbnail_height: card.image.height } : {}),

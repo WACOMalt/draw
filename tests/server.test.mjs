@@ -442,6 +442,9 @@ try {
   const page = await (await fetch(`${BASE}/s/${pv}`)).text();
   check(page.includes('property="og:image" content="' + BASE + '/api/canvases/' + pv + '/preview.png?v=' + seqNow) && page.includes('summary_large_image') && page.includes('<title>' + pv + ' · Draw</title>') && page.includes('by Funky Otter'), 'the canvas page has Open Graph tags with the preview');
   check(page.includes('application/json+oembed'), 'the canvas page links oEmbed');
+  const embedRes = await fetch(`${BASE}/e/${pv}?r=0,0,10,10`);
+  check(embedRes.headers.get('content-security-policy') === 'frame-ancestors * file: data: blob:', 'an embed page may be framed by any site (CSP frame-ancestors)');
+  check(!(await fetch(`${BASE}/s/${pv}`)).headers.get('content-security-policy'), 'the canvas page keeps the default (no frame-ancestors from the app)');
   const oe = await (await fetch(`${BASE}/api/oembed?url=${encodeURIComponent(BASE + '/s/' + pv)}`)).json();
   check(oe.type === 'rich' && oe.html.includes(`/e/${pv}?r=-10,-20,1200,630`) && oe.thumbnail_width === 1200 && oe.width === 800 && oe.height === 420, 'oEmbed gives the live embed, framed like the preview');
   check((await fetch(`${BASE}/api/oembed?url=${encodeURIComponent('https://evil.example/s/' + pv)}`)).status === 404, 'oEmbed answers only for this site');

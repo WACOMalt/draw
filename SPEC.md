@@ -373,6 +373,7 @@ An embed is a live, view-only copy of a canvas on another site, in an `<iframe>`
 - The page shows only the drawing. It fits the frame in the box, centered, and fits it again when the box changes size, until the viewer moves the view.
 - Controls: drag (or one finger) pans, two fingers pinch zoom. The wheel zooms only after a click inside the embed or with Ctrl. Before that, the wheel scrolls the page around the embed, and a hint says to click first. Buttons: zoom in, zoom out, back to the framed view, full screen, open in Draw.
 - Server: a `hello` with `embed: true` gets access from the link only. The server ignores the account and the anonymous secret, so the owner's own preview shows what visitors see. The role is at most viewer, also with an edit link. Other people do not see an embed (no `peer.join`, `peer.leave` or cursor), and the embed sees no people.
+- Framing: the server sends `Content-Security-Policy: frame-ancestors * file: data: blob:` on `/e/` pages, so any site (or a local file) can frame them. Browsers ignore `X-Frame-Options` when this rule is present, so the proxy's `X-Frame-Options: SAMEORIGIN` (sent on every response by the nginx on the server) does not block embeds. Other pages keep that protection. The code uses `allow="fullscreen"` only (`allowfullscreen` is redundant and makes Chrome warn).
 - An embed cannot ask for a join password. It shows "This drawing needs a password". Rename, or turning off or resetting the link it uses, stops it.
 
 ### 9.6 Link previews

@@ -142,6 +142,13 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
 
 const linkCtx = { store, publicUrl: PUBLIC_URL };
 
+/**
+ * Embeds (/e/KEY) are meant to be framed by any site, also a local file. A CSP frame-ancestors
+ * rule makes browsers ignore an X-Frame-Options header (the proxy may add SAMEORIGIN to every
+ * response), so this works without changing the proxy. Other pages keep the proxy's rule.
+ */
+const EMBED_CSP = 'frame-ancestors * file: data: blob:';
+
 /** /s/KEY and /e/KEY: the app shell with the link preview tags for that canvas. */
 function servePage(req: http.IncomingMessage, res: http.ServerResponse, pathname: string, search: URLSearchParams): void {
   fs.readFile(path.join(STATIC_DIR, 'index.html'), 'utf8', (err, html) => {
@@ -150,7 +157,12 @@ function servePage(req: http.IncomingMessage, res: http.ServerResponse, pathname
       .catch(() => html)
       .then((body) => {
         const buf = Buffer.from(body);
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length, 'Cache-Control': 'no-cache' });
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Length': buf.length,
+          'Cache-Control': 'no-cache',
+          ...(pathname.startsWith('/e/') ? { 'Content-Security-Policy': EMBED_CSP } : {}),
+        });
         res.end(req.method === 'HEAD' ? undefined : buf);
       });
   });
