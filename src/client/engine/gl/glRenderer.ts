@@ -177,9 +177,15 @@ export class GLRenderer implements Renderer {
   private tileWorkLastFrame = false;
   private cleanup: (() => void)[] = [];
 
+  /**
+   * `offline`: a renderer for exports, on a canvas that is not on screen. It renders only when
+   * asked (renderSync), each time to completion: no frame budget, no prefetch ring, no coarser
+   * levels.
+   */
   constructor(
     private canvas: HTMLCanvasElement,
     private gl: WebGL2RenderingContext,
+    private offline = false,
   ) {
     const coarse = matchMedia('(pointer: coarse)').matches;
     this.maxTiles = coarse ? 192 : 512;
@@ -387,7 +393,31 @@ export class GLRenderer implements Renderer {
 
   invalidate(): void {
     this.dirty = true;
-    if (!this.raf) this.raf = requestAnimationFrame(() => this.render());
+    if (!this.raf && !this.offline) this.raf = requestAnimationFrame(() => this.render());
+  }
+
+  /** Offline: brings every tile of the view up to date and composites it. */
+  renderSync(): void {
+    for (let i = 0; i < 1000; i++) {
+      this.render();
+      if (!this.lastPending) return;
+    }
+  }
+
+  /** The composited view as 8-bit RGBA, top row first (alpha is always 255). */
+  readRGBA(): Uint8ClampedArray<ArrayBuffer> | null {
+    if (this.lost) return null;
+    const gl = this.gl;
+    const w = this.compA.w, h = this.compA.h;
+    const out = this.makeTarget(w, h, true);
+    this.bindTarget(out);
+    gl.disable(gl.BLEND);
+    this.copy(this.compA.tex, out, [0, 0, w, h]);
+    const px = new Uint8ClampedArray(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.freeTarget(out);
+    for (let i = 3; i < px.length; i += 4) px[i] = 255;
+    return px;
   }
 
   // --- document ------------------------------------------------------------------------------
@@ -855,6 +885,9 @@ export class GLRenderer implements Renderer {
 
   // --- frame ---------------------------------------------------------------------------------------
 
+  /** Offline: the last render stopped before all tiles were done. */
+  private lastPending = false;
+
   private render(): void {
     this.raf = 0;
     if (this.dirty) {
@@ -899,9 +932,10 @@ export class GLRenderer implements Renderer {
     // level costs about one view of tiles, and renders only when the view is done.
     const vw = this.cssW / this.view.zoom, vh = this.cssH / this.view.zoom;
     const area = (r: TileRange) => (r.tx1 - r.tx0 + 1) * (r.ty1 - r.ty0 + 1) * keys.length;
-    const ranges: TileRange[] = [{ lod, tx0: tx0 - PREFETCH, ty0: ty0 - PREFETCH, tx1: tx1 + PREFETCH, ty1: ty1 + PREFETCH }];
+    const ring = this.offline ? 0 : PREFETCH;
+    const ranges: TileRange[] = [{ lod, tx0: tx0 - ring, ty0: ty0 - ring, tx1: tx1 + ring, ty1: ty1 + ring }];
     let total = area(ranges[0]);
-    for (let up = 1; up <= COARSE_LEVELS && lod + up <= MAX_LOD; up++) {
+    for (let up = 1; up <= (this.offline ? 0 : COARSE_LEVELS) && lod + up <= MAX_LOD; up++) {
       const ctw = tileWorld(lod + up);
       const m = (2 ** up - 1) / 2; // margin on each side, in views: 2× the view, then 4×
       const coarse = {
@@ -927,7 +961,7 @@ export class GLRenderer implements Renderer {
           const key = tileKey(layer, r.lod, tx, ty);
           let t = this.tiles.get(key);
           if (!this.needsWork(t)) continue;
-          if (spent >= fill || performance.now() - start > TILE_BUDGET_MS) {
+          if (!this.offline && (spent >= fill || performance.now() - start > TILE_BUDGET_MS)) {
             pending = true;
             break outer;
           }
@@ -936,7 +970,7 @@ export class GLRenderer implements Renderer {
             this.tiles.set(key, t);
           }
           t.used = this.frame;
-          spent += this.renderTile(t, fill - spent);
+          spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
         }
       }
     }
@@ -1001,6 +1035,7 @@ export class GLRenderer implements Renderer {
 
     gl.flush();
     this.evictTiles(ranges, ranges.reduce((n, r) => n + area(r), 0));
+    this.lastPending = pending;
     if (pending) this.invalidate();
     else if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
@@ -1248,17 +1283,9 @@ export class GLRenderer implements Renderer {
   }
 
   async exportPng(): Promise<Blob | null> {
-    if (this.lost) return null;
-    const gl = this.gl;
+    const px = this.readRGBA();
+    if (!px) return null;
     const w = this.compA.w, h = this.compA.h;
-    const out = this.makeTarget(w, h, true);
-    this.bindTarget(out);
-    gl.disable(gl.BLEND);
-    this.copy(this.compA.tex, out, [0, 0, w, h]);
-    const px = new Uint8ClampedArray(w * h * 4);
-    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    this.freeTarget(out);
-    for (let i = 3; i < px.length; i += 4) px[i] = 255;
     const c = document.createElement('canvas');
     c.width = w;
     c.height = h;

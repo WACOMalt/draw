@@ -13,6 +13,7 @@ import {
   type LayerProps,
   type Op,
   type ServerMsg,
+  type Stroke,
 } from '../../shared/types';
 import { maskKey } from './strokeIndex';
 import { ed, save, showToast, type Tool } from '../state.svelte';
@@ -338,6 +339,25 @@ export class Engine {
     const { w, h } = this.comp.size;
     const v = this.comp.view;
     return { bounds: { x0: v.x, y0: v.y, x1: v.x + w / v.zoom, y1: v.y + h / v.zoom }, w, h };
+  }
+
+  /** Confirmed document state for an off-screen render (exports, previews). */
+  snapshot(): { layers: Layer[]; strokes: Stroke[]; seq: number } {
+    return {
+      layers: this.doc.displayLayers(),
+      strokes: [...this.doc.strokes.values()].filter((st) => !st.deleted),
+      seq: this.doc.seq,
+    };
+  }
+
+  /** Bounds of everything on the visible layers; null when nothing is drawn. */
+  contentBounds(): Bounds | null {
+    return unionAll(this.doc, this.visibleLayerIds());
+  }
+
+  /** Device pixels per world unit on screen now. */
+  get deviceScale(): number {
+    return this.comp.view.zoom * (window.devicePixelRatio || 1);
   }
 
   resetView(): void {

@@ -104,6 +104,8 @@ class EditorState {
   /** Why the canvas cannot be shown (no access, password, expired, ...), or null. */
   denied = $state<DeniedReason | null>(null);
   shareOpen = $state(false);
+  /** The large image export dialog. */
+  exportOpen = $state(false);
   /** The brush paints the active layer's mask instead of the layer. */
   maskTarget = $state(false);
   /** The canvas uses features this client does not know (welcome.features). */

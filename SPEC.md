@@ -342,7 +342,24 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 - Apply: a click sets the brush (or the eraser, while it is the tool). Settings that the preset does not hold go back to their defaults.
 - API: `GET /api/presets`, `POST /api/presets` (`name`, `settings`, `anon`, `creatorName`), `POST /api/presets/<id>/delete` (`anon`). Limits: 30 saves per hour per IP address, 300 presets per creator, 5000 in total.
 
-### 9.4 Embeds
+### 9.4 Large image export
+
+The top bar has two export buttons: a snapshot of the screen (PNG, as before), and "Export a large image" (on phones, both are in the ⋮ menu).
+
+- Area: the current view, or everything on the visible layers.
+- Scale: 1× is the resolution of the screen now (device pixels). Presets 1× to 64×, or any number.
+- Formats:
+
+| Format | Limit here | Notes |
+|---|---|---|
+| PNG | 500 000 px wide (a strip of 256 rows is held in memory), 2^31 − 1 px high | Opens everywhere. RGB, the Sub filter, one zlib stream. |
+| TIFF | 2^32 − 1 px per side | Tiled (256 × 256), Deflate with the horizontal predictor. BigTIFF (64-bit offsets) when the image is over 4 GB uncompressed. GIMP 2.10.32+, Photoshop, Krita and GDAL read BigTIFF. |
+
+- Rendering: an off-screen WebGL2 renderer with its own copy of the document renders pieces of up to 2048 × 2048 px, each to completion, with the same code as the screen. The pieces go into the encoder as they are done. The dialog shows progress and can cancel. About 24 megapixels per second on a desktop GPU.
+- Writing: the Tauri apps write the file natively (save dialog, then writes and seeks). Browsers with the File System Access API (Chromium, Edge, the Electron app) stream to the file. Other browsers (Firefox, Safari) keep the file in memory, up to 1.5 GB, then download it. The dialog warns about this.
+- The export needs WebGL2. Transparency is not exported: the paper color is the background.
+
+### 9.5 Embeds
 
 An embed is a live, view-only copy of a canvas on another site, in an `<iframe>`.
 

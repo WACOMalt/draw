@@ -16,6 +16,7 @@
   import CanvasBanner from './CanvasBanner.svelte';
   import AccessScreen from './AccessScreen.svelte';
   import ShareDialog from './ShareDialog.svelte';
+  import ExportDialog from './ExportDialog.svelte';
 
   let { code, onLeave }: { code: string; onLeave: () => void } = $props();
 
@@ -74,6 +75,7 @@
       ed.canvas = null;
       ed.denied = null;
       ed.shareOpen = false;
+      ed.exportOpen = false;
     };
   });
 
@@ -165,6 +167,7 @@
       {/if}
     </div>
     {#if ed.shareOpen}<ShareDialog {code} {engine} onDeleted={onLeave} />{/if}
+    {#if ed.exportOpen && engine}<ExportDialog {engine} {code} />{/if}
     {#if narrow}
       <MobileBar {engine} bind:sheet />
     {:else}

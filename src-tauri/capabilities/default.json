@@ -1,7 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: native save dialog and writing the chosen file (PNG export, .bdraw save).",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-save", "fs:allow-write-file"]
+  "description": "Main window: native save dialog and writing the chosen file (PNG export, .bdraw save, large image export streamed in pieces).",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:allow-save",
+    "fs:allow-write-file",
+    "fs:allow-open",
+    "fs:allow-write",
+    "fs:allow-seek",
+    "fs:allow-remove"
+  ]
 }
