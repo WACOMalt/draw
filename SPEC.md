@@ -285,7 +285,7 @@ Phone layout (width under 760 px, or a short touch screen): the canvas fills the
 
 Desktop layout: the right panel (color and layers) scrolls as one when the window is short. Overlays on the canvas, such as the temporary-canvas banner, fit the canvas width and wrap their text.
 
-Sliders: size, flow and spacing use a log scale, with fine steps at the low end. Flow goes from 0.5% to 100%, spacing from 1% to 200%. A percent below 10% shows one decimal.
+Sliders: size, flow and spacing use a log scale, with fine steps at the low end. Flow goes from 0.5% to 100%, spacing from 1% to 200%. A percent below 10% shows one decimal. The slider is drawn by the app (not a native range input), with a filled part up to the value. On touch screens the hit area is 44 px high and the thumb 22 px. The track has `touch-action: pan-y`: a vertical swipe scrolls the sheet, a sideways drag moves the value (from the first sideways movement), and a tap sets the value at that point. Mouse and pen set the value at once. Keys: arrows (Shift: 10 times the step), Home, End.
 
 Touch gestures:
 
