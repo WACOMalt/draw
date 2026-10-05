@@ -226,7 +226,7 @@
 <style>
   section {
     flex: 1;
-    min-height: 0;
+    min-height: 300px;
     display: flex;
     flex-direction: column;
   }

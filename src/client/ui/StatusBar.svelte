@@ -31,6 +31,8 @@
     background: var(--bg-1);
     border-top: 1px solid var(--border);
     font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
   }
   .dim {
     color: var(--text-dim);

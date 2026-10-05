@@ -7,8 +7,13 @@
   import AccountButton from './AccountButton.svelte';
   import { pickFile } from '../files';
 
-  let { engine, code, onLeave }: { engine: Engine | null; code: string; onLeave: () => void } = $props();
-  const narrow = matchMedia('(max-width: 760px)').matches;
+  let { engine, code, narrow, onLeave }: { engine: Engine | null; code: string; narrow: boolean; onLeave: () => void } = $props();
+  /** Narrow screens: file actions and Leave go in a menu, so the bar fits on a 320 px phone. */
+  let more = $state(false);
+  function act(f: () => void) {
+    more = false;
+    f();
+  }
 
   /** Copies the link this person came with (owners use the Share dialog instead). */
   async function copyLink() {
@@ -35,7 +40,7 @@
   <div class="brand"><span class="dot"></span>Draw</div>
   {#if ed.role === 'owner'}
     <button class="code share" title="Share: people, links, password" onclick={() => (ed.shareOpen = true)}>
-      <Icon name="link" /><span>Share {code}</span>
+      <Icon name="link" /><span><span class="word">Share{" "}</span>{code}</span>
     </button>
   {:else}
     <button class="code" title="Copy the link you opened this canvas with" onclick={copyLink}>
@@ -62,11 +67,27 @@
   </div>
   <AccountButton compact={narrow} onHome={onLeave} />
 
-  {#if !narrow}<button class="icon" title="Open a .bdraw file as a new canvas (Ctrl+O)" onclick={pickFile}><Icon name="open" /></button>{/if}
-  <button class="icon" title="Save to a .bdraw file (Ctrl+S)" onclick={() => engine?.saveBdraw()}><Icon name="save" /></button>
-  <button class="icon" title="Export the view as PNG" onclick={() => engine?.exportPng()}><Icon name="download" /></button>
-  <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
+  {#if narrow}
+    <div class="more">
+      <button class="icon" title="More" aria-label="More" aria-expanded={more} onclick={() => (more = !more)}><Icon name="more" /></button>
+      {#if more}
+        <div class="menu" role="menu">
+          <button role="menuitem" onclick={() => act(pickFile)}><Icon name="open" />Open a .bdraw file</button>
+          <button role="menuitem" onclick={() => act(() => engine?.saveBdraw())}><Icon name="save" />Save to a .bdraw file</button>
+          <button role="menuitem" onclick={() => act(() => engine?.exportPng())}><Icon name="download" />Export the view as PNG</button>
+          <button role="menuitem" onclick={() => act(onLeave)}><Icon name="exit" />Leave this canvas</button>
+        </div>
+      {/if}
+    </div>
+  {:else}
+    <button class="icon" title="Open a .bdraw file as a new canvas (Ctrl+O)" onclick={pickFile}><Icon name="open" /></button>
+    <button class="icon" title="Save to a .bdraw file (Ctrl+S)" onclick={() => engine?.saveBdraw()}><Icon name="save" /></button>
+    <button class="icon" title="Export the view as PNG" onclick={() => engine?.exportPng()}><Icon name="download" /></button>
+    <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
+  {/if}
 </header>
+
+<svelte:window onpointerdown={(e) => more && !(e.target as Element).closest('.more') && (more = false)} />
 
 <style>
   header {
@@ -146,6 +167,35 @@
   .me input:hover {
     border-color: var(--line);
   }
+  .more {
+    position: relative;
+  }
+  .menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    z-index: 50;
+    width: max-content;
+    max-width: calc(100vw - 16px);
+    padding: 6px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  }
+  .menu button {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border-color: transparent;
+    padding: 10px 10px;
+  }
+  .menu button:hover {
+    background: var(--bg-3);
+  }
   @media (max-width: 760px), (max-height: 520px) and (pointer: coarse) {
     header {
       min-height: 46px;
@@ -168,8 +218,12 @@
     }
     .code {
       min-width: 0;
+      flex-shrink: 1;
       overflow: hidden;
       max-width: 42vw;
+    }
+    header > :global(*:not(.code)) {
+      flex-shrink: 0;
     }
     .code span {
       overflow: hidden;
@@ -178,6 +232,18 @@
     }
     .peers .avatar:nth-child(n + 4):not(.me .avatar) {
       display: none;
+    }
+  }
+  /* Very small phones: keep the code readable. */
+  @media (max-width: 400px) {
+    .code :global(svg),
+    .word,
+    .me {
+      display: none;
+    }
+    .code {
+      padding: 3px 6px;
+      letter-spacing: 0.5px;
     }
   }
 </style>

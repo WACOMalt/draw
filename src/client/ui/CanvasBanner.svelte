@@ -81,5 +81,22 @@
     padding: 3px 10px;
     border-radius: 12px;
     font-size: 12px;
+    white-space: nowrap;
+  }
+  /* A narrow stage: full width, and the text wraps instead of being cut. */
+  @container (max-width: 560px) {
+    .banner {
+      max-width: calc(100% - 20px);
+      width: max-content;
+      white-space: normal;
+      border-radius: 12px;
+      line-height: 1.3;
+    }
+  }
+  /* Phone layout: below the zoom pill. */
+  @media (max-width: 760px) {
+    .banner {
+      top: 46px;
+    }
   }
 </style>

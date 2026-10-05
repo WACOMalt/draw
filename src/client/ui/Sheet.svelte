@@ -40,6 +40,28 @@
   .sheet.tall {
     height: 72%;
   }
+  /* Landscape phones: a side panel on the right, full height, instead of a short wide strip. */
+  @media (orientation: landscape) and (max-height: 520px) {
+    .sheet,
+    .sheet.tall {
+      left: auto;
+      top: 0;
+      width: min(380px, 62%);
+      height: auto;
+      max-height: none;
+      border-top: none;
+      border-left: 1px solid var(--border);
+      border-radius: 12px 0 0 12px;
+      box-shadow: -10px 0 30px rgba(0, 0, 0, 0.4);
+      animation-name: left;
+    }
+  }
+  @keyframes left {
+    from {
+      transform: translateX(30px);
+      opacity: 0;
+    }
+  }
   @keyframes up {
     from {
       transform: translateY(30px);

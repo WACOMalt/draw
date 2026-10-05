@@ -251,7 +251,8 @@
   }
   .head {
     display: flex;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 4px 8px;
     align-items: baseline;
   }
   .note {
@@ -263,6 +264,8 @@
   }
   .head select {
     margin-left: auto;
+    min-width: 0;
+    max-width: 100%;
   }
   .small {
     padding: 2px 8px;
@@ -282,5 +285,6 @@
   }
   select {
     padding: 4px;
+    max-width: 100%;
   }
 </style>

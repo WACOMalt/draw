@@ -27,11 +27,20 @@
     oninput?: (v: number) => void;
   } = $props();
 
-  // Log scale maps the slider position 0..1000 to min..max exponentially (for brush size).
+  // Log scale maps the slider position 0..1000 to min..max exponentially: fine steps at the low
+  // end (size, flow, spacing). Values round to three significant digits, never finer than `step`.
   const toPos = (v: number) => (log ? (Math.log(v / min) / Math.log(max / min)) * 1000 : v);
-  const fromPos = (p: number) => (log ? Math.round(min * (max / min) ** (p / 1000)) : p);
+  function fromPos(p: number): number {
+    if (!log) return p;
+    const v = min * (max / min) ** (p / 1000);
+    const q = Math.max(step, 10 ** (Math.floor(Math.log10(v)) - 2));
+    return Math.round(v / q) * q;
+  }
 
-  const shown = $derived(percent ? Math.round(value * 100) : Math.round(value * 100) / 100);
+  // Percent: one decimal below 10%, where a log slider has finer steps.
+  const shown = $derived(
+    percent ? (value < 0.1 ? Math.round(value * 1000) / 10 : Math.round(value * 100)) : Math.round(value * 100) / 100,
+  );
 
   function set(v: number) {
     if (!Number.isFinite(v)) return;
@@ -55,6 +64,7 @@
   <input
     type="number"
     value={shown}
+    step="any"
     min={percent ? min * 100 : min}
     max={percent ? max * 100 : max}
     onchange={(e) => set(percent ? +e.currentTarget.value / 100 : +e.currentTarget.value)}

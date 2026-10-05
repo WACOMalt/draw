@@ -143,7 +143,9 @@ The client has two renderers with one interface (`src/client/engine/renderer.ts`
 ### 6.2 WebGL2 renderer
 
 - **Dabs:** one instanced draw call for each stroke and tile. The CPU computes each dab position relative to the target in double precision and sends small float32 numbers to the GPU. Thus deep zoom stays exact. A dab with a radius over 10^6 px gets a closer virtual center with the same edge. The fragment shader uses the same profile as the Canvas 2D stamp: a solid core, a cosine falloff, and one pixel of edge antialiasing.
-- **Tiles:** each tile is a float texture. The renderer updates tiles on the main thread in slices of about 6 ms per frame, from the center of the view out. A new stroke on top of a tile draws over the existing pixels. A removed or restored stroke makes the tile render again. A stale tile stays on screen until the new one is ready.
+- **Tiles:** each tile is a float texture. The renderer updates tiles on the main thread, from the center of the view out. A new stroke on top of a tile draws over the existing pixels. A removed or restored stroke makes the tile render again. A stale tile stays on screen until the new one is ready.
+- **Tile budget:** each frame gets two limits for tile work: about 6 ms of JavaScript, and a GPU fill budget (the estimated dab area in device pixels). JavaScript time does not show GPU cost. On a phone, too much queued GPU work blocks the whole page until it drains. The fill budget follows the frame interval: a frame longer than 22 ms cuts it by 25%, and a frame shorter than 17.5 ms raises it by 10%. For 150 ms after a pan or zoom, tiles get 35% of the budget, so the motion stays smooth.
+- **Split renders:** a full tile render can span frames. The strokes draw into a new texture, a few in each frame, and the new texture replaces the old one when all strokes are drawn. A stroke added to or removed from that area starts the render again.
 - **Strokes in progress:** each one has a screen-size float buffer. New dabs draw into it as points arrive. After a pan or zoom, the buffer draws again from its dabs.
 - **Dab shader:** each dab instance has a rotation. The fragment shader applies the rotation and the roundness, then uses the analytic round profile or samples the tip from a texture array with mipmaps (the GPU selects the mip level from the dab size). Grain multiplies the alpha with a tileable texture. The CPU reduces the grain origin modulo one grain tile, so the numbers stay small at any zoom.
 - **Compositing:** the layers stack in a float buffer that starts with the paper color. A normal layer without a stroke in progress or a mask goes straight onto the stack with hardware blending. Other layers go into a layer buffer first, and a blend shader combines that buffer with the stack (two buffers in turn). The blend shader uses the W3C Compositing and Blending formulas, which include hue, saturation, color, and luminosity.
@@ -278,7 +280,11 @@ Finding content on the canvas (`engine/navigator.ts`). A drawing can be off scre
 - A fly-to moves the zoom in log space. A long trip zooms out, travels, and then zooms in. Any input stops it.
 - The client computes the markers from a cache of stroke bounds, at most every 120 ms. The interval grows with the cost of the last computation (about 30 ms for 20 000 strokes). During a fly-to, the client computes the markers only at the end.
 
-Phone layout (width under 760 px, or a short touch screen): the canvas fills the screen. A bottom bar holds the tools and three buttons that open bottom sheets: brush settings, color, and layers. A zoom label at the top left resets the zoom to 100%.
+Phone layout (width under 760 px, or a short touch screen): the canvas fills the screen. A bottom bar holds the tools and three buttons that open bottom sheets: brush settings, color, and layers. On a landscape phone, the sheets open as a panel on the right side. A zoom label at the top left resets the zoom to 100%. The top bar puts Open, Save, Export PNG and Leave in a "⋮" menu. The layout works down to a 320 px wide screen.
+
+Desktop layout: the right panel (color and layers) scrolls as one when the window is short. Overlays on the canvas, such as the temporary-canvas banner, fit the canvas width and wrap their text.
+
+Sliders: size, flow and spacing use a log scale, with fine steps at the low end. Flow goes from 0.5% to 100%, spacing from 1% to 200%. A percent below 10% shows one decimal.
 
 Touch gestures:
 

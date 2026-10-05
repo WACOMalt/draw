@@ -133,8 +133,11 @@
     height: 100%;
     overflow-y: auto;
     display: grid;
+    /* minmax(0, 1fr): the column is the screen width, so the card never grows past it. */
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
-    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+    /* Room for the fixed top buttons and the version line, so a tall card never runs under them. */
+    padding: calc(max(10px, env(safe-area-inset-top)) + 44px) 16px calc(max(8px, env(safe-area-inset-bottom)) + 22px);
     background:
       radial-gradient(circle at 30% 20%, #2a3a4a 0, transparent 40%),
       radial-gradient(circle at 75% 80%, #3a2a40 0, transparent 45%),

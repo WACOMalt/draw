@@ -9,6 +9,8 @@
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
   const b = $derived(ed.activeBrush);
   let dynamicsOpen = $state(false);
+  /** The Dynamics popover opens to the right when its button is near the left edge (a wrapped row). */
+  let dynamicsLeft = $state(false);
   let presetsOpen = $state(false);
   const touchScreen = matchMedia('(any-pointer: coarse)').matches || navigator.maxTouchPoints > 0;
 
@@ -67,9 +69,9 @@
     {/if}
     <Slider wide={stacked} label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushPx} log width={110} title="Screen pixels at the current zoom. [ and ]" />
     <Slider wide={stacked} label="Opacity" bind:value={b.opacity} min={0.01} max={1} step={0.01} percent title="Keys 1–0. Caps the whole stroke." />
-    <Slider wide={stacked} label="Flow" bind:value={b.flow} min={0.01} max={1} step={0.01} percent title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
+    <Slider wide={stacked} label="Flow" bind:value={b.flow} min={0.005} max={1} step={0.001} percent log title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
     <Slider wide={stacked} label="Hardness" bind:value={b.hardness} min={0} max={1} step={0.01} percent title="Shift+[ and Shift+]" />
-    <Slider wide={stacked} label="Spacing" bind:value={b.spacing} min={0.01} max={2} step={0.01} percent width={70} title="Distance between dabs, as a percent of the diameter" />
+    <Slider wide={stacked} label="Spacing" bind:value={b.spacing} min={0.01} max={2} step={0.001} percent log width={70} title="Distance between dabs, as a percent of the diameter" />
     <Slider wide={stacked} label="Smoothing" bind:value={ed.smoothing} min={0} max={0.95} step={0.01} percent width={60} />
     <label class="field" title="Brush tip">
       <span>Tip</span>
@@ -99,16 +101,20 @@
       {/if}
       {#if !stacked}
         <span class="popwrap">
-          <button class="icon wide" class:on={dynamicsOn} title="Angle, roundness, jitter, scatter and grain" onclick={() => (dynamicsOpen = !dynamicsOpen)}>
+          <button class="icon wide" class:on={dynamicsOn} title="Angle, roundness, jitter, scatter and grain" onclick={(e) => {
+            dynamicsLeft = e.currentTarget.getBoundingClientRect().right < 300;
+            dynamicsOpen = !dynamicsOpen;
+          }}>
             <Icon name="dynamics" /> Dynamics
           </button>
           {#if dynamicsOpen}
-            <div class="pop">{@render dynamics()}</div>
+            <div class="pop" class:left={dynamicsLeft}>{@render dynamics()}</div>
           {/if}
         </span>
       {/if}
     </div>
     {#if stacked}
+      <h4 class="sub">Dynamics</h4>
       {@render dynamics()}
       <h4 class="sub">Presets</h4>
       <PresetsPanel stacked />
@@ -208,6 +214,8 @@
     top: calc(100% + 6px);
     right: 0;
     z-index: 30;
+    max-height: calc(100dvh - 140px);
+    overflow-y: auto;
     padding: 10px 12px;
     background: var(--bg-2);
     border: 1px solid var(--border);
@@ -222,6 +230,6 @@
   }
   .dyn.stacked {
     min-width: 0;
-    margin-top: 6px;
+    padding: 0;
   }
 </style>

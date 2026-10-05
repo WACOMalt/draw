@@ -54,6 +54,12 @@ interface Tile {
   /** Rendered at least once: it may be drawn while stale, so updates never flash. */
   rendered: boolean;
   used: number;
+  /**
+   * A full render that spans frames: the strokes draw into a fresh target, a few per frame,
+   * and the target replaces the old one when all are drawn. Until then the old pixels (or a
+   * stretched parent tile) stay on screen.
+   */
+  job: { target: Target; list: StrokeRec[]; next: number } | null;
 }
 
 interface Live {
@@ -80,6 +86,17 @@ interface Live {
 
 const PREFETCH = 1;
 const TILE_BUDGET_MS = 6;
+/**
+ * GPU work for tiles per frame, in device pixels of dab area (plus a fixed cost per dab and per
+ * draw call). JavaScript time does not show GPU cost: a phone can queue far more fill than fits
+ * in a frame, and then Chromium blocks the page until its GPU command buffer drains (the whole
+ * UI freezes). The budget adapts to the measured frame interval.
+ */
+const FILL_MIN = 2e5;
+const FILL_MAX = 6e7;
+/** Share of the fill budget while the view moves: panning and zooming stay smooth. */
+const MOVING_SHARE = 0.35;
+const MOVING_MS = 150;
 /** Radius in px above which dabs are virtualized to keep float32 exact. */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
@@ -141,13 +158,20 @@ export class GLRenderer implements Renderer {
   private tail = 0;
   private lost = false;
   private maxTiles: number;
+  private fillBudget: number;
+  private lastFrameAt = 0;
+  private lastViewChange = 0;
+  /** The previous frame drew tiles: its interval says how much GPU work fits. */
+  private tileWorkLastFrame = false;
   private cleanup: (() => void)[] = [];
 
   constructor(
     private canvas: HTMLCanvasElement,
     private gl: WebGL2RenderingContext,
   ) {
-    this.maxTiles = matchMedia('(pointer: coarse)').matches ? 192 : 512;
+    const coarse = matchMedia('(pointer: coarse)').matches;
+    this.maxTiles = coarse ? 192 : 512;
+    this.fillBudget = coarse ? 1.5e6 : 8e6;
     this.initGL();
     const lost = (e: Event) => {
       e.preventDefault();
@@ -336,6 +360,7 @@ export class GLRenderer implements Renderer {
 
   private viewChanged(): void {
     this.viewVersion++;
+    this.lastViewChange = performance.now();
     this.invalidate();
   }
 
@@ -380,9 +405,12 @@ export class GLRenderer implements Renderer {
     const rec = this.index.add(stroke);
     const key = strokeKey(stroke);
     for (const t of this.tiles.values()) {
-      if (t.layer !== key || t.stale) continue;
+      if (t.layer !== key) continue;
       const [x0, y0, x1, y1] = this.tileBounds(t);
       if (!intersects(rec, x0, y0, x1, y1)) continue;
+      // A render in progress has its stroke list already: start it again with this stroke.
+      if (t.job) this.dropJob(t);
+      if (t.stale) continue;
       // On top of everything the tile shows: draw it over the existing pixels.
       if (stroke.seq > t.maxSeq && t.append.length < MAX_APPEND) t.append.push(rec);
       else {
@@ -402,6 +430,7 @@ export class GLRenderer implements Renderer {
         if (t.layer !== key) continue;
         const [x0, y0, x1, y1] = this.tileBounds(t);
         if (intersects(rec, x0, y0, x1, y1)) {
+          if (t.job) this.dropJob(t);
           t.stale = true;
           t.append = [];
         }
@@ -661,7 +690,8 @@ export class GLRenderer implements Renderer {
   }
 
   /** Draws one stroke into a tile target. */
-  private drawStroke(target: Target, rec: StrokeRec, wx0: number, wy0: number, scale: number): void {
+  /** Draws one stroke into a tile target. Returns an estimate of the GPU work (see FILL_MIN). */
+  private drawStroke(target: Target, rec: StrokeRec, wx0: number, wy0: number, scale: number): number {
     const b = rec.stroke.brush;
     const w = target.w, h = target.h;
     let n = 0;
@@ -686,7 +716,14 @@ export class GLRenderer implements Renderer {
         }
       }
     }
-    if (n === 0) return;
+    if (n === 0) return 0;
+    // Fill estimate: the quad of each dab (true radius, capped at the tile), at least 16 px.
+    let work = 2000; // the draw call
+    const f = this.inst;
+    for (let i = 0; i < n; i++) {
+      const r = Math.min(f[i * INST + 4], TILE) + 1;
+      work += Math.max(16, 4 * r * r);
+    }
     const erase = b.tool === 'erase';
     // The one-dot shortcut has no tip, rotation or grain: it stands for a whole tiny stroke.
     const dot = sw < 2 && sh < 2;
@@ -706,32 +743,64 @@ export class GLRenderer implements Renderer {
       this.bindTarget(target);
       this.blendFor(erase);
       this.copy(this.strokeT.tex, target, [0, 0, w, h], b.opacity);
+      work += 3 * w * h; // clear, copy
     }
+    return work;
   }
 
-  /** Brings one tile up to date. Full render when stale or new, else draws appended strokes. */
-  private renderTile(t: Tile): void {
+  /** Stops a render in progress and returns its target to the pool. */
+  private dropJob(t: Tile): void {
+    if (!t.job) return;
+    this.tilePool.push(t.job.target);
+    t.job = null;
+  }
+
+  /**
+   * Brings one tile up to date, or moves it closer. A full render (stale or new) draws into a
+   * fresh target and may span frames: it stops once `budget` is spent and goes on next frame.
+   * Appended strokes draw at once (they are few). Returns the work spent.
+   */
+  private renderTile(t: Tile, budget: number): number {
     const [wx0, wy0, wx1, wy1] = this.tileBounds(t);
     const scale = TILE / (wx1 - wx0);
+    let work = 0;
     if (t.stale) {
-      const list = (this.index.byLayer.get(t.layer) ?? []).filter((r) => intersects(r, wx0, wy0, wx1, wy1));
-      if (list.length === 0) {
-        if (t.target) this.tilePool.push(t.target);
-        t.target = null;
-      } else {
-        t.target ??= this.allocTile();
-        this.bindTarget(t.target);
+      if (!t.job) {
+        const list = (this.index.byLayer.get(t.layer) ?? []).filter((r) => intersects(r, wx0, wy0, wx1, wy1));
+        if (list.length === 0) {
+          if (t.target) this.tilePool.push(t.target);
+          t.target = null;
+          this.finishTile(t);
+          return 1000;
+        }
+        const target = this.allocTile();
+        this.bindTarget(target);
         this.clear();
-        for (const rec of list) this.drawStroke(t.target, rec, wx0, wy0, scale);
+        t.job = { target, list, next: 0 };
+        work += TILE * TILE;
       }
+      const job = t.job;
+      // At least one stroke per call, so a tile always moves forward.
+      do {
+        work += this.drawStroke(job.target, job.list[job.next++], wx0, wy0, scale);
+      } while (job.next < job.list.length && work < budget);
+      if (job.next < job.list.length) return work;
+      if (t.target) this.tilePool.push(t.target);
+      t.target = job.target;
+      t.job = null;
     } else {
       if (!t.target) {
         t.target = this.allocTile();
         this.bindTarget(t.target);
         this.clear();
       }
-      for (const rec of t.append) this.drawStroke(t.target, rec, wx0, wy0, scale);
+      for (const rec of t.append) work += this.drawStroke(t.target, rec, wx0, wy0, scale);
     }
+    this.finishTile(t);
+    return work;
+  }
+
+  private finishTile(t: Tile): void {
     t.stale = false;
     t.append = [];
     t.maxSeq = this.index.topSeq(t.layer);
@@ -753,6 +822,10 @@ export class GLRenderer implements Renderer {
         if (this.tilePool.length < 32) this.tilePool.push(t.target);
         else this.freeTarget(t.target);
         count--;
+      }
+      if (t.job) {
+        this.freeTarget(t.job.target);
+        t.job = null;
       }
       this.tiles.delete(key);
     }
@@ -785,8 +858,18 @@ export class GLRenderer implements Renderer {
       if (l.mask?.enabled) keys.push(maskKey(l.id, l.mask.id));
     }
 
-    // 1. Bring tiles up to date, center first, within a time budget.
+    // 1. Bring tiles up to date, center first, within a time budget (JavaScript) and a fill
+    //    budget (GPU). The fill budget follows the frame interval: shorter frames raise it,
+    //    longer ones cut it. While the view moves, tiles get a smaller share.
     const start = performance.now();
+    const interval = start - this.lastFrameAt;
+    this.lastFrameAt = start;
+    if (this.tileWorkLastFrame && interval < 100) {
+      if (interval > 22) this.fillBudget = Math.max(FILL_MIN, this.fillBudget * 0.75);
+      else if (interval < 17.5) this.fillBudget = Math.min(FILL_MAX, this.fillBudget * 1.1);
+    }
+    const fill = start - this.lastViewChange < MOVING_MS ? this.fillBudget * MOVING_SHARE : this.fillBudget;
+    let spent = 0;
     let pending = false;
     const cx = (tx0 + tx1) / 2, cy = (ty0 + ty1) / 2;
     const order: [number, number][] = [];
@@ -798,18 +881,19 @@ export class GLRenderer implements Renderer {
         const key = tileKey(layer, lod, tx, ty);
         let t = this.tiles.get(key);
         if (!this.needsWork(t)) continue;
-        if (performance.now() - start > TILE_BUDGET_MS) {
+        if (spent >= fill || performance.now() - start > TILE_BUDGET_MS) {
           pending = true;
           break outer;
         }
         if (!t) {
-          t = { layer, lod, tx, ty, target: null, stale: true, append: [], maxSeq: -1, rendered: false, used: this.frame };
+          t = { layer, lod, tx, ty, target: null, stale: true, append: [], maxSeq: -1, rendered: false, used: this.frame, job: null };
           this.tiles.set(key, t);
         }
         t.used = this.frame;
-        this.renderTile(t);
+        spent += this.renderTile(t, fill - spent);
       }
     }
+    this.tileWorkLastFrame = spent > 0;
     // A committed stroke's buffer can go once the tiles show it.
     if (!pending) {
       for (const l of [...this.live.values()]) if (l.commitSeq !== null && l.commitSeq <= this.appliedSeq) this.liveCancel(l.id);

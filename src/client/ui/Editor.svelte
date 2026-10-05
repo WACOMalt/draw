@@ -110,7 +110,7 @@
   </div>
 {:else}
   <div class="editor" class:narrow>
-    <TopBar {engine} {code} {onLeave} />
+    <TopBar {engine} {code} {narrow} {onLeave} />
     {#if !narrow}
       <OptionsBar />
       <Toolbar {engine} />
@@ -183,8 +183,8 @@
     height: 100dvh;
     display: grid;
     /* The options bar wraps to more rows in a narrow window (minmax: one row of 38px). */
-    grid-template-rows: 36px minmax(38px, auto) 1fr 24px;
-    grid-template-columns: 44px 1fr 264px;
+    grid-template-rows: 36px minmax(38px, auto) minmax(0, 1fr) 24px;
+    grid-template-columns: 44px minmax(0, 1fr) 264px;
     grid-template-areas:
       'top top top'
       'opts opts opts'
@@ -192,8 +192,8 @@
       'status status status';
   }
   .editor.narrow {
-    grid-template-rows: auto 1fr auto;
-    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       'top'
       'stage'
@@ -255,6 +255,8 @@
   .stage {
     grid-area: stage;
     position: relative;
+    /* Overlays (the banner) fit themselves to the stage width, not the window width. */
+    container-type: inline-size;
     overflow: hidden;
     background: var(--bg-0);
   }
@@ -273,6 +275,10 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    /* A short window: the panels scroll as one, so the layer buttons stay reachable. */
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
   }
   .brush-cursor {
     position: absolute;

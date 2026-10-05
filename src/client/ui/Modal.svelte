@@ -23,6 +23,8 @@
     inset: 0;
     z-index: 100;
     display: grid;
+    /* minmax(0, 1fr): the card never grows past the screen, whatever its content. */
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 16px;
     background: rgba(0, 0, 0, 0.5);

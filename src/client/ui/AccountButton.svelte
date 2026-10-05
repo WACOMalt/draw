@@ -79,6 +79,7 @@
   }
   .login {
     padding: 3px 12px;
+    white-space: nowrap;
   }
   .menu {
     position: absolute;

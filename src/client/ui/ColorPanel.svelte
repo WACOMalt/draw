@@ -110,7 +110,7 @@
   }
   .sv {
     position: relative;
-    height: 140px;
+    height: clamp(72px, 20vh, 140px);
     border-radius: 3px;
     background-image: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, transparent);
     cursor: crosshair;
@@ -164,13 +164,18 @@
     display: flex;
     align-items: center;
     gap: 2px;
+    min-width: 0;
   }
   .hex {
     width: 62px;
+    min-width: 0;
+    flex: 1 1 62px;
     font-family: ui-monospace, monospace;
   }
   .fields input[type='number'] {
     width: 34px;
+    min-width: 28px;
+    flex: 1 1 34px;
     padding: 3px 2px;
     text-align: center;
   }
