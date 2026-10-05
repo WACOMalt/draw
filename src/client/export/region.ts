@@ -63,3 +63,26 @@ export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number,
     rr.destroy();
   }
 }
+
+/** `b` grown by `pad` (a fraction of its larger side) on each side. */
+export function padded(b: Bounds, pad: number): Bounds {
+  const m = Math.max(b.x1 - b.x0, b.y1 - b.y0) * pad;
+  return { x0: b.x0 - m, y0: b.y0 - m, x1: b.x1 + m, y1: b.y1 + m };
+}
+
+/** `b` grown to the aspect w / h, centered: renderPng then fills exactly w × h. */
+export function toAspect(b: Bounds, w: number, h: number): Bounds {
+  const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  const tw = Math.max(bw, (bh * w) / h), th = Math.max(bh, (bw * h) / w);
+  return { x0: cx - tw / 2, y0: cy - th / 2, x1: cx + tw / 2, y1: cy + th / 2 };
+}
+
+export function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result as string);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}

@@ -6,7 +6,8 @@
 // Chromium) and macOS stay on Tauri (src-tauri/).
 //
 // Native parts: .bdraw files the system opens the app with (sent to the page through
-// preload.cjs), and the .bdraw MIME type for AppImages (Gear Lever does not install it).
+// preload.cjs), the .bdraw MIME type for AppImages (Gear Lever does not install it), and a
+// file manager thumbnailer for .bdraw (draw-thumbnailer.sh).
 
 const { app, BrowserWindow, Menu, ipcMain, shell } = require('electron');
 const { spawnSync } = require('node:child_process');
@@ -146,12 +147,49 @@ function registerMimeForAppImage() {
   }
 }
 
+/**
+ * File manager thumbnails for .bdraw (freedesktop thumbnailer spec: KDE Dolphin through KIO,
+ * GNOME Files, ...). Installs draw-thumbnailer.sh and a .thumbnailer entry for this user, for
+ * every package type: the script reads the preview PNG that Draw stores in saved files.
+ * Rewrites only what changed.
+ */
+function registerThumbnailer() {
+  try {
+    const dataHome = process.env.XDG_DATA_HOME || path.join(app.getPath('home'), '.local/share');
+    const script = path.join(dataHome, 'xyz.bsums.draw', 'draw-thumbnailer.sh');
+    const entry = path.join(dataHome, 'thumbnailers', 'xyz.bsums.draw.thumbnailer');
+    const put = (file, content, mode) => {
+      let old = null;
+      try {
+        old = fs.readFileSync(file, 'utf8');
+      } catch {
+        // not there yet
+      }
+      if (old === content) return;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, content, { mode });
+      fs.chmodSync(file, mode);
+    };
+    put(script, fs.readFileSync(path.join(process.resourcesPath, 'draw-thumbnailer.sh'), 'utf8'), 0o755);
+    put(
+      entry,
+      ['[Thumbnailer Entry]', 'TryExec=/bin/sh', `Exec=/bin/sh ${script} %i %o %s`, 'MimeType=application/x-bdraw;', ''].join('\n'),
+      0o644,
+    );
+  } catch (e) {
+    console.error(`draw: thumbnailer registration failed: ${e.message}`);
+  }
+}
+
 collect(process.argv);
 Menu.setApplicationMenu(null);
 
 app.whenReady().then(() => {
   createWindow();
-  setTimeout(registerMimeForAppImage, 2000);
+  setTimeout(() => {
+    registerMimeForAppImage();
+    registerThumbnailer();
+  }, 2000);
   if (process.env.DRAW_GPU_INFO) {
     // Diagnostics: DRAW_GPU_INFO=1 prints the WebGL renderer the page gets and the GPU status.
     win.webContents.once('did-finish-load', () =>

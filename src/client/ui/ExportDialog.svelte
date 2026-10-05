@@ -25,7 +25,34 @@
   let format = $state<ImageFormat>('png');
   let running = $state(false);
   let progress = $state(0);
+  let startedAt = $state(0);
+  let now = $state(0);
   let controller: AbortController | null = null;
+
+  // While an export runs: a clock for the time readout, and a warning before leaving the page
+  // (closing it cuts the file off).
+  $effect(() => {
+    if (!running) return;
+    const t = setInterval(() => (now = performance.now()), 500);
+    const leave = (e: BeforeUnloadEvent) => e.preventDefault();
+    window.addEventListener('beforeunload', leave);
+    return () => {
+      clearInterval(t);
+      window.removeEventListener('beforeunload', leave);
+    };
+  });
+
+  function fmtTime(s: number): string {
+    if (!Number.isFinite(s)) return '…';
+    s = Math.round(s);
+    if (s < 60) return `${s} s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m} min ${s % 60} s`;
+    return `${Math.floor(m / 60)} h ${m % 60} min`;
+  }
+  const elapsed = $derived(running ? Math.max(0, now - startedAt) / 1000 : 0);
+  /** Time left from the pace so far; shown after a few seconds, when it means something. */
+  const left = $derived(progress > 0.01 && elapsed > 3 ? (elapsed * (1 - progress)) / progress : NaN);
 
   /** Megapixel presets: camera sizes up to gigapixel panoramas. */
   const PRESETS = [1, 4, 12, 24, 50, 100, 250, 500, 1000, 2500, 10_000, 50_000];
@@ -71,7 +98,7 @@
     running = true;
     progress = 0;
     controller = new AbortController();
-    const started = performance.now();
+    const started = (startedAt = now = performance.now());
     try {
       await exportImage({
         ...engine.snapshot(),
@@ -144,7 +171,7 @@
   {#if running}
     <div class="bar"><div style:width="{Math.round(progress * 100)}%"></div></div>
     <div class="actions">
-      <span class="muted">{Math.floor(progress * 100)}%</span>
+      <span class="muted">{Math.floor(progress * 100)}% · {fmtTime(elapsed)}{Number.isFinite(left) ? ` · about ${fmtTime(left)} left` : ''}</span>
       <button onclick={() => controller?.abort()}>Cancel</button>
     </div>
   {:else}

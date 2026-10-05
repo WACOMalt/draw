@@ -18,6 +18,12 @@ export interface BdrawFile {
   /** Draw version that wrote the file. */
   app: string;
   savedAt: string; // ISO 8601
+  /**
+   * A PNG data URL of the drawing (everything on the visible layers, fitted into 512 px), for
+   * file manager thumbnails. Information only. It stays near the start of the file, so the
+   * Linux thumbnailer finds it without reading the whole document.
+   */
+  preview?: string;
   /** The online canvas the file came from. Information only: loading always makes a new canvas. */
   source?: { key: string; url: string };
   /** Bottom to top by `order`. Deleted layers are left out. */
@@ -26,7 +32,13 @@ export interface BdrawFile {
   strokes: Stroke[];
 }
 
-export function makeBdraw(layers: Iterable<Layer>, strokes: Iterable<Stroke>, app: string, source?: BdrawFile['source']): BdrawFile {
+export function makeBdraw(
+  layers: Iterable<Layer>,
+  strokes: Iterable<Stroke>,
+  app: string,
+  source?: BdrawFile['source'],
+  preview?: string,
+): BdrawFile {
   const live = [...layers].filter((l) => !l.deleted).sort((a, b) => a.order - b.order);
   const ids = new Set(live.map((l) => l.id));
   return {
@@ -34,6 +46,7 @@ export function makeBdraw(layers: Iterable<Layer>, strokes: Iterable<Stroke>, ap
     version: BDRAW_VERSION,
     app,
     savedAt: new Date().toISOString(),
+    ...(preview ? { preview } : {}),
     ...(source ? { source } : {}),
     layers: live,
     strokes: [...strokes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.seq - b.seq),

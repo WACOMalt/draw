@@ -16,6 +16,8 @@ extraResources:
     to: xyz.bsums.draw.xml
   - from: ../src-tauri/icons/icon.png
     to: icon.png
+  - from: draw-thumbnailer.sh
+    to: draw-thumbnailer.sh
 npmRebuild: false
 fileAssociations:
   - ext: bdraw

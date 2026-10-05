@@ -26,6 +26,7 @@ import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
 import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
+import { blobToDataUrl, padded, renderPng } from '../export/region';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
@@ -1341,12 +1342,24 @@ export class Engine {
     await saveBlob(blob, `draw-${this.code}.png`, { name: 'PNG image', extensions: ['png'] });
   }
 
-  /** Saves the canvas (confirmed state, as the server sent it) to a .bdraw file. */
+  /**
+   * Saves the canvas (confirmed state, as the server sent it) to a .bdraw file, with a preview
+   * image for file manager thumbnails (left out if it cannot be made, e.g. without WebGL2).
+   */
   async saveBdraw(): Promise<void> {
-    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, {
-      key: this.code,
-      url: `${PUBLIC_ORIGIN}/s/${this.code}`,
-    });
+    let preview: string | undefined;
+    const all = this.contentBounds();
+    if (all) {
+      try {
+        const { layers, strokes, seq } = this.snapshot();
+        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512);
+        if (png) preview = await blobToDataUrl(png);
+      } catch (e) {
+        console.warn('bdraw preview', e);
+      }
+    }
+    const source = { key: this.code, url: `${PUBLIC_ORIGIN}/s/${this.code}` };
+    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview);
     await saveBlob(await encodeBdraw(file), `${this.code}.${BDRAW_EXT}`, { name: 'Draw canvas', extensions: [BDRAW_EXT] });
   }
 }
