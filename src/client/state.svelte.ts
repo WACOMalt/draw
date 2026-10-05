@@ -6,7 +6,8 @@ import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
 export type Tool = 'brush' | 'eraser' | 'eyedropper' | 'hand';
-export type BrushSettings = Omit<Brush, 'tool' | 'color'>;
+export type { BrushSettings } from '../shared/types';
+import type { BrushSettings } from '../shared/types';
 
 export interface User {
   id: string;

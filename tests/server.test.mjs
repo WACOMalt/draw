@@ -356,6 +356,23 @@ try {
   const legacyEdit = new URL((await admin.api('GET', '/api/canvases/QWRT-ZXCV/sharing')).data.editLink).searchParams.get('k');
   check((await first(await new Browser().join('QWRT-ZXCV', { link: legacyEdit })))?.role === 'editor', 'adopted canvas has an edit token link');
 
+  // --- brush presets -----------------------------------------------------------------------------
+  const settings = { size: 40, opacity: 1, flow: 0.8, hardness: 0.5, spacing: 0.2, pressureSize: true, pressureFlow: false, buildup: false, tip: 'charcoal', scatter: 0.5 };
+  const anonP = new Browser();
+  const pSaved = await anonP.api('POST', '/api/presets', { name: 'Scatter Charcoal', settings, anon: anonP.anon, creatorName: 'Busy Mongoose' });
+  check(pSaved.status === 201 && pSaved.data.preset.creatorName === 'Busy Mongoose' && /^a:[0-9a-f]{16}$/.test(pSaved.data.preset.creator), 'save a preset without an account');
+  check((await anonP.api('POST', '/api/presets', { name: 'x', settings: { ...settings, size: 5000 }, anon: anonP.anon })).status === 400, 'preset size is in screen pixels (1..1000)');
+  check((await anonP.api('POST', '/api/presets', { name: '  ', settings, anon: anonP.anon })).status === 400, 'preset needs a name');
+  const presetList = (await new Browser().api('GET', '/api/presets')).data.presets;
+  check(presetList.some((x) => x.id === pSaved.data.preset.id && x.settings.tip === 'charcoal' && x.settings.scatter === 0.5), 'everyone sees the preset');
+  const stranger2 = new Browser();
+  check((await stranger2.api('POST', `/api/presets/${pSaved.data.preset.id}/delete`, { anon: stranger2.anon })).status === 403, 'someone else cannot delete it');
+  check((await anonP.api('POST', `/api/presets/${pSaved.data.preset.id}/delete`, { anon: anonP.anon })).status === 200, 'the same browser deletes its preset');
+  const vSaved = await funky.api('POST', '/api/presets', { name: 'Charcoal', settings, creatorName: 'Spoofed Name' });
+  check(vSaved.status === 201 && vSaved.data.preset.creatorName === 'Funky Otter' && vSaved.data.preset.creator.startsWith('u:'), 'an account saves under its account name');
+  check((await anonP.api('POST', `/api/presets/${vSaved.data.preset.id}/delete`, { anon: anonP.anon })).status === 403, 'an anonymous browser cannot delete an account preset');
+  check((await admin.api('POST', `/api/presets/${vSaved.data.preset.id}/delete`, {})).status === 200, 'the admin deletes any preset');
+
   const shortLived = (await new Browser().api('POST', '/api/sessions', {})).data.key;
   const watcher = await new Browser().join(shortLived);
   await first(watcher);

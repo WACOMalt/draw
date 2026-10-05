@@ -319,6 +319,16 @@ For WebKitGTK and WKWebView, the desktop app reads the pen in the native layer (
 
 Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hides the markers. `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor.
 
+### 9.3 Brush presets
+
+- A preset is brush settings without the tool and the color, with `size` in screen pixels (`BrushSettings`), plus a name. Presets are shared: every person sees every preset.
+- Anyone can save a preset, also without an account. The server stores the creator as the account (`owner_id`), or else as the sha256 of the anonymous secret of the browser (`creator_anon`). It shows the creator as `u:<user id>` or `a:<16 hex of the hash>`, never the secret.
+- Delete: the creator (the same account, or the same browser) or an admin (`ADMIN_EMAILS`). The server makes the check. The client shows the delete button only for those presets.
+- Groups: the panel groups presets by creator, with the account name, or the display name at save time without an account. The own group is first. A group can collapse (the state is kept on the device).
+- Thumbnail: the client draws the preset along a squiggle with a pressure curve (light at both ends, full in the middle), with the same dab walker and stamps as real strokes. A large brush is scaled down to fit. Grain is an approximation on the whole stroke. The server stores no images.
+- Apply: a click sets the brush (or the eraser, while it is the tool). Settings that the preset does not hold go back to their defaults.
+- API: `GET /api/presets`, `POST /api/presets` (`name`, `settings`, `anon`, `creatorName`), `POST /api/presets/<id>/delete` (`anon`). Limits: 30 saves per hour per IP address, 300 presets per creator, 5000 in total.
+
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).

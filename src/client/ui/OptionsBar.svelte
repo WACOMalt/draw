@@ -2,12 +2,14 @@
   import { BRUSH_TIPS, GRAINS, LIMITS, type BrushTip, type GrainId } from '../../shared/types';
   import { ed } from '../state.svelte';
   import Icon from './Icon.svelte';
+  import PresetsPanel from './PresetsPanel.svelte';
   import Slider from './Slider.svelte';
 
   let { stacked = false }: { stacked?: boolean } = $props();
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
   const b = $derived(ed.activeBrush);
   let dynamicsOpen = $state(false);
+  let presetsOpen = $state(false);
 
   const TIP_LABEL: Record<BrushTip, string> = {
     round: 'Round',
@@ -52,6 +54,16 @@
 <div class="opts" class:stacked>
   <span class="tool">{ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'brush' ? 'Brush' : ed.tool === 'eyedropper' ? 'Eyedropper' : 'Hand'}</span>
   {#if painting}
+    {#if !stacked}
+      <span class="popwrap">
+        <button class="icon wide" class:on={presetsOpen} title="Brush presets, shared by everyone" onclick={() => (presetsOpen = !presetsOpen)}>
+          <Icon name="presets" /> Presets
+        </button>
+        {#if presetsOpen}
+          <div class="pop left"><PresetsPanel /></div>
+        {/if}
+      </span>
+    {/if}
     <Slider wide={stacked} label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushPx} log width={110} title="Screen pixels at the current zoom. [ and ]" />
     <Slider wide={stacked} label="Opacity" bind:value={b.opacity} min={0.01} max={1} step={0.01} percent title="Keys 1–0. Caps the whole stroke." />
     <Slider wide={stacked} label="Flow" bind:value={b.flow} min={0.01} max={1} step={0.01} percent title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
@@ -85,7 +97,11 @@
         </span>
       {/if}
     </div>
-    {#if stacked}{@render dynamics()}{/if}
+    {#if stacked}
+      {@render dynamics()}
+      <h4 class="sub">Presets</h4>
+      <PresetsPanel stacked />
+    {/if}
   {:else if ed.tool === 'eyedropper'}
     <span class="hint">Click the canvas to pick a color from all layers. Hold Alt with the brush for a quick pick.</span>
   {:else}
@@ -164,6 +180,17 @@
   }
   .popwrap {
     position: relative;
+  }
+  .sub {
+    margin: 10px 0 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+  }
+  .pop.left {
+    left: 0;
+    right: auto;
   }
   .pop {
     position: absolute;

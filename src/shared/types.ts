@@ -54,6 +54,23 @@ export type BrushTip = (typeof BRUSH_TIPS)[number];
 export const GRAINS = ['paper', 'canvas', 'noise'] as const;
 export type GrainId = (typeof GRAINS)[number];
 
+/** Brush settings as the UI holds them: no tool or color, and `size` in screen pixels. */
+export type BrushSettings = Omit<Brush, 'tool' | 'color'>;
+
+/**
+ * A shared brush preset. `creator` identifies who saved it: `u:<user id>` for an account,
+ * `a:<first 16 hex of sha256(anonymous secret)>` without one. `creatorName` is the account name,
+ * or the display name at save time.
+ */
+export interface BrushPreset {
+  id: string;
+  name: string;
+  settings: BrushSettings;
+  creator: string;
+  creatorName: string;
+  createdAt: number;
+}
+
 export const ADJUST_TYPES = ['levels', 'curves', 'hueSat', 'brightContrast'] as const;
 export type AdjustType = (typeof ADJUST_TYPES)[number];
 

@@ -9,6 +9,7 @@ import {
   type Adjust,
   type BlendMode,
   type Brush,
+  type BrushSettings,
   type LayerMask,
   type LayerProps,
   type Op,
@@ -89,6 +90,14 @@ export function validateBrush(v: unknown): Brush {
     buildup: bool(b.buildup, 'brush.buildup'),
     ...extra,
   };
+}
+
+/** Preset settings: a brush without tool and color, with `size` in screen pixels. */
+export function validateBrushSettings(v: unknown): BrushSettings {
+  const s = obj(v, 'settings');
+  num(s.size, 1, LIMITS.maxBrushPx, 'settings.size');
+  const { tool: _t, color: _c, ...settings } = validateBrush({ ...s, tool: 'paint', color: '#000000' });
+  return settings;
 }
 
 export function validateAdjust(v: unknown): Adjust {

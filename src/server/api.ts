@@ -10,7 +10,7 @@ import http from 'node:http';
 import zlib from 'node:zlib';
 import { BDRAW_VERSION, isGzip } from '../shared/bdraw';
 import { newId, newSessionCode } from '../shared/ids';
-import { normalizeName, parseKey, candidateKeys } from '../shared/types';
+import { LIMITS, normalizeName, parseKey, candidateKeys, type BrushPreset, type BrushSettings } from '../shared/types';
 import { canClaim, isTemporary, TEMP_TTL_MS } from './access';
 import {
   clearSessionCookie,
@@ -24,7 +24,8 @@ import {
   userFromToken,
   verifyPassword,
 } from './auth';
-import { linkToken, sha256, type CanvasRow, type MemberRole, type Store, type UserRow } from './db';
+import { linkToken, sha256, type CanvasRow, type MemberRole, type PresetRow, type Store, type UserRow } from './db';
+import { validateBrushSettings } from '../shared/validate';
 import { actionMail, type Mailer } from './mailer';
 
 export interface ApiContext {
@@ -76,7 +77,12 @@ const limits = {
   create: new Limiter(10, 60_000),
   device: new Limiter(10, 15 * 60_000),
   share: new Limiter(60, 60_000),
+  presets: new Limiter(30, 3600_000),
 };
+
+/** Caps for shared brush presets. */
+const MAX_PRESETS = 5000;
+const MAX_PRESETS_PER_CREATOR = 300;
 
 function publicUser(u: UserRow, admins: Set<string>) {
   return { id: u.id, email: u.email, name: u.name, admin: admins.has(u.email) };
@@ -345,6 +351,61 @@ const importCanvas: Handler = async (ctx, req) => {
 };
 
 /** Resolves what someone typed (a code with or without the dash, or a name). */
+// --- brush presets --------------------------------------------------------------------------------
+
+/** The public creator key of a preset: `u:<user id>`, or `a:` and 16 hex of the anonymous hash. */
+function presetCreator(p: Pick<PresetRow, 'owner_id' | 'creator_anon'>): string {
+  return p.owner_id ? `u:${p.owner_id}` : `a:${(p.creator_anon ?? '').slice(0, 16)}`;
+}
+
+function publicPreset(p: PresetRow): BrushPreset {
+  return { id: p.id, name: p.name, settings: JSON.parse(p.settings), creator: presetCreator(p), creatorName: p.display_name, createdAt: p.created_at };
+}
+
+const listPresets: Handler = async (ctx) => ok({ presets: ctx.store.presets().map(publicPreset) });
+
+/** Saves a preset for everyone. An account saves under its name; without one, under the display name. */
+const savePreset: Handler = async (ctx, req) => {
+  if (!limits.presets.allow(req.ip)) return err(429, 'rate_limited');
+  const name = typeof req.body.name === 'string' ? req.body.name.replace(/[\u0000-\u001f]/g, '').trim().slice(0, 40) : '';
+  if (!name) return err(400, 'bad_name');
+  let settings: BrushSettings;
+  try {
+    settings = validateBrushSettings(req.body.settings);
+  } catch {
+    return err(400, 'bad_settings');
+  }
+  const anon = !req.user && typeof req.body.anon === 'string' && req.body.anon.length >= 16 && req.body.anon.length <= 100 ? sha256(req.body.anon) : null;
+  if (!req.user && !anon) return err(400, 'bad_request');
+  const counts = ctx.store.presetCounts(req.user?.id ?? null, anon);
+  if (counts.total >= MAX_PRESETS) return err(507, 'too_many_presets');
+  if (counts.mine >= MAX_PRESETS_PER_CREATOR) return err(429, 'too_many_presets');
+  const given = typeof req.body.creatorName === 'string' ? req.body.creatorName.replace(/[\u0000-\u001f]/g, '').trim().slice(0, LIMITS.maxPeerName) : '';
+  const row = {
+    id: newId(),
+    name,
+    settings: JSON.stringify(settings),
+    owner_id: req.user?.id ?? null,
+    creator_anon: anon,
+    creator_name: req.user?.name ?? (given || 'Anonymous'),
+    created_at: Date.now(),
+  };
+  ctx.store.addPreset(row);
+  return ok({ preset: publicPreset(ctx.store.preset(row.id)!) }, 201);
+};
+
+/** The creator (account, or the same browser) or an admin may delete a preset. */
+const deletePreset: Handler = async (ctx, req) => {
+  const p = ctx.store.preset(req.params[0]);
+  if (!p) return err(404, 'not_found');
+  const admin = !!req.user && ctx.adminEmails.has(req.user.email);
+  const ownerOk = !!p.owner_id && req.user?.id === p.owner_id;
+  const anonOk = !!p.creator_anon && typeof req.body.anon === 'string' && sha256(req.body.anon) === p.creator_anon;
+  if (!admin && !ownerOk && !anonOk) return err(403, 'not_yours');
+  ctx.store.deletePreset(p.id);
+  return ok({ deleted: p.id });
+};
+
 const resolveCanvas: Handler = async (ctx, req) => {
   const key = candidateKeys(req.params[0]).find((k) => ctx.store.sessionExists(k)) ?? null;
   return ok({ exists: key !== null, key });
@@ -549,6 +610,9 @@ const ROUTES: [string, RegExp, Handler][] = [
   ['POST', /^\/api\/auth\/device\/poll$/, devicePoll],
   ['POST', /^\/api\/sessions$/, createCanvas],
   ['POST', /^\/api\/import$/, importCanvas],
+  ['GET', /^\/api\/presets$/, listPresets],
+  ['POST', /^\/api\/presets$/, savePreset],
+  ['POST', /^\/api\/presets\/([A-Za-z0-9_-]{6,40})\/delete$/, deletePreset],
   ['GET', /^\/api\/sessions\/([^/]+)$/, resolveCanvas],
   ['GET', /^\/api\/canvases$/, myCanvases],
   ['GET', /^\/api\/canvases\/([^/]+)\/sharing$/, getSharing],

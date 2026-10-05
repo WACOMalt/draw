@@ -34,6 +34,18 @@ export interface CanvasRow {
   join_password: string | null;
 }
 
+export interface PresetRow {
+  id: string;
+  name: string;
+  settings: string; // JSON of BrushSettings
+  owner_id: string | null;
+  creator_anon: string | null; // sha256 hex of the anonymous secret
+  creator_name: string;
+  created_at: number;
+  /** COALESCE(account name, creator_name), from the queries. */
+  display_name: string;
+}
+
 export interface UserRow {
   id: string;
   email: string;
@@ -165,6 +177,26 @@ export class Store {
         this.setSetting('schema', '3');
       })();
     }
+    if (version < 4) {
+      // Shared brush presets. The creator is an account (owner_id) or, without one, the hash of
+      // the browser's anonymous secret (creator_anon), as for temporary canvases.
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE presets (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            settings TEXT NOT NULL,
+            owner_id TEXT REFERENCES users (id) ON DELETE CASCADE,
+            creator_anon TEXT,
+            creator_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+          );
+          CREATE INDEX presets_owner ON presets (owner_id);
+          CREATE INDEX presets_anon ON presets (creator_anon);
+        `);
+        this.setSetting('schema', '4');
+      })();
+    }
   }
 
   setting(key: string): string | undefined {
@@ -224,6 +256,45 @@ export class Store {
       if ((e as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return false;
       throw e;
     }
+  }
+
+  // --- brush presets ------------------------------------------------------------------------
+
+  /** All presets, oldest first, with the account name for presets of an account. */
+  presets(): PresetRow[] {
+    return this.db
+      .prepare<[], PresetRow>(
+        `SELECT p.*, COALESCE(u.name, p.creator_name) AS display_name
+         FROM presets p LEFT JOIN users u ON u.id = p.owner_id ORDER BY p.created_at, p.id`,
+      )
+      .all();
+  }
+
+  preset(id: string): PresetRow | undefined {
+    return this.db
+      .prepare<[string], PresetRow>(
+        'SELECT p.*, COALESCE(u.name, p.creator_name) AS display_name FROM presets p LEFT JOIN users u ON u.id = p.owner_id WHERE p.id = ?',
+      )
+      .get(id);
+  }
+
+  addPreset(p: Omit<PresetRow, 'display_name'>): void {
+    this.db
+      .prepare('INSERT INTO presets (id, name, settings, owner_id, creator_anon, creator_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, p.name, p.settings, p.owner_id, p.creator_anon, p.creator_name, p.created_at);
+  }
+
+  deletePreset(id: string): void {
+    this.db.prepare('DELETE FROM presets WHERE id = ?').run(id);
+  }
+
+  /** Number of presets in total, and of one creator. */
+  presetCounts(ownerId: string | null, anonHash: string | null): { total: number; mine: number } {
+    const total = this.db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM presets').get()!.n;
+    const mine = this.db
+      .prepare<[string | null, string | null], { n: number }>('SELECT COUNT(*) AS n FROM presets WHERE (owner_id IS NOT NULL AND owner_id = ?) OR (creator_anon IS NOT NULL AND creator_anon = ?)')
+      .get(ownerId, anonHash)!.n;
+    return { total, mine };
   }
 
   canvas(code: string): CanvasRow | undefined {
