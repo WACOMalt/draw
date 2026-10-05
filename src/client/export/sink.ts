@@ -15,6 +15,16 @@ export interface Sink {
   abort(): Promise<void>;
   /** Bytes written so far. */
   readonly size: number;
+  /** File name (as chosen in the save dialog, when the platform tells it). */
+  readonly name: string;
+}
+
+/** The browser said the file was written, but the file on disk does not hold what was sent. */
+export class NotSavedError extends Error {
+  constructor(detail: string) {
+    super(`not_saved: ${detail}`);
+    this.name = 'NotSavedError';
+  }
 }
 
 export type SinkKind = 'native' | 'stream' | 'memory';
@@ -32,9 +42,9 @@ export const MEMORY_LIMIT = 1.5 * 2 ** 30;
 /** Writes go out in blocks of this size: one large write is much faster than many small ones. */
 const BLOCK = 4 * 2 ** 20;
 
-/** Asks where to save. Null: the person cancelled. */
-export async function openSink(name: string, mime: string, ext: string, label: string): Promise<Sink | null> {
-  const kind = sinkKind();
+/** Asks where to save. Null: the person cancelled. `memory`: a plain download (the fallback). */
+export async function openSink(name: string, mime: string, ext: string, label: string, memory = false): Promise<Sink | null> {
+  const kind = memory ? 'memory' : sinkKind();
   if (kind === 'native') return openNative(name, ext, label);
   if (kind === 'stream') return openStream(name, mime, ext, label);
   return memorySink(name, mime);
@@ -75,22 +85,37 @@ async function openStream(name: string, mime: string, ext: string, label: string
   }
   const file = await handle.createWritable();
   let size = 0;
+  // The first bytes as they must end up on disk (header patches included), to check the file.
+  const head = new Uint8Array(64);
+  let headLen = 0;
+  const keep = (position: number, data: Uint8Array) => {
+    for (let i = 0; i < data.length && position + i < head.length; i++) head[position + i] = data[i];
+    headLen = Math.max(headLen, Math.min(head.length, position + data.length));
+  };
   const out = blocked((b) => file.write(b.slice()));
   return {
+    name: handle.name,
     get size() {
       return size;
     },
     async write(data) {
+      if (size < head.length) keep(size, data);
       size += data.length;
       await out.write(data);
     },
     async patch(position, data) {
+      keep(position, data);
       await out.drain();
       await file.write({ type: 'write', position, data: data.slice() });
     },
     async close() {
       await out.drain();
       await file.close();
+      // Read it back: some browser shells report success without storing the data.
+      const saved = await handle.getFile();
+      if (saved.size !== size) throw new NotSavedError(`${saved.size} of ${size} bytes`);
+      const got = new Uint8Array(await saved.slice(0, headLen).arrayBuffer());
+      if (got.some((b, i) => b !== head[i])) throw new NotSavedError('the start of the file differs');
     },
     async abort() {
       await file.abort().catch(() => {});
@@ -104,11 +129,13 @@ async function openNative(name: string, ext: string, label: string): Promise<Sin
   if (!path) return null;
   const f = await fs.open(path, { write: true, create: true, truncate: true });
   let size = 0;
+  const base = path.split(/[\\/]/).pop() ?? name;
   const writeAll = async (b: Uint8Array) => {
     for (let o = 0; o < b.length; ) o += await f.write(b.subarray(o));
   };
   const out = blocked(writeAll);
   return {
+    name: base,
     get size() {
       return size;
     },
@@ -137,6 +164,7 @@ function memorySink(name: string, mime: string): Sink {
   const parts: Uint8Array[] = [];
   let size = 0;
   return {
+    name,
     get size() {
       return size;
     },

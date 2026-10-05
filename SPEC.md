@@ -359,7 +359,8 @@ One "Export image" button in the top bar (on phones, in the ⋮ menu) opens the 
 | TIFF | 2^32 − 1 px per side | Tiled (256 × 256), Deflate with the horizontal predictor. BigTIFF (64-bit offsets) when the image is over 4 GB uncompressed. GIMP 2.10.32+, Photoshop, Krita and GDAL read BigTIFF. |
 
 - Rendering: an off-screen WebGL2 renderer with its own copy of the document renders pieces of up to 2048 × 2048 px, each to completion, with the same code as the screen. The pieces go into the encoder as they are done. About 24 megapixels per second on a desktop GPU.
-- Progress: a bar, the percent, the time so far, and the time left (after 3 s, from the pace so far). Cancel stops the export and removes the partial file. While an export runs, the browser asks before the page closes.
+- Stages: "Choose where to save…" (the save dialog comes first, so pieces can stream to the file), then a bar with "Rendering piece N of M", the percent, the time so far and the time left (after 3 s, from the pace so far), then "Finishing and checking the file". At the end, the dialog stays open with "Saved NAME", the size in pixels and bytes, and the time. Cancel stops the export and removes the partial file. While an export runs, the browser asks before the page closes.
+- Check: after a streamed save, the dialog reads the file back (size and the first 64 bytes). If the browser reported success but the file is wrong, it says so and offers "Download instead" (a normal download, up to 1.5 GB).
 - Writing: the Tauri apps write the file natively (save dialog, then writes and seeks). Browsers with the File System Access API (Chromium, Edge, the Electron app) stream to the file. Other browsers (Firefox, Safari) keep the file in memory, up to 1.5 GB, then download it. The dialog warns about this.
 - Without WebGL2 (no off-screen renderer), the dialog offers only a PNG snapshot of the screen. Transparency is not exported: the paper color is the background.
 

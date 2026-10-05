@@ -19,8 +19,10 @@ export interface ExportJob {
   height: number;
   format: ImageFormat;
   sink: Sink;
-  /** 0..1 */
-  onProgress: (done: number) => void;
+  /** done: 0..1; piece: pieces rendered so far, of `pieces`. */
+  onProgress: (done: number, piece: number, pieces: number) => void;
+  /** Called once all pieces are in, while the file is finished and checked. */
+  onFinishing?: () => void;
   signal: AbortSignal;
 }
 
@@ -35,8 +37,10 @@ export async function exportImage(job: ExportJob): Promise<void> {
   const scale = width / (bounds.x1 - bounds.x0);
   const rr = new RegionRenderer(job.layers, job.strokes, job.seq);
   const at = (px: number, py: number): [number, number] => [bounds.x0 + px / scale, bounds.y0 + py / scale];
+  let piece = 0;
   try {
     if (job.format === 'png') {
+      const pieces = Math.ceil(height / STRIP) * Math.ceil(width / PIECE);
       const png = new PngWriter(sink, width, height);
       await png.begin();
       const strip = new Uint8ClampedArray(width * STRIP * 4);
@@ -47,13 +51,15 @@ export async function exportImage(job: ExportJob): Promise<void> {
           const w = Math.min(PIECE, width - x);
           const px = rr.render(...at(x, y), scale, w, h);
           for (let r = 0; r < h; r++) strip.set(px.subarray(r * w * 4, (r + 1) * w * 4), (r * width + x) * 4);
-          job.onProgress((y * width + (x + w) * h) / (width * height));
+          job.onProgress((y * width + (x + w) * h) / (width * height), ++piece, pieces);
           await breathe();
         }
         await png.addRows(strip, h);
       }
+      job.onFinishing?.();
       await png.end();
     } else {
+      const pieces = Math.ceil(height / PIECE) * Math.ceil(width / PIECE);
       const tiff = new TiffWriter(sink, width, height);
       await tiff.begin();
       // Pieces are whole tiles (PIECE is a multiple of TIFF_TILE).
@@ -64,15 +70,16 @@ export async function exportImage(job: ExportJob): Promise<void> {
           const w = Math.min(PIECE, width - x);
           const px = rr.render(...at(x, y), scale, w, h);
           await tiff.addPiece(px, x, y, w, h);
-          job.onProgress((y * width + (x + w) * h) / (width * height));
+          job.onProgress((y * width + (x + w) * h) / (width * height), ++piece, pieces);
           await breathe();
         }
       }
+      job.onFinishing?.();
       await tiff.end();
     }
     await sink.close();
   } catch (e) {
-    await sink.abort();
+    if ((e as Error).name !== 'NotSavedError') await sink.abort();
     throw e;
   } finally {
     rr.destroy();

@@ -8,7 +8,7 @@
   import { exportImage, rawSize, type ImageFormat } from '../export/exportImage';
   import { toAspect } from '../export/region';
   import { PNG_MAX_SIDE } from '../export/png';
-  import { MEMORY_LIMIT, openSink, sinkKind } from '../export/sink';
+  import { MEMORY_LIMIT, NotSavedError, openSink, sinkKind } from '../export/sink';
   import { TIFF_MAX_SIDE, needsBigTiff } from '../export/tiff';
   import { ed, showToast } from '../state.svelte';
   import Modal from './Modal.svelte';
@@ -48,8 +48,16 @@
     }
   });
   const mp = $derived(size === 'screen' ? screenMp : size);
-  let running = $state(false);
+  /** idle → choosing (save dialog) → rendering → finishing → done | failed (back to idle). */
+  let phase = $state<'idle' | 'choosing' | 'rendering' | 'finishing' | 'done'>('idle');
+  const running = $derived(phase === 'choosing' || phase === 'rendering' || phase === 'finishing');
   let progress = $state(0);
+  let piece = $state(0);
+  let pieces = $state(0);
+  /** Result of the last export: shown until the next one. */
+  let result = $state<{ name: string; bytes: number; seconds: number; width: number; height: number } | null>(null);
+  /** The browser claimed to save but the file was wrong: offer a plain download. */
+  let notSaved = $state<string | null>(null);
   let startedAt = $state(0);
   let now = $state(0);
   let controller: AbortController | null = null;
@@ -131,7 +139,8 @@
   }
   const megapixels = $derived((width * height) / 1e6);
 
-  async function run() {
+  /** `download`: skip the save dialog and download the file (the fallback after NotSaved). */
+  async function run(download = false) {
     if (!gl) {
       await engine.exportPng();
       ed.exportOpen = false;
@@ -139,32 +148,40 @@
     }
     if (problem || running) return;
     const ext = format === 'png' ? 'png' : 'tif';
-    const sink = await openSink(`${code}-${width}x${height}.${ext}`, format === 'png' ? 'image/png' : 'image/tiff', ext, format === 'png' ? 'PNG image' : 'TIFF image');
-    if (!sink) return;
-    running = true;
-    progress = 0;
+    result = null;
+    notSaved = null;
+    phase = 'choosing';
+    const sink = await openSink(`${code}-${width}x${height}.${ext}`, format === 'png' ? 'image/png' : 'image/tiff', ext, format === 'png' ? 'PNG image' : 'TIFF image', download).catch(() => null);
+    if (!sink) {
+      phase = 'idle';
+      return;
+    }
+    phase = 'rendering';
+    progress = piece = pieces = 0;
     controller = new AbortController();
     const started = (startedAt = now = performance.now());
+    const size = { width, height };
     try {
       await exportImage({
         ...engine.snapshot(),
         bounds: $state.snapshot(bounds),
-        width,
-        height,
+        ...size,
         format,
         sink,
-        onProgress: (p) => (progress = p),
+        onProgress: (p, i, n) => ((progress = p), (piece = i), (pieces = n)),
+        onFinishing: () => (phase = 'finishing'),
         signal: controller.signal,
       });
-      showToast(`Exported ${width} × ${height} (${fmtBytes(sink.size)}) in ${Math.round((performance.now() - started) / 1000)} s`);
-      ed.exportOpen = false;
+      result = { name: sink.name, bytes: sink.size, seconds: (performance.now() - started) / 1000, ...size };
+      phase = 'done';
     } catch (e) {
       const err = e as Error;
+      phase = 'idle';
       if (err.name === 'AbortError') showToast('Export cancelled');
+      else if (err instanceof NotSavedError) notSaved = err.message.replace(/^not_saved: /, '');
       else if (err.message === 'too_big_for_memory') showToast('The file got too large for browser memory. Use Chrome, Edge or the Draw app.');
       else showToast(`Export failed: ${err.message}`);
     } finally {
-      running = false;
       controller = null;
     }
   }
@@ -244,15 +261,38 @@
   {#if problem && gl}<p class="error">{problem}</p>
   {:else if memoryOnly && raw > MEMORY_LIMIT}<p class="warn">This browser keeps the file in memory before the download. A large image can fail; Chrome, Edge and the Draw app write straight to disk.</p>{/if}
 
-  {#if running}
+  {#if notSaved}
+    <div class="status bad">
+      <b>The file was not saved correctly.</b>
+      <span>This browser reported success, but the file on disk is wrong ({notSaved}). Download it as a normal download instead, or use Chrome, Edge or the Draw app.</span>
+    </div>
+  {/if}
+
+  {#if phase === 'choosing'}
+    <div class="status"><b>Choose where to save…</b><span>Draw renders the image after you pick the file.</span></div>
+  {:else if phase === 'rendering' || phase === 'finishing'}
     <div class="bar"><div style:width="{Math.round(progress * 100)}%"></div></div>
     <div class="actions">
-      <span class="muted">{Math.floor(progress * 100)}% · {fmtTime(elapsed)}{Number.isFinite(left) ? ` · about ${fmtTime(left)} left` : ''}</span>
+      <span class="muted"
+        >{phase === 'finishing' ? 'Finishing and checking the file…' : `Rendering piece ${piece} of ${pieces || '…'} · ${Math.floor(progress * 100)}%`} · {fmtTime(elapsed)}{phase ===
+          'rendering' && Number.isFinite(left)
+          ? ` · about ${fmtTime(left)} left`
+          : ''}</span
+      >
       <button onclick={() => controller?.abort()}>Cancel</button>
     </div>
   {:else}
+    {#if phase === 'done' && result}
+      <div class="status good">
+        <b>Saved {result.name}</b>
+        <span>{result.width.toLocaleString()} × {result.height.toLocaleString()} px · {fmtBytes(result.bytes)} · {fmtTime(result.seconds)}</span>
+      </div>
+    {/if}
     <div class="actions">
-      <button class="primary" disabled={gl && !!problem} onclick={run}>{gl ? 'Export…' : 'Save snapshot…'}</button>
+      {#if notSaved && raw <= MEMORY_LIMIT}<button class="primary" onclick={() => run(true)}>Download instead</button>{/if}
+      <button class={notSaved && raw <= MEMORY_LIMIT ? '' : 'primary'} disabled={gl && !!problem} onclick={() => run()}
+        >{gl ? (phase === 'done' ? 'Export again…' : 'Export…') : 'Save snapshot…'}</button
+      >
       <button onclick={() => (ed.exportOpen = false)}>Close</button>
     </div>
   {/if}
@@ -324,6 +364,26 @@
   }
   .warn {
     color: #e8b04a;
+  }
+  .status {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--bg-0);
+    border-left: 3px solid var(--accent);
+  }
+  .status span {
+    color: var(--text-dim);
+    font-size: 11.5px;
+  }
+  .status.good {
+    border-left-color: #51cf66;
+  }
+  .status.bad {
+    border-left-color: var(--danger);
   }
   .bar {
     height: 6px;
