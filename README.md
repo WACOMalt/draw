@@ -2,6 +2,15 @@
 
 An infinite, multiplayer drawing canvas. People join a session with a share code. See [SPEC.md](SPEC.md) for the design.
 
+## Install
+
+- **Web:** open https://draw.bsums.xyz. Chrome and Edge can install it as an app.
+- **Android:** the APK from the [latest release](https://github.com/WACOMalt/draw/releases/latest), or with [Obtainium](https://obtainium.imranr.dev/), which installs it from the GitHub releases and keeps it up to date:
+
+  <a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22xyz.bsums.draw%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2FWACOMalt%2Fdraw%22%2C%22author%22%3A%22WACOMalt%22%2C%22name%22%3A%22Draw%22%2C%22preferredApkIndex%22%3A0%2C%22additionalSettings%22%3A%22%7B%5C%22includePrereleases%5C%22%3Afalse%2C%5C%22apkFilterRegEx%5C%22%3A%5C%22android%5C%5C%5C%5C.apk%24%5C%22%7D%22%2C%22overrideSource%22%3Anull%7D"><img src="docs/assets/badge_obtainium.png" alt="Get it on Obtainium" height="56"></a>
+
+- **Desktop:** Windows, macOS, and Linux (AppImage, `.deb`, `.rpm`) installers are in the [latest release](https://github.com/WACOMalt/draw/releases/latest).
+
 ## Develop
 
 ```bash
