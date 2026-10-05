@@ -11,7 +11,7 @@ import zlib from 'node:zlib';
 import { BDRAW_VERSION, isGzip } from '../shared/bdraw';
 import { newId, newSessionCode } from '../shared/ids';
 import { LIMITS, normalizeName, parseKey, candidateKeys, type BrushPreset, type BrushSettings } from '../shared/types';
-import { canClaim, isTemporary, TEMP_TTL_MS } from './access';
+import { canClaim, isAdmin, isTemporary, TEMP_TTL_MS } from './access';
 import {
   clearSessionCookie,
   hashPassword,
@@ -27,6 +27,7 @@ import {
 import { linkToken, sha256, type CanvasRow, type MemberRole, type PresetRow, type Store, type UserRow } from './db';
 import { validateBrushSettings } from '../shared/validate';
 import { actionMail, type Mailer } from './mailer';
+import type { Captcha } from './captcha';
 
 export interface ApiContext {
   store: Store;
@@ -40,6 +41,13 @@ export interface ApiContext {
   moveCanvas(from: string, to: string): void;
   /** Fills a new canvas from a .bdraw file (Session.importDoc). */
   importDoc(row: CanvasRow, layers: unknown[], strokes: unknown[]): { layers: number; strokes: number; skipped: number };
+  /** Proof-of-work captcha for registration and password reset emails (captcha.ts). */
+  captcha: Captcha;
+  /**
+   * True: a new account must confirm its email before it can log in (EMAIL_VERIFICATION=1).
+   * False (default): registering logs in at once.
+   */
+  emailVerification: boolean;
 }
 
 type Handler = (ctx: ApiContext, req: Req) => Promise<Res>;
@@ -136,8 +144,10 @@ function mailDown(ctx: ApiContext): boolean {
   return ctx.mailer.mode === 'dev' && process.env.NODE_ENV === 'production';
 }
 
+const captchaHandler: Handler = async (ctx) => ok(await ctx.captcha.challenge());
+
 const register: Handler = async (ctx, req) => {
-  if (mailDown(ctx)) return err(503, 'mail_unavailable');
+  if (ctx.emailVerification && mailDown(ctx)) return err(503, 'mail_unavailable');
   if (!limits.register.allow(req.ip)) return err(429, 'rate_limited');
   const email = normalizeEmail(req.body.email);
   const name = str(req.body.name, 40);
@@ -145,6 +155,28 @@ const register: Handler = async (ctx, req) => {
   if (!email) return err(400, 'bad_email');
   if (!name) return err(400, 'bad_name');
   if (password.length < MIN_PASSWORD || password.length > 200) return err(400, 'bad_password', { min: MIN_PASSWORD });
+  if (!(await ctx.captcha.check(req.body.captcha))) return err(400, 'captcha');
+
+  if (!ctx.emailVerification) {
+    // No email confirmation: the account works at once, and the browser is logged in.
+    const found = ctx.store.userByEmail(email);
+    if (found?.email_verified_at) return err(409, 'email_taken');
+    const hash = await hashPassword(password);
+    let id: string;
+    if (found) {
+      // Left over from a time with email confirmation, never confirmed: take it over.
+      id = found.id;
+      ctx.store.updateUser(id, { name, password_hash: hash });
+    } else {
+      id = newId();
+      ctx.store.createUser({ id, email, name, password_hash: hash });
+    }
+    ctx.store.updateUser(id, { email_verified_at: Date.now() });
+    const user = ctx.store.userById(id)!;
+    const kind = req.body.client === 'desktop' ? 'bearer' : 'cookie';
+    const { token, cookie } = await startSession(ctx, user, kind);
+    return { status: 201, body: { user: publicUser(user, ctx.adminEmails), token: kind === 'bearer' ? token : undefined }, headers: cookie ? { 'Set-Cookie': cookie } : undefined };
+  }
 
   const existing = ctx.store.userByEmail(email);
   if (existing?.email_verified_at) {
@@ -196,7 +228,7 @@ const login: Handler = async (ctx, req) => {
   // Always run scrypt, so response time does not tell whether the account exists.
   const good = await verifyPassword(password, user?.password_hash ?? (await dummyHash));
   if (!user || !good) return err(401, 'bad_login');
-  if (!user.email_verified_at) return err(403, 'unverified');
+  if (!user.email_verified_at && ctx.emailVerification) return err(403, 'unverified');
   const kind = req.body.client === 'desktop' ? 'bearer' : 'cookie';
   const { token, cookie } = await startSession(ctx, user, kind);
   return { status: 200, body: { user: publicUser(user, ctx.adminEmails), token: kind === 'bearer' ? token : undefined }, headers: cookie ? { 'Set-Cookie': cookie } : undefined };
@@ -211,6 +243,7 @@ const me: Handler = async (ctx, req) => ok({ user: req.user ? publicUser(req.use
 
 const forgot: Handler = async (ctx, req) => {
   if (mailDown(ctx)) return err(503, 'mail_unavailable');
+  if (!(await ctx.captcha.check(req.body.captcha))) return err(400, 'captcha');
   const email = normalizeEmail(req.body.email);
   const user = email ? ctx.store.userByEmail(email) : undefined;
   if (user && limits.mail.allow(user.email)) {
@@ -424,15 +457,19 @@ function ownedCanvas(ctx: ApiContext, req: Req): { c: CanvasRow } | { res: Res }
   const key = parseKey(req.params[0]);
   const c = key ? ctx.store.canvas(key) : undefined;
   if (!c) return { res: err(404, 'not_found') };
-  if (c.owner_id !== req.user.id) return { res: err(403, 'not_owner') };
+  // Admins (ADMIN_EMAILS) manage every owned canvas like its owner.
+  if (c.owner_id !== req.user.id && !(c.owner_id && isAdmin(req.user))) return { res: err(403, 'not_owner') };
   if (!limits.share.allow(req.user.id)) return { res: err(429, 'rate_limited') };
   return { c };
 }
 
 function sharing(ctx: ApiContext, c: CanvasRow) {
   const base = `${ctx.publicUrl}/s/${c.code}`;
+  const owner = c.owner_id ? ctx.store.userById(c.owner_id) : undefined;
   return {
     key: c.code,
+    /** The owner (an admin can open the dialog on someone else's canvas). */
+    owner: owner ? { id: owner.id, name: owner.name, email: owner.email } : null,
     members: ctx.store.members(c.code).map((m) => ({ id: m.user_id, email: m.email, name: m.name, role: m.role })),
     // The canvas link (plain code): the owner picks what anyone with it can do.
     codeLink: base,
@@ -580,7 +617,7 @@ const transfer: Handler = async (ctx, req) => {
   ctx.store.transaction(() => {
     ctx.store.removeMember(r.c.code, user.id);
     ctx.store.updateCanvas(r.c.code, { owner_id: user.id });
-    ctx.store.setMember(r.c.code, req.user!.id, 'editor'); // the old owner keeps edit access
+    if (r.c.owner_id) ctx.store.setMember(r.c.code, r.c.owner_id, 'editor'); // the old owner keeps edit access
   });
   ctx.refreshCanvas(r.c.code);
   return ok();
@@ -597,6 +634,7 @@ const deleteCanvas: Handler = async (ctx, req) => {
 // --- routing -------------------------------------------------------------------------------------
 
 const ROUTES: [string, RegExp, Handler][] = [
+  ['GET', /^\/api\/captcha$/, captchaHandler],
   ['POST', /^\/api\/auth\/register$/, register],
   ['GET', /^\/api\/auth\/verify$/, verify],
   ['POST', /^\/api\/auth\/resend$/, resend],

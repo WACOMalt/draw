@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { LIMITS, parseKey, type ClientMsg } from '../shared/types';
 import { keyFromPath, oembed, pageWithTags, previewImage } from './linkPreview';
+import { makeCaptcha } from './captcha';
+import { setAdminEmails } from './access';
 import { handleApi, type ApiContext } from './api';
 import { readCookie, SESSION_COOKIE, userFromToken } from './auth';
 import { cleanup } from './cleanup';
@@ -75,9 +77,17 @@ function moveCanvas(from: string, to: string): void {
   refreshCanvas(to);
 }
 
+/** EMAIL_VERIFICATION=1: new accounts confirm their email before they can log in. */
+const EMAIL_VERIFICATION = process.env.EMAIL_VERIFICATION === '1';
+const captcha = await makeCaptcha(store.secret('captcha'));
+
+setAdminEmails(ADMIN_EMAILS);
+
 const api: ApiContext = {
   store,
   mailer,
+  captcha,
+  emailVerification: EMAIL_VERIFICATION,
   publicUrl: PUBLIC_URL,
   adminEmails: ADMIN_EMAILS,
   allowedOrigins: CORS_ORIGINS,
@@ -88,7 +98,7 @@ const api: ApiContext = {
 
 setInterval(() => {
   try {
-    cleanup(store, (code) => refreshCanvas(code, 'expired'));
+    cleanup(store, (code) => refreshCanvas(code, 'expired'), EMAIL_VERIFICATION);
   } catch (e) {
     console.error('cleanup', e);
   }
@@ -284,7 +294,7 @@ server.listen(PORT, HOST, () => {
   console.log(`draw ${VERSION} on http://${HOST}:${PORT} (db ${DB_PATH}, public ${PUBLIC_URL}, mail ${mailer.mode})`);
   if (!ADMIN_EMAILS.size) console.log('accounts: no ADMIN_EMAILS set; legacy canvases stay unassigned');
   void mailer.verify();
-  cleanup(store, (code) => refreshCanvas(code, 'expired'));
+  cleanup(store, (code) => refreshCanvas(code, 'expired'), EMAIL_VERIFICATION);
 });
 
 function shutdown() {

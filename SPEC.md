@@ -223,12 +223,14 @@ ops(code TEXT, seq INTEGER, client_id TEXT, type TEXT, data TEXT, created_at INT
 
 Accounts:
 
-- Email and password. The server stores the password as a scrypt hash (random salt, N = 2^15). A new account must open the confirmation link (valid 48 hours) before it can log in. The server deletes accounts that stay unconfirmed for 48 hours.
+- Email and password. The server stores the password as a scrypt hash (random salt, N = 2^15).
+- Email confirmation is off by default: registering makes a confirmed account and logs in at once (201 with the user, and a cookie or, for the desktop app, a token). An email that already has an account gets 409 `email_taken`. An unconfirmed account left from confirmation mode can be registered again, which takes it over. With `EMAIL_VERIFICATION=1`, a new account must open the confirmation link (valid 48 hours) before it can log in, and the server deletes accounts that stay unconfirmed for 48 hours.
+- Captcha: registering and asking for a password reset email need a solved ALTCHA challenge (altcha.org, MIT, self-hosted: `src/server/captcha.ts`). `GET /api/captcha` gives a signed challenge, valid 10 minutes: PBKDF2/SHA-256, 2000 iterations, the secret counter between 1000 and 3000 (`CAPTCHA_COST`, `CAPTCHA_COUNTER_MIN`, `CAPTCHA_COUNTER_MAX`). The browser finds the counter in about a second, in workers; the server checks in under a millisecond. Each solution works once (kept in memory until it expires). The widget loads only with these forms, solves on load, and has its "human interaction signature" collector turned off: no third party, no tracking, no image puzzles. A wrong, used or expired solution gets 400 `captcha`, and the form gets a new challenge after each try.
 - Password reset by email (link valid 2 hours, one use). A reset logs out all other sessions.
 - The web app uses an httpOnly, Secure, SameSite=Lax session cookie (30 days, sliding). The desktop app uses a bearer token, because its page has another origin.
 - Session, email, and device tokens are 256 random bits. The database keeps only their sha256.
 - The `identities` table (provider, subject, user) is ready for sign-in through Authentik, Google, GitHub, Discord, or Facebook later.
-- Register, forgot, and resend never tell if an email has an account. Login runs scrypt also for unknown emails, so its time tells nothing.
+- Forgot and resend never tell if an email has an account. Register does, when email confirmation is off (409); the captcha and the rate limit slow down guessing. Login runs scrypt also for unknown emails, so its time tells nothing.
 - State-changing API calls need a JSON body and an allowed Origin (CSRF protection). Rate limits apply to register, login, email sending, canvas creation, and sharing.
 
 Canvases:
@@ -248,11 +250,11 @@ Canvases:
 
 Roles: owner, editor, viewer. The best of these wins:
 
-1. Owner.
+1. Owner. Admins (`ADMIN_EMAILS`) count as the owner of every owned canvas: they join any canvas (also a private one, without a link or password) and can do all that the owner can, such as sharing, links, password, rename, transfer and delete. The Share dialog names the real owner and tells an admin that they manage someone else's canvas. Temporary canvases do not change: anyone with the code draws there.
 2. Member role. The owner adds a member by the email of a confirmed account.
 3. Link role: the best of the token and the canvas link. `?k=` with the private edit token gives editor. `?k=` with the private view token gives viewer. The plain code gives what the owner set for the canvas link. A wrong token gives only what the plain code gives. Link tokens are 128 random bits (22 characters).
 
-The owner can turn each link on or off, or reset it. The owner can also set a join password for link users. Members never need it. After one correct password, the client keeps a signed grant (HMAC of the canvas and the password hash). A new password makes old grants invalid. A change to sharing re-checks all connected clients at once: a lost role disconnects them, and a changed role updates their UI. The server rejects ops from viewers. The owner can transfer ownership (the old owner becomes an editor) or delete the canvas.
+The owner can turn each link on or off, or reset it. The owner can also set a join password for link users. Members never need it. After one correct password, the client keeps a signed grant (HMAC of the canvas and the password hash). A new password makes old grants invalid. A change to sharing re-checks all connected clients at once: a lost role disconnects them, and a changed role updates their UI. The server rejects ops from viewers. The owner (or an admin) can transfer ownership (the old owner becomes an editor, also when an admin makes the transfer) or delete the canvas.
 
 At load, the server replays the op log to build the document. Limits: 4 MB per message, 20 000 points per stroke, 100 layers per session, 10 new sessions per minute per IP address. The server checks each op for type, range, and size before it accepts the op.
 

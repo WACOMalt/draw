@@ -10,6 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
 import zlib from 'node:zlib';
+import { solveChallenge } from 'altcha-lib';
+import { deriveKey } from 'altcha-lib/algorithms/pbkdf2';
 
 const PORT = 3400 + Math.floor(Math.random() * 500);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -32,8 +34,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   db.close();
 }
 
+// A light proof of work, so the tests solve it fast (the real widget solves the same kind).
+const EASY_CAPTCHA = { CAPTCHA_COST: '10', CAPTCHA_COUNTER_MIN: '10', CAPTCHA_COUNTER_MAX: '40' };
 const server = spawn(process.execPath, ['dist/server/index.js'], {
-  env: { ...process.env, PORT: String(PORT), DB_PATH: DB, DEV_MAIL_DIR: MAIL, PUBLIC_URL: BASE, ADMIN_EMAILS: 'admin@example.com', TEMP_TTL_MS: '4000', CLEANUP_EVERY_MS: '1000', NODE_ENV: 'test' },
+  env: { ...process.env, PORT: String(PORT), DB_PATH: DB, DEV_MAIL_DIR: MAIL, PUBLIC_URL: BASE, ADMIN_EMAILS: 'admin@example.com', TEMP_TTL_MS: '4000', CLEANUP_EVERY_MS: '1000', NODE_ENV: 'test', ...EASY_CAPTCHA },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let log = '';
@@ -99,11 +103,15 @@ function lastMail(to) {
   const files = fs.existsSync(MAIL) ? fs.readdirSync(MAIL).filter((f) => f.includes(to)).sort() : [];
   return files.length ? JSON.parse(fs.readFileSync(path.join(MAIL, files.at(-1)), 'utf8')) : null;
 }
+/** A solved captcha payload, as the ALTCHA widget sends it. */
+async function solvedCaptcha(base = BASE) {
+  const challenge = await (await fetch(`${base}/api/captcha`)).json();
+  const solution = await solveChallenge({ challenge, deriveKey });
+  return btoa(JSON.stringify({ challenge, solution }));
+}
+/** Registers (no email confirmation on this server): logged in at once. */
 async function account(b, email, name) {
-  await b.api('POST', '/api/auth/register', { email, name, password: 'correct horse battery' });
-  const url = /(http\S+verify\?token=\S+)/.exec(lastMail(email).text)[1];
-  const r = await b.api('GET', new URL(url).pathname + new URL(url).search);
-  return r;
+  return b.api('POST', '/api/auth/register', { email, name, password: 'correct horse battery', captcha: await solvedCaptcha() });
 }
 const layerId = (welcome) => welcome.layers[0].id;
 const strokeOp = (layer, n = 1) => ({ t: 'op', opId: `op${n}xxxxx`, op: { type: 'stroke.add', stroke: { id: `stroke${n}${Math.random().toString(36).slice(2, 8)}`, layerId: layer, brush: { tool: 'paint', color: '#000000', size: 4, opacity: 1, flow: 1, hardness: 1, spacing: 0.1, pressureSize: false, pressureFlow: false, buildup: false }, pts: [0, 0, 1, 10, 10, 1] } } });
@@ -132,8 +140,12 @@ try {
   await account(busy, 'busy@example.com', 'Busy Mongoose');
   check((await busy.api('POST', `/api/canvases/${temp}/claim`, { anon: busy.anon })).status === 403, 'logged-in non-creator cannot claim');
   check((await funky.api('POST', `/api/canvases/${temp}/claim`, { anon: funky.anon })).status === 401, 'creator must log in to claim');
-  const verified = await account(funky, 'funky@example.com', 'Funky Otter');
-  check(verified.status === 302 && verified.location === '/?verify=ok', 'email verification logs in');
+  check((await funky.api('POST', '/api/auth/register', { email: 'funky@example.com', name: 'Funky Otter', password: 'correct horse battery' })).data.error === 'captcha', 'registering needs the captcha');
+  const used = await solvedCaptcha();
+  const registered = await funky.api('POST', '/api/auth/register', { email: 'funky@example.com', name: 'Funky Otter', password: 'correct horse battery', captcha: used });
+  check(registered.status === 201 && registered.data.user?.name === 'Funky Otter' && !lastMail('funky@example.com'), 'registering logs in at once, no email');
+  check((await new Browser().api('POST', '/api/auth/register', { email: 'other@example.com', name: 'X', password: 'correct horse battery', captcha: used })).data.error === 'captcha', 'a solved captcha works only once');
+  check((await new Browser().api('POST', '/api/auth/register', { email: 'FUNKY@example.com', name: 'X', password: 'correct horse battery', captcha: await solvedCaptcha() })).status === 409, 'an email that has an account cannot register again');
   check((await funky.api('GET', '/api/auth/me')).data.user?.name === 'Funky Otter', 'me returns the account');
   check((await funky.api('POST', `/api/canvases/${temp}/claim`, { anon: funky.anon })).status === 200, 'creator claims after login');
   const fAccess = await fConn.next((m) => m.t === 'access');
@@ -332,7 +344,8 @@ try {
   // --- CSRF guard, password reset, device login ----------------------------------------------------
   const evil = await fetch(`${BASE}/api/canvases/friday-jam/password`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example', Cookie: funky.cookie }, body: '{"password":null}' });
   check(evil.status === 403, 'foreign Origin is refused');
-  await stranger.api('POST', '/api/auth/forgot', { email: 'vee@example.com' });
+  check((await stranger.api('POST', '/api/auth/forgot', { email: 'vee@example.com' })).data.error === 'captcha', 'a reset email needs the captcha');
+  await stranger.api('POST', '/api/auth/forgot', { email: 'vee@example.com', captcha: await solvedCaptcha() });
   const resetTok = /reset=(\S+)/.exec(lastMail('vee@example.com').text)[1];
   check((await stranger.api('POST', '/api/auth/reset', { token: resetTok, password: 'a new long password' })).status === 200, 'password reset by email');
   check((await stranger.api('POST', '/api/auth/reset', { token: resetTok, password: 'another password' })).status === 400, 'reset link works once');
@@ -458,6 +471,48 @@ try {
   check((await (await fetch(`${BASE}/s/${pv}?k=${pvView}`)).text()).includes(`preview.png?v=${seqNow}&amp;k=${pvView}`), 'a private canvas: the view link page has the image, with the token');
   const pvRenamed = await funky.api('POST', `/api/canvases/${pv}/rename`, { name: 'preview-moved' });
   check(pvRenamed.status === 200 && (await fetch(`${BASE}/api/canvases/preview-moved/preview.png?k=${pvView}`)).status === 200, 'rename keeps the preview');
+
+  // --- admins manage every owned canvas like its owner ------------------------------------------
+  const adm = (await funky.api('POST', '/api/sessions', { name: 'admin-test' })).data.key;
+  await funky.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'none' });
+  check((await first(await new Browser().join(adm)))?.reason === 'login_required', 'admin test: the canvas is private');
+  check((await first(await admin.join(adm)))?.role === 'owner', 'an admin joins any canvas as its owner');
+  const admShare = await admin.api('GET', `/api/canvases/${adm}/sharing`);
+  check(admShare.status === 200 && admShare.data.owner?.name === 'Funky Otter', 'an admin opens sharing, which names the real owner');
+  check((await admin.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'viewer' })).status === 200, 'an admin changes the canvas link');
+  const admRen = await admin.api('POST', `/api/canvases/${adm}/rename`, { name: 'admin-renamed' });
+  check(admRen.status === 200 && admRen.data.key === 'admin-renamed', 'an admin renames');
+  check((await busy.api('GET', '/api/canvases/admin-renamed/sharing')).status === 403, 'a normal account still cannot');
+  check((await admin.api('POST', '/api/canvases/admin-renamed/transfer', { email: 'busy@example.com' })).status === 200, 'an admin transfers ownership');
+  const afterTransfer = (await busy.api('GET', '/api/canvases/admin-renamed/sharing')).data;
+  check(afterTransfer.owner?.name === 'Busy Mongoose' && afterTransfer.members.some((m) => m.name === 'Funky Otter' && m.role === 'editor') && !afterTransfer.members.some((m) => m.email === 'admin@example.com'), 'transfer keeps the old owner (not the admin) as editor');
+
+  // --- email confirmation mode (EMAIL_VERIFICATION=1), on a second server ------------------------
+  {
+    const port2 = PORT + 501;
+    const base2 = `http://127.0.0.1:${port2}`;
+    const mail2 = path.join(dir, 'mail2');
+    const srv2 = spawn(process.execPath, ['dist/server/index.js'], {
+      env: { ...process.env, PORT: String(port2), DB_PATH: path.join(dir, 'verify.db'), DEV_MAIL_DIR: mail2, PUBLIC_URL: base2, NODE_ENV: 'test', EMAIL_VERIFICATION: '1', ...EASY_CAPTCHA },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let log2 = '';
+    srv2.stdout.on('data', (d) => (log2 += d));
+    for (let i = 0; i < 50 && !log2.includes('draw '); i++) await sleep(100);
+    try {
+      const post = (p, body, cookie) => fetch(base2 + p, { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/json', 'X-Real-IP': '10.9.9.9', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify(body) });
+      const r = await post('/api/auth/register', { email: 'conf@example.com', name: 'Conf', password: 'correct horse battery', captcha: await solvedCaptcha(base2) });
+      const body = await r.json();
+      check(r.status === 201 && body.verify === true && !body.user && !r.headers.get('set-cookie'), 'confirmation mode: registering sends a link, no login yet');
+      check((await (await post('/api/auth/login', { email: 'conf@example.com', password: 'correct horse battery' })).json()).error === 'unverified', 'confirmation mode: no login before the link');
+      const files = fs.readdirSync(mail2).filter((f) => f.includes('conf@example.com'));
+      const link = /(http\S+verify\?token=\S+)/.exec(JSON.parse(fs.readFileSync(path.join(mail2, files.at(-1)), 'utf8')).text)[1];
+      const v = await fetch(link, { redirect: 'manual' });
+      check(v.status === 302 && v.headers.get('location') === '/?verify=ok', 'confirmation mode: the link confirms and logs in');
+    } finally {
+      srv2.kill();
+    }
+  }
 
   const shortLived = (await new Browser().api('POST', '/api/sessions', {})).data.key;
   const watcher = await new Browser().join(shortLived);

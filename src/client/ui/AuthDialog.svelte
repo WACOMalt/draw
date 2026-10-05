@@ -4,6 +4,7 @@
   import { desktopToken } from '../identity';
   import { ed, showToast, type User } from '../state.svelte';
   import Modal from './Modal.svelte';
+  import Captcha from './Captcha.svelte';
 
   let email = $state(ed.authEmail);
   let password = $state('');
@@ -11,6 +12,10 @@
   let error = $state('');
   let unverified = $state(false);
   let busy = $state(false);
+  /** Captcha solution for register and forgot; `captchaRound` renews the widget after a try. */
+  let captcha = $state('');
+  let captchaRound = $state(0);
+  const needsCaptcha = $derived(ed.auth === 'register' || ed.auth === 'forgot');
 
   const titles = { login: 'Log in', register: 'Create an account', forgot: 'Reset your password', reset: 'Choose a new password', sent: 'Check your email' };
 
@@ -42,12 +47,22 @@
         unverified = r.data.error === 'unverified';
         error = errorText(r.data.error);
       } else if (ed.auth === 'register') {
-        const r = await api('POST', '/api/auth/register', { email, password, name });
+        const r = await api<{ user?: User; token?: string; verify?: boolean }>('POST', '/api/auth/register', {
+          email,
+          password,
+          name,
+          captcha,
+          client: IS_TAURI ? 'desktop' : undefined,
+        });
+        captchaRound++; // a challenge works once
         if (!r.ok) return void (error = errorText(r.data.error));
+        // No email confirmation on this server: logged in at once.
+        if (r.data.user) return signedIn(r.data.user, r.data.token);
         ed.authEmail = email;
         view('sent');
       } else if (ed.auth === 'forgot') {
-        const r = await api('POST', '/api/auth/forgot', { email });
+        const r = await api('POST', '/api/auth/forgot', { email, captcha });
+        captchaRound++;
         if (!r.ok) return void (error = errorText(r.data.error));
         ed.authEmail = email;
         view('sent');
@@ -94,12 +109,15 @@
         <label for="a-pw">{ed.auth === 'login' ? 'Password' : 'New password (at least 8 characters)'}</label>
         <input id="a-pw" type="password" minlength={ed.auth === 'login' ? 1 : 8} autocomplete={ed.auth === 'login' ? 'current-password' : 'new-password'} bind:value={password} required />
       {/if}
+      {#if needsCaptcha}
+        {#key captchaRound}<Captcha bind:payload={captcha} />{/key}
+      {/if}
       {#if error}
         <p class="error">{error}</p>
         {#if unverified}<button type="button" class="linklike" onclick={resend}>Send the confirmation email again</button>{/if}
       {/if}
       <div class="actions">
-        <button class="primary" type="submit" disabled={busy}>
+        <button class="primary" type="submit" disabled={busy || (needsCaptcha && !captcha)} title={needsCaptcha && !captcha ? 'Wait for the check above' : undefined}>
           {ed.auth === 'login' ? 'Log in' : ed.auth === 'register' ? 'Create account' : ed.auth === 'forgot' ? 'Send reset link' : 'Save password'}
         </button>
       </div>

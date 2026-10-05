@@ -95,6 +95,10 @@ export function errorText(code: string | undefined): string {
       return 'Email is not set up on this server yet, so accounts cannot be confirmed. Try again later.';
     case 'network':
       return 'Cannot reach the server.';
+    case 'captcha':
+      return 'The check did not pass or expired. Wait for the new check, then try again.';
+    case 'email_taken':
+      return 'That email already has an account. Log in, or reset the password.';
     default:
       return 'Something went wrong. Try again.';
   }

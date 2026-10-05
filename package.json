@@ -26,6 +26,7 @@
     "@tauri-apps/api": "^2.12.1",
     "@tauri-apps/plugin-dialog": "^2.8.1",
     "@tauri-apps/plugin-fs": "^2.6.0",
+    "altcha-lib": "^2.6.0",
     "better-sqlite3": "12.9.0",
     "nodemailer": "^10.0.14",
     "ws": "^8.22.0"
@@ -37,6 +38,7 @@
     "@types/node": "^26.6.4",
     "@types/nodemailer": "^8.0.2",
     "@types/ws": "^8.18.2",
+    "altcha": "^3.3.0",
     "electron": "^44.5.1",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",

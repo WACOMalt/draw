@@ -17,6 +17,7 @@
   }
   interface Sharing {
     key: string;
+    owner: { id: string; name: string; email: string } | null;
     members: Member[];
     codeLink: string;
     codeRole: 'editor' | 'viewer' | 'none';
@@ -116,7 +117,8 @@
 
   async function transfer(e: SubmitEvent) {
     e.preventDefault();
-    if (!confirm(`Make ${transferTo} the owner of ${code}? You keep edit access, but only they can manage sharing.`)) return;
+    const mine = !s?.owner || s.owner.id === ed.user?.id;
+    if (!confirm(`Make ${transferTo} the owner of ${code}? ${mine ? 'You keep' : `${s?.owner?.name} keeps`} edit access, but only the new owner can manage sharing.`)) return;
     if (await call('POST', '/transfer', { email: transferTo })) {
       showToast('Ownership transferred');
       ed.shareOpen = false;
@@ -136,10 +138,13 @@
   {#if !s}
     <p class="muted">{error || 'Loading…'}</p>
   {:else}
+    {#if s.owner && ed.user && s.owner.id !== ed.user.id}
+      <p class="admin-note">You manage this canvas as an admin. It belongs to <b>{s.owner.name}</b>.</p>
+    {/if}
     <section>
       <h3>People</h3>
       <ul class="people">
-        <li><span class="who"><b>{ed.user?.name}</b> <span class="muted">{ed.user?.email}</span></span><span class="muted">Owner</span></li>
+        <li><span class="who"><b>{s.owner?.name ?? ed.user?.name}</b> <span class="muted">{s.owner?.email ?? ed.user?.email}</span></span><span class="muted">Owner</span></li>
         {#each s.members as m (m.id)}
           <li>
             <span class="who"><b>{m.name}</b> <span class="muted">{m.email}</span></span>
@@ -339,6 +344,14 @@
   select {
     padding: 4px;
     max-width: 100%;
+  }
+  .admin-note {
+    margin: 0 0 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border-left: 3px solid #e8b04a;
+    background: var(--bg-0);
+    font-size: 12px;
   }
   .preview {
     display: block;

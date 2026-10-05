@@ -2,7 +2,7 @@
 //
 // Temporary canvas (no owner): anyone with the code edits. Only the creating browser may claim.
 // Owned canvas, best role wins:
-//   owner  > member role (added by email) > link role
+//   owner (or an admin: ADMIN_EMAILS) > member role (added by email) > link role
 //   link role: ?k=<edit token> -> editor, ?k=<view token> -> viewer
 //              plain /s/CODE    -> code_role: 'viewer' (default), 'editor' (public) or 'none'
 //   The code is in every link, so only a public canvas gives edit access by the code alone.
@@ -57,11 +57,18 @@ function linkRole(c: CanvasRow, link: string | undefined): Role | null {
   return null;
 }
 
+/** Accounts with an owner's rights on every owned canvas (ADMIN_EMAILS, set at start). */
+let adminEmails = new Set<string>();
+export function setAdminEmails(emails: Set<string>): void {
+  adminEmails = new Set([...emails].map((e) => e.toLowerCase()));
+}
+export const isAdmin = (user: UserRow | undefined): boolean => !!user && adminEmails.has(user.email.toLowerCase());
+
 export async function resolveAccess(store: Store, c: CanvasRow, input: AccessInput): Promise<Access> {
   if (!c.owner_id) return { ok: true, role: 'editor' }; // temporary or legacy canvas
 
   let best: Role | null = null;
-  if (input.user?.id === c.owner_id) best = 'owner';
+  if (input.user?.id === c.owner_id || isAdmin(input.user)) best = 'owner';
   else if (input.user) best = store.memberRole(c.code, input.user.id) ?? null;
 
   const viaLink = linkRole(c, input.link);
