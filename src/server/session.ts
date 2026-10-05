@@ -2,6 +2,7 @@ import type { WebSocket } from 'ws';
 import { newId } from '../shared/ids';
 import {
   LIMITS,
+  PREVIEW_LIMITS,
   type AppliedOp,
   type ClientMsg,
   type Layer,
@@ -82,6 +83,8 @@ export class Session {
   strokes = new Map<string, Stroke>();
   clients = new Map<string, Client>();
   unloadTimer: NodeJS.Timeout | null = null;
+  /** When the last link preview was stored (rate limit). */
+  private previewAt = 0;
 
   constructor(
     public code: string, // changes when the owner renames the canvas
@@ -271,6 +274,9 @@ export class Session {
       case 'live.end':
         if (typeof msg.id === 'string') this.broadcast({ t: 'live.end', by: client.id, id: msg.id }, client);
         return;
+      case 'preview':
+        this.takePreview(client, msg);
+        return;
       case 'cursor': {
         if (client.embed || !client.cursor.take()) return;
         const coord = (v: unknown) =>
@@ -292,6 +298,36 @@ export class Session {
         return;
       }
     }
+  }
+
+  /**
+   * Stores a link preview from an editor: a PNG of the size in PREVIEW_LIMITS, newer than the
+   * stored one, at most once a minute per canvas. Anything else is dropped without an answer.
+   */
+  private takePreview(client: Client, msg: Extract<ClientMsg, { t: 'preview' }>): void {
+    if (client.embed || !atLeast(client.role, 'editor')) return;
+    const now = Date.now();
+    if (now - this.previewAt < PREVIEW_LIMITS.minIntervalMs) return;
+    const seq = msg.seq;
+    if (!Number.isInteger(seq) || seq < 0 || seq > this.seq) return;
+    const stored = this.store.previewInfo(this.code);
+    if (stored && stored.seq >= seq) return;
+    const f = msg.frame;
+    if (!Array.isArray(f) || f.length !== 4 || !f.every((v) => typeof v === 'number' && Number.isFinite(v)) || f[2] <= 0 || f[3] <= 0) return;
+    if (typeof msg.png !== 'string' || msg.png.length > (PREVIEW_LIMITS.maxBytes * 4) / 3 + 4) return;
+    const png = Buffer.from(msg.png, 'base64');
+    // A PNG of exactly the preview size: signature, then IHDR with width and height.
+    const ok =
+      png.length > 33 &&
+      png.length <= PREVIEW_LIMITS.maxBytes &&
+      png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) &&
+      png.toString('latin1', 12, 16) === 'IHDR' &&
+      png.readUInt32BE(16) === PREVIEW_LIMITS.width &&
+      png.readUInt32BE(20) === PREVIEW_LIMITS.height;
+    if (!ok) return;
+    this.previewAt = now;
+    this.store.setPreview(this.code, png, seq, f.join(','));
+    this.broadcast({ t: 'preview.saved', seq });
   }
 
   private async hello(client: Client, msg: Extract<ClientMsg, { t: 'hello' }>): Promise<void> {
@@ -350,6 +386,7 @@ export class Session {
         canvas: this.info(client),
         grant: access.grant,
         features: docFeatures(this.layers.values(), this.strokes.values()),
+        previewSeq: this.store.previewInfo(this.code)?.seq ?? null,
       });
       if (!client.embed) this.broadcast({ t: 'peer.join', peer: client.peer }, client);
     } finally {

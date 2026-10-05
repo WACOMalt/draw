@@ -374,6 +374,17 @@ An embed is a live, view-only copy of a canvas on another site, in an `<iframe>`
 - Server: a `hello` with `embed: true` gets access from the link only. The server ignores the account and the anonymous secret, so the owner's own preview shows what visitors see. The role is at most viewer, also with an edit link. Other people do not see an embed (no `peer.join`, `peer.leave` or cursor), and the embed sees no people.
 - An embed cannot ask for a join password. It shows "This drawing needs a password". Rename, or turning off or resetting the link it uses, stops it.
 
+### 9.6 Link previews
+
+What Discord, X/Twitter, Slack, Mastodon, iMessage and others show for a `/s/` or `/e/` link. Code: `src/server/linkPreview.ts`.
+
+- Tags: the server puts Open Graph and Twitter Card tags in the HTML of `/s/KEY` and `/e/KEY` (crawlers run no JavaScript): title (the name, or "Drawing CODE"), a description (owner, draw or watch, temporary or last change), the preview image (`summary_large_image`), and an oEmbed link. Without a preview image: the app icon (`summary`).
+- Access: a crawler has no account, so the card shows what the link alone gives: the plain code of a public or view-only canvas, or a `?k=` token (the image URL carries the same token). A private link, or a canvas with a join password, gets a generic card: "A private drawing", no image, no owner.
+- Image: the server cannot render, so an editor's browser does. 8 s after the last change (5 s after joining), at most every 90 s, and only when the stored image shows an older `seq`, it renders everything on the visible layers (6% margin, widened to 1200:630) with the off-screen renderer and sends `{t: 'preview', png, seq, frame}`. The server keeps it when the sender can edit, the PNG is exactly 1200 × 630 and at most 1.5 MB, the `seq` is newer, and the last one is at least a minute old. It tells everyone `preview.saved`. Table `previews` (schema 5), kept on rename, deleted with the canvas.
+- `GET /api/canvases/KEY/preview.png?v=SEQ&k=TOKEN`: the image, cached 10 minutes (a new image has a new `v`).
+- `GET /api/oembed?url=…`: a `rich` oEmbed answer with the live embed (§9.5) as an `<iframe>`, framed like the preview image (or the `r` of an `/e/` link), 800 px wide (or `maxwidth`). 401 for a private link, 404 for other sites.
+- Limits: Discord and X show images, not live pages: the image is a recent snapshot, and Discord keeps its copy of a card for a while. Sites that embed through oEmbed (directly or through Iframely, such as Notion and Medium) can show the live canvas.
+
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).

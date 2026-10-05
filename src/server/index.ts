@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { LIMITS, parseKey, type ClientMsg } from '../shared/types';
+import { keyFromPath, oembed, pageWithTags, previewImage } from './linkPreview';
 import { handleApi, type ApiContext } from './api';
 import { readCookie, SESSION_COOKIE, userFromToken } from './auth';
 import { cleanup } from './cleanup';
@@ -139,6 +140,22 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
   });
 }
 
+const linkCtx = { store, publicUrl: PUBLIC_URL };
+
+/** /s/KEY and /e/KEY: the app shell with the link preview tags for that canvas. */
+function servePage(req: http.IncomingMessage, res: http.ServerResponse, pathname: string, search: URLSearchParams): void {
+  fs.readFile(path.join(STATIC_DIR, 'index.html'), 'utf8', (err, html) => {
+    if (err) return void res.writeHead(404).end('not found');
+    pageWithTags(linkCtx, html, pathname, search)
+      .catch(() => html)
+      .then((body) => {
+        const buf = Buffer.from(body);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length, 'Cache-Control': 'no-cache' });
+        res.end(req.method === 'HEAD' ? undefined : buf);
+      });
+  });
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -162,6 +179,28 @@ const server = http.createServer((req, res) => {
   }
 
   if (p === '/api/health') return json(res, 200, { ok: true, version: VERSION, sessions: sessions.size, mail: mailer.mode });
+  // Link previews (linkPreview.ts): the image, and oEmbed.
+  const previewPath = /^\/api\/canvases\/([^/]+)\/preview\.png$/.exec(p);
+  if (previewPath && (req.method === 'GET' || req.method === 'HEAD')) {
+    let key: string | null = null;
+    try {
+      key = parseKey(decodeURIComponent(previewPath[1]));
+    } catch {
+      key = null;
+    }
+    if (!key) return json(res, 404, { error: 'not_found' });
+    previewImage(linkCtx, req, res, key, url.searchParams.get('k')).catch((e) => {
+      console.error('preview', e);
+      if (!res.headersSent) json(res, 500, { error: 'internal' });
+    });
+    return;
+  }
+  if (p === '/api/oembed' && req.method === 'GET') {
+    oembed(linkCtx, url.searchParams)
+      .then((r) => json(res, r.status, r.body))
+      .catch(() => json(res, 500, { error: 'internal' }));
+    return;
+  }
   if (p.startsWith('/api/')) {
     handleApi(api, req, res, url, clientIp(req))
       .then((handled) => {
@@ -174,6 +213,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return void res.writeHead(405).end();
+  if (keyFromPath(p)) return void servePage(req, res, p, url.searchParams);
   serveStatic(req, res, p);
 });
 

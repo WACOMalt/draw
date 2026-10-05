@@ -169,6 +169,9 @@ export interface CanvasInfo {
   canClaim: boolean;
 }
 
+/** Link preview images: size of the PNG, and the gap between two from the same canvas. */
+export const PREVIEW_LIMITS = { width: 1200, height: 630, maxBytes: 1_500_000, minIntervalMs: 60_000 } as const;
+
 export type DeniedReason = 'no_access' | 'login_required' | 'password_required' | 'password_wrong' | 'expired' | 'deleted';
 
 export type ClientMsg =
@@ -195,6 +198,11 @@ export type ClientMsg =
   | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
   | { t: 'live.end'; id: string }
   | { t: 'cursor'; x: number | null; y: number | null; layerId: string | null }
+  /**
+   * Link preview image from an editor's browser: a PNG (base64, at most PREVIEW_LIMITS) of the
+   * document at `seq`, framing the world rectangle `frame` (x, y, w, h).
+   */
+  | { t: 'preview'; png: string; seq: number; frame: [number, number, number, number] }
   | { t: 'ping' };
 
 export type ServerMsg =
@@ -212,9 +220,13 @@ export type ServerMsg =
       grant?: string;
       /** Features the document uses. A client that does not know one asks for an update. */
       features?: string[];
+      /** Seq that the stored link preview shows; null: none yet. Editors send a newer one. */
+      previewSeq?: number | null;
     }
   /** Role or canvas state changed while connected (claimed, sharing edited). */
   | { t: 'access'; role: Role; canvas: CanvasInfo }
+  /** A new link preview is stored (it shows this seq): other editors need not send one. */
+  | { t: 'preview.saved'; seq: number }
   /** Join refused or access lost. The server closes the socket after this unless it asks for a password. */
   | { t: 'denied'; reason: DeniedReason }
   | { t: 'op'; seq: number; by: string; opId: string; op: AppliedOp }

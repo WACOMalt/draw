@@ -6,6 +6,7 @@ import {
   DEFAULT_ADJUST,
   DOC_FEATURES,
   LIMITS,
+  PREVIEW_LIMITS,
   type Adjust,
   type AdjustType,
   type Brush,
@@ -26,7 +27,7 @@ import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
 import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
-import { blobToDataUrl, padded, renderPng } from '../export/region';
+import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
@@ -152,6 +153,10 @@ export class Engine {
   /** Embed: the wheel zooms only after a click inside (or with Ctrl), so the page scrolls. */
   private engaged = false;
   private wheelHintAt = 0;
+  /** Seq the server's link preview shows (null: none). Editors send a newer one. */
+  private previewSeq: number | null = null;
+  private previewAt = 0;
+  private previewTimer: number | undefined;
 
   /**
    * `frame` turns on embed mode: view only, no presence and no cursor, pan and zoom only, and
@@ -237,6 +242,7 @@ export class Engine {
   }
 
   destroy(): void {
+    window.clearTimeout(this.previewTimer);
     this.endStroke();
     this.cleanup.forEach((f) => f());
     this.net.close();
@@ -1175,8 +1181,13 @@ export class Engine {
         for (const p of this.doc.pending) this.net.send({ t: 'op', opId: p.opId, op: p.op });
         this.refreshLayers();
         ed.status = 'online';
+        this.previewSeq = m.previewSeq ?? null;
+        this.schedulePreview(5000);
         break;
       }
+      case 'preview.saved':
+        this.previewSeq = Math.max(this.previewSeq ?? -1, m.seq);
+        break;
       case 'op': {
         this.doc.apply(m.seq, m.op);
         if (m.by === ed.clientId) this.doc.dropPending(m.opId);
@@ -1192,6 +1203,7 @@ export class Engine {
         }
         ed.strokeCount = this.doc.strokes.size;
         if (op.type.startsWith('stroke.')) this.scheduleMarkers();
+        this.schedulePreview(8000);
         break;
       }
       case 'reject': {
@@ -1333,6 +1345,41 @@ export class Engine {
     } else if (key === 'd') {
       ed.fg = '#000000';
       ed.bg = '#ffffff';
+    }
+  }
+
+  /**
+   * Link preview (Discord, X, ...): editors render everything on the visible layers into a
+   * PREVIEW_LIMITS image and send it, `delay` ms after the last change, at most every 90 s, and
+   * only when the server's preview is older. The server keeps the newest (session.ts).
+   */
+  private schedulePreview(delay: number): void {
+    if (this.frame || !ed.canEdit || this.comp.kind !== 'webgl2') return;
+    window.clearTimeout(this.previewTimer);
+    const wait = Math.max(delay, this.previewAt + 90_000 - Date.now());
+    this.previewTimer = window.setTimeout(() => void this.sendPreview(), wait);
+  }
+
+  private async sendPreview(): Promise<void> {
+    if (!ed.canEdit || this.doc.seq <= (this.previewSeq ?? -1)) return;
+    const all = this.contentBounds();
+    if (!all) return;
+    const { width: W, height: H, maxBytes } = PREVIEW_LIMITS;
+    const frame = toAspect(padded(all, 0.06), W, H);
+    const seq = this.doc.seq;
+    this.previewAt = Date.now();
+    try {
+      const { layers, strokes } = this.snapshot();
+      const png = await renderPng(layers, strokes, seq, frame, W, H);
+      if (!png || png.size > maxBytes) return;
+      const bmp = await createImageBitmap(png);
+      const ok = bmp.width === W && bmp.height === H;
+      bmp.close();
+      if (!ok) return;
+      const data = (await blobToDataUrl(png)).replace(/^data:image\/png;base64,/, '');
+      this.net.send({ t: 'preview', png: data, seq, frame: [frame.x0, frame.y0, frame.x1 - frame.x0, frame.y1 - frame.y0] });
+    } catch (e) {
+      console.warn('link preview', e);
     }
   }
 

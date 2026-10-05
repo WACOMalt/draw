@@ -405,6 +405,57 @@ try {
   const embViewTok = new URL(embView.viewLink).searchParams.get('k');
   check((await first(await new Browser().join(emb, { embed: true, link: embViewTok })))?.role === 'viewer', 'a private canvas embeds with the private view link');
 
+  // --- link previews ------------------------------------------------------------------------------
+  const pngOf = (w, h) => {
+    const crcT = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+    const crc = (b) => { let c = 0xffffffff; for (const x of b) c = crcT[(c ^ x) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+    const chunk = (type, data) => { const t = Buffer.from(type); const len = Buffer.alloc(4); len.writeUInt32BE(data.length); const c = Buffer.alloc(4); c.writeUInt32BE(crc(Buffer.concat([t, data]))); return Buffer.concat([len, t, data, c]); };
+    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+    const raw = Buffer.alloc((w * 3 + 1) * h, 255); for (let y = 0; y < h; y++) raw[y * (w * 3 + 1)] = 0;
+    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+  };
+  const pv = (await funky.api('POST', '/api/sessions', { name: 'preview-test' })).data.key;
+  await funky.api('POST', `/api/canvases/${pv}/links`, { kind: 'code', role: 'editor' });
+  const pvOwner = await funky.join(pv);
+  const pvWelcome = await first(pvOwner);
+  check(pvWelcome?.previewSeq === null, 'link preview: none at first');
+  pvOwner.send(strokeOp(layerId(pvWelcome), 11));
+  await pvOwner.next((m) => m.t === 'op' && m.op.type === 'stroke.add');
+  const seqNow = pvOwner.msgs.filter((m) => m.t === 'op').at(-1).seq;
+  const frame = [-10, -20, 1200, 630];
+  const viewerPv = await new Browser().join(pv, { embed: true });
+  await first(viewerPv);
+  viewerPv.send({ t: 'preview', png: pngOf(1200, 630).toString('base64'), seq: seqNow, frame });
+  await sleep(200);
+  check((await fetch(`${BASE}/api/canvases/${pv}/preview.png`)).status === 404, 'an embed (view only) cannot set the preview');
+  pvOwner.send({ t: 'preview', png: pngOf(800, 600).toString('base64'), seq: seqNow, frame });
+  await sleep(200);
+  check((await fetch(`${BASE}/api/canvases/${pv}/preview.png`)).status === 404, 'a preview of the wrong size is refused');
+  pvOwner.send({ t: 'preview', png: pngOf(1200, 630).toString('base64'), seq: seqNow, frame });
+  check((await pvOwner.next((m) => m.t === 'preview.saved'))?.seq === seqNow, 'an editor sets the preview; everyone is told');
+  const img = await fetch(`${BASE}/api/canvases/${pv}/preview.png?v=${seqNow}`);
+  check(img.status === 200 && img.headers.get('content-type') === 'image/png' && (await img.arrayBuffer()).byteLength > 33, 'the preview image is served');
+  pvOwner.send({ t: 'preview', png: pngOf(1200, 630).toString('base64'), seq: seqNow + 0, frame });
+  await sleep(200);
+  check(pvOwner.msgs.filter((m) => m.t === 'preview.saved').length === 1, 'the same seq again, within a minute: ignored');
+  check((await first(await new Browser().join(pv)))?.previewSeq === seqNow, 'welcome tells the preview seq');
+  const page = await (await fetch(`${BASE}/s/${pv}`)).text();
+  check(page.includes('property="og:image" content="' + BASE + '/api/canvases/' + pv + '/preview.png?v=' + seqNow) && page.includes('summary_large_image') && page.includes('<title>' + pv + ' · Draw</title>') && page.includes('by Funky Otter'), 'the canvas page has Open Graph tags with the preview');
+  check(page.includes('application/json+oembed'), 'the canvas page links oEmbed');
+  const oe = await (await fetch(`${BASE}/api/oembed?url=${encodeURIComponent(BASE + '/s/' + pv)}`)).json();
+  check(oe.type === 'rich' && oe.html.includes(`/e/${pv}?r=-10,-20,1200,630`) && oe.thumbnail_width === 1200 && oe.width === 800 && oe.height === 420, 'oEmbed gives the live embed, framed like the preview');
+  check((await fetch(`${BASE}/api/oembed?url=${encodeURIComponent('https://evil.example/s/' + pv)}`)).status === 404, 'oEmbed answers only for this site');
+  await funky.api('POST', `/api/canvases/${pv}/links`, { kind: 'code', role: 'none' });
+  const privPage = await (await fetch(`${BASE}/s/${pv}`)).text();
+  check(!privPage.includes('preview.png') && privPage.includes('A private drawing') && !privPage.includes('Funky'), 'a private canvas: generic card, no image, no owner');
+  check((await fetch(`${BASE}/api/canvases/${pv}/preview.png`)).status === 404, 'a private canvas: no image without a token');
+  check((await fetch(`${BASE}/api/oembed?url=${encodeURIComponent(BASE + '/s/' + pv)}`)).status === 401, 'a private canvas: oEmbed says private');
+  const pvView = new URL((await funky.api('POST', `/api/canvases/${pv}/links`, { kind: 'view', action: 'enable' })).data.viewLink).searchParams.get('k');
+  check((await fetch(`${BASE}/api/canvases/${pv}/preview.png?k=${pvView}`)).status === 200, 'a private canvas: the view link token shows the image');
+  check((await (await fetch(`${BASE}/s/${pv}?k=${pvView}`)).text()).includes(`preview.png?v=${seqNow}&amp;k=${pvView}`), 'a private canvas: the view link page has the image, with the token');
+  const pvRenamed = await funky.api('POST', `/api/canvases/${pv}/rename`, { name: 'preview-moved' });
+  check(pvRenamed.status === 200 && (await fetch(`${BASE}/api/canvases/preview-moved/preview.png?k=${pvView}`)).status === 200, 'rename keeps the preview');
+
   const shortLived = (await new Browser().api('POST', '/api/sessions', {})).data.key;
   const watcher = await new Browser().join(shortLived);
   await first(watcher);

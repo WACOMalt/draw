@@ -34,6 +34,13 @@ export interface CanvasRow {
   join_password: string | null;
 }
 
+export interface PreviewInfo {
+  seq: number;
+  /** "x,y,w,h" in world units. */
+  frame: string;
+  updated_at: number;
+}
+
 export interface PresetRow {
   id: string;
   name: string;
@@ -197,6 +204,22 @@ export class Store {
         this.setSetting('schema', '4');
       })();
     }
+    if (version < 5) {
+      // Link preview images (Open Graph): the newest PNG an editor's browser rendered, the seq it
+      // shows, and the world rectangle it frames (x,y,w,h: also the frame of an oEmbed embed).
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE previews (
+            code TEXT PRIMARY KEY REFERENCES sessions (code) ON DELETE CASCADE,
+            png BLOB NOT NULL,
+            seq INTEGER NOT NULL,
+            frame TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+        `);
+        this.setSetting('schema', '5');
+      })();
+    }
   }
 
   setting(key: string): string | undefined {
@@ -249,6 +272,7 @@ export class Store {
         this.db.prepare(`INSERT INTO sessions (code, ${list}) SELECT ?, ${list} FROM sessions WHERE code = ?`).run(to, from);
         this.db.prepare('UPDATE ops SET code = ? WHERE code = ?').run(to, from);
         this.db.prepare('UPDATE members SET code = ? WHERE code = ?').run(to, from);
+        this.db.prepare('UPDATE previews SET code = ? WHERE code = ?').run(to, from);
         this.db.prepare('DELETE FROM sessions WHERE code = ?').run(from);
       });
       return true;
@@ -256,6 +280,25 @@ export class Store {
       if ((e as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return false;
       throw e;
     }
+  }
+
+  // --- link previews ------------------------------------------------------------------------
+
+  previewInfo(code: string): PreviewInfo | undefined {
+    return this.db.prepare<[string], PreviewInfo>('SELECT seq, frame, updated_at FROM previews WHERE code = ?').get(code);
+  }
+
+  previewPng(code: string): Buffer | undefined {
+    return this.db.prepare<[string], { png: Buffer }>('SELECT png FROM previews WHERE code = ?').get(code)?.png;
+  }
+
+  setPreview(code: string, png: Buffer, seq: number, frame: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO previews (code, png, seq, frame, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (code) DO UPDATE SET png = excluded.png, seq = excluded.seq, frame = excluded.frame, updated_at = excluded.updated_at`,
+      )
+      .run(code, png, seq, frame, Date.now());
   }
 
   // --- brush presets ------------------------------------------------------------------------
