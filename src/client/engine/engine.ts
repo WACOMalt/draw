@@ -627,7 +627,40 @@ export class Engine {
     // Mice report 0.5 while pressed. Only pens give a real pressure: from the engine, or from
     // the desktop app's native layer when the engine calls the pen a mouse (nativePen.ts).
     if (e.pointerType === 'pen') return e.pressure;
+    if (e.pointerType === 'touch') return this.touchPressure(e);
     return nativePenFor(e)?.pressure ?? 1;
+  }
+
+  /** Smallest and largest finger contact diameter seen (CSS px): the range for touch pressure. */
+  private touchSize = { lo: 0, hi: 0 };
+  /** Largest touch pressure the screen reported, once it reported a real one (else 0). */
+  private touchPrsMax = 0;
+
+  /**
+   * Finger pressure. First choice: the pressure the screen reports (Android's "Prs" in Pointer
+   * location, MotionEvent.getPressure), which Chromium and the Android WebView pass as
+   * PointerEvent.pressure. A browser without it reports exactly 0.5 while touching, so a value
+   * other than 0.5 turns this on. Some screens go above 1: the value is scaled by the largest
+   * seen. Else: the contact size. Android and some other browsers report the contact ellipse as
+   * width × height: a light touch is small, a firm press is wide. That range adapts to this
+   * finger and screen: it starts around the first contact and grows with every size seen.
+   * Without either (width and height 1), the pressure is full.
+   */
+  private touchPressure(e: PointerEvent): number {
+    if (!ed.touchPressure) return 1;
+    const prs = e.pressure;
+    if (prs > 0 && prs !== 0.5) this.touchPrsMax = Math.max(this.touchPrsMax, prs, 1);
+    if (this.touchPrsMax > 0 && prs > 0) return Math.min(1, Math.max(0.02, prs / this.touchPrsMax));
+    if (!(e.width > 1 && e.height > 1)) return 1;
+    const d = Math.sqrt(e.width * e.height);
+    const s = this.touchSize;
+    if (s.hi === 0) {
+      s.lo = d * 0.75;
+      s.hi = d * 1.5;
+    }
+    s.lo = Math.min(s.lo, d);
+    s.hi = Math.max(s.hi, d);
+    return Math.min(1, Math.max(0.05, (d - s.lo) / (s.hi - s.lo)));
   }
 
   /** Chromium and Firefox send the eraser end as button 5 (buttons bit 32); see also nativePen.ts. */

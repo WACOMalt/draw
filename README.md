@@ -82,6 +82,15 @@ npm run linux:build                                 # AppImage, .deb, .rpm in di
 
 Settings: `DRAW_OZONE=x11` forces X11 (default: native Wayland on a Wayland desktop), `DRAW_GPU_INFO=1` prints the WebGL renderer.
 
+Android: Tauri (`src-tauri/gen/android/`), in the Android System WebView. Needs JDK 17 or 21, the Android SDK and NDK, and the Rust Android targets:
+
+```bash
+export ANDROID_HOME=~/Android/Sdk NDK_HOME=~/Android/Sdk/ndk/<version> JAVA_HOME=<jdk 21>
+npx tauri android build --apk     # unsigned without src-tauri/gen/android/keystore.properties
+```
+
+CI signs the release APK with the keystore in the GitHub secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`. Keep a backup of that keystore: Android installs an update only with the same key.
+
 Windows and macOS: Tauri (`src-tauri/`). Needs Rust and the Tauri system packages.
 
 ```bash

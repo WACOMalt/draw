@@ -10,6 +10,7 @@
   const b = $derived(ed.activeBrush);
   let dynamicsOpen = $state(false);
   let presetsOpen = $state(false);
+  const touchScreen = matchMedia('(any-pointer: coarse)').matches || navigator.maxTouchPoints > 0;
 
   const TIP_LABEL: Record<BrushTip, string> = {
     round: 'Round',
@@ -86,6 +87,16 @@
       <button class="icon wide" class:on={b.buildup} title="Airbrush: paint keeps building up while the pen stays still" onclick={() => (b.buildup = !b.buildup)}>
         Airbrush
       </button>
+      {#if touchScreen}
+        <button
+          class="icon wide"
+          class:on={ed.touchPressure}
+          title="Finger pressure: the screen's touch pressure where it has one, else the touch size (press harder for more)"
+          onclick={() => (ed.touchPressure = !ed.touchPressure)}
+        >
+          Finger pressure
+        </button>
+      {/if}
       {#if !stacked}
         <span class="popwrap">
           <button class="icon wide" class:on={dynamicsOn} title="Angle, roundness, jitter, scatter and grain" onclick={() => (dynamicsOpen = !dynamicsOpen)}>

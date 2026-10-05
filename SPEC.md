@@ -306,6 +306,12 @@ The client reads pens through Pointer Events: `pointerType` "pen", `pressure`, a
 | WebKitGTK (the Linux app) | No. Every pointer is a mouse with pressure 0 (WebKit bug 204115). |
 | WKWebView and Safari (the macOS app) | No. Pressure comes only from Force Touch trackpads, not from tablets. |
 
+Finger pressure ("Finger pressure", on by default, shown on touch screens):
+
+1. The touch pressure of the screen, where it has one: Android's "Prs" (`MotionEvent.getPressure`), which Chrome and the Android WebView give as `PointerEvent.pressure`. A browser without it gives exactly 0.5 while touching, so the first other value turns this source on. Values over 1 are scaled by the largest value seen.
+2. Else the contact size: Android and some other browsers report the contact as `width` × `height`. A light touch is small, a firm press is wide. The range adapts to the finger and the screen: it starts around the first contact and grows with each size it sees.
+3. Else (width and height 1) full pressure.
+
 For WebKitGTK and WKWebView, the desktop app reads the pen in the native layer (`src-tauri/src/pen.rs`). On Linux, it connects to the GTK motion and button signals of the WebKitWebView and reads the device source (pen or eraser) and the pressure axis. On macOS, an AppKit local event monitor reads tablet-point and tablet-proximity events. GDK motion compression is off on the web view, so the native layer gets every pen sample. For each sample, it runs `window.__drawPen(pressure, eraser, x, y, kind)` in the page before the engine forwards the same event (x, y in CSS pixels from the top left of the web view; kind: move, press, or release). It runs `__drawPen(null)` when another device moves. The client (`engine/nativePen.ts`) uses these values only for pointer events that the engine reports as a mouse. A stroke from a native pen takes its points from the samples, not from the pointer moves: when the page is busy, WebKit merges pointer moves into one and loses the points and pressures between them. The press sample gives the offset from sample positions to client positions. If a pointer move is not near the recent sample path (24 px), the stroke continues with pointer events.
 
 ### 9.2 Files (.bdraw)
@@ -340,6 +346,13 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 - nginx: a server block for `draw.bsums.xyz` sends all traffic to the Node port, with the WebSocket upgrade headers for `/ws`. `/api/import` allows 33 MB bodies (the nginx default is 1 MB). TLS comes from the existing certbot setup.
 - Data: `DB_PATH` (`/var/lib/draw/canvas.db` on the server). Back up this one file.
 - Settings: `PUBLIC_URL` (links in emails), `ADMIN_EMAILS` (adopt legacy canvases), `TEMP_TTL_MS` and `CLEANUP_EVERY_MS` (expiry, for tests).
+
+Android app (Tauri v2, `src-tauri/gen/android/`):
+
+- The same bundled client as the Windows and macOS apps, in the Android System WebView (Chromium). Thus WebGL2, pen pressure, and touch size work as in Chrome. The app talks to `https://draw.bsums.xyz` from the origin `http://tauri.localhost`, which the server allows for CORS.
+- CI builds one universal APK for arm64, armv7, and x86_64 (`Draw_<version>_android.apk`). The version code comes from the version (major × 1 000 000 + minor × 1000 + patch), so each release installs over the one before.
+- Signing: a release keystore in the GitHub secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, and `ANDROID_KEY_ALIAS`. CI writes `keystore.properties` from them. Android installs an update only with the same key, so the keystore has a backup outside GitHub. A local build without `keystore.properties` makes an unsigned APK.
+- Local build: JDK 17 or 21, the Android SDK and NDK, and the Rust Android targets, then `npx tauri android build --apk`.
 
 Desktop app on Linux (Electron, `electron/`):
 

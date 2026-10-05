@@ -58,6 +58,7 @@ const prefs = load('draw.prefs', {
   eraser: { ...brushDefaults, hardness: 0.6, size: 40, pressureSize: false } as BrushSettings,
   smoothing: 0.25,
   showMarkers: true,
+  touchPressure: true,
   fg: '#1e1e1e',
   bg: '#ffffff',
   swatches: [] as string[],
@@ -69,6 +70,8 @@ class EditorState {
   eraser = $state<BrushSettings>({ ...brushDefaults, ...prefs.eraser });
   smoothing = $state(prefs.smoothing);
   showMarkers = $state(prefs.showMarkers);
+  /** Finger strokes take their pressure from the contact size (where the browser reports it). */
+  touchPressure = $state(prefs.touchPressure);
   markers = $state<Marker[]>([]);
   fg = $state(prefs.fg);
   bg = $state(prefs.bg);
@@ -128,6 +131,7 @@ class EditorState {
       eraser: $state.snapshot(this.eraser),
       smoothing: this.smoothing,
       showMarkers: this.showMarkers,
+      touchPressure: this.touchPressure,
       fg: this.fg,
       bg: this.bg,
       swatches: $state.snapshot(this.swatches),

@@ -8,6 +8,7 @@
 mod pen;
 
 use std::{collections::HashSet, path::PathBuf, sync::Mutex};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tauri::Manager;
 
 #[derive(Default)]

@@ -76,6 +76,7 @@ jobs:
           | Linux (any) | \`Draw_${VERSION}_amd64.AppImage\` |
           | Windows | \`Draw_${VERSION}_x64-setup.exe\` or \`.msi\`. Not signed yet: in SmartScreen, select **More info**, then **Run anyway**. |
           | macOS (Intel and Apple silicon) | \`Draw_${VERSION}_universal.dmg\`. Not signed yet: right-click the app, then **Open**. |
+          | Android | \`Draw_${VERSION}_android.apk\`. Allow installs from your browser or file manager, then open the file. |
 
           **Server** (draw.bsums.xyz): \`bash /opt/draw/update-server.sh\`
 
@@ -167,9 +168,68 @@ jobs:
           done
           exit 1
 
+  android:
+    name: Android (APK)
+    needs: prepare
+    runs-on: ubuntu-latest # has the Android SDK and NDK
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: node scripts/set-version.mjs ${{ needs.prepare.outputs.version }}
+
+      - name: Signing key (from secrets; the same key for every release, so updates install)
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "password=$PASSWORD"
+            echo "keyAlias=$ALIAS"
+          } > src-tauri/gen/android/keystore.properties
+
+      # arm64 and armv7 phones, x86_64 Chromebooks and emulators.
+      - run: npx tauri android build --apk --target aarch64 armv7 x86_64
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*release*.apk' ! -name '*unsigned*' | head -1)
+          test -n "$apk" || { echo "::error::no signed APK"; exit 1; }
+          cp "$apk" "Draw_${VERSION}_android.apk"
+          for i in 1 2 3 4 5; do
+            gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber "Draw_${VERSION}_android.apk" && exit 0
+            sleep 20
+          done
+          exit 1
+
   publish:
     name: Publish release
-    needs: [prepare, desktop, linux]
+    needs: [prepare, desktop, linux, android]
     # Publish when the web bundle is ready, even if one desktop platform failed: the server
     # update must not wait for macOS. A failed platform shows red in the Actions run.
     if: ${{ !cancelled() && needs.prepare.result == 'success' }}

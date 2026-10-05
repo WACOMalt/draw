@@ -79,7 +79,7 @@
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
