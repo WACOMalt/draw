@@ -85,6 +85,17 @@ interface Live {
 }
 
 const PREFETCH = 1;
+/** Coarser levels kept ready around the view, for zoom out and pan (see render). */
+const COARSE_LEVELS = 2;
+
+/** Tiles from (tx0, ty0) to (tx1, ty1), inclusive, at one level of detail. */
+interface TileRange {
+  lod: number;
+  tx0: number;
+  ty0: number;
+  tx1: number;
+  ty1: number;
+}
 const TILE_BUDGET_MS = 6;
 /**
  * GPU work for tiles per frame, in device pixels of dab area (plus a fixed cost per dab and per
@@ -158,6 +169,7 @@ export class GLRenderer implements Renderer {
   private tail = 0;
   private lost = false;
   private maxTiles: number;
+  private hardMaxTiles: number;
   private fillBudget: number;
   private lastFrameAt = 0;
   private lastViewChange = 0;
@@ -171,6 +183,7 @@ export class GLRenderer implements Renderer {
   ) {
     const coarse = matchMedia('(pointer: coarse)').matches;
     this.maxTiles = coarse ? 192 : 512;
+    this.hardMaxTiles = coarse ? 400 : 1200; // about 200 MB and 600 MB of RGBA16F tiles
     this.fillBudget = coarse ? 1.5e6 : 8e6;
     this.initGL();
     const lost = (e: Event) => {
@@ -811,13 +824,21 @@ export class GLRenderer implements Renderer {
     return !t || t.stale || t.append.length > 0;
   }
 
-  private evictTiles(): void {
+  /**
+   * Frees the least recently used tiles when there are too many. Tiles in the ranges that render
+   * keeps current are never freed: a tile that is done but not on screen (the prefetch ring, the
+   * coarser level) would otherwise be freed and rendered again, over and over. The limit grows to
+   * fit those ranges for every visible layer.
+   */
+  private evictTiles(ranges: TileRange[], needed: number): void {
+    const inView = (t: Tile) => ranges.some((r) => t.lod === r.lod && t.tx >= r.tx0 && t.tx <= r.tx1 && t.ty >= r.ty0 && t.ty <= r.ty1);
+    const max = Math.min(this.hardMaxTiles, Math.max(this.maxTiles, Math.ceil(needed * 1.25)));
     let count = 0;
-    for (const t of this.tiles.values()) if (t.target) count++;
-    if (count <= this.maxTiles && this.tiles.size <= 20000) return;
-    const old = [...this.tiles.entries()].filter(([, t]) => t.used < this.frame).sort((a, b) => a[1].used - b[1].used);
+    for (const t of this.tiles.values()) count += (t.target ? 1 : 0) + (t.job ? 1 : 0);
+    if (count <= max && this.tiles.size <= 20000) return;
+    const old = [...this.tiles.entries()].filter(([, t]) => t.used < this.frame && !inView(t)).sort((a, b) => a[1].used - b[1].used);
     for (const [key, t] of old) {
-      if (count <= this.maxTiles * 0.85 && this.tiles.size <= 16000) break;
+      if (count <= max * 0.85 && this.tiles.size <= 16000) break;
       if (t.target) {
         if (this.tilePool.length < 32) this.tilePool.push(t.target);
         else this.freeTarget(t.target);
@@ -826,6 +847,7 @@ export class GLRenderer implements Renderer {
       if (t.job) {
         this.freeTarget(t.job.target);
         t.job = null;
+        count--;
       }
       this.tiles.delete(key);
     }
@@ -871,26 +893,51 @@ export class GLRenderer implements Renderer {
     const fill = start - this.lastViewChange < MOVING_MS ? this.fillBudget * MOVING_SHARE : this.fillBudget;
     let spent = 0;
     let pending = false;
-    const cx = (tx0 + tx1) / 2, cy = (ty0 + ty1) / 2;
-    const order: [number, number][] = [];
-    for (let ty = ty0 - PREFETCH; ty <= ty1 + PREFETCH; ty++)
-      for (let tx = tx0 - PREFETCH; tx <= tx1 + PREFETCH; tx++) order.push([tx, ty]);
-    order.sort((a, b) => Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy));
-    outer: for (const [tx, ty] of order) {
-      for (const layer of keys) {
-        const key = tileKey(layer, lod, tx, ty);
-        let t = this.tiles.get(key);
-        if (!this.needsWork(t)) continue;
-        if (spent >= fill || performance.now() - start > TILE_BUDGET_MS) {
-          pending = true;
-          break outer;
+    // First the view and a ring of PREFETCH tiles. Then COARSE_LEVELS coarser levels, centered:
+    // one level up over 2× the view, two levels up over 4×. After a zoom out by 2 or 4 that is
+    // the whole screen, and a pan shows stretched content at once instead of blank tiles. Each
+    // level costs about one view of tiles, and renders only when the view is done.
+    const vw = this.cssW / this.view.zoom, vh = this.cssH / this.view.zoom;
+    const area = (r: TileRange) => (r.tx1 - r.tx0 + 1) * (r.ty1 - r.ty0 + 1) * keys.length;
+    const ranges: TileRange[] = [{ lod, tx0: tx0 - PREFETCH, ty0: ty0 - PREFETCH, tx1: tx1 + PREFETCH, ty1: ty1 + PREFETCH }];
+    let total = area(ranges[0]);
+    for (let up = 1; up <= COARSE_LEVELS && lod + up <= MAX_LOD; up++) {
+      const ctw = tileWorld(lod + up);
+      const m = (2 ** up - 1) / 2; // margin on each side, in views: 2× the view, then 4×
+      const coarse = {
+        lod: lod + up,
+        tx0: Math.floor((vx - vw * m) / ctw),
+        ty0: Math.floor((vy - vh * m) / ctw),
+        tx1: Math.floor((vx + vw * (1 + m)) / ctw),
+        ty1: Math.floor((vy + vh * (1 + m)) / ctw),
+      };
+      // Many layers: GPU memory goes to the view first.
+      if (total + area(coarse) > this.hardMaxTiles) break;
+      total += area(coarse);
+      ranges.push(coarse);
+    }
+    outer: for (const r of ranges) {
+      const rtw = tileWorld(r.lod);
+      const cx = (vx + vw / 2) / rtw - 0.5, cy = (vy + vh / 2) / rtw - 0.5;
+      const order: [number, number][] = [];
+      for (let ty = r.ty0; ty <= r.ty1; ty++) for (let tx = r.tx0; tx <= r.tx1; tx++) order.push([tx, ty]);
+      order.sort((a, b) => Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy));
+      for (const [tx, ty] of order) {
+        for (const layer of keys) {
+          const key = tileKey(layer, r.lod, tx, ty);
+          let t = this.tiles.get(key);
+          if (!this.needsWork(t)) continue;
+          if (spent >= fill || performance.now() - start > TILE_BUDGET_MS) {
+            pending = true;
+            break outer;
+          }
+          if (!t) {
+            t = { layer, lod: r.lod, tx, ty, target: null, stale: true, append: [], maxSeq: -1, rendered: false, used: this.frame, job: null };
+            this.tiles.set(key, t);
+          }
+          t.used = this.frame;
+          spent += this.renderTile(t, fill - spent);
         }
-        if (!t) {
-          t = { layer, lod, tx, ty, target: null, stale: true, append: [], maxSeq: -1, rendered: false, used: this.frame, job: null };
-          this.tiles.set(key, t);
-        }
-        t.used = this.frame;
-        spent += this.renderTile(t, fill - spent);
       }
     }
     this.tileWorkLastFrame = spent > 0;
@@ -953,7 +1000,7 @@ export class GLRenderer implements Renderer {
     this.quad(p, null, [0, 0, this.canvas.width, this.canvas.height]);
 
     gl.flush();
-    this.evictTiles();
+    this.evictTiles(ranges, ranges.reduce((n, r) => n + area(r), 0));
     if (pending) this.invalidate();
     else if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
