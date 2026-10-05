@@ -24,8 +24,14 @@ const MAX_FILE = 64 * 1024 * 1024;
 if (process.env.DRAW_OZONE) app.commandLine.appendSwitch('ozone-platform', process.env.DRAW_OZONE);
 else app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
 
+// `draw --thumbnail IN OUT SIZE`: render a .bdraw to a PNG and exit (thumbnail.cjs). No window,
+// no single-instance lock: the file manager may run several at once, next to the open app.
+const thumbAt = process.argv.indexOf('--thumbnail');
+const THUMBNAIL = thumbAt > 0;
+if (THUMBNAIL) require('./thumbnail.cjs')(app, BrowserWindow, process.argv.slice(thumbAt + 1, thumbAt + 4));
+
 // One app instance: a .bdraw opened later goes to the window that is already open.
-if (!app.requestSingleInstanceLock()) app.quit();
+if (!THUMBNAIL && !app.requestSingleInstanceLock()) app.quit();
 
 /** .bdraw paths from the command line (the file manager passes them), not yet sent to the page. */
 const pending = [];
@@ -171,9 +177,12 @@ function registerThumbnailer() {
       fs.chmodSync(file, mode);
     };
     put(script, fs.readFileSync(path.join(process.resourcesPath, 'draw-thumbnailer.sh'), 'utf8'), 0o755);
+    // The app itself renders files without a stored preview: the AppImage file, or the binary.
+    const exe = process.env.APPIMAGE || process.execPath;
+    const q = (p) => (/\s/.test(p) ? `"${p}"` : p);
     put(
       entry,
-      ['[Thumbnailer Entry]', 'TryExec=/bin/sh', `Exec=/bin/sh ${script} %i %o %s`, 'MimeType=application/x-bdraw;', ''].join('\n'),
+      ['[Thumbnailer Entry]', 'TryExec=/bin/sh', `Exec=/bin/sh ${q(script)} %i %o %s ${q(exe)}`, 'MimeType=application/x-bdraw;', ''].join('\n'),
       0o644,
     );
   } catch (e) {
@@ -181,10 +190,11 @@ function registerThumbnailer() {
   }
 }
 
-collect(process.argv);
+if (!THUMBNAIL) collect(process.argv);
 Menu.setApplicationMenu(null);
 
 app.whenReady().then(() => {
+  if (THUMBNAIL) return;
   createWindow();
   setTimeout(() => {
     registerMimeForAppImage();
@@ -206,4 +216,6 @@ app.whenReady().then(() => {
   }
 });
 
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  if (!THUMBNAIL) app.quit();
+});

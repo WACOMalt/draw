@@ -17,9 +17,10 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
-    "linux:dev": "electron electron",
-    "linux:build": "electron-builder --projectDir electron --linux",
-    "test:server": "npm run build:server && node tests/server.test.mjs"
+    "linux:dev": "npm run build:thumb && electron electron",
+    "linux:build": "npm run build:thumb && electron-builder --projectDir electron --linux",
+    "test:server": "npm run build:server && node tests/server.test.mjs",
+    "build:thumb": "vite build --config vite.thumb.config.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",

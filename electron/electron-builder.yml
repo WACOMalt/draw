@@ -11,6 +11,8 @@ files:
   - preload.cjs
   - offline.html
   - package.json
+  - thumbnail.cjs
+  - thumb/**
 extraResources:
   - from: ../src-tauri/mime/xyz.bsums.draw.xml
     to: xyz.bsums.draw.xml
