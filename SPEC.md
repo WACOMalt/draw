@@ -347,7 +347,7 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 The top bar has two export buttons: a snapshot of the screen (PNG, as before), and "Export a large image" (on phones, both are in the ⋮ menu).
 
 - Area: the current view, or everything on the visible layers.
-- Scale: 1× is the resolution of the screen now (device pixels). Presets 1× to 64×, or any number.
+- Size: a pixel count. Presets 1, 4, 12, 24, 50, 100, 250 and 500 MP, 1, 2.5, 10 and 50 GP, or any number of megapixels. The area is fitted to that count and keeps its shape: width = √(pixels × aspect). The dialog also shows the size as a multiple of the detail on screen now.
 - Formats:
 
 | Format | Limit here | Notes |

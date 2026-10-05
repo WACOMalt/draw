@@ -1,7 +1,8 @@
 <script lang="ts">
-  // Export a large image: the current view or everything, at a multiple of the screen's
-  // resolution, as PNG or tiled TIFF (BigTIFF past 4 GB). Pieces render off screen and stream to
-  // the file, so the size is limited by the format and the disk, not by memory.
+  // Export a large image: the current view or everything, at a chosen pixel count (the area is
+  // fitted to it, keeping its shape), as PNG or tiled TIFF (BigTIFF past 4 GB). Pieces render
+  // off screen and stream to the file, so the size is limited by the format and the disk, not
+  // by memory.
   import type { Engine } from '../engine/engine';
   import { exportImage, rawSize, type ImageFormat } from '../export/exportImage';
   import { PNG_MAX_SIDE } from '../export/png';
@@ -19,25 +20,32 @@
   const memoryOnly = sinkKind() === 'memory';
 
   let area = $state<'view' | 'all'>('view');
-  let scale = $state(2);
+  /** Target size in megapixels. */
+  let mp = $state(24);
   let format = $state<ImageFormat>('png');
   let running = $state(false);
   let progress = $state(0);
   let controller: AbortController | null = null;
 
-  const SCALES = [1, 2, 4, 8, 16, 32, 64];
+  /** Megapixel presets: camera sizes up to gigapixel panoramas. */
+  const PRESETS = [1, 4, 12, 24, 50, 100, 250, 500, 1000, 2500, 10_000, 50_000];
+  const label = (m: number) => (m >= 1000 ? `${m / 1000} GP` : `${m} MP`);
   /** PNG strips hold width × 256 rows in memory; keep that under about 512 MB. */
   const PNG_MAX_WIDTH = 500_000;
 
   const bounds = $derived(area === 'all' && content ? content : view.bounds);
-  const width = $derived(Math.max(1, Math.round((bounds.x1 - bounds.x0) * density * scale)));
-  const height = $derived(Math.max(1, Math.round((bounds.y1 - bounds.y0) * density * scale)));
+  // width × height = mp × 10^6, with the shape of the area.
+  const aspect = $derived((bounds.x1 - bounds.x0) / (bounds.y1 - bounds.y0));
+  const width = $derived(Math.max(1, Math.round(Math.sqrt(Math.max(0, mp) * 1e6 * aspect))));
+  const height = $derived(Math.max(1, Math.round(width / aspect)));
+  /** The same size as a multiple of the screen's resolution (1× = what the screen shows now). */
+  const screens = $derived(width / ((bounds.x1 - bounds.x0) * density));
   const raw = $derived(rawSize(width, height));
   const big = $derived(format === 'tiff' && needsBigTiff(width, height));
 
   /** Why this export cannot run, or null. */
   const problem = $derived.by(() => {
-    if (!(scale > 0) || !Number.isFinite(scale)) return 'Enter a scale above 0.';
+    if (!(mp > 0) || !Number.isFinite(mp)) return 'Enter a size above 0 megapixels.';
     if (format === 'png' && (width > PNG_MAX_WIDTH || height > PNG_MAX_SIDE)) return `PNG export goes up to ${PNG_MAX_WIDTH.toLocaleString()} px wide here. Use TIFF for larger images.`;
     if (format === 'tiff' && (width > TIFF_MAX_SIDE || height > TIFF_MAX_SIDE)) return 'TIFF goes up to 4 294 967 295 px per side.';
     if (memoryOnly && raw > MEMORY_LIMIT * 4) return 'This browser keeps the whole file in memory. Use Chrome, Edge or the Draw app for an image this large.';
@@ -99,15 +107,15 @@
   </div>
 
   <div class="field">
-    <span class="label">Scale</span>
+    <span class="label">Size</span>
     <div class="seg wrap">
-      {#each SCALES as s (s)}
-        <button class:on={scale === s} disabled={running} onclick={() => (scale = s)}>{s}×</button>
+      {#each PRESETS as m (m)}
+        <button class:on={mp === m} disabled={running} onclick={() => (mp = m)}>{label(m)}</button>
       {/each}
-      <input type="number" min="0.1" max="100000" step="any" disabled={running} bind:value={scale} aria-label="Scale" />
+      <label class="custom"><input type="number" min="0.01" max="10000000" step="any" disabled={running} bind:value={mp} aria-label="Megapixels" /> MP</label>
     </div>
   </div>
-  <p class="muted note">1× is the resolution of your screen now. 2× has twice the detail in each direction.</p>
+  <p class="muted note">The area is fitted to this many pixels and keeps its shape.</p>
 
   <div class="field">
     <span class="label">Format</span>
@@ -123,7 +131,11 @@
 
   <div class="size">
     <b>{width.toLocaleString()} × {height.toLocaleString()} px</b>
-    <span class="muted">{megapixels >= 1000 ? `${(megapixels / 1000).toFixed(1)} gigapixels` : `${megapixels.toFixed(1)} megapixels`} · up to {fmtBytes(raw)} uncompressed</span>
+    <span class="muted"
+      >{megapixels >= 1000 ? `${(megapixels / 1000).toFixed(1)} gigapixels` : `${megapixels.toFixed(1)} megapixels`} · {screens >= 10
+        ? Math.round(screens)
+        : screens.toFixed(1)}× the detail on your screen · up to {fmtBytes(raw)} uncompressed</span
+    >
   </div>
 
   {#if problem}<p class="error">{problem}</p>
@@ -152,6 +164,8 @@
   }
   .label {
     width: 52px;
+    align-self: flex-start;
+    padding-top: 4px;
     color: var(--text-dim);
     flex: none;
   }
@@ -171,8 +185,15 @@
     border-color: var(--accent-dim);
     background: #24394c;
   }
-  .seg input {
-    width: 70px;
+  .custom {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+    color: var(--text-dim);
+  }
+  .custom input {
+    width: 76px;
   }
   .note {
     margin: 4px 0 0 62px;
