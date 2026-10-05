@@ -1,10 +1,12 @@
 <script lang="ts">
-  // Export a large image: the current view or everything, at a chosen pixel count (the area is
-  // fitted to it, keeping its shape), as PNG or tiled TIFF (BigTIFF past 4 GB). Pieces render
+  // Export an image: the current view or everything, in its own shape or a common aspect ratio
+  // (the area is centered and widened to it, never cut), at a chosen pixel count ("Screen" is
+  // the resolution of the screen now), as PNG or tiled TIFF (BigTIFF past 4 GB). Pieces render
   // off screen and stream to the file, so the size is limited by the format and the disk, not
-  // by memory.
+  // by memory. The settings are kept for next time.
   import type { Engine } from '../engine/engine';
   import { exportImage, rawSize, type ImageFormat } from '../export/exportImage';
+  import { toAspect } from '../export/region';
   import { PNG_MAX_SIDE } from '../export/png';
   import { MEMORY_LIMIT, openSink, sinkKind } from '../export/sink';
   import { TIFF_MAX_SIDE, needsBigTiff } from '../export/tiff';
@@ -18,11 +20,34 @@
   const content = (() => engine.contentBounds())();
   const density = (() => engine.deviceScale)(); // device px per world unit at 1×
   const memoryOnly = sinkKind() === 'memory';
+  /** Without WebGL2 there is no off-screen renderer: only a snapshot of the screen. */
+  const gl = (() => engine.comp.kind === 'webgl2')();
 
-  let area = $state<'view' | 'all'>('view');
-  /** Target size in megapixels. */
-  let mp = $state(24);
-  let format = $state<ImageFormat>('png');
+  /** Megapixels of the current view at the screen's resolution: the "Screen" preset. */
+  const screenMp = (view.w * view.h * (window.devicePixelRatio || 1) ** 2) / 1e6;
+
+  const KEY = 'draw.export';
+  const saved = (() => {
+    try {
+      return JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<{ area: string; mp: number | 'screen'; aspect: string; format: string }>;
+    } catch {
+      return {};
+    }
+  })();
+
+  let area = $state<'view' | 'all'>(saved.area === 'all' && content ? 'all' : 'view');
+  /** Target size in megapixels, or the screen's resolution. */
+  let size = $state<number | 'screen'>(saved.mp === 'screen' || (typeof saved.mp === 'number' && saved.mp > 0) ? saved.mp : 'screen');
+  let aspect = $state(saved.aspect ?? 'area');
+  let format = $state<ImageFormat>(saved.format === 'tiff' ? 'tiff' : 'png');
+  $effect(() => {
+    try {
+      localStorage.setItem(KEY, JSON.stringify({ area, mp: size, aspect, format }));
+    } catch {
+      // storage may be unavailable
+    }
+  });
+  const mp = $derived(size === 'screen' ? screenMp : size);
   let running = $state(false);
   let progress = $state(0);
   let startedAt = $state(0);
@@ -55,16 +80,32 @@
   const left = $derived(progress > 0.01 && elapsed > 3 ? (elapsed * (1 - progress)) / progress : NaN);
 
   /** Megapixel presets: camera sizes up to gigapixel panoramas. */
-  const PRESETS = [1, 4, 12, 24, 50, 100, 250, 500, 1000, 2500, 10_000, 50_000];
+  const PRESETS = [4, 12, 24, 50, 100, 250, 500, 1000, 2500, 10_000, 50_000];
+  /** Width : height. "area" keeps the shape of the view or of the drawing. */
+  const ASPECTS: [id: string, w: number, h: number][] = [
+    ['1:1', 1, 1],
+    ['4:3', 4, 3],
+    ['3:2', 3, 2],
+    ['16:9', 16, 9],
+    ['21:9', 21, 9],
+    ['4:5', 4, 5],
+    ['2:3', 2, 3],
+    ['9:16', 9, 16],
+  ];
   const label = (m: number) => (m >= 1000 ? `${m / 1000} GP` : `${m} MP`);
   /** PNG strips hold width × 256 rows in memory; keep that under about 512 MB. */
   const PNG_MAX_WIDTH = 500_000;
 
-  const bounds = $derived(area === 'all' && content ? content : view.bounds);
-  // width × height = mp × 10^6, with the shape of the area.
-  const aspect = $derived((bounds.x1 - bounds.x0) / (bounds.y1 - bounds.y0));
-  const width = $derived(Math.max(1, Math.round(Math.sqrt(Math.max(0, mp) * 1e6 * aspect))));
-  const height = $derived(Math.max(1, Math.round(width / aspect)));
+  const areaBounds = $derived(area === 'all' && content ? content : view.bounds);
+  /** The area centered and widened to the chosen shape. */
+  const bounds = $derived.by(() => {
+    const a = ASPECTS.find(([id]) => id === aspect);
+    return a ? toAspect(areaBounds, a[1], a[2]) : areaBounds;
+  });
+  // width × height = mp × 10^6, with the shape of the frame.
+  const ratio = $derived((bounds.x1 - bounds.x0) / (bounds.y1 - bounds.y0));
+  const width = $derived(Math.max(1, Math.round(Math.sqrt(Math.max(0, mp) * 1e6 * ratio))));
+  const height = $derived(Math.max(1, Math.round(width / ratio)));
   /** The same size as a multiple of the screen's resolution (1× = what the screen shows now). */
   const screens = $derived(width / ((bounds.x1 - bounds.x0) * density));
   const raw = $derived(rawSize(width, height));
@@ -91,6 +132,11 @@
   const megapixels = $derived((width * height) / 1e6);
 
   async function run() {
+    if (!gl) {
+      await engine.exportPng();
+      ed.exportOpen = false;
+      return;
+    }
     if (problem || running) return;
     const ext = format === 'png' ? 'png' : 'tif';
     const sink = await openSink(`${code}-${width}x${height}.${ext}`, format === 'png' ? 'image/png' : 'image/tiff', ext, format === 'png' ? 'PNG image' : 'TIFF image');
@@ -125,6 +171,9 @@
 </script>
 
 <Modal title="Export image" onClose={() => (running ? controller?.abort() : (ed.exportOpen = false))}>
+  {#if !gl}
+    <p class="warn">This device has no WebGL2, so Draw can only save a snapshot of the screen (PNG, as you see it).</p>
+  {:else}
   <div class="field">
     <span class="label">Area</span>
     <div class="seg">
@@ -134,15 +183,40 @@
   </div>
 
   <div class="field">
-    <span class="label">Size</span>
+    <span class="label">Shape</span>
     <div class="seg wrap">
-      {#each PRESETS as m (m)}
-        <button class:on={mp === m} disabled={running} onclick={() => (mp = m)}>{label(m)}</button>
+      <button class:on={aspect === 'area'} disabled={running} onclick={() => (aspect = 'area')}>{area === 'view' ? 'As on screen' : 'As drawn'}</button>
+      {#each ASPECTS as [id] (id)}
+        <button class:on={aspect === id} disabled={running} onclick={() => (aspect = id)}>{id}</button>
       {/each}
-      <label class="custom"><input type="number" min="0.01" max="10000000" step="any" disabled={running} bind:value={mp} aria-label="Megapixels" /> MP</label>
     </div>
   </div>
-  <p class="muted note">The area is fitted to this many pixels and keeps its shape.</p>
+  {#if aspect !== 'area'}<p class="muted note">The area is centered and widened to this shape, never cut. Paper fills the rest.</p>{/if}
+
+  <div class="field">
+    <span class="label">Size</span>
+    <div class="seg wrap">
+      <button class:on={size === 'screen'} disabled={running} title="The resolution of your screen now" onclick={() => (size = 'screen')}>Screen</button>
+      {#each PRESETS as m (m)}
+        <button class:on={size === m} disabled={running} onclick={() => (size = m)}>{label(m)}</button>
+      {/each}
+      <label class="custom"
+        ><input
+          type="number"
+          min="0.01"
+          max="10000000"
+          step="any"
+          disabled={running}
+          value={size === 'screen' ? +screenMp.toFixed(2) : size}
+          oninput={(e) => {
+            const v = +e.currentTarget.value;
+            if (v > 0) size = v;
+          }}
+          aria-label="Megapixels"
+        /> MP</label
+      >
+    </div>
+  </div>
 
   <div class="field">
     <span class="label">Format</span>
@@ -165,7 +239,9 @@
     >
   </div>
 
-  {#if problem}<p class="error">{problem}</p>
+  {/if}
+
+  {#if problem && gl}<p class="error">{problem}</p>
   {:else if memoryOnly && raw > MEMORY_LIMIT}<p class="warn">This browser keeps the file in memory before the download. A large image can fail; Chrome, Edge and the Draw app write straight to disk.</p>{/if}
 
   {#if running}
@@ -176,7 +252,7 @@
     </div>
   {:else}
     <div class="actions">
-      <button class="primary" disabled={!!problem} onclick={run}>Export…</button>
+      <button class="primary" disabled={gl && !!problem} onclick={run}>{gl ? 'Export…' : 'Save snapshot…'}</button>
       <button onclick={() => (ed.exportOpen = false)}>Close</button>
     </div>
   {/if}

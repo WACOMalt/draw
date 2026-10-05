@@ -344,12 +344,13 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 - Apply: a click sets the brush (or the eraser, while it is the tool). Settings that the preset does not hold go back to their defaults.
 - API: `GET /api/presets`, `POST /api/presets` (`name`, `settings`, `anon`, `creatorName`), `POST /api/presets/<id>/delete` (`anon`). Limits: 30 saves per hour per IP address, 300 presets per creator, 5000 in total.
 
-### 9.4 Large image export
+### 9.4 Image export
 
-The top bar has two export buttons: a snapshot of the screen (PNG, as before), and "Export a large image" (on phones, both are in the ⋮ menu).
+One "Export image" button in the top bar (on phones, in the ⋮ menu) opens the export dialog. It keeps its settings for next time (in the browser).
 
 - Area: the current view, or everything on the visible layers.
-- Size: a pixel count. Presets 1, 4, 12, 24, 50, 100, 250 and 500 MP, 1, 2.5, 10 and 50 GP, or any number of megapixels. The area is fitted to that count and keeps its shape: width = √(pixels × aspect). The dialog also shows the size as a multiple of the detail on screen now.
+- Shape: as on screen (or as drawn, for everything), or 1:1, 4:3, 3:2, 16:9, 21:9, 4:5, 2:3 or 9:16. The area is centered and widened to the shape, never cut. Paper fills the rest.
+- Size: a pixel count. "Screen" is the pixel count of the view at the screen's resolution now (with the screen's shape, that is a snapshot of the screen). Presets 4, 12, 24, 50, 100, 250 and 500 MP, 1, 2.5, 10 and 50 GP, or any number of megapixels. The area is fitted to that count and keeps its shape: width = √(pixels × aspect). The dialog also shows the size as a multiple of the detail on screen now.
 - Formats:
 
 | Format | Limit here | Notes |
@@ -360,7 +361,7 @@ The top bar has two export buttons: a snapshot of the screen (PNG, as before), a
 - Rendering: an off-screen WebGL2 renderer with its own copy of the document renders pieces of up to 2048 × 2048 px, each to completion, with the same code as the screen. The pieces go into the encoder as they are done. About 24 megapixels per second on a desktop GPU.
 - Progress: a bar, the percent, the time so far, and the time left (after 3 s, from the pace so far). Cancel stops the export and removes the partial file. While an export runs, the browser asks before the page closes.
 - Writing: the Tauri apps write the file natively (save dialog, then writes and seeks). Browsers with the File System Access API (Chromium, Edge, the Electron app) stream to the file. Other browsers (Firefox, Safari) keep the file in memory, up to 1.5 GB, then download it. The dialog warns about this.
-- The export needs WebGL2. Transparency is not exported: the paper color is the background.
+- Without WebGL2 (no off-screen renderer), the dialog offers only a PNG snapshot of the screen. Transparency is not exported: the paper color is the background.
 
 ### 9.5 Embeds
 

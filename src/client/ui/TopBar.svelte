@@ -74,8 +74,7 @@
         <div class="menu" role="menu">
           <button role="menuitem" onclick={() => act(pickFile)}><Icon name="open" />Open a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => engine?.saveBdraw())}><Icon name="save" />Save to a .bdraw file</button>
-          <button role="menuitem" onclick={() => act(() => engine?.exportPng())}><Icon name="download" />Export the view as PNG</button>
-          <button role="menuitem" onclick={() => act(() => (ed.exportOpen = true))}><Icon name="image" />Export a large image…</button>
+          <button role="menuitem" onclick={() => act(() => (ed.exportOpen = true))}><Icon name="download" />Export an image…</button>
           <button role="menuitem" onclick={() => act(onLeave)}><Icon name="exit" />Leave this canvas</button>
         </div>
       {/if}
@@ -83,8 +82,7 @@
   {:else}
     <button class="icon" title="Open a .bdraw file as a new canvas (Ctrl+O)" onclick={pickFile}><Icon name="open" /></button>
     <button class="icon" title="Save to a .bdraw file (Ctrl+S)" onclick={() => engine?.saveBdraw()}><Icon name="save" /></button>
-    <button class="icon" title="Export the view as PNG (a snapshot of the screen)" onclick={() => engine?.exportPng()}><Icon name="download" /></button>
-    <button class="icon" title="Export a large image: any scale, PNG or TIFF" onclick={() => (ed.exportOpen = true)}><Icon name="image" /></button>
+    <button class="icon" title="Export an image: the screen or larger, any shape, PNG or TIFF" onclick={() => (ed.exportOpen = true)}><Icon name="download" /></button>
     <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
   {/if}
 </header>
