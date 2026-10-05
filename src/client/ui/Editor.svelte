@@ -17,6 +17,7 @@
   import AccessScreen from './AccessScreen.svelte';
   import ShareDialog from './ShareDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
+  import TransformOverlay from './TransformOverlay.svelte';
 
   let { code, onLeave }: { code: string; onLeave: () => void } = $props();
 
@@ -76,6 +77,7 @@
       ed.denied = null;
       ed.shareOpen = false;
       ed.exportOpen = false;
+      ed.transform = null;
     };
   });
 
@@ -142,6 +144,9 @@
         <div class="conn">{ed.status === 'connecting' ? 'Connecting…' : 'Offline, reconnecting…'}</div>
       {/if}
       <CanvasBanner {code} />
+      {#if ed.transform && engine}
+        {#key ed.transform.id}<TransformOverlay {engine} id={ed.transform.id} />{/key}
+      {/if}
       {#if ed.denied}<AccessScreen {engine} {onLeave} />{/if}
       <div class="viewctl">
         <button

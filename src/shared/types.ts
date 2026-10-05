@@ -100,16 +100,28 @@ export interface LayerMask {
   enabled: boolean;
 }
 
+/**
+ * A layer's blend mode. 'pass' (pass through) is for groups only: the group's layers blend with
+ * what is below the group, as if they were not grouped. Any other mode makes a group isolated:
+ * its layers composite on their own, then the result blends as one layer.
+ */
+export type LayerBlend = BlendMode | 'pass';
+
 export interface Layer {
   id: string;
   name: string;
-  order: number; // fractional index, ascending = bottom to top
-  blend: BlendMode;
+  order: number; // fractional index among the layers of the same parent, ascending = bottom to top
+  blend: LayerBlend;
   opacity: number;
   visible: boolean;
   deleted: boolean;
-  /** 'adjust': no paint of its own; it changes everything below it. Set at creation. Default 'paint'. */
-  kind?: 'paint' | 'adjust';
+  /**
+   * 'adjust': no paint of its own; it changes everything below it. 'group': a folder of layers
+   * (layers name it as `parent`). Set at creation. Default 'paint'.
+   */
+  kind?: 'paint' | 'adjust' | 'group';
+  /** The group this layer is in; absent or null: the top level. A deleted group hides its layers. */
+  parent?: string | null;
   adjust?: Adjust;
   /** Clipped to the nearest layer below that is not clipped (the base of the clipping group). */
   clip?: boolean;
@@ -128,10 +140,13 @@ export interface Stroke {
   mask?: string;
 }
 
-export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask'>;
+export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent'>;
+
+/** A 2D affine transform [a, b, c, d, e, f]: x' = a·x + c·y + e, y' = b·x + d·y + f. */
+export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -141,7 +156,18 @@ export type Op =
   | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind'> & LayerProps }
   | { type: 'layer.update'; id: string; props: Partial<LayerProps> }
   | { type: 'layer.remove'; id: string }
-  | { type: 'layer.restore'; id: string };
+  | { type: 'layer.restore'; id: string }
+  /**
+   * Moves, scales, rotates or skews a layer, or a group with everything in it: every stroke of
+   * those layers (masks included, deleted strokes too, so undoing a delete puts them back in place).
+   */
+  | { type: 'layer.transform'; id: string; m: Affine }
+  /**
+   * Copies a layer, or a group with everything in it. The copy of the layer (or group) `id` gets
+   * `newId`; copies of its layers and strokes get ids derived from `newId` and the original id
+   * (derivedId), so every client makes the same copy. The copy goes into `parent` at `order`.
+   */
+  | { type: 'layer.duplicate'; id: string; newId: string; name: string; order: number; parent: string | null };
 
 /** An op as the server broadcasts it: restore ops carry the full object so late joiners can apply them. */
 export type AppliedOp =
@@ -243,6 +269,8 @@ export const LIMITS = {
   maxMessageBytes: 4 * 1024 * 1024,
   maxStrokePoints: 20000,
   maxLayers: 100,
+  /** Groups inside groups, at most. */
+  maxGroupDepth: 8,
   maxLayerName: 64,
   maxPeerName: 32,
   /** Brush size in the UI, in screen pixels. */

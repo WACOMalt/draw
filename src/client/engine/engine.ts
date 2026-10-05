@@ -8,6 +8,7 @@ import {
   LIMITS,
   PREVIEW_LIMITS,
   type Adjust,
+  type Affine,
   type AdjustType,
   type Brush,
   type Layer,
@@ -28,6 +29,7 @@ import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
 import { Net } from './net';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
+import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
@@ -375,8 +377,10 @@ export class Engine {
 
   // --- finding content ---------------------------------------------------------------------
 
+  /** Paint layers that show (visible, in groups that are all visible). */
   private visibleLayerIds(): Set<string> {
-    return new Set(ed.layers.filter((l) => l.visible).map((l) => l.id));
+    const byId = new Map(ed.layers.map((l) => [l.id, l]));
+    return new Set(ed.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(byId, l)).map((l) => l.id));
   }
 
   /**
@@ -476,7 +480,8 @@ export class Engine {
   // --- tools and cursor ---------------------------------------------------------------------
 
   private effectiveTool(): Tool {
-    if (this.frame || this.spaceDown || this.pan) return 'hand';
+    // While a transform is open, the canvas only pans: the overlay has the handles.
+    if (this.frame || ed.transform || this.spaceDown || this.pan) return 'hand';
     if (this.altDown && (ed.tool === 'brush' || ed.tool === 'eraser')) return 'eyedropper';
     return ed.tool;
   }
@@ -786,7 +791,8 @@ export class Engine {
     if (!ed.canEdit) return showToast('View only: you can look around but not draw');
     const layer = this.activeLayer();
     if (!layer) return showToast('Add a layer first');
-    if (!layer.visible) return showToast('The active layer is hidden');
+    if (layer.kind === 'group') return showToast('A group holds no paint: select a layer in it');
+    if (!effectivelyVisible(new Map(ed.layers.map((l) => [l.id, l])), layer)) return showToast('The active layer is hidden');
     const mask = ed.maskTarget && layer.mask ? layer.mask : null;
     if (layer.kind === 'adjust' && !mask) {
       return showToast(layer.mask ? 'Select the mask to paint on an adjustment layer' : 'An adjustment layer has no paint. Add a mask to paint where it applies.');
@@ -961,6 +967,7 @@ export class Engine {
   undo(): void {
     if (!ed.canEdit) return;
     if (this.stroke) return;
+    if (ed.transform) return this.cancelTransform();
     const e = this.undoStack.pop();
     if (!e) return;
     e.undo.forEach((op) => this.sendOp(op));
@@ -993,13 +1000,30 @@ export class Engine {
     this.scheduleMarkers();
   }
 
-  /** The order value for a new layer right above the active one. */
-  private newLayerOrder(): number {
-    const layers = this.doc.displayLayers();
-    const i = layers.findIndex((l) => l.id === ed.activeLayerId);
-    const active = layers[i];
-    const above = layers[i + 1];
-    return active ? (above ? (active.order + above.order) / 2 : active.order + 1) : 1;
+  /** Live layers in the group `parent` (null: the top level), bottom to top. */
+  private siblings(parent: string | null): Layer[] {
+    return ed.layers.filter((l) => (l.parent ?? null) === parent).sort(sortLayers);
+  }
+
+  /** An order value right above `l` among its siblings. */
+  private orderAbove(l: Layer): number {
+    const sib = this.siblings(l.parent ?? null);
+    const above = sib[sib.findIndex((x) => x.id === l.id) + 1];
+    return above ? (l.order + above.order) / 2 : l.order + 1;
+  }
+
+  /**
+   * Where a new layer goes: right above the active layer, in its group; inside the active group,
+   * at its top.
+   */
+  private newLayerPlace(): { order: number; parent?: string } {
+    const active = this.activeLayer();
+    if (!active) return { order: 1 };
+    if (active.kind === 'group') {
+      const top = this.siblings(active.id).at(-1);
+      return { order: top ? top.order + 1 : 1, parent: active.id };
+    }
+    return { order: this.orderAbove(active), ...(active.parent ? { parent: active.parent } : {}) };
   }
 
   private nextName(prefix: string): string {
@@ -1017,7 +1041,7 @@ export class Engine {
     const id = newId();
     this.sendOp({
       type: 'layer.add',
-      layer: { id, name: this.nextName('Layer'), order: this.newLayerOrder(), blend: 'normal', opacity: 1, visible: true },
+      layer: { id, name: this.nextName('Layer'), ...this.newLayerPlace(), blend: 'normal', opacity: 1, visible: true },
     });
     this.pushUndo({ undo: [{ type: 'layer.remove', id }], redo: [{ type: 'layer.restore', id }] });
     this.setMaskTarget(false);
@@ -1041,7 +1065,7 @@ export class Engine {
         id,
         kind: 'adjust',
         name: this.nextName(Engine.ADJUST_NAMES[type]),
-        order: this.newLayerOrder(),
+        ...this.newLayerPlace(),
         blend: 'normal',
         opacity: 1,
         visible: true,
@@ -1105,13 +1129,20 @@ export class Engine {
     }
   }
 
+  /** Deletes a layer, or a group with everything in it. Undo brings it all back. */
   deleteLayer(id: string): void {
     if (!ed.canEdit) return;
     const layers = this.doc.displayLayers();
-    if (layers.length <= 1) return showToast('A canvas needs at least one layer');
+    const gone = subtreeIds(layers, id);
+    const rest = layers.filter((l) => !gone.has(l.id) && l.kind !== 'group');
+    if (rest.length === 0) return showToast('A canvas needs at least one layer');
     const i = layers.findIndex((l) => l.id === id);
     if (i < 0) return;
-    if (ed.activeLayerId === id) ed.activeLayerId = (layers[i - 1] ?? layers[i + 1]).id;
+    if (ed.activeLayerId && gone.has(ed.activeLayerId)) {
+      const below = layers.slice(0, i).reverse().find((l) => !gone.has(l.id));
+      ed.activeLayerId = (below ?? layers.find((l) => !gone.has(l.id)))!.id;
+    }
+    if (ed.transform && gone.has(ed.transform.id)) this.cancelTransform();
     this.sendOp({ type: 'layer.remove', id });
     this.pushUndo({ undo: [{ type: 'layer.restore', id }], redo: [{ type: 'layer.remove', id }] });
   }
@@ -1143,18 +1174,160 @@ export class Engine {
     });
   }
 
-  /** dir +1 moves the layer up (toward the top), -1 moves it down. */
+  /** dir +1 moves the layer up (toward the top) among the layers of its group, -1 down. */
   moveLayer(id: string, dir: 1 | -1): void {
     if (!ed.canEdit) return;
-    const layers = this.doc.displayLayers();
-    const i = layers.findIndex((l) => l.id === id);
-    const neighbor = layers[i + dir];
+    const l = this.doc.layer(id);
+    if (!l) return;
+    const sib = this.siblings(l.parent ?? null);
+    const i = sib.findIndex((x) => x.id === id);
+    const neighbor = sib[i + dir];
     if (i < 0 || !neighbor) return;
-    const beyond = layers[i + 2 * dir];
+    const beyond = sib[i + 2 * dir];
     let order = beyond ? (neighbor.order + beyond.order) / 2 : neighbor.order + dir;
     if (order === neighbor.order) order = neighbor.order + dir * 1e-9;
     this.updateLayer(id, { order });
   }
+
+  /** Whether a move up (+1) or down (-1) is possible: a layer above or below in its group. */
+  canMove(id: string, dir: 1 | -1): boolean {
+    const l = ed.layers.find((x) => x.id === id);
+    if (!l) return false;
+    const sib = this.siblings(l.parent ?? null);
+    return !!sib[sib.findIndex((x) => x.id === id) + dir];
+  }
+
+  /**
+   * Moves a layer (or group) into `parent` (null: the top level) between the siblings `below` and
+   * `above` (null: at that end). Drag and drop in the layers panel.
+   */
+  moveTo(id: string, parent: string | null, below: string | null, above: string | null): void {
+    if (!ed.canEdit) return;
+    const l = this.doc.layer(id);
+    if (!l) return;
+    if (parent && subtreeIds(this.doc.displayLayers(), id).has(parent)) return showToast('A group cannot go into itself');
+    const sib = this.siblings(parent).filter((x) => x.id !== id);
+    const b = below ? sib.find((x) => x.id === below) : undefined;
+    const a = above ? sib.find((x) => x.id === above) : undefined;
+    const order = b && a ? (b.order + a.order) / 2 : b ? b.order + 1 : a ? a.order - 1 : 1;
+    const props: Partial<LayerProps> = { order };
+    if ((l.parent ?? null) !== parent) props.parent = parent;
+    this.updateLayer(id, props);
+  }
+
+  /** Puts the layer (or group) into a new group in its place (Ctrl+G). */
+  groupLayer(id: string): void {
+    if (!ed.canEdit) return;
+    const l = this.doc.layer(id);
+    if (!l) return;
+    const gid = newId();
+    const group: Op = {
+      type: 'layer.add',
+      layer: { id: gid, kind: 'group', name: this.nextName('Group'), order: l.order, blend: 'pass', opacity: 1, visible: true, ...(l.parent ? { parent: l.parent } : {}) },
+    };
+    const into: Op = { type: 'layer.update', id, props: { parent: gid, order: 1 } };
+    const back: Op = { type: 'layer.update', id, props: { parent: l.parent ?? null, order: l.order } };
+    this.sendOp(group);
+    this.sendOp(into);
+    this.pushUndo({ undo: [back, { type: 'layer.remove', id: gid }], redo: [{ type: 'layer.restore', id: gid }, into] });
+    ed.activeLayerId = gid;
+  }
+
+  /** A new empty group above the active layer (or at the top of the active group). */
+  addGroup(): void {
+    if (!ed.canEdit) return;
+    const id = newId();
+    this.sendOp({ type: 'layer.add', layer: { id, kind: 'group', name: this.nextName('Group'), ...this.newLayerPlace(), blend: 'pass', opacity: 1, visible: true } });
+    this.pushUndo({ undo: [{ type: 'layer.remove', id }], redo: [{ type: 'layer.restore', id }] });
+    ed.activeLayerId = id;
+  }
+
+  /** Takes the layers out of a group, in its place and order, and deletes the group (Ctrl+Shift+G). */
+  ungroup(id: string): void {
+    if (!ed.canEdit) return;
+    const g = this.doc.layer(id);
+    if (!g || g.kind !== 'group') return;
+    const kids = this.siblings(id);
+    const parent = g.parent ?? null;
+    const sib = this.siblings(parent);
+    const below = sib[sib.findIndex((x) => x.id === id) - 1];
+    const lo = below ? below.order : g.order - 1;
+    const out: Op[] = kids.map((k, i) => ({ type: 'layer.update', id: k.id, props: { parent, order: lo + ((g.order - lo) * (i + 1)) / (kids.length + 1) } }));
+    const back: Op[] = kids.map((k) => ({ type: 'layer.update', id: k.id, props: { parent: id, order: k.order } }));
+    for (const op of out) this.sendOp(op);
+    this.sendOp({ type: 'layer.remove', id });
+    this.pushUndo({ undo: [{ type: 'layer.restore', id }, ...back], redo: [...out, { type: 'layer.remove', id }] });
+    ed.activeLayerId = kids.at(-1)?.id ?? ed.activeLayerId;
+  }
+
+  /** Copies a layer, or a group with everything in it, right above it. One op: see layer.duplicate. */
+  duplicate(id: string): void {
+    if (!ed.canEdit) return;
+    const l = this.doc.layer(id);
+    if (!l) return;
+    const nid = newId();
+    const name = `${l.name} copy`.slice(0, LIMITS.maxLayerName);
+    this.sendOp({ type: 'layer.duplicate', id, newId: nid, name, order: this.orderAbove(l), parent: l.parent ?? null });
+    this.pushUndo({ undo: [{ type: 'layer.remove', id: nid }], redo: [{ type: 'layer.restore', id: nid }] });
+    this.setMaskTarget(false);
+    ed.activeLayerId = nid;
+  }
+
+  // --- transform ---------------------------------------------------------------------------------
+
+  /** World bounds of what a layer or group draws (paint strokes; mask strokes if there is no paint). */
+  contentOf(id: string): Bounds | null {
+    const ids = subtreeIds(this.doc.displayLayers(), id);
+    let paint: Bounds | null = null, masks: Bounds | null = null;
+    for (const [sid, st] of this.doc.strokes) {
+      if (!ids.has(st.layerId)) continue;
+      const b = this.doc.bounds.get(sid);
+      if (!b) continue;
+      const acc: Bounds | null = st.mask ? masks : paint;
+      const u: Bounds = acc ? { x0: Math.min(acc.x0, b.x0), y0: Math.min(acc.y0, b.y0), x1: Math.max(acc.x1, b.x1), y1: Math.max(acc.y1, b.y1) } : b;
+      if (st.mask) masks = u;
+      else paint = u;
+    }
+    return paint ?? masks;
+  }
+
+  /** Free transform of the active layer or group (Ctrl+T): the overlay shows handles. */
+  startTransform(): void {
+    if (!ed.canEdit) return;
+    const l = this.activeLayer();
+    if (!l) return;
+    if (!this.contentOf(l.id)) return showToast('Nothing to transform on this layer');
+    ed.transform = { id: l.id };
+  }
+
+  /** Live preview while the handles move (no op until apply). */
+  previewTransform(m: Affine): void {
+    if (ed.transform) this.comp.setTransformPreview({ id: ed.transform.id, m });
+  }
+
+  cancelTransform(): void {
+    ed.transform = null;
+    this.comp.setTransformPreview(null);
+  }
+
+  /** Applies the transform: one op; undo applies the inverse. The preview stays until the tiles catch up. */
+  applyTransform(m: Affine): void {
+    const t = ed.transform;
+    ed.transform = null;
+    const inv = invert(m);
+    const identity = m.every((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) < 1e-12);
+    if (!t || !inv || identity || !ed.canEdit) {
+      this.comp.setTransformPreview(null);
+      return;
+    }
+    this.comp.setTransformPreview({ id: t.id, m });
+    this.transformOp = t.id;
+    this.sendOp({ type: 'layer.transform', id: t.id, m });
+    this.pushUndo({ undo: [{ type: 'layer.transform', id: t.id, m: inv }], redo: [{ type: 'layer.transform', id: t.id, m }] });
+  }
+
+  /** Layer of this client's transform op waiting for its echo (the preview shows until then). */
+  private transformOp: string | null = null;
 
   setActiveLayer(id: string): void {
     if (id !== ed.activeLayerId) this.setMaskTarget(false);
@@ -1189,10 +1362,24 @@ export class Engine {
         this.previewSeq = Math.max(this.previewSeq ?? -1, m.seq);
         break;
       case 'op': {
-        this.doc.apply(m.seq, m.op);
+        const changes = this.doc.apply(m.seq, m.op);
         if (m.by === ed.clientId) this.doc.dropPending(m.opId);
         const op = m.op;
-        if (op.type === 'stroke.add' || op.type === 'stroke.restore') {
+        if (changes) {
+          // A transform or a duplicate: strokes changed in place, or new copies.
+          for (const st of changes.changed) {
+            this.comp.removeStroke(st.id, m.seq);
+            this.comp.addStroke(st, m.seq);
+          }
+          for (const st of changes.added) this.comp.addStroke(st, m.seq);
+          this.comp.advanceSeq(m.seq);
+          this.refreshLayers();
+          if (op.type === 'layer.transform' && m.by === ed.clientId && this.transformOp === op.id) {
+            this.transformOp = null;
+            this.comp.settleTransformPreview();
+          }
+          this.scheduleMarkers();
+        } else if (op.type === 'stroke.add' || op.type === 'stroke.restore') {
           this.comp.addStroke(op.stroke, m.seq);
           this.comp.liveCommit(op.stroke.id, m.seq);
         } else if (op.type === 'stroke.remove') {
@@ -1211,6 +1398,10 @@ export class Engine {
         if (p?.op.type === 'stroke.add') {
           this.comp.liveCancel(p.op.stroke.id);
           this.net.send({ t: 'live.end', id: p.op.stroke.id });
+        }
+        if (p?.op.type === 'layer.transform' && this.transformOp === p.op.id) {
+          this.transformOp = null;
+          this.comp.setTransformPreview(null);
         }
         if (!/duplicate|no such stroke|not deleted/.test(m.reason)) showToast(`Change rejected: ${m.reason}`);
         this.refreshLayers();
@@ -1299,6 +1490,18 @@ export class Engine {
       } else if (key === 'y') {
         e.preventDefault();
         this.redo();
+      } else if (key === 't') {
+        // Ctrl+T (browsers keep it for a new tab; the desktop apps and V work everywhere).
+        e.preventDefault();
+        this.startTransform();
+      } else if (key === 'g') {
+        e.preventDefault();
+        const a = this.activeLayer();
+        if (a && e.shiftKey) this.ungroup(a.id);
+        else if (a) this.groupLayer(a.id);
+      } else if (key === 'j') {
+        e.preventDefault();
+        if (ed.activeLayerId) this.duplicate(ed.activeLayerId);
       } else if (key === '=' || key === '+') {
         e.preventDefault();
         this.zoomBy(1.25);
@@ -1332,7 +1535,9 @@ export class Engine {
       return;
     }
     const tools: Record<string, Tool> = { b: 'brush', e: 'eraser', i: 'eyedropper', h: 'hand' };
-    if (tools[key]) {
+    if (key === 'v') {
+      this.startTransform();
+    } else if (tools[key]) {
       ed.tool = tools[key];
       this.updateCursor();
     } else if (key === 'x') {

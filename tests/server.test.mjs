@@ -472,6 +472,107 @@ try {
   const pvRenamed = await funky.api('POST', `/api/canvases/${pv}/rename`, { name: 'preview-moved' });
   check(pvRenamed.status === 200 && (await fetch(`${BASE}/api/canvases/preview-moved/preview.png?k=${pvView}`)).status === 200, 'rename keeps the preview');
 
+  // --- layer groups, transforms, duplicates ------------------------------------------------------
+  {
+    // Its own account (and address): canvas creation is rate limited per address.
+    const gb = new Browser();
+    await account(gb, 'groups@example.com', 'Group Tester');
+    const gc = (await gb.api('POST', '/api/sessions', { name: 'groups-test' })).data.key;
+    const o = await gb.join(gc);
+    const w = await first(o);
+    const L1 = layerId(w);
+    let opn = 100;
+    const send = (op) => o.send({ t: 'op', opId: `g${opn++}xxxxx`, op });
+    const echo = (pred) => o.next((m) => m.t === 'op' && pred(m.op), 2000);
+    const rejected = (n) => o.next((m) => m.t === 'reject' && m.opId === `g${n}xxxxx`, 2000);
+    const layer = (id, extra = {}) => ({ type: 'layer.add', layer: { id, name: id, order: 2, blend: 'normal', opacity: 1, visible: true, ...extra } });
+
+    send(layer('groupAAAA1', { kind: 'group', blend: 'pass' }));
+    check(!!(await echo((op) => op.type === 'layer.add' && op.layer.id === 'groupAAAA1')), 'groups: add a group (pass through)');
+    let n = opn;
+    send(layer('paintPASS1', { blend: 'pass' }));
+    check(!!(await rejected(n)), 'groups: pass through is for groups only');
+    send({ type: 'layer.update', id: L1, props: { parent: 'groupAAAA1', order: 1 } });
+    check(!!(await echo((op) => op.type === 'layer.update' && op.props.parent === 'groupAAAA1')), 'groups: move a layer into a group');
+    o.send(strokeOp(L1, 41));
+    const st = await o.next((m) => m.t === 'op' && m.op.type === 'stroke.add');
+    check(!!st, 'groups: draw on a layer in a group');
+    n = opn;
+    send({ type: 'stroke.add', stroke: { id: 'strokeGRP01', layerId: 'groupAAAA1', brush: st.op.stroke.brush, pts: [0, 0, 1, 5, 5, 1] } });
+    check(!!(await rejected(n)), 'groups: a group holds no paint');
+    send(layer('groupBBBB1', { kind: 'group', parent: 'groupAAAA1' }));
+    await echo((op) => op.type === 'layer.add' && op.layer.id === 'groupBBBB1');
+    n = opn;
+    send({ type: 'layer.update', id: 'groupAAAA1', props: { parent: 'groupBBBB1' } });
+    check(!!(await rejected(n)), 'groups: a group cannot go into itself');
+    n = opn;
+    send({ type: 'layer.update', id: 'groupBBBB1', props: { parent: L1 } });
+    check(!!(await rejected(n)), 'groups: only a group can hold layers');
+
+    // Transform the group: the stroke of the layer inside moves.
+    send({ type: 'layer.transform', id: 'groupAAAA1', m: [2, 0, 0, 2, 100, 50] });
+    check(!!(await echo((op) => op.type === 'layer.transform')), 'transform: a group transform is accepted');
+    const w2 = await first(await gb.join(gc));
+    const moved = w2.strokes.find((x) => x.id === st.op.stroke.id);
+    check(moved?.pts[0] === 100 && moved.pts[1] === 50 && moved.pts[3] === 120 && moved.pts[4] === 70 && moved.brush.size === 8, 'transform: points mapped, brush scaled by the average scale');
+    n = opn;
+    send({ type: 'layer.transform', id: L1, m: [1e14, 0, 0, 1e14, 0, 0] });
+    check(!!(await rejected(n)), 'transform: out of range is refused, nothing changes');
+    n = opn;
+    send({ type: 'layer.transform', id: L1, m: [1, 0, 0, 0, 0, 0] });
+    check(!!(await rejected(n)), 'transform: a flat (not invertible) matrix is refused');
+
+    // Duplicate the group: the copy has the inner group, the layer and the stroke, with new ids.
+    send({ type: 'layer.duplicate', id: 'groupAAAA1', newId: 'groupCOPY1', name: 'Copy', order: 3, parent: null });
+    check(!!(await echo((op) => op.type === 'layer.duplicate')), 'duplicate: a group duplicate is accepted');
+    const w3 = await first(await gb.join(gc));
+    const copyLayers = w3.layers.filter((l) => l.id === 'groupCOPY1' || l.parent === 'groupCOPY1');
+    const copyPaint = copyLayers.find((l) => l.kind !== 'group' && l.id !== 'groupCOPY1');
+    const copyStroke = w3.strokes.find((x) => x.layerId === copyPaint?.id);
+    check(copyLayers.length === 3 && copyLayers.some((l) => l.kind === 'group' && l.parent === 'groupCOPY1') && copyStroke && copyStroke.id !== st.op.stroke.id && copyStroke.pts[0] === 100, 'duplicate: layers and strokes copied, with new ids');
+    check(w3.features.includes('groups'), 'groups: welcome lists the groups feature');
+
+    // Deleting the group hides its layers: no drawing there until restored.
+    send({ type: 'layer.remove', id: 'groupAAAA1' });
+    await echo((op) => op.type === 'layer.remove');
+    n = opn;
+    o.send({ t: 'op', opId: `g${opn++}xxxxx`, op: strokeOp(L1, 42).op });
+    check(!!(await rejected(n)), 'groups: a layer in a deleted group takes no strokes');
+    send({ type: 'layer.restore', id: 'groupAAAA1' });
+    await echo((op) => op.type === 'layer.restore');
+    o.send(strokeOp(L1, 43));
+    check(!!(await o.next((m) => m.t === 'op' && m.op.type === 'stroke.add' && m.op.stroke.layerId === L1 && m.seq > st.seq)), 'groups: restoring the group brings its layers back');
+
+    // Nesting deeper than the limit is refused.
+    let parent = null, refused = false;
+    for (let d = 0; d < 10; d++) {
+      const id = `deepGRP${d}xx`;
+      n = opn;
+      send(layer(id, { kind: 'group', ...(parent ? { parent } : {}) }));
+      const r = await o.next((m) => (m.t === 'op' && m.op.type === 'layer.add' && m.op.layer.id === id) || (m.t === 'reject' && m.opId === `g${n}xxxxx`), 2000);
+      if (r?.t === 'reject') {
+        refused = d === 8;
+        break;
+      }
+      parent = id;
+    }
+    check(refused, 'groups: nesting is limited to 8 levels');
+
+    // A .bdraw with a layer listed before its group: the import adds the group first.
+    const brush = { tool: 'paint', color: '#000000', size: 4, opacity: 1, flow: 1, hardness: 1, spacing: 0.1, pressureSize: false, pressureFlow: false, buildup: false };
+    const file = {
+      format: 'bdraw', version: 2, app: 'test', savedAt: '',
+      layers: [
+        { id: 'impLAYER1', name: 'In group', order: 1, blend: 'normal', opacity: 1, visible: true, deleted: false, parent: 'impGROUP1' },
+        { id: 'impGROUP1', name: 'Group', order: 1, blend: 'pass', opacity: 1, visible: true, deleted: false, kind: 'group' },
+      ],
+      strokes: [{ id: 'impSTROKE1', layerId: 'impLAYER1', seq: 1, author: 'x', brush, pts: [0, 0, 1, 5, 5, 1] }],
+    };
+    const gImp = await gb.upload(Buffer.from(JSON.stringify(file)), {});
+    const gw = await first(await new Browser().join(gImp.data.key));
+    check(gImp.status === 201 && gImp.data.skipped === 0 && gw.layers.find((l) => l.id === 'impLAYER1')?.parent === 'impGROUP1' && gw.strokes.length === 1, 'groups: a .bdraw with a group imports, layers listed before their group');
+  }
+
   // --- admins manage every owned canvas like its owner ------------------------------------------
   const adm = (await funky.api('POST', '/api/sessions', { name: 'admin-test' })).data.key;
   await funky.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'none' });

@@ -55,9 +55,9 @@ Three rules drive the design:
 A document is a set of layers and a set of strokes. The server gives each accepted op a sequence number (`seq`). The `seq` sets one total order for all clients.
 
 ```ts
-Layer  { id, name, order: number, blend: BlendMode, opacity: 0..1, visible, deleted,
-         kind?: 'paint' | 'adjust', adjust?: Adjust, clip?: boolean,
-         mask?: { id, enabled } | null }
+Layer  { id, name, order: number, blend: BlendMode | 'pass', opacity: 0..1, visible, deleted,
+         kind?: 'paint' | 'adjust' | 'group', parent?: groupId | null,
+         adjust?: Adjust, clip?: boolean, mask?: { id, enabled } | null }
 Stroke { id, layerId, seq, author, brush: Brush, pts: number[], deleted, mask?: maskId }
 Brush  { tool: 'paint' | 'erase', color: '#rrggbb', size, opacity, flow,
          hardness, spacing, pressureSize, pressureFlow, buildup,
@@ -69,6 +69,7 @@ All fields with `?` are optional. Older documents have none of them and stay val
 
 - **Adjustment layer** (`kind: 'adjust'`): it has no paint. It changes the composite of everything below it. `Adjust` is levels, curves (2 to 16 points), hue/saturation, or brightness/contrast. The server refuses a plain stroke on an adjustment layer. A mask stroke is permitted.
 - **Clipping mask** (`clip: true`): the layer shows only where the nearest layer below it that is not clipped (the base) has alpha. The base and its clipped layers are a clipping group.
+- **Group** (`kind: 'group'`), as in Photoshop: a folder of layers. A layer's `parent` names its group (absent or null: the top level), and `order` sorts the layers of one parent. Groups nest up to 8 levels (`LIMITS.maxGroupDepth`; layers may sit inside the 8th). A group has no paint. Its blend is "pass through" (`'pass'`, the default, for groups only): its layers blend with what is below the group, as if they were not grouped, and with opacity under 100% the result is mixed with the backdrop by the opacity. Any other blend makes the group isolated: its layers composite on their own (adjustment layers inside change only the group), then the result blends as one layer. Hiding a group hides its layers. Deleting a group deletes its layers with it (they count as deleted while the group is), and restoring it brings them back unchanged. Clipping works among the layers of one group; a group can be a clipping base. The server checks that the parent is a live group, that a group never goes into itself, and the depth. Rules: `src/shared/layers.ts`.
 - **Layer mask** (`mask`): strokes with `mask: <mask id>` on the layer. They paint grey on an implied white mask: black hides the layer, white shows it, and the eraser goes back to white. A new mask gets a new id. Thus the strokes of a deleted mask stay out of a later mask, and undo of the delete brings them back. `enabled: false` turns the mask off and keeps it.
 
 - `pts` is a flat array of `x, y, pressure` triples in world units. One world unit is one CSS pixel at 100% zoom.
@@ -77,6 +78,8 @@ All fields with `?` are optional. Older documents have none of them and stay val
 - `order` is a fractional index. A move sets `order` to the midpoint of the two neighbor layers. Thus a reorder is one property write, and two users can reorder at the same time without a conflict.
 - Delete is a tombstone (`deleted: true`). A tombstone makes undo of a delete possible.
 - A stroke keeps the `seq` of its creation. If a user restores a stroke, it goes back to its original position in the z-order.
+- **Transform** (`layer.transform`, with an affine matrix `m = [a, b, c, d, e, f]`): changes the points of every stroke of a layer, or of a group and everything in it (masks too, and deleted strokes, so undoing a delete puts them back in the new place). The brush size scales by √|det m| (the average scale), and a fixed tip angle turns with the rotation. Strokes stay vectors, so a transformed layer stays sharp at any scale. A non-uniform scale or a skew keeps the tip shape. The server refuses a matrix that is not invertible, and a transform that would move a point past `maxCoord`. Undo is the inverse matrix.
+- **Duplicate** (`layer.duplicate`, with the source `id`, a `newId`, the name, the order and the parent): copies a layer, or a group with everything in it, in one op. The copies' ids come from `derivedId(newId, original id)` (three FNV-1a hashes, base 62), so the server and every client make the same copy. Copied strokes keep their `seq` and author. Undo deletes the copy.
 
 ## 5. Brush model
 
@@ -303,6 +306,14 @@ A second finger within 300 ms of the first cancels the stroke of the first finge
 PWA: the app has a web manifest, icons (also maskable), and a service worker. The service worker caches the app shell. It loads pages from the network first, so a deploy shows at once. It never caches `/api` or `/ws`. Chrome, Edge, and Firefox for Android can install the app. Desktop Firefox has no general PWA install.
 
 The landing page keeps a list of recent sessions in local storage on each device. With an account, it shows a name field (empty: "Random code") and two buttons, "Create private canvas" and "Create public canvas". Without an account, it shows "New canvas" (temporary). In the web app (not the desktop app), a "Download app" button opens the latest GitHub release.
+
+### 9.0 Layers panel, groups and transform
+
+- The panel is a tree, top layer first: a group's row (folder icon, an arrow to open or close it; closed groups are kept per device), then its layers, indented. Every row has a grip: drag it (mouse, pen or finger) onto the upper or lower part of a row to go above or below it, or onto the middle of a group to go into it, at its top. The up and down buttons move a layer among the layers of its group.
+- Buttons: new layer, new adjustment layer, group (puts the active layer in a new group; on a group: ungroup), mask, clip, duplicate, transform, up, down, delete. Shortcuts: Ctrl+G groups, Ctrl+Shift+G ungroups, Ctrl+J duplicates, Ctrl+T or V transforms (browsers keep Ctrl+T for a new tab; V works there).
+- New layers go above the active layer in its group, or at the top of the active group. A group cannot be painted on: the brush says so.
+- Transform: a box around what the layer or group draws, with 8 handles and a rotate handle. Drag inside to move. A corner scales and keeps the shape (Shift: free; Alt: from the center). An edge stretches one way. The rotate handle turns (Shift: 15° steps). A toolbar shows the size and the angle, and has flip horizontal, flip vertical, reset, cancel and apply. Enter applies, Esc cancels, arrow keys nudge (Shift: 10 px). While the box is open the canvas only pans, and the wheel still zooms over the box.
+- Preview: while the handles move, the renderer draws a copy of what the layer showed on screen through the transform (one GPU pass), so dragging stays smooth even for a large group. Parts that were off screen are missing until the transform is applied. After Apply, the preview stays until the layer's tiles show the transformed strokes, so the layer does not flash back.
 
 ### 9.1 Pen input
 

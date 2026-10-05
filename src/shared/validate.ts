@@ -7,13 +7,16 @@ import {
   GRAINS,
   LIMITS,
   type Adjust,
+  type Affine,
   type BlendMode,
   type Brush,
   type BrushSettings,
+  type LayerBlend,
   type LayerMask,
   type LayerProps,
   type Op,
 } from './types';
+import { validAffine } from './layers';
 
 export class ValidationError extends Error {}
 
@@ -158,7 +161,8 @@ export function validatePoints(v: unknown, minPoints = 1): number[] {
   return out;
 }
 
-function blend(v: unknown): BlendMode {
+function blend(v: unknown): LayerBlend {
+  if (v === 'pass') return 'pass'; // groups only (checked where the layer kind is known)
   if (typeof v !== 'string' || !(BLEND_MODES as readonly string[]).includes(v)) fail('bad blend');
   return v as BlendMode;
 }
@@ -175,6 +179,7 @@ function layerProps(v: unknown, partial: boolean): Partial<LayerProps> {
   if (p.adjust !== undefined) out.adjust = validateAdjust(p.adjust);
   if (p.clip !== undefined) out.clip = bool(p.clip, 'clip');
   if (p.mask !== undefined) out.mask = layerMask(p.mask);
+  if (p.parent !== undefined) out.parent = p.parent === null ? null : id(p.parent, 'parent');
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -202,13 +207,26 @@ export function validateOp(v: unknown): Op {
       return { type: o.type, id: id(o.id) };
     case 'layer.add': {
       const l = obj(o.layer, 'layer');
-      const kind = l.kind === undefined ? undefined : oneOf(l.kind, ['paint', 'adjust'] as const, 'layer.kind');
+      const kind = l.kind === undefined ? undefined : oneOf(l.kind, ['paint', 'adjust', 'group'] as const, 'layer.kind');
       const props = layerProps(l, false) as LayerProps;
       if (kind === 'adjust' && !props.adjust) fail('adjustment layer without adjust');
+      if (props.blend === 'pass' && kind !== 'group') fail('pass through is for groups');
       return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
     }
     case 'layer.update':
       return { type: 'layer.update', id: id(o.id), props: layerProps(o.props, true) };
+    case 'layer.transform':
+      if (!validAffine(o.m)) fail('bad transform');
+      return { type: 'layer.transform', id: id(o.id), m: [...(o.m as Affine)] as Affine };
+    case 'layer.duplicate':
+      return {
+        type: 'layer.duplicate',
+        id: id(o.id),
+        newId: id(o.newId, 'newId'),
+        name: str(o.name, LIMITS.maxLayerName, 'name'),
+        order: num(o.order, -1e12, 1e12, 'order'),
+        parent: o.parent === null || o.parent === undefined ? null : id(o.parent, 'parent'),
+      };
     default:
       fail('unknown op type');
   }

@@ -2,7 +2,7 @@
 // - GLRenderer: WebGL2, half-float buffers, shader blend modes (preferred)
 // - Canvas2DRenderer: Canvas 2D + tile worker, 8-bit (fallback without WebGL2)
 
-import type { Brush, Layer, Stroke } from '../../shared/types';
+import type { Affine, Brush, Layer, Stroke } from '../../shared/types';
 
 export interface ViewState {
   x: number; // world coordinate at the left edge of the canvas
@@ -38,6 +38,14 @@ export interface Renderer {
   liveCancel(id: string): void;
   /** Drops remote strokes that stopped without a commit (peer left, op rejected). */
   sweepLive(): void;
+
+  /**
+   * Draws the layer or group `p.id` moved by the world transform `p.m` (not applied yet) instead
+   * of its tiles: the live preview of a transform. Null clears it.
+   */
+  setTransformPreview(p: { id: string; m: Affine } | null): void;
+  /** The transform is applied: keep the preview until the layer's tiles show it, then drop it. */
+  settleTransformPreview(): void;
 
   /** Composited color under a CSS-pixel position, as #rrggbb. */
   sample(cssX: number, cssY: number): string;

@@ -106,6 +106,10 @@ class EditorState {
   shareOpen = $state(false);
   /** The large image export dialog. */
   exportOpen = $state(false);
+  /** The layer or group being transformed (free transform: the overlay shows its handles). */
+  transform = $state<{ id: string } | null>(null);
+  /** Groups closed in the layers panel (this device only). */
+  collapsed = $state<Set<string>>(new Set());
   /** The brush paints the active layer's mask instead of the layer. */
   maskTarget = $state(false);
   /** The canvas uses features this client does not know (welcome.features). */

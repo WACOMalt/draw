@@ -2,7 +2,8 @@
 // layer opacity and blend modes, onto the visible canvas.
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
-import type { BlendMode, Brush, Layer, Stroke } from '../../shared/types';
+import type { Affine, BlendMode, Brush, Layer, LayerBlend, Stroke } from '../../shared/types';
+import { compose, effectivelyVisible, layerTree, type LayerNode } from '../../shared/layers';
 import { LUT_SIZE, hueSat, toneLut } from './adjust';
 import type { Renderer, ViewState } from './renderer';
 import { DabPainter, StampCache } from './stamp';
@@ -18,6 +19,9 @@ import {
   type TileView,
   type ToWorker,
 } from './tiles';
+
+/** The composite operation of a blend mode (pass through draws like normal once isolated). */
+const op = (b: LayerBlend): GlobalCompositeOperation => BLEND_OP[b === 'pass' ? 'normal' : b] ?? 'source-over';
 
 const BLEND_OP: Record<BlendMode, GlobalCompositeOperation> = {
   normal: 'source-over',
@@ -87,6 +91,10 @@ export class Canvas2DRenderer implements Renderer {
   private tiles = new Map<string, TileEntry>();
   private bitmapCount = 0;
   private layers: Layer[] = [];
+  private tree: LayerNode[] = [];
+  private byId = new Map<string, Layer>();
+  /** A layer or group drawn moved by a transform not applied yet (see the WebGL2 renderer). */
+  private preview: { id: string; m: Affine; settle: boolean; settleAt: number; snap: OffscreenCanvas | null; capture: { x: number; y: number; ds: number } | null } | null = null;
   private live = new Map<string, Live>();
   private pool: OffscreenCanvas[] = [];
   private scratch: OffscreenCanvas;
@@ -168,6 +176,23 @@ export class Canvas2DRenderer implements Renderer {
 
   setLayers(layers: Layer[]): void {
     this.layers = layers;
+    this.tree = layerTree(layers);
+    this.byId = new Map(layers.map((l) => [l.id, l]));
+    this.invalidate();
+  }
+
+  setTransformPreview(p: { id: string; m: Affine } | null): void {
+    const old = this.preview;
+    if (p && old && old.id === p.id && !old.settle) old.m = p.m;
+    else this.preview = p ? { id: p.id, m: p.m, settle: false, settleAt: 0, snap: null, capture: null } : null;
+    this.invalidate();
+  }
+
+  /** Tiles render in a worker here: the preview simply stays a moment after the transform. */
+  settleTransformPreview(): void {
+    if (!this.preview) return;
+    this.preview.settle = true;
+    this.preview.settleAt = performance.now();
     this.invalidate();
   }
 
@@ -349,7 +374,7 @@ export class Canvas2DRenderer implements Renderer {
     const tx0 = Math.floor(vx / tw), ty0 = Math.floor(vy / tw);
     const tx1 = Math.floor(wx1 / tw), ty1 = Math.floor(wy1 / tw);
 
-    const visible = this.layers.filter((l) => l.visible && !l.deleted);
+    const visible = this.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(this.byId, l));
     this.current = {
       lod,
       tx0: tx0 - PREFETCH,
@@ -378,37 +403,110 @@ export class Canvas2DRenderer implements Renderer {
     const Y = (ty: number) => Math.round((ty * tw - vy) * ds);
 
     const grid: Grid = { lod, tx0, ty0, tx1, ty1, X, Y };
-    // Same order and clipping groups as the WebGL2 renderer (gl/glRenderer.ts).
-    for (let i = 0; i < visible.length; ) {
-      const base = visible[i];
-      let j = i + 1;
-      while (j < visible.length && visible[j].clip) j++;
-      const clipped = visible.slice(i + 1, j);
-      if (clipped.length === 0 || base.kind === 'adjust') {
-        for (const l of [base, ...clipped]) this.drawLayerOnto(ctx, l, grid, false);
-      } else {
-        const g = this.buffer('group');
-        g.ctx.globalCompositeOperation = 'source-over';
-        g.ctx.globalAlpha = 1;
-        g.ctx.clearRect(0, 0, g.canvas.width, g.canvas.height);
-        this.renderLayer(base, grid);
-        g.ctx.drawImage(this.scratch, 0, 0);
-        // Clipped layers draw "atop" the base. Canvas 2D has no blend mode with atop: normal only.
-        for (const c of clipped) this.drawLayerOnto(g.ctx, c, grid, true);
-        ctx.globalAlpha = base.opacity;
-        ctx.globalCompositeOperation = BLEND_OP[base.blend] ?? 'source-over';
-        ctx.drawImage(g.canvas, 0, 0);
-      }
-      i = j;
-    }
+    // Same order, groups and clipping groups as the WebGL2 renderer (gl/glRenderer.ts).
+    this.drawNodes(ctx, this.tree, grid, 0);
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
+    const pv = this.preview;
+    if (pv?.settle && performance.now() - pv.settleAt > 800) {
+      this.preview = null;
+      this.invalidate();
+    }
     this.onFrame?.();
     if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
 
+  /** Sibling layers bottom to top onto `dst`, with clipping groups (see the WebGL2 renderer). */
+  private drawNodes(dst: Ctx, nodes: LayerNode[], g: Grid, depth: number): void {
+    const list = nodes.filter((n) => n.layer.visible);
+    for (let i = 0; i < list.length; ) {
+      const base = list[i];
+      let j = i + 1;
+      while (j < list.length && list[j].layer.clip) j++;
+      const clipped = list.slice(i + 1, j);
+      if (clipped.length === 0 || base.layer.kind === 'adjust') {
+        for (const n of [base, ...clipped]) this.drawNode(dst, n, g, false, depth);
+      } else {
+        const b = this.clearBuffer(`clip${depth}`);
+        b.ctx.drawImage(this.nodePixels(base, g, depth), 0, 0);
+        // Clipped layers draw "atop" the base. Canvas 2D has no blend mode with atop: normal only.
+        for (const c of clipped) this.drawNode(b.ctx, c, g, true, depth);
+        this.put(dst, b.canvas, base.layer.opacity, op(base.layer.blend));
+      }
+      i = j;
+    }
+  }
+
+  private drawNode(dst: Ctx, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
+    const l = node.layer;
+    if (this.preview?.id === l.id) return this.drawPreview(dst, node, g, atop, depth);
+    if (l.kind !== 'group') return this.drawLayerOnto(dst, l, g, atop);
+    if (l.blend === 'pass' && !atop) {
+      if (l.opacity >= 1) return this.drawNodes(dst, node.children, g, depth + 1);
+      const save = this.clearBuffer(`pass${depth}`);
+      save.ctx.drawImage(dst.canvas, 0, 0);
+      this.drawNodes(dst, node.children, g, depth + 1);
+      this.put(dst, save.canvas, 1 - l.opacity, 'source-over');
+      return;
+    }
+    this.put(dst, this.renderGroup(node, g, depth), l.opacity, atop ? 'source-atop' : op(l.blend));
+  }
+
+  private renderGroup(node: LayerNode, g: Grid, depth: number): OffscreenCanvas {
+    const b = this.clearBuffer(`iso${depth}`);
+    this.drawNodes(b.ctx, node.children, g, depth + 1);
+    return b.canvas;
+  }
+
+  private nodePixels(node: LayerNode, g: Grid, depth: number): OffscreenCanvas {
+    if (node.layer.kind === 'group') return this.renderGroup(node, g, depth);
+    this.renderLayer(node.layer, g);
+    return this.scratch;
+  }
+
+  private drawPreview(dst: Ctx, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
+    const pv = this.preview!;
+    if (!pv.snap || pv.snap.width !== this.canvas.width || pv.snap.height !== this.canvas.height) {
+      if (pv.settle) {
+        this.preview = null;
+        return this.drawNode(dst, node, g, atop, depth);
+      }
+      const src = this.nodePixels(node, g, depth);
+      pv.snap = new OffscreenCanvas(src.width, src.height);
+      pv.snap.getContext('2d')!.drawImage(src, 0, 0);
+      pv.capture = { x: this.view.x, y: this.view.y, ds: this.view.zoom * this.dpr };
+    }
+    const c = pv.capture!;
+    const ds = this.view.zoom * this.dpr;
+    const S = compose([ds, 0, 0, ds, -this.view.x * ds, -this.view.y * ds], compose(pv.m, [1 / c.ds, 0, 0, 1 / c.ds, c.x, c.y]));
+    const t = this.clearBuffer(`xform${depth}`);
+    t.ctx.setTransform(S[0], S[1], S[2], S[3], S[4], S[5]);
+    t.ctx.drawImage(pv.snap, 0, 0);
+    t.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const l = node.layer;
+    this.put(dst, t.canvas, l.kind === 'adjust' ? 1 : l.opacity, atop ? 'source-atop' : op(l.blend));
+  }
+
+  /** Draws a screen-sized canvas onto `dst` with an opacity and a composite operation. */
+  private put(dst: Ctx, src: OffscreenCanvas, alpha: number, gco: GlobalCompositeOperation): void {
+    dst.globalAlpha = alpha;
+    dst.globalCompositeOperation = gco;
+    dst.drawImage(src, 0, 0);
+    dst.globalAlpha = 1;
+    dst.globalCompositeOperation = 'source-over';
+  }
+
+  private clearBuffer(name: string): { canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } {
+    const b = this.buffer(name);
+    b.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    b.ctx.globalCompositeOperation = 'source-over';
+    b.ctx.globalAlpha = 1;
+    b.ctx.clearRect(0, 0, b.canvas.width, b.canvas.height);
+    return b;
+  }
+
   /** A screen-sized offscreen canvas that only some frames need. */
-  private buffer(name: 'group' | 'mask'): { canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } {
+  private buffer(name: string): { canvas: OffscreenCanvas; ctx: OffscreenCanvasRenderingContext2D } {
     let b = this.buffers.get(name);
     const w = this.canvas.width, h = this.canvas.height;
     if (!b) {
@@ -454,12 +552,12 @@ export class Canvas2DRenderer implements Renderer {
     if (layer.kind === 'adjust') return this.applyAdjust(dst, layer, g);
     if (!atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
       dst.globalAlpha = layer.opacity;
-      dst.globalCompositeOperation = BLEND_OP[layer.blend] ?? 'source-over';
+      dst.globalCompositeOperation = op(layer.blend);
       this.drawTiles(dst, layer.id, g);
     } else {
       this.renderLayer(layer, g);
       dst.globalAlpha = layer.opacity;
-      dst.globalCompositeOperation = atop ? 'source-atop' : (BLEND_OP[layer.blend] ?? 'source-over');
+      dst.globalCompositeOperation = atop ? 'source-atop' : op(layer.blend);
       dst.drawImage(this.scratch, 0, 0);
     }
     dst.globalAlpha = 1;

@@ -74,7 +74,11 @@
     if (e.button !== 0 || drag) return;
     const touch = e.pointerType === 'touch';
     drag = { id: e.pointerId, touch, x0: e.clientX, y0: e.clientY, live: !touch };
-    track.setPointerCapture?.(e.pointerId);
+    try {
+      track.setPointerCapture(e.pointerId);
+    } catch {
+      // the pointer is already gone
+    }
     if (!touch) {
       e.preventDefault(); // no text selection while dragging
       track.focus();

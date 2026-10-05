@@ -5,6 +5,7 @@
 
 import { isGzip, type BdrawFile } from '../shared/bdraw';
 import { Doc } from './engine/doc';
+import { effectivelyDeleted, effectivelyVisible } from '../shared/layers';
 import { unionAll } from './engine/navigator';
 import { padded, renderPng } from './export/region';
 
@@ -22,7 +23,8 @@ async function renderBdraw(fileB64: string, size: number): Promise<string | null
   const seq = file.strokes.reduce((m, s) => Math.max(m, s.seq ?? 0), 0);
   const doc = new Doc();
   doc.reset(seq, file.layers, file.strokes);
-  const visible = new Set(file.layers.filter((l) => l.visible && !l.deleted).map((l) => l.id));
+  const byId = new Map(file.layers.map((l) => [l.id, l]));
+  const visible = new Set(file.layers.filter((l) => !effectivelyDeleted(byId, l) && effectivelyVisible(byId, l)).map((l) => l.id));
   const all = unionAll(doc, visible);
   if (!all) return null;
   const png = await renderPng(doc.displayLayers(), file.strokes, seq, padded(all, 0.04), size, size);

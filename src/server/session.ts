@@ -22,6 +22,7 @@ import {
   validateString,
 } from '../shared/validate';
 import { docFeatures } from '../shared/features';
+import { depthOf, duplicateOf, effectivelyDeleted, subtreeHeight, subtreeIds, transformStroke } from '../shared/layers';
 import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
 import { userFromToken } from './auth';
 import { sha256, type CanvasRow, type Store, type UserRow } from './db';
@@ -132,9 +133,16 @@ export class Session {
     const field = (v: unknown, k: string) => (v && typeof v === 'object' ? (v as Record<string, unknown>)[k] : undefined);
     const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
     store.transaction(() => {
-      for (const l of layers) {
-        if (field(l, 'deleted') === true) continue;
-        tryCommit(() => validateOp({ type: 'layer.add', layer: l }), 'import', 'layers');
+      // Groups before the layers in them: add what has its parent in place, round by round.
+      let todo = layers.filter((l) => field(l, 'deleted') !== true);
+      for (let round = 0; todo.length && round <= LIMITS.maxGroupDepth + 1; round++) {
+        const later: unknown[] = [];
+        for (const l of todo) {
+          const parent = field(l, 'parent');
+          if (typeof parent === 'string' && !s.layers.has(parent) && todo.some((x) => field(x, 'id') === parent)) later.push(l);
+          else tryCommit(() => validateOp({ type: 'layer.add', layer: l }), 'import', 'layers');
+        }
+        todo = later;
       }
       const ordered = [...strokes].sort((a, b) => num(field(a, 'seq')) - num(field(b, 'seq')));
       for (const st of ordered) {
@@ -161,7 +169,8 @@ export class Session {
     switch (op.type) {
       case 'stroke.add': {
         const layer = this.layers.get(op.stroke.layerId);
-        if (!layer || layer.deleted) throw new OpError('no such layer');
+        if (!layer || effectivelyDeleted(this.layers, layer)) throw new OpError('no such layer');
+        if (layer.kind === 'group') throw new OpError('groups hold no paint');
         if (layer.kind === 'adjust' && !op.stroke.mask) throw new OpError('adjustment layers hold no paint');
         if (this.strokes.has(op.stroke.id)) throw new OpError('duplicate stroke');
         const stroke: Stroke = { ...op.stroke, seq, author: by };
@@ -182,16 +191,47 @@ export class Session {
       }
       case 'layer.add': {
         if (this.layers.has(op.layer.id)) throw new OpError('duplicate layer');
-        let live = 0;
-        for (const l of this.layers.values()) if (!l.deleted) live++;
-        if (live >= LIMITS.maxLayers) throw new OpError('too many layers');
+        if (this.liveLayers() >= LIMITS.maxLayers) throw new OpError('too many layers');
+        this.checkParent(op.layer.parent ?? null, op.layer.kind === 'group' ? 1 : 0);
         this.layers.set(op.layer.id, { ...op.layer, deleted: false });
         return op;
       }
       case 'layer.update': {
         const l = this.layers.get(op.id);
         if (!l) throw new OpError('no such layer');
+        if (op.props.blend === 'pass' && l.kind !== 'group') throw new OpError('pass through is for groups');
+        if (op.props.parent !== undefined && op.props.parent !== (l.parent ?? null)) {
+          if (op.props.parent && subtreeIds(this.layers.values(), l.id).has(op.props.parent)) throw new OpError('a group cannot go into itself');
+          this.checkParent(op.props.parent, subtreeHeight(this.layers.values(), l.id));
+        }
         Object.assign(l, op.props);
+        if (l.parent === null) delete l.parent;
+        return op;
+      }
+      case 'layer.transform': {
+        const l = this.layers.get(op.id);
+        if (!l || effectivelyDeleted(this.layers, l)) throw new OpError('no such layer');
+        const ids = subtreeIds(this.layers.values(), l.id);
+        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush'>][] = [];
+        for (const st of this.strokes.values()) {
+          if (!ids.has(st.layerId)) continue;
+          const t = transformStroke(st, op.m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
+          if (!t) throw new OpError('the transform goes out of range');
+          changes.push([st, t]);
+        }
+        for (const [st, t] of changes) Object.assign(st, t);
+        return op;
+      }
+      case 'layer.duplicate': {
+        const src = this.layers.get(op.id);
+        if (!src || effectivelyDeleted(this.layers, src)) throw new OpError('no such layer');
+        if (this.layers.has(op.newId)) throw new OpError('duplicate layer');
+        this.checkParent(op.parent, subtreeHeight(this.layers.values(), src.id));
+        const copy = duplicateOf(this.layers, this.strokes.values(), op);
+        if (this.liveLayers() + copy.layers.length > LIMITS.maxLayers) throw new OpError('too many layers');
+        if (copy.layers.some((l) => this.layers.has(l.id)) || copy.strokes.some((st) => this.strokes.has(st.id))) throw new OpError('duplicate ids');
+        for (const l of copy.layers) this.layers.set(l.id, l);
+        for (const st of copy.strokes) this.strokes.set(st.id, st);
         return op;
       }
       case 'layer.remove': {
@@ -207,6 +247,24 @@ export class Session {
         return op;
       }
     }
+  }
+
+  /** Layers that count against the limit: not deleted, and not inside a deleted group. */
+  private liveLayers(): number {
+    let n = 0;
+    for (const l of this.layers.values()) if (!effectivelyDeleted(this.layers, l)) n++;
+    return n;
+  }
+
+  /**
+   * A layer that needs `height` levels below its place (subtreeHeight) may go into `parent`: a
+   * live group, with everything within LIMITS.maxGroupDepth.
+   */
+  private checkParent(parent: string | null, height: number): void {
+    if (!parent) return;
+    const g = this.layers.get(parent);
+    if (!g || g.kind !== 'group' || effectivelyDeleted(this.layers, g)) throw new OpError('no such group');
+    if (depthOf(this.layers, g) + 1 + height > LIMITS.maxGroupDepth) throw new OpError('groups nested too deep');
   }
 
   private commit(op: Op, by: string, opId = ''): void {

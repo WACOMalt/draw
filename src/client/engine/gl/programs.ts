@@ -22,6 +22,23 @@ void main() {
   gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
 
+/**
+ * A screen-sized texture drawn through an affine transform (target pixels from source pixels):
+ * the live preview of a layer transform. Affine, so the texture coordinates stay linear.
+ */
+const XFORM_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aCorner;   // 0..1
+uniform mat3 uM;        // source pixel -> target pixel
+uniform vec2 uSrcSize;  // source size in pixels
+uniform vec2 uTarget;   // target size in pixels
+out vec2 vUv;
+void main() {
+  vec2 p = (uM * vec3(aCorner * uSrcSize, 1.0)).xy;
+  vUv = aCorner;
+  gl_Position = vec4(p / uTarget * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
 /** Texture copy, scaled by an opacity. Used for tiles, stroke buffers and layers. */
 const COPY_FS = `#version 300 es
 precision highp float;
@@ -307,6 +324,7 @@ export function createPrograms(gl: WebGL2RenderingContext) {
   const quad = ['uDst', 'uSrc', 'uTarget', 'uFlipY'];
   return {
     copy: link(gl, QUAD_VS, COPY_FS, [...quad, 'uTex', 'uOpacity']),
+    xform: link(gl, XFORM_VS, COPY_FS, ['uM', 'uSrcSize', 'uTarget', 'uTex', 'uOpacity']),
     present: link(gl, QUAD_VS, PRESENT_FS, [...quad, 'uTex', 'uDither']),
     blend: link(gl, QUAD_VS, BLEND_FS, [...quad, 'uBack', 'uLayer', 'uOpacity', 'uMode', 'uAtop']),
     mask: link(gl, QUAD_VS, MASK_FS, [...quad, 'uMask']),

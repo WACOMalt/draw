@@ -3,7 +3,8 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, GRAINS, type BlendMode, type Brush, type Layer, type Stroke } from '../../../shared/types';
+import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Stroke } from '../../../shared/types';
+import { compose, effectivelyVisible, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
@@ -37,6 +38,22 @@ interface Target {
   w: number;
   h: number;
 }
+
+interface TransformPreview {
+  /** The layer or group. */
+  id: string;
+  /** World transform not applied yet. */
+  m: Affine;
+  /** Applied: waiting for the tiles (settlePreview). */
+  settle: boolean;
+  settleAt: number;
+  /** What the layer showed on screen at the start, and the view then. */
+  snap: Target | null;
+  capture: { x: number; y: number; ds: number } | null;
+}
+
+/** The blend mode a shader knows: pass through draws like normal once a group is isolated. */
+const modeOf = (b: LayerBlend) => (b === 'pass' ? 'normal' : b);
 
 interface Tile {
   layer: string;
@@ -143,7 +160,8 @@ export class GLRenderer implements Renderer {
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
   private pickT!: Target;
   /** Screen buffers made only when a frame needs them: layer masks and clipping groups. */
-  private extra = new Map<'mask' | 'groupA' | 'groupB', Target>();
+  /** Screen-sized buffers some frames need (masks, clipping and group buffers per depth). */
+  private extra = new Map<string, Target>();
   private tipTex!: WebGLTexture;
   private grainTex!: WebGLTexture;
   private tipsReady = new Set<number>();
@@ -156,6 +174,11 @@ export class GLRenderer implements Renderer {
   private tiles = new Map<string, Tile>();
   private index = new StrokeIndex();
   private layers: Layer[] = [];
+  /** The layer tree of `layers` (groups with their layers), and the layers by id. */
+  private tree: LayerNode[] = [];
+  private byId = new Map<string, Layer>();
+  /** A layer or group drawn moved by a transform that is not applied yet (see setTransformPreview). */
+  private preview: TransformPreview | null = null;
   private live = new Map<string, Live>();
   private appliedSeq = 0;
 
@@ -273,6 +296,7 @@ export class GLRenderer implements Renderer {
     this.livePool = [];
     // Old textures died with the context: forget every tile, redraw live strokes.
     this.tiles.clear();
+    this.preview = null;
     for (const l of this.live.values()) {
       l.target = null;
       l.viewVersion = -1;
@@ -319,7 +343,7 @@ export class GLRenderer implements Renderer {
   }
 
   /** A screen-sized buffer that only some frames need, made on first use. */
-  private screen(name: 'mask' | 'groupA' | 'groupB'): Target {
+  private screen(name: string): Target {
     let t = this.extra.get(name);
     if (!t) this.extra.set(name, (t = this.makeTarget(this.canvas.width || 1, this.canvas.height || 1)));
     return t;
@@ -424,6 +448,8 @@ export class GLRenderer implements Renderer {
 
   setLayers(layers: Layer[]): void {
     this.layers = layers;
+    this.tree = layerTree(layers);
+    this.byId = new Map(layers.map((l) => [l.id, l]));
     for (const [id, l] of this.luts) {
       if (!layers.some((x) => x.id === id && x.kind === 'adjust')) {
         this.gl.deleteTexture(l.tex);
@@ -904,7 +930,8 @@ export class GLRenderer implements Renderer {
     const tx0 = Math.floor(vx / tw), ty0 = Math.floor(vy / tw);
     const tx1 = Math.floor((vx + this.cssW / this.view.zoom) / tw);
     const ty1 = Math.floor((vy + this.cssH / this.view.zoom) / tw);
-    const visible = this.layers.filter((l) => l.visible && !l.deleted);
+    // Paint and adjustment layers that show: visible, in groups that are all visible.
+    const visible = this.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(this.byId, l));
     // Tile sets to keep current, topmost first: each paint layer, and each enabled layer mask.
     const keys: string[] = [];
     for (let li = visible.length - 1; li >= 0; li--) {
@@ -999,28 +1026,10 @@ export class GLRenderer implements Renderer {
     this.bindTarget(main.a);
     const [pr, pg, pb] = hexToRgb(this.paper);
     this.clear(pr, pg, pb, 1);
-    for (let i = 0; i < visible.length; ) {
-      const base = visible[i];
-      let j = i + 1;
-      while (j < visible.length && visible[j].clip) j++;
-      const clipped = visible.slice(i + 1, j);
-      if (clipped.length === 0 || base.kind === 'adjust') {
-        // Nothing clips to this layer, or it has no pixels to clip to: each layer on its own.
-        main = this.compositeLayer(base, main, grid, false);
-        for (const c of clipped) main = this.compositeLayer(c, main, grid, false);
-      } else {
-        let group: Pair = { a: this.screen('groupA'), b: this.screen('groupB') };
-        this.renderLayer(base, grid);
-        this.bindTarget(group.a);
-        gl.disable(gl.BLEND);
-        this.copy(this.layerT.tex, group.a, [0, 0, group.a.w, group.a.h]);
-        for (const c of clipped) group = this.compositeLayer(c, group, grid, true);
-        main = this.blendOnto(group.a, base.blend, base.opacity, main, false);
-      }
-      i = j;
-    }
+    main = this.compositeNodes(this.tree, main, grid, 0);
     this.compA = main.a;
     this.compB = main.b;
+    this.settlePreview(grid);
 
     // 4. Present with dither.
     this.bindTarget(null);
@@ -1047,10 +1056,191 @@ export class GLRenderer implements Renderer {
       .sort((a, b) => (a.commitSeq ?? Infinity) - (b.commitSeq ?? Infinity) || a.started - b.started);
   }
 
+  /**
+   * Composites sibling layers (bottom to top) onto `pair.a`. A layer with clipped layers right above
+   * it is the base of a clipping group: the group draws in its own buffer, each clipped layer only
+   * where the base has alpha ("atop"), then goes onto the composite with the base's blend and
+   * opacity. `depth` picks the buffers, so groups inside groups do not share them.
+   */
+  private compositeNodes(nodes: LayerNode[], pair: Pair, g: Grid, depth: number): Pair {
+    const list = nodes.filter((n) => n.layer.visible);
+    for (let i = 0; i < list.length; ) {
+      const base = list[i];
+      let j = i + 1;
+      while (j < list.length && list[j].layer.clip) j++;
+      const clipped = list.slice(i + 1, j);
+      if (clipped.length === 0 || base.layer.kind === 'adjust') {
+        // Nothing clips to this layer, or it has no pixels to clip to: each layer on its own.
+        pair = this.compositeNode(base, pair, g, false, depth);
+        for (const c of clipped) pair = this.compositeNode(c, pair, g, false, depth);
+      } else {
+        const gl = this.gl;
+        let group: Pair = { a: this.screen(`clipA${depth}`), b: this.screen(`clipB${depth}`) };
+        const src = this.nodePixels(base, g, depth);
+        this.bindTarget(group.a);
+        gl.disable(gl.BLEND);
+        this.copy(src.tex, group.a, [0, 0, group.a.w, group.a.h]);
+        for (const c of clipped) group = this.compositeNode(c, group, g, true, depth);
+        pair = this.blendOnto(group.a, base.layer.blend, base.layer.opacity, pair, false);
+      }
+      i = j;
+    }
+    return pair;
+  }
+
+  /** One layer or group onto `pair.a` (`atop`: only where `pair.a` has alpha, for clipping). */
+  private compositeNode(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
+    const l = node.layer;
+    if (this.preview?.id === l.id) return this.drawPreview(node, pair, g, atop, depth);
+    if (l.kind !== 'group') return this.compositeLayer(l, pair, g, atop);
+    if (l.blend === 'pass' && !atop) {
+      // Pass through: the group's layers blend straight onto what is below, as if not grouped.
+      if (l.opacity >= 1) return this.compositeNodes(node.children, pair, g, depth + 1);
+      // With less opacity: composite them, then mix the result with the backdrop by the opacity.
+      const gl = this.gl;
+      const save = this.screen(`pass${depth}`);
+      this.bindTarget(save);
+      gl.disable(gl.BLEND);
+      this.copy(pair.a.tex, save, [0, 0, save.w, save.h]);
+      pair = this.compositeNodes(node.children, pair, g, depth + 1);
+      this.bindTarget(pair.a);
+      this.blendFor(false);
+      this.copy(save.tex, pair.a, [0, 0, pair.a.w, pair.a.h], 1 - l.opacity);
+      return pair;
+    }
+    return this.blendOnto(this.renderGroup(node, g, depth), l.blend, l.opacity, pair, atop);
+  }
+
+  /** An isolated group: its layers composited onto a clear buffer. Returns that buffer. */
+  private renderGroup(node: LayerNode, g: Grid, depth: number): Target {
+    let p: Pair = { a: this.screen(`isoA${depth}`), b: this.screen(`isoB${depth}`) };
+    this.bindTarget(p.a);
+    this.clear();
+    p = this.compositeNodes(node.children, p, g, depth + 1);
+    return p.a;
+  }
+
+  /** A layer's or group's own pixels, before its blend and opacity. */
+  private nodePixels(node: LayerNode, g: Grid, depth: number): Target {
+    if (node.layer.kind === 'group') return this.renderGroup(node, g, depth);
+    this.renderLayer(node.layer, g);
+    return this.layerT;
+  }
+
+  // --- transform preview ----------------------------------------------------------------------
+
+  /**
+   * Draws the layer or group `p.id` moved by the world transform `p.m`, instead of its tiles, until
+   * cleared: the live preview of a transform. The first frame keeps a copy of what the layer
+   * shows on screen; later frames draw that copy through the transform (fast, so dragging the
+   * handles stays smooth; parts that were off screen are missing until the transform is applied).
+   * Null clears it.
+   */
+  setTransformPreview(p: { id: string; m: Affine } | null): void {
+    const old = this.preview;
+    if (p && old && old.id === p.id && !old.settle) old.m = p.m;
+    else {
+      this.dropPreview();
+      if (p) this.preview = { id: p.id, m: p.m, settle: false, settleAt: 0, snap: null, capture: null };
+    }
+    this.invalidate();
+  }
+
+  /**
+   * The transform is applied (its strokes changed): keep the preview until the tiles of the
+   * layer show the new strokes, so the layer does not flash back to where it was.
+   */
+  settleTransformPreview(): void {
+    if (!this.preview) return;
+    this.preview.settle = true;
+    this.preview.settleAt = performance.now();
+    this.invalidate();
+  }
+
+  private dropPreview(): void {
+    if (this.preview?.snap) this.freeTarget(this.preview.snap);
+    this.preview = null;
+  }
+
+  private drawPreview(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
+    const pv = this.preview!;
+    const gl = this.gl;
+    if (pv.snap && (pv.snap.w !== this.canvas.width || pv.snap.h !== this.canvas.height)) {
+      this.freeTarget(pv.snap);
+      pv.snap = null;
+    }
+    if (!pv.snap) {
+      if (pv.settle) {
+        // The screen changed size after the transform was applied: the tiles are right now.
+        this.dropPreview();
+        return this.compositeNode(node, pair, g, atop, depth);
+      }
+      const src = this.nodePixels(node, g, depth);
+      pv.snap = this.makeTarget(src.w, src.h);
+      this.bindTarget(pv.snap);
+      gl.disable(gl.BLEND);
+      this.copy(src.tex, pv.snap, [0, 0, src.w, src.h]);
+      pv.capture = { x: this.view.x, y: this.view.y, ds: this.view.zoom * this.dpr };
+    }
+    // Device pixels now ← world ← device pixels at capture time.
+    const c = pv.capture!;
+    const ds = this.view.zoom * this.dpr;
+    const toNow: Affine = [ds, 0, 0, ds, -this.view.x * ds, -this.view.y * ds];
+    const fromCapture: Affine = [1 / c.ds, 0, 0, 1 / c.ds, c.x, c.y];
+    const S = compose(toNow, compose(pv.m, fromCapture));
+    const t = this.screen(`xform${depth}`);
+    this.bindTarget(t);
+    this.clear();
+    gl.disable(gl.BLEND);
+    const p = this.progs.xform;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pv.snap.tex);
+    gl.uniform1i(p.u.uTex, 0);
+    gl.uniform1f(p.u.uOpacity, 1);
+    gl.uniformMatrix3fv(p.u.uM, false, [S[0], S[1], 0, S[2], S[3], 0, S[4], S[5], 1]);
+    gl.uniform2f(p.u.uSrcSize, pv.snap.w, pv.snap.h);
+    gl.uniform2f(p.u.uTarget, t.w, t.h);
+    gl.bindVertexArray(this.quadVao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    const blend = node.layer.kind === 'group' && node.layer.blend === 'pass' ? 'normal' : node.layer.blend;
+    return this.blendOnto(t, blend, node.layer.kind === 'adjust' ? 1 : node.layer.opacity, pair, atop);
+  }
+
+  /** After a frame: a settling preview ends once every tile of the layer in view is current. */
+  private settlePreview(g: Grid): void {
+    const pv = this.preview;
+    if (!pv?.settle) return;
+    let done = performance.now() - pv.settleAt > 4000;
+    if (!done) {
+      const ids = subtreeIds(this.layers, pv.id);
+      const keys: string[] = [];
+      for (const l of this.layers) {
+        if (!ids.has(l.id)) continue;
+        if (l.kind === 'paint' || l.kind === undefined) keys.push(l.id);
+        if (l.mask?.enabled) keys.push(maskKey(l.id, l.mask.id));
+      }
+      done = true;
+      outer: for (const key of keys)
+        for (let ty = g.ty0; ty <= g.ty1; ty++)
+          for (let tx = g.tx0; tx <= g.tx1; tx++) {
+            const t = this.tiles.get(tileKey(key, g.lod, tx, ty));
+            if (t ? !t.rendered || this.needsWork(t) : this.index.byLayer.get(key)?.length) {
+              done = false;
+              break outer;
+            }
+          }
+    }
+    if (done) {
+      this.dropPreview();
+      this.invalidate();
+    }
+  }
+
   /** Draws one layer onto `pair.a`. Returns the pair with the result in `a`. */
   private compositeLayer(layer: Layer, pair: Pair, g: Grid, atop: boolean): Pair {
     if (layer.kind === 'adjust') return this.applyAdjust(layer, pair, g);
-    const mode = BLEND_MODES.indexOf(layer.blend);
+    const mode = BLEND_MODES.indexOf(modeOf(layer.blend));
     if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
       // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
       this.bindTarget(pair.a);
@@ -1063,9 +1253,9 @@ export class GLRenderer implements Renderer {
   }
 
   /** Blends a screen-sized buffer onto `pair.a` with a blend mode and opacity. */
-  private blendOnto(src: Target, blend: BlendMode, opacity: number, pair: Pair, atop: boolean): Pair {
+  private blendOnto(src: Target, blend: LayerBlend, opacity: number, pair: Pair, atop: boolean): Pair {
     const gl = this.gl;
-    const mode = BLEND_MODES.indexOf(blend);
+    const mode = BLEND_MODES.indexOf(modeOf(blend));
     if (mode <= 0 && !atop) {
       this.bindTarget(pair.a);
       this.blendFor(false);

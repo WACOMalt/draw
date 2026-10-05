@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { ADJUST_TYPES, BLEND_MODES, LIMITS, type BlendMode } from '../../shared/types';
+  // The layers panel: a tree, top layer first, groups as folders (Photoshop style). A row's grip
+  // drags it (mouse, pen or finger): drop on the upper or lower part of a row to go above or below
+  // it, on the middle of a group to go into it. Groups open and close with their arrow.
+  import { ADJUST_TYPES, BLEND_MODES, LIMITS, type Layer, type LayerBlend } from '../../shared/types';
+  import { layerTree, subtreeIds, type LayerNode } from '../../shared/layers';
   import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
   import AdjustPanel from './AdjustPanel.svelte';
@@ -8,25 +12,53 @@
 
   let { engine }: { engine: Engine | null } = $props();
 
-  const topDown = $derived([...ed.layers].reverse());
+  interface Row {
+    layer: Layer;
+    depth: number;
+    group: boolean;
+    open: boolean;
+  }
+
+  const tree = $derived(layerTree(ed.layers));
+  /** Rows top-down: a group's row, then (when open) its layers, top first. */
+  const rows = $derived.by(() => {
+    const out: Row[] = [];
+    const walk = (nodes: LayerNode[], depth: number) => {
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i];
+        const group = n.layer.kind === 'group';
+        const open = group && !ed.collapsed.has(n.layer.id);
+        out.push({ layer: n.layer, depth, group, open });
+        if (open) walk(n.children, depth + 1);
+      }
+    };
+    walk(tree, 0);
+    return out;
+  });
   const active = $derived(ed.layers.find((l) => l.id === ed.activeLayerId) ?? null);
-  const index = $derived(ed.layers.findIndex((l) => l.id === ed.activeLayerId));
 
   let editing = $state<string | null>(null);
   let adjustMenu = $state(false);
 
-  /** A layer is drawn clipped only when a layer that is not clipped lies somewhere below it. */
+  /** Drawn clipped: a clipped layer with a sibling below it that is not clipped (and not an adjustment). */
   const clippedIds = $derived.by(() => {
     const out = new Set<string>();
-    let base = false;
-    for (const l of ed.layers) {
-      if (l.clip && base) out.add(l.id);
-      else base = l.kind !== 'adjust';
-    }
+    const walk = (nodes: LayerNode[]) => {
+      let base = false;
+      for (const n of nodes) {
+        if (n.layer.clip && base) out.add(n.layer.id);
+        else base = n.layer.kind !== 'adjust';
+        walk(n.children);
+      }
+    };
+    walk(tree);
     return out;
   });
+  /** Whether the active layer has a sibling below it (it can clip to it). */
+  const hasBelow = $derived(!!active && !!engine?.canMove(active.id, -1));
 
-  const BLEND_LABEL: Record<BlendMode, string> = {
+  const BLEND_LABEL: Record<LayerBlend, string> = {
+    pass: 'Pass Through',
     normal: 'Normal',
     multiply: 'Multiply',
     screen: 'Screen',
@@ -45,6 +77,7 @@
     luminosity: 'Luminosity',
     add: 'Add (Linear Dodge)',
   };
+  const blendModes = $derived<LayerBlend[]>(active?.kind === 'group' ? ['pass', ...BLEND_MODES] : [...BLEND_MODES]);
 
   // Slider drags send at most one op per 60 ms.
   let opacityTimer: number | undefined;
@@ -71,18 +104,84 @@
     el.select();
   }
 
+  function toggleOpen(id: string) {
+    const next = new Set(ed.collapsed);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    ed.collapsed = next;
+  }
+
   const peersOn = (layerId: string) => ed.peers.filter((p) => p.layerId === layerId);
+
+  // --- drag and drop -----------------------------------------------------------------------------
+
+  let list = $state<HTMLUListElement>()!;
+  /** The row being dragged, and where it would land. */
+  let dragId = $state<string | null>(null);
+  let drop = $state<{ id: string; where: 'above' | 'below' | 'into' } | null>(null);
+
+  function grab(e: PointerEvent, id: string) {
+    if (e.button !== 0 || !ed.canEdit) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    } catch {
+      // the pointer is already gone
+    }
+    dragId = id;
+    drop = null;
+  }
+
+  function dragMove(e: PointerEvent) {
+    if (!dragId) return;
+    const banned = subtreeIds(ed.layers, dragId);
+    drop = null;
+    for (const li of list.querySelectorAll<HTMLElement>('li[data-id]')) {
+      const r = li.getBoundingClientRect();
+      if (e.clientY < r.top || e.clientY >= r.bottom) continue;
+      const id = li.dataset.id!;
+      if (banned.has(id)) return;
+      const f = (e.clientY - r.top) / r.height;
+      const group = ed.layers.find((l) => l.id === id)?.kind === 'group';
+      drop = { id, where: group ? (f < 0.25 ? 'above' : f > 0.75 ? 'below' : 'into') : f < 0.5 ? 'above' : 'below' };
+      return;
+    }
+  }
+
+  function dragEnd() {
+    const id = dragId, d = drop;
+    dragId = null;
+    drop = null;
+    if (!id || !d || !engine) return;
+    const target = ed.layers.find((l) => l.id === d.id);
+    if (!target) return;
+    if (d.where === 'into') {
+      // At the top of the group.
+      const top = rows.find((r) => r.layer.parent === target.id && r.layer.id !== id);
+      engine.moveTo(id, target.id, top?.layer.id ?? null, null);
+      if (ed.collapsed.has(target.id)) toggleOpen(target.id);
+      return;
+    }
+    const parent = target.parent ?? null;
+    // Siblings bottom to top, without the dragged layer.
+    const sib = ed.layers.filter((l) => (l.parent ?? null) === parent && l.id !== id).sort((a, b) => a.order - b.order);
+    const i = sib.findIndex((l) => l.id === target.id);
+    // "above" in the panel is higher in the stack.
+    if (d.where === 'above') engine.moveTo(id, parent, target.id, sib[i + 1]?.id ?? null);
+    else engine.moveTo(id, parent, sib[i - 1]?.id ?? null, target.id);
+  }
 </script>
 
 <section>
   <h2>Layers</h2>
   <div class="controls">
     <select
-      disabled={!active}
+      disabled={!active || active.kind === 'adjust'}
       value={active?.blend ?? 'normal'}
-      onchange={(e) => active && engine?.updateLayer(active.id, { blend: e.currentTarget.value as BlendMode })}
+      onchange={(e) => active && engine?.updateLayer(active.id, { blend: e.currentTarget.value as LayerBlend })}
     >
-      {#each BLEND_MODES as m}
+      {#each blendModes as m}
         <option value={m}>{BLEND_LABEL[m]}</option>
       {/each}
     </select>
@@ -91,17 +190,28 @@
     {/key}
   </div>
 
-  <ul>
-    {#each topDown as layer (layer.id)}
+  <ul bind:this={list} class:dragging={!!dragId} onpointermove={dragMove} onpointerup={dragEnd} onpointercancel={dragEnd}>
+    {#each rows as row (row.layer.id)}
+      {@const layer = row.layer}
       {@const isActive = layer.id === ed.activeLayerId}
       <li
+        data-id={layer.id}
         class:active={isActive}
         class:clipped={clippedIds.has(layer.id)}
+        class:group={row.group}
+        class:lifted={dragId === layer.id}
+        class:drop-above={drop?.id === layer.id && drop.where === 'above'}
+        class:drop-below={drop?.id === layer.id && drop.where === 'below'}
+        class:drop-into={drop?.id === layer.id && drop.where === 'into'}
+        style:--depth={row.depth}
         onpointerdown={() => {
           engine?.setActiveLayer(layer.id);
           engine?.setMaskTarget(false);
         }}
       >
+        <span class="grip" title="Drag to move (into a group: drop on its middle)" role="button" tabindex="-1" onpointerdown={(e) => grab(e, layer.id)}>
+          <Icon name="grip" />
+        </span>
         {#if clippedIds.has(layer.id)}<span class="cliparrow" title="Clipped to the layer below">↳</span>{/if}
         <button
           class="icon eye"
@@ -111,6 +221,17 @@
         >
           <Icon name={layer.visible ? 'eye' : 'eyeoff'} />
         </button>
+        {#if row.group}
+          <button
+            class="icon chev"
+            class:open={row.open}
+            title={row.open ? 'Close the group' : 'Open the group'}
+            onpointerdown={(e) => e.stopPropagation()}
+            onclick={() => toggleOpen(layer.id)}
+          >
+            <Icon name="chevron" />
+          </button>
+        {/if}
         {#if editing === layer.id}
           <input
             type="text"
@@ -125,6 +246,7 @@
         {:else}
           <span class="name" class:hidden={!layer.visible} class:target={isActive && !ed.maskTarget} role="button" tabindex="-1" ondblclick={() => (editing = layer.id)} title="Double-click to rename">
             {#if layer.kind === 'adjust'}<span class="kind" title="Adjustment layer"><Icon name="adjust" /></span>{/if}
+            {#if row.group}<span class="kind" title="Group"><Icon name="folder" /></span>{/if}
             {layer.name}
           </span>
         {/if}
@@ -148,7 +270,7 @@
           {#each peersOn(layer.id) as p (p.id)}
             <span class="pdot" style:background={p.color} title="{p.name} is on this layer"></span>
           {/each}
-          {#if layer.blend !== 'normal'}<span class="tag">{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
+          {#if layer.blend !== 'normal' && layer.blend !== 'pass'}<span class="tag">{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
           {#if layer.opacity < 1}<span class="tag">{Math.round(layer.opacity * 100)}%</span>{/if}
         </span>
       </li>
@@ -192,11 +314,18 @@
         </div>
       {/if}
     </span>
+    {#if active?.kind === 'group'}
+      <button class="icon" title="Ungroup: take the layers out (Ctrl+Shift+G)" onclick={() => engine?.ungroup(active.id)}><Icon name="folder" /></button>
+    {:else}
+      <button class="icon" title={active ? 'Put the layer in a new group (Ctrl+G)' : 'New group'} onclick={() => (active ? engine?.groupLayer(active.id) : engine?.addGroup())}>
+        <Icon name="group" />
+      </button>
+    {/if}
     <button
       class="icon"
       title={active?.mask ? 'Delete the layer mask' : 'Add a layer mask'}
       class:on={!!active?.mask}
-      disabled={!active}
+      disabled={!active || active.kind === 'group'}
       onclick={() => active && (active.mask ? engine?.deleteMask(active.id) : engine?.addMask(active.id))}
     >
       <Icon name="mask" />
@@ -205,19 +334,23 @@
       class="icon"
       title={active?.clip ? 'Release from the clipping mask' : 'Clip to the layer below (clipping mask)'}
       class:on={!!active?.clip}
-      disabled={!active || index <= 0}
+      disabled={!active || !hasBelow}
       onclick={() => active && engine?.setClip(active.id, !active.clip)}
     >
       <Icon name="clip" />
     </button>
-    <button class="icon" title="Move up" disabled={!active || index >= ed.layers.length - 1} onclick={() => active && engine?.moveLayer(active.id, 1)}>
+    <button class="icon" title="Duplicate (Ctrl+J)" disabled={!active} onclick={() => active && engine?.duplicate(active.id)}><Icon name="copy" /></button>
+    <button class="icon" title="Transform: move, scale, rotate (Ctrl+T or V)" disabled={!active || active.kind === 'adjust'} onclick={() => engine?.startTransform()}>
+      <Icon name="transform" />
+    </button>
+    <button class="icon" title="Move up" disabled={!active || !engine?.canMove(active.id, 1)} onclick={() => active && engine?.moveLayer(active.id, 1)}>
       <Icon name="up" />
     </button>
-    <button class="icon" title="Move down" disabled={!active || index <= 0} onclick={() => active && engine?.moveLayer(active.id, -1)}>
+    <button class="icon" title="Move down" disabled={!active || !engine?.canMove(active.id, -1)} onclick={() => active && engine?.moveLayer(active.id, -1)}>
       <Icon name="down" />
     </button>
     <span class="grow"></span>
-    <button class="icon" title="Delete layer" disabled={!active || ed.layers.length <= 1} onclick={() => active && engine?.deleteLayer(active.id)}>
+    <button class="icon" title={active?.kind === 'group' ? 'Delete the group and its layers' : 'Delete layer'} disabled={!active} onclick={() => active && engine?.deleteLayer(active.id)}>
       <Icon name="trash" />
     </button>
   </div>
@@ -306,8 +439,65 @@
     border-radius: 3px;
     padding: 0 4px;
   }
+  li {
+    padding-left: calc(2px + var(--depth, 0) * 14px);
+    position: relative;
+  }
   li.clipped {
-    padding-left: 14px;
+    padding-left: calc(14px + var(--depth, 0) * 14px);
+  }
+  li.group .name {
+    font-weight: 600;
+  }
+  .grip {
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 100%;
+    flex: none;
+    color: var(--text-faint);
+    cursor: grab;
+    touch-action: none;
+  }
+  .grip:hover {
+    color: var(--text-dim);
+  }
+  ul.dragging,
+  ul.dragging * {
+    cursor: grabbing;
+  }
+  li.lifted {
+    opacity: 0.45;
+  }
+  li.drop-above::before,
+  li.drop-below::after {
+    content: '';
+    position: absolute;
+    left: calc(var(--depth, 0) * 14px);
+    right: 0;
+    height: 2px;
+    background: var(--accent);
+    pointer-events: none;
+  }
+  li.drop-above::before {
+    top: -1px;
+  }
+  li.drop-below::after {
+    bottom: -1px;
+  }
+  li.drop-into {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .chev {
+    width: 18px;
+    height: 18px;
+    flex: none;
+    color: var(--text-dim);
+    transition: transform 0.12s;
+  }
+  .chev.open {
+    transform: rotate(90deg);
   }
   .cliparrow {
     color: var(--text-dim);
@@ -404,6 +594,7 @@
   }
   .footer {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 2px;
     padding: 4px 6px;
@@ -416,6 +607,9 @@
   @media (pointer: coarse) {
     li {
       height: 46px;
+    }
+    .grip {
+      width: 26px;
     }
     .footer :global(button.icon) {
       width: 40px;

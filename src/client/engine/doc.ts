@@ -1,7 +1,8 @@
 // Client document: the confirmed state from the server, plus this client's ops that the
 // server has not echoed yet. The UI shows confirmed state with pending layer ops on top.
 
-import type { AppliedOp, Layer, Op, Stroke } from '../../shared/types';
+import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shared/layers';
+import { LIMITS, type AppliedOp, type Layer, type Op, type Stroke } from '../../shared/types';
 
 export interface PendingOp {
   opId: string;
@@ -15,9 +16,19 @@ function applyLayerOp(layers: Map<string, Layer>, op: Op | AppliedOp): boolean {
       return true;
     case 'layer.update': {
       const l = layers.get(op.id);
-      if (l) layers.set(op.id, { ...l, ...op.props });
+      if (l) {
+        const next = { ...l, ...op.props };
+        if (next.parent === null) delete next.parent;
+        layers.set(op.id, next);
+      }
       return true;
     }
+    case 'layer.duplicate':
+      // The layers only (pending view); Doc.apply copies the strokes too.
+      for (const l of duplicateOf(layers, [], op).layers) layers.set(l.id, l);
+      return true;
+    case 'layer.transform':
+      return true;
     case 'layer.remove':
     case 'layer.restore': {
       const l = layers.get(op.id);
@@ -29,8 +40,14 @@ function applyLayerOp(layers: Map<string, Layer>, op: Op | AppliedOp): boolean {
   }
 }
 
-export function sortLayers(a: Layer, b: Layer): number {
-  return a.order - b.order || (a.id < b.id ? -1 : 1);
+export { sortLayers } from '../../shared/layers';
+
+/** What an op changed in the strokes, for the renderer. */
+export interface StrokeChanges {
+  /** Strokes that changed in place (same id: the renderer drops and adds them). */
+  changed: Stroke[];
+  /** New strokes (copies). */
+  added: Stroke[];
 }
 
 /** World bounding box of a stroke, including its brush radius. */
@@ -82,10 +99,36 @@ export class Doc {
     return this.pending.splice(i, 1)[0];
   }
 
-  /** Applies a server op to the confirmed state. */
-  apply(seq: number, op: AppliedOp): void {
+  /** Applies a server op to the confirmed state. Returns what changed in the strokes, if anything. */
+  apply(seq: number, op: AppliedOp): StrokeChanges | null {
     this.seq = seq;
     switch (op.type) {
+      case 'layer.transform': {
+        const ids = subtreeIds(this.layers.values(), op.id);
+        const changed: Stroke[] = [];
+        for (const st of this.strokes.values()) {
+          if (!ids.has(st.layerId)) continue;
+          // The server checked the range; a failure here means the documents differ: skip.
+          const t = transformStroke(st, op.m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
+          if (!t) continue;
+          const next = { ...st, ...t };
+          this.strokes.set(st.id, next);
+          this.bounds.set(st.id, strokeBounds(next));
+          changed.push(next);
+        }
+        this.version++;
+        return { changed, added: [] };
+      }
+      case 'layer.duplicate': {
+        const copy = duplicateOf(this.layers, this.strokes.values(), op);
+        for (const l of copy.layers) this.layers.set(l.id, l);
+        for (const st of copy.strokes) {
+          this.strokes.set(st.id, st);
+          this.bounds.set(st.id, strokeBounds(st));
+        }
+        this.version++;
+        return { changed: [], added: copy.strokes };
+      }
       case 'stroke.add':
       case 'stroke.restore':
         this.strokes.set(op.stroke.id, { ...op.stroke, deleted: false });
@@ -100,21 +143,27 @@ export class Doc {
       default:
         applyLayerOp(this.layers, op);
     }
+    return null;
   }
 
-  /** Layers as the user sees them, bottom to top, without deleted ones. */
+  /**
+   * Layers as the user sees them, in paint order (bottom to top; a group's layers come right before
+   * the group), without deleted ones and without layers in deleted groups. Groups included.
+   */
   displayLayers(): Layer[] {
+    return paintOrder(this.layerView().values());
+  }
+
+  /** All layers (deleted ones too) with the pending ops applied. */
+  layerView(): Map<string, Layer> {
     const view = new Map(this.layers);
     for (const p of this.pending) applyLayerOp(view, p.op);
-    return [...view.values()].filter((l) => !l.deleted).sort(sortLayers);
+    return view;
   }
 
   /** Every layer including deleted ones, with pending ops applied. Used for undo bookkeeping. */
   layer(id: string): Layer | undefined {
-    const view = new Map<string, Layer>();
-    const base = this.layers.get(id);
-    if (base) view.set(id, base);
-    for (const p of this.pending) if ('id' in p.op ? p.op.id === id : p.op.type === 'layer.add' && p.op.layer.id === id) applyLayerOp(view, p.op);
-    return view.get(id);
+    return this.layerView().get(id);
   }
+
 }
