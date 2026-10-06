@@ -5,7 +5,8 @@ import type { Brush, CanvasInfo, DeniedReason, Layer, Role } from '../shared/typ
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
-export type Tool = 'brush' | 'eraser' | 'eyedropper' | 'hand';
+/** strokeEraser: removes whole strokes whose path the circle touches (see engine.ts). */
+export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'hand';
 export type { BrushSettings } from '../shared/types';
 import type { BrushSettings } from '../shared/types';
 
@@ -59,6 +60,9 @@ const prefs = load('draw.prefs', {
   smoothing: 0.25,
   showMarkers: true,
   touchPressure: true,
+  /** Stroke eraser: circle diameter in screen pixels, and which strokes it removes. */
+  strokeEraserSize: 30,
+  strokeEraserAll: true,
   fg: '#1e1e1e',
   bg: '#ffffff',
   swatches: [] as string[],
@@ -72,6 +76,9 @@ class EditorState {
   showMarkers = $state(prefs.showMarkers);
   /** Finger strokes take their pressure from the contact size (where the browser reports it). */
   touchPressure = $state(prefs.touchPressure);
+  /** Stroke eraser: circle diameter (screen px); true: all visible layers, false: the active layer. */
+  strokeEraserSize = $state(prefs.strokeEraserSize);
+  strokeEraserAll = $state(prefs.strokeEraserAll);
   markers = $state<Marker[]>([]);
   fg = $state(prefs.fg);
   bg = $state(prefs.bg);
@@ -138,6 +145,8 @@ class EditorState {
       smoothing: this.smoothing,
       showMarkers: this.showMarkers,
       touchPressure: this.touchPressure,
+      strokeEraserSize: this.strokeEraserSize,
+      strokeEraserAll: this.strokeEraserAll,
       fg: this.fg,
       bg: this.bg,
       swatches: $state.snapshot(this.swatches),

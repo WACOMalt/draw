@@ -8,6 +8,7 @@
   const TOOLS: { id: Tool; icon: string; label: string; key: string }[] = [
     { id: 'brush', icon: 'brush', label: 'Brush', key: 'B' },
     { id: 'eraser', icon: 'eraser', label: 'Eraser', key: 'E' },
+    { id: 'strokeEraser', icon: 'strokeEraser', label: 'Stroke eraser: removes whole strokes', key: 'Shift+E' },
     { id: 'eyedropper', icon: 'eyedropper', label: 'Eyedropper', key: 'I' },
     { id: 'hand', icon: 'hand', label: 'Hand', key: 'H' },
   ];

@@ -23,6 +23,8 @@
 
   let canvas = $state<HTMLCanvasElement>()!;
   let brushCursor = $state<HTMLDivElement>()!;
+  /** Where the stroke eraser shows the stroke paths (engine.ts drawPaths). */
+  let pathsCanvas = $state<HTMLCanvasElement>()!;
   let engine = $state<Engine | null>(null);
   let missing = $state(false);
 
@@ -58,12 +60,16 @@
         }
         addRecent(code);
         e = engine = new Engine(code, canvas, brushCursor);
+        e.setPathsCanvas(pathsCanvas);
         e.updateCursor();
         // Console handle for debugging: __draw.ed (state), __draw.engine.
         (window as unknown as { __draw: unknown }).__draw = { ed, engine: e };
       })
       .catch(() => {
-        if (!dead) e = engine = new Engine(code, canvas, brushCursor);
+        if (!dead) {
+          e = engine = new Engine(code, canvas, brushCursor);
+          e.setPathsCanvas(pathsCanvas);
+        }
       });
     // Log in or out while here: reconnect so the server sees the new identity.
     const reauth = () => engine?.reconnect();
@@ -83,7 +89,7 @@
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
@@ -121,6 +127,7 @@
     {/if}
     <div class="stage">
       <canvas bind:this={canvas}></canvas>
+      <canvas class="paths" bind:this={pathsCanvas}></canvas>
       <div class="brush-cursor" bind:this={brushCursor}></div>
       {#each ed.markers as m (m.key)}
         <button
@@ -163,7 +170,7 @@
       {#if narrow}
         <button class="zoom" title="Reset to 100%" onclick={() => engine?.resetView()}>{zoomLabel}</button>
         {#if sheet === 'brush'}
-          <Sheet title={ed.tool === 'eraser' ? 'Eraser' : 'Brush'} onClose={() => (sheet = null)}><OptionsBar stacked /></Sheet>
+          <Sheet title={ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'strokeEraser' ? 'Stroke eraser' : 'Brush'} onClose={() => (sheet = null)}><OptionsBar stacked /></Sheet>
         {:else if sheet === 'color'}
           <Sheet title="Color" onClose={() => (sheet = null)}><ColorPanel {engine} /></Sheet>
         {:else if sheet === 'layers'}
@@ -287,6 +294,10 @@
     overflow-y: auto;
     overflow-x: hidden;
     scrollbar-width: thin;
+  }
+  canvas.paths {
+    display: none;
+    pointer-events: none;
   }
   .brush-cursor {
     position: absolute;

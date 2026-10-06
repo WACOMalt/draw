@@ -9,13 +9,14 @@
   const TOOLS: { id: Tool; icon: string; label: string }[] = [
     { id: 'brush', icon: 'brush', label: 'Brush' },
     { id: 'eraser', icon: 'eraser', label: 'Eraser' },
+    { id: 'strokeEraser', icon: 'strokeEraser', label: 'Stroke eraser' },
     { id: 'eyedropper', icon: 'eyedropper', label: 'Eyedropper' },
     { id: 'hand', icon: 'hand', label: 'Hand' },
   ];
 
   function tool(t: Tool) {
     // Tapping the active painting tool again opens its settings.
-    if (ed.tool === t && (t === 'brush' || t === 'eraser')) sheet = sheet === 'brush' ? null : 'brush';
+    if (ed.tool === t && (t === 'brush' || t === 'eraser' || t === 'strokeEraser')) sheet = sheet === 'brush' ? null : 'brush';
     else ed.tool = t;
     engine?.updateCursor();
   }

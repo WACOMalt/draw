@@ -118,6 +118,22 @@ function greyOf(hex: string): string {
 /** What a layer property is when it is not set: undo must send a value, not undefined. */
 const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null };
 
+/** Squared distance between the segments a–b and c–d (zero when they cross). */
+function segDist2(ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number): number {
+  const cross = (ox: number, oy: number, px: number, py: number, qx: number, qy: number) => (px - ox) * (qy - oy) - (py - oy) * (qx - ox);
+  const d1 = cross(cx, cy, dx, dy, ax, ay), d2 = cross(cx, cy, dx, dy, bx, by);
+  const d3 = cross(ax, ay, bx, by, cx, cy), d4 = cross(ax, ay, bx, by, dx, dy);
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return 0;
+  const pt = (px: number, py: number, sx: number, sy: number, ex: number, ey: number) => {
+    const vx = ex - sx, vy = ey - sy;
+    const len = vx * vx + vy * vy;
+    const t = len > 0 ? Math.max(0, Math.min(1, ((px - sx) * vx + (py - sy) * vy) / len)) : 0;
+    const qx = sx + t * vx - px, qy = sy + t * vy - py;
+    return qx * qx + qy * qy;
+  };
+  return Math.min(pt(ax, ay, cx, cy, dx, dy), pt(bx, by, cx, cy, dx, dy), pt(cx, cy, ax, ay, bx, by), pt(dx, dy, ax, ay, bx, by));
+}
+
 export class Engine {
   readonly comp: Renderer;
   private doc = new Doc();
@@ -245,6 +261,7 @@ export class Engine {
 
   destroy(): void {
     window.clearTimeout(this.previewTimer);
+    cancelAnimationFrame(this.pathsRaf);
     this.endStroke();
     this.cleanup.forEach((f) => f());
     this.net.close();
@@ -306,6 +323,7 @@ export class Engine {
     if (this.frame) return; // no markers, and nothing saved for an embed
     this.updateBrushCursor();
     this.scheduleMarkers();
+    this.schedulePaths();
     window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => save(`draw.view.${this.code}`, ed.view), 300);
   }
@@ -491,16 +509,17 @@ export class Engine {
     this.canvas.style.cursor =
       tool === 'hand' ? (this.pan ? 'grabbing' : 'grab') : tool === 'eyedropper' ? 'crosshair' : 'none';
     this.updateBrushCursor();
+    this.schedulePaths(); // the path overlay shows with the stroke eraser only
   }
 
   updateBrushCursor(): void {
     const el = this.brushCursor;
     const tool = this.effectiveTool();
-    if (!this.pointer || (tool !== 'brush' && tool !== 'eraser')) {
+    if (!this.pointer || (tool !== 'brush' && tool !== 'eraser' && tool !== 'strokeEraser')) {
       el.style.display = 'none';
       return;
     }
-    const d = Math.max(3, ed.activeBrush.size);
+    const d = Math.max(3, tool === 'strokeEraser' ? ed.strokeEraserSize : ed.activeBrush.size);
     el.style.display = 'block';
     el.style.width = el.style.height = `${d}px`;
     el.style.transform = `translate(${this.pointer.x - d / 2}px, ${this.pointer.y - d / 2}px)`;
@@ -539,6 +558,7 @@ export class Engine {
       this.pick(x, y);
       return;
     }
+    if (tool === 'strokeEraser' && !eraserEnd) return this.beginSweep(e, x, y);
     this.beginStroke(e, x, y, eraserEnd);
   }
 
@@ -550,8 +570,16 @@ export class Engine {
       if (this.ignoredTouches.has(e.pointerId) || this.touchLock) return;
     }
     // Only a hovering mouse or pen shows the brush outline.
+    if (this.sweep && e.pointerId === this.sweep.pointerId) {
+      const events = e.getCoalescedEvents?.() ?? [];
+      for (const ce of events.length ? events : [e]) this.sweepTo(...this.local(ce));
+      this.pointer = { x, y };
+      this.updateBrushCursor();
+      return;
+    }
     if (!this.frame) {
       this.pointer = e.pointerType === 'touch' ? null : { x, y };
+      if (this.effectiveTool() === 'strokeEraser') this.hoverAt(x, y);
       const [wx, wy] = this.comp.toWorld(x, y);
       ed.cursor = { x: wx, y: wy };
       this.updateBrushCursor();
@@ -596,6 +624,7 @@ export class Engine {
       this.picking = null;
       this.addSwatch(ed.fg);
     }
+    if (this.sweep && e.pointerId === this.sweep.pointerId) this.endSweep();
     if (this.stroke && e.pointerId === this.stroke.pointerId) {
       // The last pen samples before the release (the release itself has no pressure).
       if (this.stroke.native) this.addNativeSamples(this.stroke, null);
@@ -608,9 +637,13 @@ export class Engine {
       this.engaged = false; // back to page scrolling once the pointer is outside
       return;
     }
-    if (this.stroke) return;
+    if (this.stroke || this.sweep) return;
     this.pointer = null;
     ed.cursor = null;
+    if (this.hover.size) {
+      this.hover = new Set();
+      this.schedulePaths();
+    }
     this.updateBrushCursor();
     this.net.send({ t: 'cursor', x: null, y: null, layerId: ed.activeLayerId });
   }
@@ -998,6 +1031,7 @@ export class Engine {
     if (!layers.some((l) => l.id === ed.activeLayerId)) ed.activeLayerId = layers.at(-1)?.id ?? null;
     if (ed.maskTarget && !layers.find((l) => l.id === ed.activeLayerId)?.mask) this.setMaskTarget(false);
     this.scheduleMarkers();
+    this.schedulePaths();
   }
 
   /** Live layers in the group `parent` (null: the top level), bottom to top. */
@@ -1273,6 +1307,195 @@ export class Engine {
     ed.activeLayerId = nid;
   }
 
+  // --- stroke eraser -------------------------------------------------------------------------------
+  //
+  // Removes whole strokes: every stroke whose path (its center line) the circle touches while it
+  // moves. One drag is one undo step (restore brings the strokes back). With the tool selected, an
+  // overlay shows the paths as thin lines, and the ones under the circle in red.
+
+  /** The drag in progress: the last point (world) and the strokes it removed, in order. */
+  private sweep: { pointerId: number; last: [number, number]; removed: string[]; gone: Set<string> } | null = null;
+  /** Strokes under the circle while it hovers (drawn red in the overlay). */
+  private hover = new Set<string>();
+  private pathsCanvas: HTMLCanvasElement | null = null;
+  private pathsRaf = 0;
+
+  /** Which strokes the stroke eraser may remove: on visible layers, or on the active layer only. */
+  private sweepTargets(): (st: Stroke) => boolean {
+    if (!ed.strokeEraserAll) {
+      const a = this.activeLayer();
+      if (!a || a.kind === 'group') return () => false;
+      const mask = ed.maskTarget && a.mask ? a.mask.id : null;
+      return (st) => st.layerId === a.id && (mask ? st.mask === mask : !st.mask);
+    }
+    const shown = this.visibleLayerIds();
+    return (st) => shown.has(st.layerId) && !st.mask;
+  }
+
+  /** Strokes removed by this client and not yet confirmed by the server. */
+  private pendingRemovals(): Set<string> {
+    const out = new Set<string>();
+    for (const p of this.doc.pending) if (p.op.type === 'stroke.remove') out.add(p.op.id);
+    return out;
+  }
+
+  /**
+   * Strokes whose path comes within `r` (world) of the segment a–b. Stroke bounds (which include
+   * the brush radius) reject most strokes before the exact segment-to-segment test.
+   */
+  private strokesNear(ax: number, ay: number, bx: number, by: number, r: number): string[] {
+    const want = this.sweepTargets();
+    const skip = this.pendingRemovals();
+    const x0 = Math.min(ax, bx) - r, x1 = Math.max(ax, bx) + r;
+    const y0 = Math.min(ay, by) - r, y1 = Math.max(ay, by) + r;
+    const r2 = r * r;
+    const out: string[] = [];
+    for (const [id, b] of this.doc.bounds) {
+      if (b.x1 < x0 || b.x0 > x1 || b.y1 < y0 || b.y0 > y1 || skip.has(id) || this.sweep?.gone.has(id)) continue;
+      const st = this.doc.strokes.get(id);
+      if (!st || !want(st)) continue;
+      const p = st.pts;
+      if (p.length === 3) {
+        if (segDist2(ax, ay, bx, by, p[0], p[1], p[0], p[1]) <= r2) out.push(id);
+        continue;
+      }
+      for (let i = 3; i < p.length; i += 3) {
+        const cx = p[i - 3], cy = p[i - 2], dx = p[i], dy = p[i + 1];
+        // Quick reject per segment, then the exact distance.
+        if (Math.max(cx, dx) < x0 || Math.min(cx, dx) > x1 || Math.max(cy, dy) < y0 || Math.min(cy, dy) > y1) continue;
+        if (segDist2(ax, ay, bx, by, cx, cy, dx, dy) <= r2) {
+          out.push(id);
+          break;
+        }
+      }
+    }
+    return out;
+  }
+
+  private beginSweep(e: PointerEvent, x: number, y: number): void {
+    if (!ed.canEdit) return showToast('View only: you can look around but not erase');
+    const w = this.comp.toWorld(x, y);
+    this.sweep = { pointerId: e.pointerId, last: w, removed: [], gone: new Set() };
+    this.pointer = { x, y };
+    this.hover = new Set();
+    this.sweepTo(x, y);
+    this.updateBrushCursor();
+  }
+
+  /** Moves the circle to (x, y) on screen: removes what the path from the last point touches. */
+  private sweepTo(x: number, y: number): void {
+    const sw = this.sweep;
+    if (!sw) return;
+    const [wx, wy] = this.comp.toWorld(x, y);
+    const r = ed.strokeEraserSize / 2 / this.comp.view.zoom;
+    for (const id of this.strokesNear(sw.last[0], sw.last[1], wx, wy, r)) {
+      sw.gone.add(id);
+      sw.removed.push(id);
+      this.sendOp({ type: 'stroke.remove', id });
+    }
+    sw.last = [wx, wy];
+    this.schedulePaths();
+  }
+
+  private endSweep(): void {
+    const sw = this.sweep;
+    this.sweep = null;
+    if (!sw || sw.removed.length === 0) return;
+    this.pushUndo({
+      undo: sw.removed.map((id) => ({ type: 'stroke.restore', id }) as Op),
+      redo: sw.removed.map((id) => ({ type: 'stroke.remove', id }) as Op),
+    });
+    showToast(`Removed ${sw.removed.length} stroke${sw.removed.length === 1 ? '' : 's'}`);
+  }
+
+  /** Hovering: the strokes under the circle turn red in the overlay. */
+  private hoverAt(x: number, y: number): void {
+    const [wx, wy] = this.comp.toWorld(x, y);
+    const next = new Set(this.strokesNear(wx, wy, wx, wy, ed.strokeEraserSize / 2 / this.comp.view.zoom));
+    if (next.size === this.hover.size && [...next].every((id) => this.hover.has(id))) return;
+    this.hover = next;
+    this.schedulePaths();
+  }
+
+  /** The canvas over the stage where the stroke eraser draws the paths (Editor gives it). */
+  setPathsCanvas(c: HTMLCanvasElement | null): void {
+    this.pathsCanvas = c;
+    this.schedulePaths();
+  }
+
+  private schedulePaths(): void {
+    if (!this.pathsCanvas || this.pathsRaf) return;
+    this.pathsRaf = requestAnimationFrame(() => {
+      this.pathsRaf = 0;
+      this.drawPaths();
+    });
+  }
+
+  /**
+   * The paths of the strokes the stroke eraser can remove, as thin lines (red under the circle).
+   * Only strokes in view, each thinned to points at least about a pixel apart; a stroke smaller
+   * than two pixels is a dot. Thus the cost follows what the screen can show, not the canvas size.
+   */
+  private drawPaths(): void {
+    const c = this.pathsCanvas;
+    if (!c) return;
+    const on = ed.tool === 'strokeEraser' && !ed.transform && !this.frame;
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(this.rect.width * dpr), h = Math.round(this.rect.height * dpr);
+    if (c.width !== w || c.height !== h) {
+      c.width = w;
+      c.height = h;
+    }
+    const ctx = c.getContext('2d')!;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    c.style.display = on ? 'block' : 'none';
+    if (!on) return;
+    const v = this.comp.view;
+    const ds = v.zoom * dpr;
+    const vx1 = v.x + w / ds, vy1 = v.y + h / ds;
+    const want = this.sweepTargets();
+    const skip = this.pendingRemovals();
+    const normal = new Path2D(), hot = new Path2D();
+    for (const [id, b] of this.doc.bounds) {
+      if (b.x1 < v.x || b.x0 > vx1 || b.y1 < v.y || b.y0 > vy1 || skip.has(id) || this.sweep?.gone.has(id)) continue;
+      const st = this.doc.strokes.get(id);
+      if (!st || !want(st)) continue;
+      const path = this.hover.has(id) ? hot : normal;
+      const p = st.pts;
+      if ((b.x1 - b.x0) * ds < 2 && (b.y1 - b.y0) * ds < 2) {
+        const x = (p[0] - v.x) * ds, y = (p[1] - v.y) * ds;
+        path.rect(x - 0.75, y - 0.75, 1.5, 1.5);
+        continue;
+      }
+      let lx = (p[0] - v.x) * ds, ly = (p[1] - v.y) * ds;
+      path.moveTo(lx, ly);
+      if (p.length === 3) path.lineTo(lx + 0.01, ly);
+      for (let i = 3; i < p.length; i += 3) {
+        const x = (p[i] - v.x) * ds, y = (p[i + 1] - v.y) * ds;
+        if (i + 3 < p.length && Math.abs(x - lx) < 1 && Math.abs(y - ly) < 1) continue;
+        path.lineTo(x, y);
+        lx = x;
+        ly = y;
+      }
+    }
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    // A dark halo under a light line: readable on light and dark paint.
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.35)';
+    ctx.lineWidth = 2.5 * dpr;
+    ctx.stroke(normal);
+    ctx.strokeStyle = 'rgba(80, 190, 255, 0.95)';
+    ctx.lineWidth = 1 * dpr;
+    ctx.stroke(normal);
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.lineWidth = 3.5 * dpr;
+    ctx.stroke(hot);
+    ctx.strokeStyle = '#ff4d4f';
+    ctx.lineWidth = 2 * dpr;
+    ctx.stroke(hot);
+  }
+
   // --- transform ---------------------------------------------------------------------------------
 
   /** World bounds of what a layer or group draws (paint strokes; mask strokes if there is no paint). */
@@ -1389,7 +1612,10 @@ export class Engine {
           this.refreshLayers();
         }
         ed.strokeCount = this.doc.strokes.size;
-        if (op.type.startsWith('stroke.')) this.scheduleMarkers();
+        if (op.type.startsWith('stroke.')) {
+          this.scheduleMarkers();
+          this.schedulePaths();
+        }
         this.schedulePreview(8000);
         break;
       }
@@ -1534,7 +1760,7 @@ export class Engine {
       else b.opacity = v;
       return;
     }
-    const tools: Record<string, Tool> = { b: 'brush', e: 'eraser', i: 'eyedropper', h: 'hand' };
+    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', h: 'hand' };
     if (key === 'v') {
       this.startTransform();
     } else if (tools[key]) {

@@ -1,12 +1,13 @@
 <script lang="ts">
   import { BRUSH_TIPS, GRAINS, LIMITS, type BrushTip, type GrainId } from '../../shared/types';
-  import { ed } from '../state.svelte';
+  import { ed, type Tool } from '../state.svelte';
   import Icon from './Icon.svelte';
   import PresetsPanel from './PresetsPanel.svelte';
   import Slider from './Slider.svelte';
 
   let { stacked = false }: { stacked?: boolean } = $props();
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
+  const TOOL_LABEL: Record<Tool, string> = { brush: 'Brush', eraser: 'Eraser', strokeEraser: 'Stroke eraser', eyedropper: 'Eyedropper', hand: 'Hand' };
   const b = $derived(ed.activeBrush);
   let dynamicsOpen = $state(false);
   /** The Dynamics popover opens to the right when its button is near the left edge (a wrapped row). */
@@ -55,7 +56,7 @@
 {/snippet}
 
 <div class="opts" class:stacked>
-  <span class="tool">{ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'brush' ? 'Brush' : ed.tool === 'eyedropper' ? 'Eyedropper' : 'Hand'}</span>
+  <span class="tool">{TOOL_LABEL[ed.tool]}</span>
   {#if painting}
     {#if !stacked}
       <span class="popwrap">
@@ -119,6 +120,15 @@
       <h4 class="sub">Presets</h4>
       <PresetsPanel stacked />
     {/if}
+  {:else if ed.tool === 'strokeEraser'}
+    <Slider wide={stacked} label="Size" bind:value={ed.strokeEraserSize} min={2} max={400} log width={110} title="Circle diameter in screen pixels" />
+    <div class="toggles">
+      <button class="icon wide" class:on={ed.strokeEraserAll} title="Remove strokes on every visible layer" onclick={() => (ed.strokeEraserAll = true)}>All layers</button>
+      <button class="icon wide" class:on={!ed.strokeEraserAll} title="Remove strokes on the active layer only (its mask, when you paint the mask)" onclick={() => (ed.strokeEraserAll = false)}>
+        Active layer
+      </button>
+    </div>
+    <span class="hint">Removes every stroke whose path the circle touches. Undo brings them back.</span>
   {:else if ed.tool === 'eyedropper'}
     <span class="hint">Click the canvas to pick a color from all layers. Hold Alt with the brush for a quick pick.</span>
   {:else}

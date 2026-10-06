@@ -307,6 +307,17 @@ PWA: the app has a web manifest, icons (also maskable), and a service worker. Th
 
 The landing page keeps a list of recent sessions in local storage on each device. With an account, it shows a name field (empty: "Random code") and two buttons, "Create private canvas" and "Create public canvas". Without an account, it shows "New canvas" (temporary). In the web app (not the desktop app), a "Download app" button opens the latest GitHub release.
 
+### 8.9 Stroke eraser
+
+A tool (Shift+E; after the eraser in the toolbars) that removes whole strokes, as vectors allow, instead of painting transparency.
+
+- A circle with a size in screen pixels (2 to 400, log scale). Every stroke whose path (its center line) the circle touches while it moves is removed with `stroke.remove`: the stroke leaves the canvas entirely. The test is the distance between the circle's movement (segment by segment) and each segment of the stroke's path, after a quick check of the stroke bounds.
+- Scope: all visible layers (default), or the active layer only (and then its mask strokes when the mask is the paint target). Mask strokes are left alone in "all layers".
+- One drag is one undo step: undo restores every stroke it removed, redo removes them again. A toast counts them.
+- With the tool selected, an overlay canvas shows the paths of the strokes it can remove as thin lines (a light line over a dark halo), and the strokes under the circle in red. Only strokes in view are drawn, each thinned to points about a pixel apart, and a stroke smaller than two pixels is a dot, so the cost follows the screen. The overlay redraws only when the view, the strokes or the hover set change.
+- Mouse and pen hover show the circle and the red highlight; a finger shows the circle while it erases. The eraser end of a pen still paints transparency.
+- The size and the scope are kept with the other preferences.
+
 ### 9.0 Layers panel, groups and transform
 
 - The panel is a tree, top layer first: a group's row (folder icon, an arrow to open or close it; closed groups are kept per device), then its layers, indented. Every row has a grip: drag it (mouse, pen or finger) onto the upper or lower part of a row to go above or below it, or onto the middle of a group to go into it, at its top. The up and down buttons move a layer among the layers of its group.
