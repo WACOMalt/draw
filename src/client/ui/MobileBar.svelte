@@ -23,7 +23,7 @@
   const toggle = (s: SheetName) => (sheet = sheet === s ? null : s);
 </script>
 
-<nav>
+<nav class="mobilebar">
   {#each TOOLS as t}
     <button class="icon" class:on={ed.tool === t.id} aria-label={t.label} onclick={() => tool(t.id)}><Icon name={t.icon} /></button>
   {/each}

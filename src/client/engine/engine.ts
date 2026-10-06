@@ -31,6 +31,7 @@ import { Net } from './net';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
+import { takeDismissed } from '../dismiss';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
 // This range stays precise for drawings within about 1e4 world units of where you work.
@@ -216,6 +217,9 @@ export class Engine {
     this.listen(canvas, 'wheel', (e) => this.onWheel(e as WheelEvent), { passive: false });
     this.listen(canvas, 'contextmenu', (e) => e.preventDefault());
     if (!frame) {
+      // Ctrl+wheel and trackpad pinches over a panel or popup zoom the canvas, not the page. A
+      // plain wheel over a popup that floats on the canvas zooms too, when the popup cannot scroll.
+      this.listen(window, 'wheel', (e) => this.onPageWheel(e as WheelEvent), { passive: false });
       this.listen(window, 'keydown', (e) => this.onKey(e as KeyboardEvent, true));
       this.listen(window, 'keyup', (e) => this.onKey(e as KeyboardEvent, false));
     }
@@ -536,6 +540,11 @@ export class Engine {
     this.stopFlight(); // any touch stops a fly-to
     if (e.pointerType === 'pen' || nativePenFor(e)) this.penSeen = true;
     if (e.pointerType === 'touch' && this.onTouchDown(e, x, y)) return;
+    if (takeDismissed(e.pointerId)) {
+      // This press closed a popup: it does not paint. A finger pans (a second one pinches).
+      if (e.pointerType === 'touch' && !this.stroke && !this.pan) this.pan = { pointerId: e.pointerId, x, y };
+      return;
+    }
     if (this.stroke || this.pan || this.picking !== null) return;
     this.engaged = true;
     try {
@@ -733,6 +742,22 @@ export class Engine {
     st.timers.forEach((t) => window.clearInterval(t));
     this.comp.liveCancel(st.id);
     if (st.started) this.net.send({ t: 'live.end', id: st.id });
+  }
+
+  private onPageWheel(e: WheelEvent): void {
+    const t = e.target as Element | null;
+    if (!t || t === this.canvas || t.closest('[aria-modal]')) return; // the canvas has its own listener
+    if (e.ctrlKey || e.metaKey) return this.onWheel(e);
+    const pop = t.closest('[data-over-canvas]');
+    if (!pop) return;
+    for (let el: Element | null = t; el; el = el === pop ? null : el.parentElement) {
+      const y = getComputedStyle(el).overflowY;
+      if ((y === 'auto' || y === 'scroll') && el.scrollHeight > el.clientHeight + 1) {
+        const room = e.deltaY < 0 ? el.scrollTop > 0 : el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+        if (room) return; // the popup scrolls
+      }
+    }
+    this.onWheel(e);
   }
 
   private onWheel(e: WheelEvent): void {
@@ -1699,9 +1724,13 @@ export class Engine {
       this.updateCursor();
       return;
     }
-    if (!down || typing) return;
     const mod = e.ctrlKey || e.metaKey;
     const key = e.key.toLowerCase();
+    // Zoom keys also work from a number field or a list (in a popup, say): there they mean
+    // nothing, and the browser would zoom the whole page instead.
+    const zoomKey = mod && (key === '=' || key === '+' || key === '-' || key === '0' || key === '1');
+    const textField = t && (t.tagName === 'TEXTAREA' || t.isContentEditable || (t instanceof HTMLInputElement && t.type !== 'number'));
+    if (!down || (typing && !(zoomKey && !textField))) return;
     if (mod) {
       if (key === 'z') {
         e.preventDefault();

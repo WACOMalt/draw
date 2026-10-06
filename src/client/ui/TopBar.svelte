@@ -6,6 +6,7 @@
   import { links } from '../identity';
   import AccountButton from './AccountButton.svelte';
   import { pickFile } from '../files';
+  import { dismiss } from '../dismiss';
 
   let { engine, code, narrow, onLeave }: { engine: Engine | null; code: string; narrow: boolean; onLeave: () => void } = $props();
   /** Narrow screens: file actions and Leave go in a menu, so the bar fits on a 320 px phone. */
@@ -68,7 +69,7 @@
   <AccountButton compact={narrow} onHome={onLeave} />
 
   {#if narrow}
-    <div class="more">
+    <div class="more" use:dismiss={{ open: more, close: () => (more = false) }}>
       <button class="icon" title="More" aria-label="More" aria-expanded={more} onclick={() => (more = !more)}><Icon name="more" /></button>
       {#if more}
         <div class="menu" role="menu">
@@ -87,7 +88,6 @@
   {/if}
 </header>
 
-<svelte:window onpointerdown={(e) => more && !(e.target as Element).closest('.more') && (more = false)} />
 
 <style>
   header {

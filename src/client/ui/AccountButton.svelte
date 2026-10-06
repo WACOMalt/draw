@@ -1,6 +1,7 @@
 <script lang="ts">
   import { announceAuth, logout } from '../api';
   import { ed, showToast } from '../state.svelte';
+  import { dismiss } from '../dismiss';
 
   let { compact = false, onHome }: { compact?: boolean; onHome?: () => void } = $props();
   let open = $state(false);
@@ -21,9 +22,7 @@
   }
 </script>
 
-<svelte:window onpointerdown={(e) => open && !(e.target as Element).closest('.account') && (open = false)} />
-
-<div class="account">
+<div class="account" use:dismiss={{ open, close: () => (open = false) }}>
   {#if ed.user}
     <button class="me" onclick={() => (open = !open)} title={ed.user.email} aria-expanded={open}>
       <span class="avatar">{initials(ed.user.name)}</span>

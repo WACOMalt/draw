@@ -1,13 +1,16 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import Icon from './Icon.svelte';
+  import { dismiss } from '../dismiss';
 
-  // Bottom sheet for the phone layout. Tapping the backdrop closes it.
+  // Bottom sheet for the phone layout. A press anywhere outside closes it (the bottom bar
+  // switches sheets itself). The dim backdrop lets presses through: a finger on the canvas
+  // closes the sheet and pans, and two fingers pinch-zoom at once.
   let { title, onClose, children, tall = false }: { title: string; onClose: () => void; children: Snippet; tall?: boolean } = $props();
 </script>
 
-<div class="backdrop" role="presentation" onpointerdown={onClose}></div>
-<div class="sheet" class:tall role="dialog" aria-label={title}>
+<div class="backdrop"></div>
+<div class="sheet" class:tall role="dialog" aria-label={title} use:dismiss={{ open: true, close: onClose, keep: '.mobilebar' }}>
   <header>
     <span>{title}</span>
     <button class="icon" aria-label="Close" onclick={onClose}><Icon name="close" /></button>
@@ -21,6 +24,7 @@
     inset: 0;
     background: rgba(0, 0, 0, 0.35);
     z-index: 20;
+    pointer-events: none;
   }
   .sheet {
     position: absolute;

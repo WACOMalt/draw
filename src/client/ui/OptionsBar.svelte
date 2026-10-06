@@ -4,6 +4,7 @@
   import Icon from './Icon.svelte';
   import PresetsPanel from './PresetsPanel.svelte';
   import Slider from './Slider.svelte';
+  import { dismiss } from '../dismiss';
 
   let { stacked = false }: { stacked?: boolean } = $props();
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
@@ -59,12 +60,12 @@
   <span class="tool">{TOOL_LABEL[ed.tool]}</span>
   {#if painting}
     {#if !stacked}
-      <span class="popwrap">
+      <span class="popwrap" use:dismiss={{ open: presetsOpen, close: () => (presetsOpen = false) }}>
         <button class="icon wide" class:on={presetsOpen} title="Brush presets, shared by everyone" onclick={() => (presetsOpen = !presetsOpen)}>
           <Icon name="presets" /> Presets
         </button>
         {#if presetsOpen}
-          <div class="pop left"><PresetsPanel /></div>
+          <div class="pop left" data-over-canvas><PresetsPanel /></div>
         {/if}
       </span>
     {/if}
@@ -101,7 +102,7 @@
         </button>
       {/if}
       {#if !stacked}
-        <span class="popwrap">
+        <span class="popwrap" use:dismiss={{ open: dynamicsOpen, close: () => (dynamicsOpen = false) }}>
           <button class="icon wide" class:on={dynamicsOn} title="Angle, roundness, jitter, scatter and grain" onclick={(e) => {
             dynamicsLeft = e.currentTarget.getBoundingClientRect().right < 300;
             dynamicsOpen = !dynamicsOpen;
@@ -109,7 +110,7 @@
             <Icon name="dynamics" /> Dynamics
           </button>
           {#if dynamicsOpen}
-            <div class="pop" class:left={dynamicsLeft}>{@render dynamics()}</div>
+            <div class="pop" data-over-canvas class:left={dynamicsLeft}>{@render dynamics()}</div>
           {/if}
         </span>
       {/if}

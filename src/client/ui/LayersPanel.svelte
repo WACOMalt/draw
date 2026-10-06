@@ -9,6 +9,7 @@
   import AdjustPanel from './AdjustPanel.svelte';
   import Icon from './Icon.svelte';
   import Slider from './Slider.svelte';
+  import { dismiss } from '../dismiss';
 
   let { engine }: { engine: Engine | null } = $props();
 
@@ -298,7 +299,7 @@
 
   <div class="footer">
     <button class="icon" title="New layer" onclick={() => engine?.addLayer()}><Icon name="plus" /></button>
-    <span class="menuwrap">
+    <span class="menuwrap" use:dismiss={{ open: adjustMenu, close: () => (adjustMenu = false) }}>
       <button class="icon" title="New adjustment layer" onclick={() => (adjustMenu = !adjustMenu)}><Icon name="adjust" /></button>
       {#if adjustMenu}
         <div class="menu" role="menu">
