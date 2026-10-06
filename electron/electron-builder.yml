@@ -12,6 +12,7 @@ files:
   - offline.html
   - package.json
   - thumbnail.cjs
+  - update.cjs
   - thumb/**
 extraResources:
   - from: ../src-tauri/mime/xyz.bsums.draw.xml

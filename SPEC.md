@@ -414,6 +414,18 @@ What Discord, X/Twitter, Slack, Mastodon, iMessage and others show for a `/s/` o
 - `GET /api/oembed?url=…`: a `rich` oEmbed answer with the live embed (§9.5) as an `<iframe>`, framed like the preview image (or the `r` of an `/e/` link), 800 px wide (or `maxwidth`). 401 for a private link, 404 for other sites.
 - Limits: Discord and X show images, not live pages: the image is a recent snapshot, and Discord keeps its copy of a card for a while. Sites that embed through oEmbed (directly or through Iframely, such as Notion and Medium) can show the live canvas.
 
+### 9.7 App updates
+
+The Android app and the Linux AppImage update themselves from the latest GitHub release. Code: `src/client/update.svelte.ts` (the logic), `ui/UpdateDialog.svelte`, `src-tauri/gen/android/.../AppUpdate.kt`, `electron/update.cjs`.
+
+- Check: a little after start, then every 6 hours while the app is open (and when an Android app comes back after 6 hours). The start page has "Check for updates". `releases/latest` must not be a draft or a pre-release, and its tag must be newer than the app. The dialog lists the commit subjects since the installed version (GitHub's compare API).
+- Dialog: Update, Later, Skip this version (not offered again until a newer one), and "Check automatically" (off: only the start page button checks). Stored in `localStorage` `draw.update`.
+- Android: the page finds the asset `Draw_<ver>_android.apk`, and the app (as `window.DrawAppUpdate`) downloads it into its cache from GitHub hosts only, makes sure the file is a package of this app, and opens Android's installer. Android installs it only when the release key signed it. The first time, the dialog explains how to allow Draw to install apps and opens that setting (permission `REQUEST_INSTALL_PACKAGES`).
+- AppImage: the app reads the release, downloads `Draw_<ver>_amd64.AppImage` (every redirect must stay on a GitHub host) next to the running file, checks the size, the SHA-256 that GitHub lists for the asset and the AppImage header, and renames it over the running AppImage. The path does not change, so Gear Lever's entry and desktop launchers keep working. "Restart now" starts the new file; otherwise the next start runs it. A folder the user cannot write gets the release link instead.
+- `.deb` and `.rpm`: the dialog says a new version exists and opens the release page; the package manager updates the app.
+- The web app and the Windows and macOS apps show nothing.
+- Keep the asset names above and the `--latest` publish in `.github/workflows/release.yml`, or the apps stop finding updates. Apps before v0.2.35 have no updater: update those by hand one time.
+
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).

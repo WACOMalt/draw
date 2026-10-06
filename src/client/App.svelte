@@ -9,6 +9,8 @@
   import Modal from './ui/Modal.svelte';
   import OpenFileDialog from './ui/OpenFileDialog.svelte';
   import { isBdrawName, offerFile, watchOpenedFiles } from './files';
+  import UpdateDialog from './ui/UpdateDialog.svelte';
+  import { watchUpdates } from './update.svelte';
 
   let path = $state(location.pathname);
   const code = $derived.by(() => {
@@ -40,6 +42,7 @@
     void loadMe();
     watchOpenedFiles();
     watchAuth();
+    watchUpdates();
     // Links from emails and the desktop app arrive as query parameters. Handle, then tidy the URL.
     const q = new URLSearchParams(location.search);
     const verify = q.get('verify');
@@ -114,6 +117,8 @@
     {/if}
   </Modal>
 {/if}
+
+<UpdateDialog />
 
 {#if ed.toast}<div class="toast" role="status">{ed.toast}</div>{/if}
 

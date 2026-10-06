@@ -7,12 +7,14 @@
 //
 // Native parts: .bdraw files the system opens the app with (sent to the page through
 // preload.cjs), the .bdraw MIME type for AppImages (Gear Lever does not install it), and a
-// file manager thumbnailer for .bdraw (draw-thumbnailer.sh).
+// file manager thumbnailer for .bdraw (draw-thumbnailer.sh), and updates from the GitHub
+// releases (update.cjs).
 
 const { app, BrowserWindow, Menu, ipcMain, shell } = require('electron');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const updates = require('./update.cjs');
 
 const SITE = (process.env.DRAW_URL || 'https://draw.bsums.xyz').replace(/\/+$/, '');
 const ORIGIN = new URL(SITE).origin;
@@ -111,6 +113,16 @@ ipcMain.on('opened-files-ready', (e) => {
   pageReady = true;
   sendPending();
 });
+
+// Updates (update.cjs). Only the site's page may ask.
+const fromPage = (e) => win && e.sender === win.webContents && isOurs(e.senderFrame?.url ?? '');
+ipcMain.handle('update-check', (e) => (fromPage(e) ? updates.check() : null));
+ipcMain.handle('update-download', (e) => {
+  if (!fromPage(e)) return;
+  const wc = e.sender;
+  return updates.download((fraction) => !wc.isDestroyed() && wc.send('update-progress', fraction));
+});
+ipcMain.handle('update-restart', (e) => fromPage(e) && updates.restart());
 
 app.on('second-instance', (_e, argv) => {
   collect(argv);

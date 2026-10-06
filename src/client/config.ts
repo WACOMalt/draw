@@ -15,6 +15,15 @@ export const IS_TAURI = '__TAURI_INTERNALS__' in window;
 export interface DrawDesktop {
   kind: 'electron';
   onOpenFile(callback: (name: string, bytes: Uint8Array) => void): void;
+  /** Updates from the GitHub releases (electron/update.cjs). Missing in apps before v0.2.35. */
+  updates?: {
+    check(): Promise<{
+      current: string;
+      update: { version: string; page: string; install: 'appimage' | 'manual'; size: number; installed: boolean } | null;
+    }>;
+    download(onProgress: (fraction: number) => void): Promise<void>;
+    restart(): Promise<void>;
+  };
 }
 export const ELECTRON = (window as unknown as { drawDesktop?: DrawDesktop }).drawDesktop ?? null;
 

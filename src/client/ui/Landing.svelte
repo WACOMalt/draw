@@ -1,6 +1,7 @@
 <script lang="ts">
   import { loadRecent, removeRecent, type Recent } from '../recent';
   import { DOWNLOAD_URL, IS_DESKTOP } from '../config';
+  import { CAN_UPDATE, checkForUpdates, upd } from '../update.svelte';
   import { api } from '../api';
   import { pickFile } from '../files';
   import { links } from '../identity';
@@ -124,7 +125,12 @@
       </ul>
     {/if}
   </div>
-  <p class="version">v{__APP_VERSION__}</p>
+  <p class="version">
+    v{__APP_VERSION__}
+    {#if CAN_UPDATE}
+      · <button class="check" disabled={upd.checking} onclick={() => checkForUpdates(true)}>{upd.checking ? 'Checking…' : 'Check for updates'}</button>
+    {/if}
+  </p>
 </main>
 
 <style>
@@ -271,6 +277,18 @@
     margin: 0;
     font-size: 11px;
     color: var(--text-faint);
+  }
+  .version .check {
+    padding: 0;
+    border: none;
+    background: none;
+    font-size: inherit;
+    color: var(--text-dim);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .version .check:disabled {
+    text-decoration: none;
   }
   .x {
     font-size: 16px;

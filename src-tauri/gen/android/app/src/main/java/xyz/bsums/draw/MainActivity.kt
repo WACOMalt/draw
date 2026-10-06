@@ -3,6 +3,7 @@ package xyz.bsums.draw
 import android.graphics.Color
 import android.os.Bundle
 import android.view.View
+import android.webkit.WebView
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
@@ -26,5 +27,10 @@ class MainActivity : TauriActivity() {
       v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
       WindowInsetsCompat.CONSUMED
     }
+  }
+
+  // Updates from the GitHub releases (AppUpdate.kt): the page calls window.DrawAppUpdate.
+  override fun onWebViewCreate(webView: WebView) {
+    webView.addJavascriptInterface(AppUpdate(this, webView), "DrawAppUpdate")
   }
 }
