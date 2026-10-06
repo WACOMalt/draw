@@ -122,7 +122,7 @@
   <div class="editor" class:narrow>
     <TopBar {engine} {code} {narrow} {onLeave} />
     {#if !narrow}
-      <OptionsBar />
+      <OptionsBar {engine} />
       <Toolbar {engine} />
     {/if}
     <div class="stage">
@@ -174,7 +174,7 @@
         {:else if sheet === 'color'}
           <Sheet title="Color" onClose={() => (sheet = null)}><ColorPanel {engine} /></Sheet>
         {:else if sheet === 'layers'}
-          <Sheet title="Layers" tall onClose={() => (sheet = null)}><LayersPanel {engine} /></Sheet>
+          <Sheet title="Layers" tall onClose={() => (sheet = null)}><LayersPanel {engine} sheet /></Sheet>
         {/if}
       {/if}
     </div>

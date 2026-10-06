@@ -5,13 +5,20 @@
 
   let { engine }: { engine: Engine | null } = $props();
 
-  const TOOLS: { id: Tool; icon: string; label: string; key: string }[] = [
+  // Top: painting tools, the colors, the eyedropper and Transform. Bottom: navigation.
+  type T = { id: Tool; icon: string; label: string; key: string };
+  const PAINT: T[] = [
     { id: 'brush', icon: 'brush', label: 'Brush', key: 'B' },
     { id: 'eraser', icon: 'eraser', label: 'Eraser', key: 'E' },
     { id: 'strokeEraser', icon: 'strokeEraser', label: 'Stroke eraser: removes whole strokes', key: 'Shift+E' },
-    { id: 'eyedropper', icon: 'eyedropper', label: 'Eyedropper', key: 'I' },
-    { id: 'hand', icon: 'hand', label: 'Hand', key: 'H' },
   ];
+  const PICK: T = { id: 'eyedropper', icon: 'eyedropper', label: 'Eyedropper', key: 'I' };
+  const VIEW: T[] = [
+    { id: 'hand', icon: 'hand', label: 'Hand', key: 'H' },
+    { id: 'zoom', icon: 'zoom', label: 'Zoom: click zooms in, Alt+click or right-click zooms out, drag sideways', key: 'Z' },
+  ];
+
+  const active = $derived(ed.layers.find((l) => l.id === ed.activeLayerId) ?? null);
 
   function select(t: Tool) {
     ed.tool = t;
@@ -19,12 +26,14 @@
   }
 </script>
 
+{#snippet tool(t: T)}
+  <button class="icon tool" class:on={ed.tool === t.id} title="{t.label} ({t.key})" aria-label={t.label} onclick={() => select(t.id)}>
+    <Icon name={t.icon} />
+  </button>
+{/snippet}
+
 <nav>
-  {#each TOOLS as t}
-    <button class="icon tool" class:on={ed.tool === t.id} title="{t.label} ({t.key})" onclick={() => select(t.id)}>
-      <Icon name={t.icon} />
-    </button>
-  {/each}
+  {#each PAINT as t}{@render tool(t)}{/each}
 
   <div class="colors">
     <button class="swatch bg" style:background={ed.bg} title="Background color (X swaps)" aria-label="Background color" onclick={() => ([ed.fg, ed.bg] = [ed.bg, ed.fg])}></button>
@@ -32,6 +41,21 @@
     <button class="icon mini swap" title="Swap colors (X)" onclick={() => ([ed.fg, ed.bg] = [ed.bg, ed.fg])}><Icon name="swap" /></button>
     <button class="mini reset" title="Default colors (D)" aria-label="Default colors" onclick={() => ((ed.fg = '#000000'), (ed.bg = '#ffffff'))}></button>
   </div>
+
+  {@render tool(PICK)}
+  <button
+    class="icon tool"
+    class:on={!!ed.transform}
+    title="Transform the layer: move, scale, rotate (Ctrl+T or V)"
+    aria-label="Transform the layer"
+    disabled={!ed.canEdit || !active || active.kind === 'adjust'}
+    onclick={() => (ed.transform ? engine?.cancelTransform() : engine?.startTransform())}
+  >
+    <Icon name="transform" />
+  </button>
+
+  <span class="grow"></span>
+  {#each VIEW as t}{@render tool(t)}{/each}
 </nav>
 
 <style>
@@ -44,16 +68,26 @@
     padding: 8px 0;
     background: var(--bg-2);
     border-right: 1px solid var(--border);
+    /* A very small window (options in 3 rows, 400 px tall) scrolls the bar: a thin scrollbar
+       shows that Hand and Zoom are below. */
+    overflow-y: auto;
+    scrollbar-width: thin;
   }
   .tool {
     width: 32px;
     height: 30px;
+    flex: none;
+  }
+  .grow {
+    flex: 1;
+    min-height: 8px;
   }
   .colors {
     position: relative;
+    flex: none;
     width: 36px;
     height: 44px;
-    margin-top: 10px;
+    margin: 6px 0;
   }
   .swatch {
     position: absolute;
@@ -89,6 +123,19 @@
   .swap :global(svg) {
     width: 11px;
     height: 11px;
+  }
+  /* Short windows: a tighter bar, so every tool shows without scrolling. */
+  @media (max-height: 480px) {
+    nav {
+      gap: 1px;
+      padding: 4px 0;
+    }
+    .tool {
+      height: 27px;
+    }
+    .colors {
+      margin: 3px 0;
+    }
   }
   .reset {
     left: 1px;

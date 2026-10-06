@@ -144,6 +144,8 @@ export class Engine {
   private stroke: ActiveStroke | null = null;
   private pan: { pointerId: number; x: number; y: number } | null = null;
   private picking: number | null = null;
+  /** Magnifier press: a click zooms in or out at x0,y0, a sideways drag zooms smoothly. */
+  private zooming: { pointerId: number; x0: number; y0: number; zoom0: number; out: boolean; moved: boolean } | null = null;
   private spaceDown = false;
   private altDown = false;
   private rect: DOMRect;
@@ -349,6 +351,37 @@ export class Engine {
     this.zoomAt(w / 2, h / 2, this.comp.view.zoom * factor);
   }
 
+  /** The magnifier's zoom animation in progress: where it ends. */
+  private glide: { x: number; y: number; zoom: number; token: number } | null = null;
+
+  /** A short animated zoom about a point (the magnifier's click). */
+  private glideZoom(cssX: number, cssY: number, zoom: number): void {
+    const token = ++this.flight;
+    const z0 = this.comp.view.zoom;
+    const z1 = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom));
+    this.glide = { x: cssX, y: cssY, zoom: z1, token };
+    const start = performance.now();
+    const step = () => {
+      if (token !== this.flight) return;
+      const t = Math.min(1, (performance.now() - start) / 160);
+      const e = 1 - (1 - t) ** 3;
+      this.zoomAt(cssX, cssY, z0 * (z1 / z0) ** e);
+      if (t < 1) requestAnimationFrame(step);
+      else this.glide = null;
+    };
+    requestAnimationFrame(step);
+  }
+
+  /** Ends a magnifier animation at its target at once (quick clicks add up exactly). */
+  private finishGlide(): void {
+    const g = this.glide;
+    this.glide = null;
+    if (g && g.token === this.flight) {
+      this.flight++;
+      this.zoomAt(g.x, g.y, g.zoom);
+    }
+  }
+
   /** Embed: scales the frame to fit the box, centered (no animation). */
   private showFrame(): void {
     const f = this.frame!;
@@ -511,7 +544,17 @@ export class Engine {
   updateCursor(): void {
     const tool = this.effectiveTool();
     this.canvas.style.cursor =
-      tool === 'hand' ? (this.pan ? 'grabbing' : 'grab') : tool === 'eyedropper' ? 'crosshair' : 'none';
+      tool === 'hand'
+        ? this.pan
+          ? 'grabbing'
+          : 'grab'
+        : tool === 'eyedropper'
+          ? 'crosshair'
+          : tool === 'zoom'
+            ? this.altDown
+              ? 'zoom-out'
+              : 'zoom-in'
+            : 'none';
     this.updateBrushCursor();
     this.schedulePaths(); // the path overlay shows with the stroke eraser only
   }
@@ -537,6 +580,7 @@ export class Engine {
 
   private onPointerDown(e: PointerEvent): void {
     const [x, y] = this.local(e);
+    this.finishGlide(); // a magnifier zoom in progress ends at its target
     this.stopFlight(); // any touch stops a fly-to
     if (e.pointerType === 'pen' || nativePenFor(e)) this.penSeen = true;
     if (e.pointerType === 'touch' && this.onTouchDown(e, x, y)) return;
@@ -545,7 +589,7 @@ export class Engine {
       if (e.pointerType === 'touch' && !this.stroke && !this.pan) this.pan = { pointerId: e.pointerId, x, y };
       return;
     }
-    if (this.stroke || this.pan || this.picking !== null) return;
+    if (this.stroke || this.pan || this.picking !== null || this.zooming) return;
     this.engaged = true;
     try {
       this.canvas.setPointerCapture(e.pointerId);
@@ -557,6 +601,11 @@ export class Engine {
       e.preventDefault();
       this.pan = { pointerId: e.pointerId, x, y };
       this.updateCursor();
+      return;
+    }
+    if (tool === 'zoom' && (e.button === 0 || e.button === 2) && !this.isEraserEnd(e)) {
+      e.preventDefault();
+      this.zooming = { pointerId: e.pointerId, x0: x, y0: y, zoom0: this.comp.view.zoom, out: e.button === 2 || e.altKey, moved: false };
       return;
     }
     // The eraser end of a pen erases, whatever tool is selected.
@@ -595,6 +644,15 @@ export class Engine {
       this.sendCursor(wx, wy);
     }
 
+    if (this.zooming && e.pointerId === this.zooming.pointerId) {
+      const zm = this.zooming;
+      const dx = x - zm.x0;
+      if (!zm.moved && Math.abs(dx) < 4) return;
+      zm.moved = this.moved = true;
+      // Right zooms in, left zooms out: 100 px is about 2.7x.
+      this.zoomAt(zm.x0, zm.y0, zm.zoom0 * Math.exp(dx * 0.01));
+      return;
+    }
     if (this.pan && e.pointerId === this.pan.pointerId) {
       this.moved = true;
       const v = this.comp.view;
@@ -632,6 +690,14 @@ export class Engine {
     if (this.picking === e.pointerId) {
       this.picking = null;
       this.addSwatch(ed.fg);
+    }
+    if (this.zooming && e.pointerId === this.zooming.pointerId) {
+      const zm = this.zooming;
+      this.zooming = null;
+      if (!zm.moved && e.type === 'pointerup') {
+        this.moved = true;
+        this.glideZoom(zm.x0, zm.y0, zm.zoom0 * (zm.out ? 0.5 : 2));
+      }
     }
     if (this.sweep && e.pointerId === this.sweep.pointerId) this.endSweep();
     if (this.stroke && e.pointerId === this.stroke.pointerId) {
@@ -683,6 +749,7 @@ export class Engine {
       }
       this.pan = null;
       this.picking = null;
+      this.zooming = null;
       this.startGesture();
       return true;
     }
@@ -1789,7 +1856,7 @@ export class Engine {
       else b.opacity = v;
       return;
     }
-    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', h: 'hand' };
+    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', h: 'hand', z: 'zoom' };
     if (key === 'v') {
       this.startTransform();
     } else if (tools[key]) {

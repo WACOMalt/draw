@@ -11,7 +11,8 @@
   import Slider from './Slider.svelte';
   import { dismiss } from '../dismiss';
 
-  let { engine }: { engine: Engine | null } = $props();
+  /** sheet: the phone's layers sheet. It keeps the Transform button (no tool bar on phones). */
+  let { engine, sheet = false }: { engine: Engine | null; sheet?: boolean } = $props();
 
   interface Row {
     layer: Layer;
@@ -341,9 +342,11 @@
       <Icon name="clip" />
     </button>
     <button class="icon" title="Duplicate (Ctrl+J)" disabled={!active} onclick={() => active && engine?.duplicate(active.id)}><Icon name="copy" /></button>
-    <button class="icon" title="Transform: move, scale, rotate (Ctrl+T or V)" disabled={!active || active.kind === 'adjust'} onclick={() => engine?.startTransform()}>
-      <Icon name="transform" />
-    </button>
+    {#if sheet}
+      <button class="icon" title="Transform: move, scale, rotate" disabled={!active || active.kind === 'adjust'} onclick={() => engine?.startTransform()}>
+        <Icon name="transform" />
+      </button>
+    {/if}
     <button class="icon" title="Move up" disabled={!active || !engine?.canMove(active.id, 1)} onclick={() => active && engine?.moveLayer(active.id, 1)}>
       <Icon name="up" />
     </button>

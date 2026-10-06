@@ -267,7 +267,7 @@ The layout is close to Photoshop, but simpler, with a dark theme.
 
 - Top bar: app name, session code with a copy-link button, peer avatars, connection state
 - Options bar: the settings of the current tool (size, opacity, flow, hardness, spacing, pressure, build-up). In a narrow window, the bar wraps to a second row. It never cuts off a control.
-- Left toolbar: brush (B), eraser (E), eyedropper (I), hand (H), foreground and background colors
+- Left toolbar, top to bottom: brush (B), eraser (E), stroke eraser (Shift+E), foreground and background colors, eyedropper (I), Transform (Ctrl+T or V; it opens and closes the transform box of the active layer); at the bottom: hand (H) and zoom (Z). Zoom tool: a click zooms in 2× at the point (a short animation), Alt+click or right-click zooms out 2×, a sideways drag zooms smoothly about the press point (right: in); the cursor shows zoom-in or zoom-out. Its options bar has zoom out, zoom in, 100% and Fit all. Two fingers still pinch-zoom with any tool
 - Right panels: Color, Layers
 - Status bar: zoom, cursor position in world units, stroke count
 
@@ -323,7 +323,7 @@ A tool (Shift+E; after the eraser in the toolbars) that removes whole strokes, a
 ### 9.0 Layers panel, groups and transform
 
 - The panel is a tree, top layer first: a group's row (folder icon, an arrow to open or close it; closed groups are kept per device), then its layers, indented. Every row has a grip: drag it (mouse, pen or finger) onto the upper or lower part of a row to go above or below it, or onto the middle of a group to go into it, at its top. The up and down buttons move a layer among the layers of its group.
-- Buttons: new layer, new adjustment layer, group (puts the active layer in a new group; on a group: ungroup), mask, clip, duplicate, transform, up, down, delete. Shortcuts: Ctrl+G groups, Ctrl+Shift+G ungroups, Ctrl+J duplicates, Ctrl+T or V transforms (browsers keep Ctrl+T for a new tab; V works there).
+- Buttons: new layer, new adjustment layer, group (puts the active layer in a new group; on a group: ungroup), mask, clip, duplicate, up, down, delete. Transform is in the left toolbar; the phone's layers sheet keeps a Transform button (phones have no left toolbar). Shortcuts: Ctrl+G groups, Ctrl+Shift+G ungroups, Ctrl+J duplicates, Ctrl+T or V transforms (browsers keep Ctrl+T for a new tab; V works there).
 - New layers go above the active layer in its group, or at the top of the active group. A group cannot be painted on: the brush says so.
 - Transform: a box around what the layer or group draws, with 8 handles and a rotate handle. Drag inside to move. A corner scales and keeps the shape (Shift: free; Alt: from the center). An edge stretches one way. The rotate handle turns (Shift: 15° steps). A toolbar shows the size and the angle, and has flip horizontal, flip vertical, reset, cancel and apply. Enter applies, Esc cancels, arrow keys nudge (Shift: 10 px). While the box is open the canvas only pans, and the wheel still zooms over the box.
 - Preview: while the handles move, the renderer draws a copy of what the layer showed on screen through the transform (one GPU pass), so dragging stays smooth even for a large group. Parts that were off screen are missing until the transform is applied. After Apply, the preview stays until the layer's tiles show the transformed strokes, so the layer does not flash back.

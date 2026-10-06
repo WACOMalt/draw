@@ -5,8 +5,11 @@ import type { Brush, CanvasInfo, DeniedReason, Layer, Role } from '../shared/typ
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
-/** strokeEraser: removes whole strokes whose path the circle touches (see engine.ts). */
-export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'hand';
+/**
+ * strokeEraser: removes whole strokes whose path the circle touches. zoom: the magnifier (click
+ * zooms in, Alt+click or right-click zooms out, a sideways drag zooms smoothly). See engine.ts.
+ */
+export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'hand' | 'zoom';
 export type { BrushSettings } from '../shared/types';
 import type { BrushSettings } from '../shared/types';
 

@@ -1,14 +1,15 @@
 <script lang="ts">
   import { BRUSH_TIPS, GRAINS, LIMITS, type BrushTip, type GrainId } from '../../shared/types';
+  import type { Engine } from '../engine/engine';
   import { ed, type Tool } from '../state.svelte';
   import Icon from './Icon.svelte';
   import PresetsPanel from './PresetsPanel.svelte';
   import Slider from './Slider.svelte';
   import { dismiss } from '../dismiss';
 
-  let { stacked = false }: { stacked?: boolean } = $props();
+  let { stacked = false, engine = null }: { stacked?: boolean; engine?: Engine | null } = $props();
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
-  const TOOL_LABEL: Record<Tool, string> = { brush: 'Brush', eraser: 'Eraser', strokeEraser: 'Stroke eraser', eyedropper: 'Eyedropper', hand: 'Hand' };
+  const TOOL_LABEL: Record<Tool, string> = { brush: 'Brush', eraser: 'Eraser', strokeEraser: 'Stroke eraser', eyedropper: 'Eyedropper', hand: 'Hand', zoom: 'Zoom' };
   const b = $derived(ed.activeBrush);
   let dynamicsOpen = $state(false);
   /** The Dynamics popover opens to the right when its button is near the left edge (a wrapped row). */
@@ -132,6 +133,14 @@
     <span class="hint">Removes every stroke whose path the circle touches. Undo brings them back.</span>
   {:else if ed.tool === 'eyedropper'}
     <span class="hint">Click the canvas to pick a color from all layers. Hold Alt with the brush for a quick pick.</span>
+  {:else if ed.tool === 'zoom'}
+    <div class="toggles">
+      <button class="icon wide" title="Zoom out (Ctrl+−)" onclick={() => engine?.zoomBy(0.5)}>−</button>
+      <button class="icon wide" title="Zoom in (Ctrl+=)" onclick={() => engine?.zoomBy(2)}>+</button>
+      <button class="icon wide" title="Actual size (Ctrl+1)" onclick={() => engine?.resetView()}>100%</button>
+      <button class="icon wide" title="Fit everything (Ctrl+0)" onclick={() => engine?.fitAll()}>Fit all</button>
+    </div>
+    <span class="hint">Click to zoom in. Alt+click or right-click to zoom out. Drag right or left to zoom smoothly.</span>
   {:else}
     <span class="hint">Drag to pan. Hold Space with any tool to pan. Scroll to zoom.</span>
   {/if}
