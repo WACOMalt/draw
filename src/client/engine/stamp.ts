@@ -4,6 +4,9 @@ import { brushShape } from '../../shared/brush';
 import type { Brush, BrushTip } from '../../shared/types';
 import { TIP_SIZE, tipMask } from './tips';
 
+/** Above this diameter in pixels, an axis-aligned dab draws only its visible part (see dab). */
+const HUGE_STAMP = 8192;
+
 export type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
 const MIN_STAMP = 4;
@@ -159,7 +162,24 @@ export class DabPainter {
     ctx.globalAlpha = Math.min(1, a);
     const cx = (x - this.ox) * this.scale, cy = (y - this.oy) * this.scale;
     if ((this.tip === 'round' && this.roundness >= 1) || d <= 1) {
-      ctx.drawImage(this.lastStamp!, cx - d / 2, cy - d / 2, d, d);
+      const img = this.lastStamp!;
+      if (d <= HUGE_STAMP) {
+        ctx.drawImage(img, cx - d / 2, cy - d / 2, d, d);
+        return;
+      }
+      // A huge dab (deep zoom): draw only the part of the stamp over the canvas. Destination
+      // rectangles of millions of pixels lose precision, and the dab vanished.
+      const x0 = Math.max(0, cx - d / 2), y0 = Math.max(0, cy - d / 2);
+      const x1 = Math.min(ctx.canvas.width, cx + d / 2), y1 = Math.min(ctx.canvas.height, cy + d / 2);
+      if (x1 <= x0 || y1 <= y0) return;
+      const k = img.width / d;
+      let sx = (x0 - (cx - d / 2)) * k, sy = (y0 - (cy - d / 2)) * k, sw = (x1 - x0) * k, sh = (y1 - y0) * k;
+      // At extreme zoom the visible part of the stamp is a billionth of a pixel: float32 makes
+      // that an empty rectangle. Read at least 1/64 pixel around the same point (one color there).
+      const MIN = 1 / 64;
+      if (sw < MIN) [sx, sw] = [sx + sw / 2 - MIN / 2, MIN];
+      if (sh < MIN) [sy, sh] = [sy + sh / 2 - MIN / 2, MIN];
+      ctx.drawImage(img, sx, sy, sw, sh, x0, y0, x1 - x0, y1 - y0);
       return;
     }
     // Rotate, then squash along the tip height.

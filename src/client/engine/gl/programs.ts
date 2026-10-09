@@ -75,6 +75,7 @@ layout(location = 1) in vec4 aDab;      // cx, cy, rv, alpha
 layout(location = 2) in float aR;       // true radius in px
 layout(location = 3) in float aRot;     // tip rotation, radians
 layout(location = 4) in vec4 aPaint;    // r, g, b, hardness (per dab: strokes share draw calls)
+layout(location = 5) in vec3 aHuge;     // stand-in of a huge dab: edge offset, true center x, y
 uniform vec2 uTarget;
 out vec2 vLocal;
 flat out float vRv;
@@ -83,6 +84,8 @@ flat out float vA;
 flat out float vRot;
 flat out vec3 vColor;
 flat out float vHardness;
+flat out float vOff;
+flat out vec2 vTrue;
 void main() {
   float ext = aDab.z + 1.0;               // one pixel margin for the antialiased edge
   vLocal = (aCorner * 2.0 - 1.0) * ext;
@@ -92,6 +95,8 @@ void main() {
   vRot = aRot;
   vColor = aPaint.rgb;
   vHardness = aPaint.a;
+  vOff = aHuge.x;
+  vTrue = aHuge.yz;
   vec2 p = aDab.xy + vLocal;
   gl_Position = vec4(p / uTarget * 2.0 - 1.0, 0.0, 1.0);
 }`;
@@ -112,6 +117,8 @@ flat in float vA;
 flat in float vRot;
 flat in vec3 vColor;
 flat in float vHardness;
+flat in float vOff;
+flat in vec2 vTrue;
 uniform int uTip;
 uniform float uRoundness;
 uniform sampler2DArray uTips;
@@ -129,7 +136,7 @@ void main() {
   float a;
   if (uTip < 0) {
     float d = length(q);
-    float edge = vRv - d;                 // pixels inside the edge
+    float edge = vRv - d + vOff;          // pixels inside the edge (vOff: see putDab)
     if (edge <= -0.5) discard;
     float t = clamp(1.0 - edge / vR, 0.0, 1.0); // 0 at the center, 1 at the edge
     a = 1.0;
@@ -139,7 +146,11 @@ void main() {
     }
     a *= clamp(edge + 0.5, 0.0, 1.0);    // one pixel of antialiasing
   } else {
-    vec2 uv = q / max(vRv, 1e-6) * 0.5 + 0.5;
+    // Relative to the true center (vTrue is 0 unless the dab is huge), in units of its radius.
+    vec2 l = vLocal - vTrue;
+    vec2 qt = vec2(c * l.x + s * l.y, -s * l.x + c * l.y);
+    qt.y /= uRoundness;
+    vec2 uv = qt / max(vR, 1e-6) * 0.5 + 0.5;
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) discard;
     a = texture(uTips, vec3(uv, float(uTip))).r;
   }

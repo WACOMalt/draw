@@ -31,10 +31,11 @@ interface Grid {
 }
 
 /**
- * Floats per dab instance on the GPU: cx, cy, rv, a, r, rot, then r, g, b, hardness (paintDabs).
- * Color and hardness per dab let a run of strokes share one draw call (drawStrokes).
+ * Floats per dab instance on the GPU: cx, cy, rv, a, r, rot, then r, g, b, hardness (paintDabs),
+ * then the stand-in data of a huge dab (putDab): edge offset, true center x, y. Color and
+ * hardness per dab let a run of strokes share one draw call (drawStrokes).
  */
-const INST = 10;
+const INST = 13;
 /** Most dabs in one batched draw call. */
 const MAX_BATCH = 65536;
 
@@ -301,6 +302,9 @@ export class GLRenderer implements Renderer {
     gl.enableVertexAttribArray(4);
     gl.vertexAttribPointer(4, 4, gl.FLOAT, false, stride, 24);
     gl.vertexAttribDivisor(4, 1);
+    gl.enableVertexAttribArray(5);
+    gl.vertexAttribPointer(5, 3, gl.FLOAT, false, stride, 40);
+    gl.vertexAttribDivisor(5, 1);
     gl.bindVertexArray(null);
 
     // Tips and grains upload on first use (tips.ts generates them on the CPU).
@@ -640,16 +644,27 @@ export class GLRenderer implements Renderer {
     }
     if (a <= 1e-5) return false;
     let rv = rp;
+    let off = 0, tx = 0, ty = 0;
     if (rp > HUGE_PX) {
-      // Move the center toward the target so the edge stays put but the numbers stay small.
+      // A stand-in circle of radius HUGE_PX, placed so that its edge lies along the true edge
+      // near the target: float32 keeps the edge exact there. Its center goes no deeper than
+      // half its radius inside; `off` adds the rest of the true depth to the edge distance.
+      // Without it, a target deeper than 2 × HUGE_PX inside the dab fell outside the stand-in,
+      // and a big stroke vanished when zoomed far into it. (tx, ty) is the true center relative
+      // to the stand-in's, for textured tips.
       const tcx = w / 2, tcy = h / 2;
       const dx = tcx - cx, dy = tcy - cy;
       const dist = Math.hypot(dx, dy);
-      const inside = rp - dist; // edge distance at the target center
+      const inside = rp - dist; // true edge distance at the target center
       const ux = dist > 0 ? dx / dist : 1, uy = dist > 0 ? dy / dist : 0;
       rv = HUGE_PX;
-      cx = tcx - ux * (rv - inside);
-      cy = tcy - uy * (rv - inside);
+      const keep = Math.min(inside, rv / 2);
+      off = inside - keep;
+      const vx = tcx - ux * (rv - keep), vy = tcy - uy * (rv - keep);
+      tx = cx - vx;
+      ty = cy - vy;
+      cx = vx;
+      cy = vy;
     }
     const o = i * INST;
     const f = this.inst;
@@ -659,6 +674,9 @@ export class GLRenderer implements Renderer {
     f[o + 3] = Math.min(1, a);
     f[o + 4] = rp;
     f[o + 5] = rot;
+    f[o + 10] = off;
+    f[o + 11] = tx;
+    f[o + 12] = ty;
     return true;
   }
 
