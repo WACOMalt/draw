@@ -2,7 +2,10 @@
 // layer opacity and blend modes, onto the visible canvas.
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
-import type { Affine, BlendMode, Brush, Layer, LayerBlend, Stroke } from '../../shared/types';
+import type { Affine, BlendMode, Brush, Layer, LayerBlend, Shape, Stroke } from '../../shared/types';
+import { byZ } from '../../shared/shapes';
+import { ShapeIndex, shapeRec } from './shapeIndex';
+import { drawShapes } from './shapeRaster';
 import { compose, effectivelyVisible, layerTree, type LayerNode } from '../../shared/layers';
 import { LUT_SIZE, hueSat, toneLut } from './adjust';
 import type { Renderer, ViewState } from './renderer';
@@ -63,6 +66,17 @@ interface TileEntry {
   ty: number;
 }
 
+/** A shape layer being edited, drawn on the main thread (see Hot in gl/glRenderer.ts). */
+interface Hot {
+  canvas: OffscreenCanvas;
+  rect: [number, number] | null;
+  version: number;
+  viewVersion: number;
+  /** The drafts ended: stay until the worker reports this seq rendered (or 3 s pass). */
+  settleSeq: number | null;
+  settleAt: number;
+}
+
 interface Live {
   id: string;
   layerId: string;
@@ -99,6 +113,15 @@ export class Canvas2DRenderer implements Renderer {
   /** A layer or group drawn moved by a transform not applied yet (see the WebGL2 renderer). */
   private preview: { id: string; m: Affine; settle: boolean; settleAt: number; snap: OffscreenCanvas | null; capture: { x: number; y: number; ds: number } | null } | null = null;
   private live = new Map<string, Live>();
+  /** Committed shapes, kept here too: edited shape layers draw on the main thread. */
+  private shapes = new ShapeIndex();
+  private shapeLayers = '';
+  private drafts = new Map<string, Map<string, Shape>>();
+  private draftVersion = 0;
+  private hot = new Map<string, Hot>();
+  /** Highest seq sent with a shape change, and the highest the worker reported rendered. */
+  private shapeSeq = 0;
+  private renderedSeq = 0;
   private pool: OffscreenCanvas[] = [];
   private scratch: OffscreenCanvas;
   private scratchCtx: OffscreenCanvasRenderingContext2D;
@@ -181,7 +204,105 @@ export class Canvas2DRenderer implements Renderer {
     this.layers = layers;
     this.tree = layerTree(layers);
     this.byId = new Map(layers.map((l) => [l.id, l]));
+    const ids = layers.filter((l) => l.kind === 'shape').map((l) => l.id);
+    if (ids.join() !== this.shapeLayers) {
+      this.shapeLayers = ids.join();
+      this.toWorker({ t: 'shapeLayers', ids });
+    }
     this.invalidate();
+  }
+
+  // --- shapes -----------------------------------------------------------------------------
+
+  resetShapes(shapes: Shape[]): void {
+    this.shapes.clear();
+    for (const s of shapes) this.shapes.put(s);
+    this.toWorker({ t: 'shapes', shapes });
+    this.draftVersion++;
+    this.invalidate();
+  }
+
+  putShape(shape: Shape, seq: number): void {
+    this.shapes.put(shape);
+    this.shapeSeq = Math.max(this.shapeSeq, seq);
+    this.toWorker({ t: 'shape', shape, seq });
+    this.draftVersion++;
+    this.invalidate();
+  }
+
+  removeShape(id: string, seq: number): void {
+    this.shapes.remove(id);
+    this.shapeSeq = Math.max(this.shapeSeq, seq);
+    this.toWorker({ t: 'shape.remove', id, seq });
+    this.draftVersion++;
+    this.invalidate();
+  }
+
+  setShapeDrafts(owner: string, shapes: Shape[]): void {
+    if (shapes.length) this.drafts.set(owner, new Map(shapes.map((s) => [s.id, s])));
+    else if (!this.drafts.delete(owner)) return;
+    this.draftVersion++;
+    this.invalidate();
+  }
+
+  /** Redraws the screen buffers of edited shape layers; drops the ones that settled. */
+  private updateHot(): void {
+    const want = new Set<string>();
+    const over = new Map<string, Shape>();
+    for (const d of this.drafts.values()) {
+      for (const s of d.values()) {
+        over.set(s.id, s);
+        want.add(s.layerId);
+        const old = this.shapes.recs.get(s.id);
+        if (old) want.add(old.shape.layerId);
+      }
+    }
+    const now = performance.now();
+    for (const [id, h] of this.hot) {
+      if (want.has(id)) {
+        h.settleSeq = null;
+        continue;
+      }
+      if (h.settleSeq === null) {
+        h.settleSeq = this.shapeSeq;
+        h.settleAt = now;
+      }
+      if (this.renderedSeq >= h.settleSeq || now - h.settleAt > 3000) this.hot.delete(id);
+      else this.invalidate(); // check again next frame
+    }
+    for (const id of want) {
+      if (!this.hot.has(id)) this.hot.set(id, { canvas: new OffscreenCanvas(1, 1), rect: null, version: -1, viewVersion: -1, settleSeq: null, settleAt: 0 });
+    }
+    const W = this.canvas.width, H = this.canvas.height;
+    const ds = this.view.zoom * this.dpr;
+    for (const [id, h] of this.hot) {
+      if (h.version === this.draftVersion && h.viewVersion === this.viewVersion) continue;
+      h.version = this.draftVersion;
+      h.viewVersion = this.viewVersion;
+      const list: Shape[] = [];
+      for (const r of this.shapes.layer(id)) if (!over.has(r.shape.id)) list.push(r.shape);
+      for (const s of over.values()) if (s.layerId === id && !s.deleted) list.push(s);
+      list.sort(byZ);
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const s of list) {
+        const r = shapeRec(s);
+        x0 = Math.min(x0, (r.x0 - this.view.x) * ds);
+        y0 = Math.min(y0, (r.y0 - this.view.y) * ds);
+        x1 = Math.max(x1, (r.x1 - this.view.x) * ds);
+        y1 = Math.max(y1, (r.y1 - this.view.y) * ds);
+      }
+      const rx0 = Math.max(0, Math.floor(x0) - 1), ry0 = Math.max(0, Math.floor(y0) - 1);
+      const rx1 = Math.min(W, Math.ceil(x1) + 1), ry1 = Math.min(H, Math.ceil(y1) + 1);
+      if (!(rx1 > rx0 && ry1 > ry0)) {
+        h.rect = null;
+        continue;
+      }
+      const w = rx1 - rx0, hh = ry1 - ry0;
+      h.canvas.width = w;
+      h.canvas.height = hh;
+      drawShapes(h.canvas.getContext('2d')!, list, this.view.x + rx0 / ds, this.view.y + ry0 / ds, ds, w, hh);
+      h.rect = [rx0, ry0];
+    }
   }
 
   setTransformPreview(p: { id: string; m: Affine } | null): void {
@@ -325,7 +446,9 @@ export class Canvas2DRenderer implements Renderer {
       this.invalidate();
       this.evict();
     } else if (m.t === 'rendered') {
+      this.renderedSeq = m.seq;
       for (const l of this.live.values()) if (l.commitSeq !== null && l.commitSeq <= m.seq) this.liveCancel(l.id);
+      if (this.hot.size) this.invalidate();
     }
   }
 
@@ -406,6 +529,7 @@ export class Canvas2DRenderer implements Renderer {
     const Y = (ty: number) => Math.round((ty * tw - vy) * ds);
 
     const grid: Grid = { lod, tx0, ty0, tx1, ty1, X, Y };
+    if (this.hot.size || this.drafts.size) this.updateHot();
     // Same order, groups and clipping groups as the WebGL2 renderer (gl/glRenderer.ts).
     this.drawNodes(ctx, this.tree, grid, 0);
     ctx.globalAlpha = 1;
@@ -530,6 +654,12 @@ export class Canvas2DRenderer implements Renderer {
   }
 
   private drawTiles(target: Ctx, key: string, g: Grid): void {
+    const hot = this.hot.get(key);
+    if (hot) {
+      // A shape layer being edited: its screen buffer instead of the tiles.
+      if (hot.rect) target.drawImage(hot.canvas, hot.rect[0], hot.rect[1]);
+      return;
+    }
     for (let ty = g.ty0; ty <= g.ty1; ty++) {
       const y0 = g.Y(ty), y1 = g.Y(ty + 1);
       for (let tx = g.tx0; tx <= g.tx1; tx++) {

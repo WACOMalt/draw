@@ -1,4 +1,4 @@
-import type { Stroke } from '../../shared/types';
+import type { Shape, Stroke } from '../../shared/types';
 
 /** Tile side in device pixels. */
 export const TILE = 256;
@@ -36,6 +36,11 @@ export type ToWorker =
   | { t: 'remove'; id: string; seq: number }
   | { t: 'seq'; seq: number }
   | { t: 'view'; view: TileView }
+  /** Which layers are shape layers (their tiles draw shapes). */
+  | { t: 'shapeLayers'; ids: string[] }
+  | { t: 'shapes'; shapes: Shape[] }
+  | { t: 'shape'; shape: Shape; seq: number }
+  | { t: 'shape.remove'; id: string; seq: number }
   | { t: 'forget'; keys: string[] };
 
 export type FromWorker =

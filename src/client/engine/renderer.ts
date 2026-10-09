@@ -2,7 +2,7 @@
 // - GLRenderer: WebGL2, half-float buffers, shader blend modes (preferred)
 // - Canvas2DRenderer: Canvas 2D + tile worker, 8-bit (fallback without WebGL2)
 
-import type { Affine, Brush, Layer, Stroke } from '../../shared/types';
+import type { Affine, Brush, Layer, Shape, Stroke } from '../../shared/types';
 import type { PerfProfile } from './perf';
 
 export interface ViewState {
@@ -33,6 +33,18 @@ export interface Renderer {
   addStroke(stroke: Stroke, seq: number): void;
   removeStroke(id: string, seq: number): void;
   advanceSeq(seq: number): void;
+
+  /** Committed shapes (live ones), as in the welcome. */
+  resetShapes(shapes: Shape[]): void;
+  /** A committed shape that is new or changed. A deleted shape is removed. */
+  putShape(shape: Shape, seq: number): void;
+  removeShape(id: string, seq: number): void;
+  /**
+   * Shapes as someone edits them (`owner`: 'local' or a peer id), drawn over the committed ones
+   * with the same id (deleted: hidden). An empty list ends that owner's drafts. A layer with
+   * drafts draws straight to the screen until the edit ends and its tiles catch up.
+   */
+  setShapeDrafts(owner: string, shapes: Shape[]): void;
 
   liveBegin(id: string, layerId: string, brush: Brush, remote: boolean): void;
   hasLive(id: string): boolean;

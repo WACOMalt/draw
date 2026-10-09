@@ -4,6 +4,8 @@
 import { DAB_CHUNK, DAB_STRIDE } from '../../shared/brush';
 import { DabPainter, StampCache } from './stamp';
 import { StrokeIndex, strokeDabs, strokeKey, type StrokeRec as Rec } from './strokeIndex';
+import { ShapeIndex, shapeTouches, type ShapeRec } from './shapeIndex';
+import { drawShapes } from './shapeRaster';
 import { TILE, tileKey, tileWorld, type FromWorker, type TileView, type ToWorker } from './tiles';
 
 interface TileRef {
@@ -17,6 +19,8 @@ const post = (msg: FromWorker, transfer: Transferable[] = []) =>
   (self as unknown as DedicatedWorkerGlobalScope).postMessage(msg, transfer);
 
 const index = new StrokeIndex();
+const shapes = new ShapeIndex();
+let shapeLayers = new Set<string>();
 /** Tiles the main thread holds. */
 const delivered = new Map<string, TileRef>();
 /** Delivered tiles whose content is out of date. */
@@ -48,6 +52,27 @@ function invalidate(rec: Rec): void {
   }
 }
 
+/** Marks the delivered tiles of the shape's layer under it stale. */
+function invalidateShape(rec: ShapeRec): void {
+  for (const [key, t] of delivered) {
+    if (t.layer !== rec.shape.layerId) continue;
+    const [x0, y0, x1, y1] = tileBounds(t.lod, t.tx, t.ty);
+    if (shapeTouches(rec, x0, y0, x1, y1, (x1 - x0) / TILE)) stale.add(key);
+  }
+}
+
+function renderShapeTile(t: TileRef): ImageBitmap | null {
+  const [wx0, wy0, wx1, wy1] = tileBounds(t.lod, t.tx, t.ty);
+  const scale = TILE / (wx1 - wx0);
+  const list = shapes.layer(t.layer).filter((r) => shapeTouches(r, wx0, wy0, wx1, wy1, 1 / scale));
+  if (list.length === 0) return null;
+  tileCtx.globalCompositeOperation = 'source-over';
+  tileCtx.globalAlpha = 1;
+  tileCtx.clearRect(0, 0, TILE, TILE);
+  drawShapes(tileCtx, list.map((r) => r.shape), wx0, wy0, scale, TILE, TILE);
+  return tileCanvas.transferToImageBitmap();
+}
+
 function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: number, wy0: number, wx1: number, wy1: number, scale: number): void {
   const painter = new DabPainter(ctx, stamps, rec.stroke.brush, wx0, wy0, scale);
   const w = (rec.x1 - rec.x0) * scale;
@@ -75,6 +100,7 @@ function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: numbe
 }
 
 function renderTile(t: TileRef): ImageBitmap | null {
+  if (shapeLayers.has(t.layer)) return renderShapeTile(t);
   const list = index.byLayer.get(t.layer);
   if (!list || list.length === 0) return null;
   const [wx0, wy0, wx1, wy1] = tileBounds(t.lod, t.tx, t.ty);
@@ -172,6 +198,31 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
     case 'view':
       setView(m.view);
       break;
+    case 'shapeLayers': {
+      const next = new Set(m.ids);
+      // A layer that just became known as a shape layer: its tiles were drawn as paint.
+      for (const [key, t] of delivered) if (next.has(t.layer) !== shapeLayers.has(t.layer)) stale.add(key);
+      shapeLayers = next;
+      break;
+    }
+    case 'shapes':
+      shapes.clear();
+      for (const sh of m.shapes) shapes.put(sh);
+      for (const [key, t] of delivered) if (shapeLayers.has(t.layer)) stale.add(key);
+      break;
+    case 'shape': {
+      const { old, rec } = shapes.put(m.shape);
+      if (old) invalidateShape(old);
+      if (rec) invalidateShape(rec);
+      appliedSeq = m.seq;
+      break;
+    }
+    case 'shape.remove': {
+      const old = shapes.remove(m.id);
+      if (old) invalidateShape(old);
+      appliedSeq = m.seq;
+      break;
+    }
     case 'forget':
       for (const key of m.keys) {
         delivered.delete(key);

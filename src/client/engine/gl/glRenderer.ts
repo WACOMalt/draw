@@ -3,7 +3,8 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Stroke } from '../../../shared/types';
+import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Shape, type Stroke } from '../../../shared/types';
+import { byZ } from '../../../shared/shapes';
 import { compose, effectivelyVisible, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
@@ -12,6 +13,8 @@ import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
 import { createPrograms, type Program, type Programs } from './programs';
 import { perfProfile, type PerfProfile } from '../perf';
+import { ShapeIndex, shapeRec, shapeTouches, type ShapeRec } from '../shapeIndex';
+import { drawShapes } from '../shapeRaster';
 
 /** Two screen buffers: `a` holds the composite so far, `b` receives the next blend pass. */
 interface Pair {
@@ -108,6 +111,21 @@ interface Live {
   started: number;
 }
 
+/**
+ * A shape layer being edited (it has drafts, or they just ended): drawn straight to the screen
+ * each frame instead of from its tiles, so a drag shows at once. `rect`: where the buffer goes
+ * on the screen (device px); null: nothing of the layer is on screen.
+ */
+interface Hot {
+  tex: WebGLTexture;
+  rect: [number, number, number, number] | null;
+  /** draftVersion and viewVersion the buffer shows. */
+  version: number;
+  viewVersion: number;
+  /** The drafts ended at this time: the buffer stays until the tiles are current. */
+  settleAt: number | null;
+}
+
 const PREFETCH = 1;
 /** Slow-device check: frames while the view moves, and the median interval that is too slow. */
 const SPEED_FRAMES = 60;
@@ -187,6 +205,18 @@ export class GLRenderer implements Renderer {
 
   private tiles = new Map<string, Tile>();
   private index = new StrokeIndex();
+  private shapes = new ShapeIndex();
+  /** Ids of the shape layers: their tiles draw shapes, not strokes. */
+  private shapeLayers = new Set<string>();
+  /** Shapes being changed, by who changes them ('local' or a peer): they replace committed ones. */
+  private drafts = new Map<string, Map<string, Shape>>();
+  private draftVersion = 0;
+  private hot = new Map<string, Hot>();
+  /** Canvas where shapes are drawn before they go to a tile texture (made on first use). */
+  private shapeCanvas: OffscreenCanvas | null = null;
+  /** Canvas for the screen buffers of hot layers (one at a time). */
+  private hotCanvas: OffscreenCanvas | null = null;
+  private shapeTex!: WebGLTexture;
   private layers: Layer[] = [];
   /** The layer tree of `layers` (groups with their layers), and the layers by id. */
   private tree: LayerNode[] = [];
@@ -316,6 +346,8 @@ export class GLRenderer implements Renderer {
 
     this.strokeT = this.makeTarget(TILE, TILE);
     this.pickT = this.makeTarget(1, 1, true);
+    this.shapeTex = this.makeTexture();
+    this.hot.clear();
     this.tilePool = [];
     this.livePool = [];
     // Old textures died with the context: forget every tile, redraw live strokes.
@@ -342,6 +374,28 @@ export class GLRenderer implements Renderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
     return { tex, fbo, w, h };
+  }
+
+  /** An RGBA8 texture that canvases are uploaded into (uploadCanvas). */
+  private makeTexture(): WebGLTexture {
+    const gl = this.gl;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return tex;
+  }
+
+  /** Copies a canvas into a texture. Canvas rows go top first, as image space wants. */
+  private uploadCanvas(tex: WebGLTexture, c: OffscreenCanvas): void {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    // The canvas holds premultiplied colors, as the buffers here do.
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, c);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   }
 
   /** A mipmapped single-channel texture array for tips or grains. */
@@ -474,6 +528,7 @@ export class GLRenderer implements Renderer {
     this.layers = layers;
     this.tree = layerTree(layers);
     this.byId = new Map(layers.map((l) => [l.id, l]));
+    this.shapeLayers = new Set(layers.filter((l) => l.kind === 'shape').map((l) => l.id));
     for (const [id, l] of this.luts) {
       if (!layers.some((x) => x.id === id && x.kind === 'adjust')) {
         this.gl.deleteTexture(l.tex);
@@ -536,6 +591,183 @@ export class GLRenderer implements Renderer {
   advanceSeq(seq: number): void {
     this.appliedSeq = seq;
     this.invalidate();
+  }
+
+  // --- shapes --------------------------------------------------------------------------------
+
+  resetShapes(shapes: Shape[]): void {
+    this.shapes.clear();
+    for (const s of shapes) this.shapes.put(s);
+    for (const t of this.tiles.values()) {
+      if (!this.shapeLayers.has(t.layer) && !shapes.some((s) => s.layerId === t.layer)) continue;
+      if (t.job) this.dropJob(t);
+      t.stale = true;
+    }
+    this.draftVersion++;
+    this.invalidate();
+  }
+
+  putShape(shape: Shape, seq: number): void {
+    const { old, rec } = this.shapes.put(shape);
+    if (old) this.shapeTilesStale(old);
+    if (rec) this.shapeTilesStale(rec);
+    this.draftVersion++;
+    this.appliedSeq = seq;
+    this.invalidate();
+  }
+
+  removeShape(id: string, seq: number): void {
+    const old = this.shapes.remove(id);
+    if (old) this.shapeTilesStale(old);
+    this.draftVersion++;
+    this.appliedSeq = seq;
+    this.invalidate();
+  }
+
+  setShapeDrafts(owner: string, shapes: Shape[]): void {
+    if (shapes.length) this.drafts.set(owner, new Map(shapes.map((s) => [s.id, s])));
+    else if (!this.drafts.delete(owner)) return;
+    this.draftVersion++;
+    this.invalidate();
+  }
+
+  /** Marks the tiles of the shape's layer under it for a new render. */
+  private shapeTilesStale(rec: ShapeRec): void {
+    for (const t of this.tiles.values()) {
+      if (t.layer !== rec.shape.layerId) continue;
+      const [x0, y0, x1, y1] = this.tileBounds(t);
+      if (!shapeTouches(rec, x0, y0, x1, y1, (x1 - x0) / TILE)) continue;
+      if (t.job) this.dropJob(t);
+      t.stale = true;
+      t.append = [];
+    }
+  }
+
+  /** A layer's shapes as they show now: committed ones, with every draft over them. */
+  private liveShapes(layer: string): Shape[] {
+    const over = new Map<string, Shape>();
+    for (const d of this.drafts.values()) for (const [id, s] of d) over.set(id, s);
+    const out: Shape[] = [];
+    for (const r of this.shapes.layer(layer)) if (!over.has(r.shape.id)) out.push(r.shape);
+    for (const s of over.values()) if (s.layerId === layer && !s.deleted) out.push(s);
+    return out.sort(byZ);
+  }
+
+  /** Renders a shape layer's tile in one go: shapes on a canvas, then into the tile texture. */
+  private renderShapeTile(t: Tile): number {
+    const [wx0, wy0, wx1, wy1] = this.tileBounds(t);
+    const scale = TILE / (wx1 - wx0);
+    const list = this.shapes.layer(t.layer).filter((r) => shapeTouches(r, wx0, wy0, wx1, wy1, 1 / scale));
+    if (t.job) this.dropJob(t);
+    if (list.length === 0) {
+      if (t.target) this.tilePool.push(t.target);
+      t.target = null;
+      this.finishTile(t);
+      return 1000;
+    }
+    const c = (this.shapeCanvas ??= new OffscreenCanvas(TILE, TILE));
+    const ctx = c.getContext('2d')!;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, TILE, TILE);
+    drawShapes(ctx, list.map((r) => r.shape), wx0, wy0, scale, TILE, TILE);
+    this.uploadCanvas(this.shapeTex, c);
+    t.target ??= this.allocTile();
+    this.bindTarget(t.target);
+    this.gl.disable(this.gl.BLEND);
+    this.copy(this.shapeTex, t.target, [0, 0, TILE, TILE]);
+    this.finishTile(t);
+    return 3 * TILE * TILE + list.length * 2000;
+  }
+
+  /**
+   * Brings the screen buffers of edited shape layers up to date. A layer is hot while it has
+   * drafts, and after they end until its tiles in view are current again (no flash back).
+   */
+  private updateHot(g: Grid): void {
+    const want = new Set<string>();
+    for (const d of this.drafts.values()) {
+      for (const s of d.values()) {
+        want.add(s.layerId);
+        const old = this.shapes.recs.get(s.id);
+        if (old) want.add(old.shape.layerId);
+      }
+    }
+    const now = performance.now();
+    for (const [id, h] of this.hot) {
+      if (want.has(id)) {
+        h.settleAt = null;
+        continue;
+      }
+      h.settleAt ??= now;
+      let done = now - h.settleAt > 3000;
+      if (!done) {
+        done = true;
+        for (let ty = g.ty0; done && ty <= g.ty1; ty++)
+          for (let tx = g.tx0; tx <= g.tx1; tx++) {
+            const t = this.tiles.get(tileKey(id, g.lod, tx, ty));
+            if (!t || !t.rendered || this.needsWork(t)) {
+              done = false;
+              break;
+            }
+          }
+      }
+      if (done) {
+        this.gl.deleteTexture(h.tex);
+        this.hot.delete(id);
+        this.invalidate();
+      }
+    }
+    for (const id of want) {
+      if (!this.hot.has(id)) this.hot.set(id, { tex: this.makeTexture(), rect: null, version: -1, viewVersion: -1, settleAt: null });
+    }
+    const W = this.canvas.width, H = this.canvas.height;
+    const ds = this.view.zoom * this.dpr;
+    for (const [id, h] of this.hot) {
+      if (h.version === this.draftVersion && h.viewVersion === this.viewVersion) continue;
+      h.version = this.draftVersion;
+      h.viewVersion = this.viewVersion;
+      const list = this.liveShapes(id);
+      // Only the part of the screen the shapes cover.
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const s of list) {
+        const r = shapeRec(s);
+        x0 = Math.min(x0, (r.x0 - this.view.x) * ds);
+        y0 = Math.min(y0, (r.y0 - this.view.y) * ds);
+        x1 = Math.max(x1, (r.x1 - this.view.x) * ds);
+        y1 = Math.max(y1, (r.y1 - this.view.y) * ds);
+      }
+      const rx0 = Math.max(0, Math.floor(x0) - 1), ry0 = Math.max(0, Math.floor(y0) - 1);
+      const rx1 = Math.min(W, Math.ceil(x1) + 1), ry1 = Math.min(H, Math.ceil(y1) + 1);
+      if (!(rx1 > rx0 && ry1 > ry0)) {
+        h.rect = null;
+        continue;
+      }
+      const w = rx1 - rx0, hh = ry1 - ry0;
+      const c = (this.hotCanvas ??= new OffscreenCanvas(w, hh));
+      if (c.width !== w || c.height !== hh) {
+        c.width = w;
+        c.height = hh;
+      }
+      const ctx = c.getContext('2d')!;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, w, hh);
+      drawShapes(ctx, list, this.view.x + rx0 / ds, this.view.y + ry0 / ds, ds, w, hh);
+      this.uploadCanvas(h.tex, c);
+      h.rect = [rx0, ry0, w, hh];
+    }
+  }
+
+  /**
+   * A layer's own content onto `target` (blend state set by the caller): its tiles, or the screen
+   * buffer of a shape layer being edited.
+   */
+  private drawLayerContent(layer: string, g: Grid, target: Target, opacity: number): void {
+    const h = this.hot.get(layer);
+    if (h) {
+      if (h.rect) this.copy(h.tex, target, h.rect, opacity);
+      return;
+    }
+    this.drawLayerTiles(layer, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, target, opacity);
   }
 
   // --- strokes in progress -------------------------------------------------------------------
@@ -941,6 +1173,7 @@ export class GLRenderer implements Renderer {
    * Appended strokes draw at once (they are few). Returns the work spent.
    */
   private renderTile(t: Tile, budget: number): number {
+    if (this.shapeLayers.has(t.layer)) return this.renderShapeTile(t);
     const [wx0, wy0, wx1, wy1] = this.tileBounds(t);
     const scale = TILE / (wx1 - wx0);
     let work = 0;
@@ -1184,6 +1417,7 @@ export class GLRenderer implements Renderer {
       X: (tx) => Math.round((tx * tw - vx) * ds),
       Y: (ty) => Math.round((ty * tw - vy) * ds),
     };
+    if (this.hot.size || this.drafts.size) this.updateHot(grid);
     let main: Pair = { a: this.compA, b: this.compB };
     this.bindTarget(main.a);
     const [pr, pg, pb] = hexToRgb(this.paper);
@@ -1379,7 +1613,7 @@ export class GLRenderer implements Renderer {
       const keys: string[] = [];
       for (const l of this.layers) {
         if (!ids.has(l.id)) continue;
-        if (l.kind === 'paint' || l.kind === undefined) keys.push(l.id);
+        if (l.kind === 'paint' || l.kind === undefined || l.kind === 'shape') keys.push(l.id);
         if (l.mask?.enabled) keys.push(maskKey(l.id, l.mask.id));
       }
       done = true;
@@ -1387,7 +1621,8 @@ export class GLRenderer implements Renderer {
         for (let ty = g.ty0; ty <= g.ty1; ty++)
           for (let tx = g.tx0; tx <= g.tx1; tx++) {
             const t = this.tiles.get(tileKey(key, g.lod, tx, ty));
-            if (t ? !t.rendered || this.needsWork(t) : this.index.byLayer.get(key)?.length) {
+            const content = this.shapeLayers.has(key) ? this.shapes.layer(key).length : this.index.byLayer.get(key)?.length;
+            if (t ? !t.rendered || this.needsWork(t) : content) {
               done = false;
               break outer;
             }
@@ -1407,7 +1642,7 @@ export class GLRenderer implements Renderer {
       // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
       this.bindTarget(pair.a);
       this.blendFor(false);
-      this.drawLayerTiles(layer.id, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, pair.a, layer.opacity);
+      this.drawLayerContent(layer.id, g, pair.a, layer.opacity);
       return pair;
     }
     this.renderLayer(layer, g);
@@ -1448,7 +1683,7 @@ export class GLRenderer implements Renderer {
     this.bindTarget(this.layerT);
     this.clear();
     gl.disable(gl.BLEND);
-    this.drawLayerTiles(layer.id, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, this.layerT, 1);
+    this.drawLayerContent(layer.id, g, this.layerT, 1);
     for (const l of this.livesFor(layer.id)) {
       this.blendFor(l.brush.tool === 'erase');
       this.copy(l.target!.tex, this.layerT, [0, 0, this.layerT.w, this.layerT.h], l.brush.opacity);

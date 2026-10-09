@@ -117,9 +117,10 @@ export interface Layer {
   deleted: boolean;
   /**
    * 'adjust': no paint of its own; it changes everything below it. 'group': a folder of layers
-   * (layers name it as `parent`). Set at creation. Default 'paint'.
+   * (layers name it as `parent`). 'shape': holds vector shapes (Shape), no strokes except on its
+   * mask. Set at creation. Default 'paint'.
    */
-  kind?: 'paint' | 'adjust' | 'group';
+  kind?: LayerKind;
   /** The group this layer is in; absent or null: the top level. A deleted group hides its layers. */
   parent?: string | null;
   adjust?: Adjust;
@@ -140,13 +141,79 @@ export interface Stroke {
   mask?: string;
 }
 
+export const LAYER_KINDS = ['paint', 'adjust', 'group', 'shape'] as const;
+export type LayerKind = (typeof LAYER_KINDS)[number];
+
+// --- vector shapes ---------------------------------------------------------------------------
+
+/** Never remove a kind after a release: old documents would break. Add new ones. */
+export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line'] as const;
+export type ShapeKind = (typeof SHAPE_KINDS)[number];
+export const STROKE_ALIGNS = ['center', 'inside', 'outside'] as const;
+export type StrokeAlign = (typeof STROKE_ALIGNS)[number];
+export const LINE_CAPS = ['butt', 'round', 'square'] as const;
+export type LineCap = (typeof LINE_CAPS)[number];
+export const LINE_JOINS = ['miter', 'round', 'bevel'] as const;
+export type LineJoin = (typeof LINE_JOINS)[number];
+
+/**
+ * What a shape op may set. Geometry: a frame of w × h local units, (0, 0) to (w, h), that the
+ * affine `m` maps to the world. Moves, rotations and layer transforms change `m` only, so they
+ * stay exact; a resize changes the frame. Lengths (radii, rounding, stroke width) are local
+ * units, so a layer transform scales them with the shape.
+ *
+ * Live settings, by kind (shapes stay editable; phase 2 point editing turns them into paths):
+ * - rect: `radii`, the corner radii top left, top right, bottom right, bottom left.
+ *   `radiiLinked`: the editor changes all four together.
+ * - polygon: `sides` (3 to 64). star: `points` (3 to 64) and `innerRatio`, the inner radius as a
+ *   fraction of the outer one. Both: `rounding`, a corner radius (each corner gets at most what
+ *   fits).
+ * - line: `line`, the start and end points (x0, y0, x1, y1) in the frame.
+ * The polygon and the star fill the frame: their points are scaled to its width and height.
+ */
+export interface ShapeProps {
+  name: string;
+  /** Order within the layer, ascending = bottom to top (a fractional index, as layer `order`). */
+  z: number;
+  w: number;
+  h: number;
+  m: Affine;
+  radii?: [number, number, number, number];
+  radiiLinked?: boolean;
+  sides?: number;
+  points?: number;
+  innerRatio?: number;
+  rounding?: number;
+  line?: [number, number, number, number];
+  /** #rrggbb, or null: no fill. Lines have no fill. */
+  fill: string | null;
+  /** #rrggbb, or null: no stroke. */
+  stroke: string | null;
+  strokeWidth: number;
+  /** Lines always stroke on the center. */
+  align: StrokeAlign;
+  cap: LineCap;
+  join: LineJoin;
+}
+
+/** A shape as a client sends it in shape.add and shape.live. */
+export type ShapeInput = ShapeProps & { id: string; layerId: string; kind: ShapeKind };
+
+export interface Shape extends ShapeInput {
+  /** Who added it. */
+  author: string;
+  /** Seq of the op that added it. */
+  seq: number;
+  deleted?: boolean;
+}
+
 export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent'>;
 
 /** A 2D affine transform [a, b, c, d, e, f]: x' = a·x + c·y + e, y' = b·x + d·y + f. */
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -158,22 +225,31 @@ export type Op =
   | { type: 'layer.remove'; id: string }
   | { type: 'layer.restore'; id: string }
   /**
-   * Moves, scales, rotates or skews a layer, or a group with everything in it: every stroke of
-   * those layers (masks included, deleted strokes too, so undoing a delete puts them back in place).
+   * Moves, scales, rotates or skews a layer, or a group with everything in it: every stroke and
+   * shape of those layers (masks included, deleted ones too, so undoing a delete puts them back
+   * in place).
    */
   | { type: 'layer.transform'; id: string; m: Affine }
+  /** Adds a shape to a shape layer. */
+  | { type: 'shape.add'; shape: ShapeInput }
+  /** Changes some props of a shape. The result must still be a valid shape of its kind. */
+  | { type: 'shape.update'; id: string; props: Partial<ShapeProps> }
+  | { type: 'shape.remove'; id: string }
+  | { type: 'shape.restore'; id: string }
   /**
    * Copies a layer, or a group with everything in it. The copy of the layer (or group) `id` gets
-   * `newId`; copies of its layers and strokes get ids derived from `newId` and the original id
+   * `newId`; copies of its layers, strokes and shapes get ids derived from `newId` and the original id
    * (derivedId), so every client makes the same copy. The copy goes into `parent` at `order`.
    */
   | { type: 'layer.duplicate'; id: string; newId: string; name: string; order: number; parent: string | null };
 
 /** An op as the server broadcasts it: restore ops carry the full object so late joiners can apply them. */
 export type AppliedOp =
-  | Exclude<Op, { type: 'stroke.add' } | { type: 'stroke.restore' }>
+  | Exclude<Op, { type: 'stroke.add' } | { type: 'stroke.restore' } | { type: 'shape.add' } | { type: 'shape.restore' }>
   | { type: 'stroke.add'; stroke: Stroke }
-  | { type: 'stroke.restore'; id: string; stroke: Stroke };
+  | { type: 'stroke.restore'; id: string; stroke: Stroke }
+  | { type: 'shape.add'; shape: Shape }
+  | { type: 'shape.restore'; id: string; shape: Shape };
 
 export interface Peer {
   id: string;
@@ -223,6 +299,11 @@ export type ClientMsg =
   | { t: 'op'; opId: string; op: Op }
   | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
   | { t: 'live.end'; id: string }
+  /**
+   * Shapes as this client shows them during a drag (not persisted): new ones, or changed copies
+   * of existing ones. Each message replaces the last; an empty list ends the preview.
+   */
+  | { t: 'shape.live'; shapes: ShapeInput[] }
   | { t: 'cursor'; x: number | null; y: number | null; layerId: string | null }
   /**
    * Link preview image from an editor's browser: a PNG (base64, at most PREVIEW_LIMITS) of the
@@ -239,6 +320,8 @@ export type ServerMsg =
       seq: number;
       layers: Layer[];
       strokes: Stroke[];
+      /** Live shapes (not deleted). Absent from servers before shapes. */
+      shapes?: Shape[];
       peers: Peer[];
       role: Role;
       canvas: CanvasInfo;
@@ -259,6 +342,7 @@ export type ServerMsg =
   | { t: 'reject'; opId: string; reason: string }
   | { t: 'live'; by: string; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
   | { t: 'live.end'; by: string; id: string }
+  | { t: 'shape.live'; by: string; shapes: ShapeInput[] }
   | { t: 'cursor'; by: string; x: number | null; y: number | null; layerId: string | null }
   | { t: 'peer.join'; peer: Peer }
   | { t: 'peer.leave'; id: string }
@@ -279,6 +363,13 @@ export const LIMITS = {
   minBrushWorld: 1e-12,
   maxBrushWorld: 1e15,
   maxCoord: 1e15,
+  /** Live shapes per canvas, and shapes in one shape.live message. */
+  maxShapes: 20000,
+  maxLiveShapes: 200,
+  maxShapeName: 64,
+  /** Polygon sides and star points. */
+  minCorners: 3,
+  maxCorners: 64,
 } as const;
 
 /** Unambiguous alphabet for session codes: no 0/O, 1/I/L. */

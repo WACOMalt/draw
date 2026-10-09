@@ -24,12 +24,13 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>):
     if (l.clip) f.add('clip');
     if (l.mask) f.add('mask');
     if (l.kind === 'group' || l.parent) f.add('groups');
+    if (l.kind === 'shape') f.add('shapes');
   }
   for (const s of strokes) {
     if (s.deleted) continue;
     if (s.mask) f.add('mask');
     if (brushHasDynamics(s.brush)) f.add('tips');
-    if (f.size === 5) break;
+    if (f.has('mask') && f.has('tips')) break; // nothing more to learn from strokes
   }
   return [...f];
 }

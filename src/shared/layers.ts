@@ -10,7 +10,7 @@
 //   before the group itself. The panel shows the reverse: the group's row, then its layers.
 
 import { derivedId } from './ids';
-import type { Affine, Brush, Layer, Stroke } from './types';
+import type { Affine, Brush, Layer, Shape, Stroke } from './types';
 
 export interface LayerNode {
   layer: Layer;
@@ -185,16 +185,17 @@ export function validAffine(m: unknown): m is Affine {
 /**
  * The copies layer.duplicate makes of the layer or group `id`: new layers (the top one with
  * `newId`, name, order and parent from the op; the others keep their name and order under their
- * copied group) and new strokes (same seq and author, ids derived from the copy's id). Only live
- * layers and strokes are copied. Both the server and the clients run this.
+ * copied group), new strokes and new shapes (same seq and author, ids derived from the copy's
+ * id). Only live layers, strokes and shapes are copied. Both the server and the clients run this.
  */
 export function duplicateOf(
   layers: Map<string, Layer>,
   strokes: Iterable<Stroke>,
   op: { id: string; newId: string; name: string; order: number; parent: string | null },
-): { layers: Layer[]; strokes: Stroke[] } {
+  shapes: Iterable<Shape> = [],
+): { layers: Layer[]; strokes: Stroke[]; shapes: Shape[] } {
   const src = layers.get(op.id);
-  if (!src) return { layers: [], strokes: [] };
+  if (!src) return { layers: [], strokes: [], shapes: [] };
   const mapId = new Map<string, string>([[op.id, op.newId]]);
   const outLayers: Layer[] = [];
   const walk = (l: Layer, top: boolean) => {
@@ -217,5 +218,11 @@ export function duplicateOf(
     if (!nl) continue;
     outStrokes.push({ ...s, id: derivedId(op.newId, s.id), layerId: nl });
   }
-  return { layers: outLayers, strokes: outStrokes };
+  const outShapes: Shape[] = [];
+  for (const s of shapes) {
+    if (s.deleted) continue;
+    const nl = mapId.get(s.layerId);
+    if (nl) outShapes.push({ ...s, id: derivedId(op.newId, s.id), layerId: nl });
+  }
+  return { layers: outLayers, strokes: outStrokes, shapes: outShapes };
 }

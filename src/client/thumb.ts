@@ -21,13 +21,14 @@ async function renderBdraw(fileB64: string, size: number): Promise<string | null
   const file = JSON.parse(await gunzip(bytes)) as BdrawFile;
   if (file.format !== 'bdraw' || !Array.isArray(file.layers) || !Array.isArray(file.strokes)) throw new Error('not a .bdraw file');
   const seq = file.strokes.reduce((m, s) => Math.max(m, s.seq ?? 0), 0);
+  const shapes = Array.isArray(file.shapes) ? file.shapes : [];
   const doc = new Doc();
-  doc.reset(seq, file.layers, file.strokes);
+  doc.reset(seq, file.layers, file.strokes, shapes);
   const byId = new Map(file.layers.map((l) => [l.id, l]));
   const visible = new Set(file.layers.filter((l) => !effectivelyDeleted(byId, l) && effectivelyVisible(byId, l)).map((l) => l.id));
   const all = unionAll(doc, visible);
   if (!all) return null;
-  const png = await renderPng(doc.displayLayers(), file.strokes, seq, padded(all, 0.04), size, size);
+  const png = await renderPng(doc.displayLayers(), file.strokes, seq, padded(all, 0.04), size, size, shapes);
   if (!png) return null;
   const buf = new Uint8Array(await png.arrayBuffer());
   let bin = '';

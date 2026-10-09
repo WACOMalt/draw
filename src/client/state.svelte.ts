@@ -1,15 +1,56 @@
 // Reactive editor state shared by the Svelte UI and the engine.
 
 import { DEFAULT_BRUSH } from '../shared/brush';
-import type { Brush, CanvasInfo, DeniedReason, Layer, Role } from '../shared/types';
+import type { Brush, CanvasInfo, DeniedReason, Layer, LineCap, Role, Shape, ShapeKind, StrokeAlign } from '../shared/types';
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
 /**
  * strokeEraser: removes whole strokes whose path the circle touches. zoom: the magnifier (click
  * zooms in, Alt+click or right-click zooms out, a sideways drag zooms smoothly). See engine.ts.
+ * select: selects, moves, scales and rotates shapes; on a paint layer or a group, it transforms
+ * the layer. shape: draws a new shape of `ed.shapeKind`. See shapeTool.ts.
  */
-export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'hand' | 'zoom';
+export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'select' | 'shape' | 'hand' | 'zoom';
+
+/**
+ * Settings for new shapes (the options bar edits the selected shapes instead, when there are
+ * any). Lengths are screen pixels at the zoom where the shape is drawn, as brush sizes are.
+ */
+export interface ShapeStyle {
+  fill: string | null;
+  stroke: string | null;
+  strokeWidth: number;
+  align: StrokeAlign;
+  cap: LineCap;
+  /** Rectangle corners: top left, top right, bottom right, bottom left. */
+  radii: [number, number, number, number];
+  radiiLinked: boolean;
+  sides: number;
+  points: number;
+  innerRatio: number;
+  /** Polygon and star corners. */
+  rounding: number;
+}
+
+/** What the Select tool shows over the canvas (CSS px in the stage). shapeTool.ts makes it. */
+export interface SelectOverlay {
+  /** The shape a click would select, and its name. */
+  hover: { outline: string[]; label: string; x: number; y: number } | null;
+  /** Outlines of the selected shapes, as SVG path data. */
+  outlines: string[];
+  /** The selection box: four corners. */
+  box: [number, number][] | null;
+  /** Scale handles, rotation stems are not drawn (rotation is "just outside a corner"). */
+  handles: [number, number][];
+  /** Corner radius dots (one rectangle selected). */
+  dots: [number, number][];
+  /** End points of one selected line. */
+  ends: [number, number][];
+  marquee: [number, number, number, number] | null;
+  /** Live numbers while drawing or changing a shape. */
+  readout: { text: string; x: number; y: number } | null;
+}
 export type { BrushSettings } from '../shared/types';
 import type { BrushSettings } from '../shared/types';
 
@@ -69,6 +110,22 @@ const prefs = load('draw.prefs', {
   fg: '#1e1e1e',
   bg: '#ffffff',
   swatches: [] as string[],
+  shapeKind: 'rect' as ShapeKind,
+  shapeStyle: {
+    fill: '#7c3aed',
+    stroke: null,
+    strokeWidth: 4,
+    align: 'inside',
+    cap: 'round',
+    radii: [0, 0, 0, 0],
+    radiiLinked: true,
+    sides: 6,
+    points: 5,
+    innerRatio: 0.45,
+    rounding: 0,
+  } as ShapeStyle,
+  /** Clicks on empty canvas keep the selection (only Esc and Deselect clear it). */
+  keepSelection: false,
 });
 
 class EditorState {
@@ -88,6 +145,14 @@ class EditorState {
   swatches = $state<string[]>(prefs.swatches);
   name = $state(prefs.name);
   color = $state(prefs.color);
+  shapeKind = $state<ShapeKind>(prefs.shapeKind);
+  shapeStyle = $state<ShapeStyle>({ ...prefs.shapeStyle });
+  keepSelection = $state(prefs.keepSelection);
+  /** Selected shapes (ids). */
+  selection = $state<string[]>([]);
+  /** Live shapes as the user sees them (pending changes included), for the panels. */
+  shapes = $state<Shape[]>([]);
+  overlay = $state<SelectOverlay | null>(null);
 
   layers = $state<Layer[]>([]); // bottom to top
   activeLayerId = $state<string | null>(null);
@@ -153,6 +218,9 @@ class EditorState {
       fg: this.fg,
       bg: this.bg,
       swatches: $state.snapshot(this.swatches),
+      shapeKind: this.shapeKind,
+      shapeStyle: $state.snapshot(this.shapeStyle),
+      keepSelection: this.keepSelection,
     });
   }
 }

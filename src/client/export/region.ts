@@ -3,7 +3,7 @@
 // .bdraw preview, and the link preview image.
 
 import { FULL_PROFILE } from '../engine/perf';
-import type { Layer, Stroke } from '../../shared/types';
+import type { Layer, Shape, Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { GLRenderer } from '../engine/gl/glRenderer';
 
@@ -17,12 +17,13 @@ export class RegionRenderer {
   private h = 0;
 
   /** Throws when WebGL2 is not available. */
-  constructor(layers: Layer[], strokes: Stroke[], seq: number) {
+  constructor(layers: Layer[], strokes: Stroke[], seq: number, shapes: Shape[] = []) {
     const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false });
     if (!gl) throw new Error('WebGL2 is not available');
     this.r = new GLRenderer(this.canvas, gl, true, FULL_PROFILE);
     this.r.setLayers(layers);
     this.r.resetStrokes(strokes, seq);
+    this.r.resetShapes(shapes);
   }
 
   /**
@@ -48,13 +49,13 @@ export class RegionRenderer {
 }
 
 /** A PNG of `b` fitted into at most maxW × maxH pixels (aspect kept), on the paper color. */
-export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number): Promise<Blob | null> {
+export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number, shapes: Shape[] = []): Promise<Blob | null> {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
   if (!(bw > 0 && bh > 0)) return null;
   const scale = Math.min(maxW / bw, maxH / bh);
   const w = Math.max(1, Math.min(PIECE, Math.round(bw * scale)));
   const h = Math.max(1, Math.min(PIECE, Math.round(bh * scale)));
-  const rr = new RegionRenderer(layers, strokes, seq);
+  const rr = new RegionRenderer(layers, strokes, seq, shapes);
   try {
     const px = rr.render(b.x0, b.y0, scale, w, h);
     const c = new OffscreenCanvas(w, h);

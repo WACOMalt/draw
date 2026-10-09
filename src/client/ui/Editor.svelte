@@ -18,6 +18,7 @@
   import ShareDialog from './ShareDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
   import TransformOverlay from './TransformOverlay.svelte';
+  import SelectOverlay from './SelectOverlay.svelte';
 
   let { code, onLeave }: { code: string; onLeave: () => void } = $props();
 
@@ -84,12 +85,21 @@
       ed.shareOpen = false;
       ed.exportOpen = false;
       ed.transform = null;
+      ed.selection = [];
+      ed.shapes = [];
+      ed.overlay = null;
     };
+  });
+
+  // The Select tool on a paint layer or a group shows the layer transform (engine.syncSelect).
+  $effect(() => {
+    void [ed.tool, ed.activeLayerId, ed.transform, ed.layers, ed.role];
+    engine?.syncSelect();
   });
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.keepSelection]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
@@ -129,6 +139,7 @@
       <canvas bind:this={canvas}></canvas>
       <canvas class="paths" bind:this={pathsCanvas}></canvas>
       <div class="brush-cursor" bind:this={brushCursor}></div>
+      <SelectOverlay />
       {#each ed.markers as m (m.key)}
         <button
           class="marker {m.kind}"
@@ -170,7 +181,10 @@
       {#if narrow}
         <button class="zoom" title="Reset to 100%" onclick={() => engine?.resetView()}>{zoomLabel}</button>
         {#if sheet === 'brush'}
-          <Sheet title={ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'strokeEraser' ? 'Stroke eraser' : 'Brush'} onClose={() => (sheet = null)}><OptionsBar stacked /></Sheet>
+          <Sheet
+            title={ed.tool === 'eraser' ? 'Eraser' : ed.tool === 'strokeEraser' ? 'Stroke eraser' : ed.tool === 'shape' ? 'Shape' : ed.tool === 'select' ? 'Select' : 'Brush'}
+            onClose={() => (sheet = null)}><OptionsBar stacked {engine} /></Sheet
+          >
         {:else if sheet === 'color'}
           <Sheet title="Color" onClose={() => (sheet = null)}><ColorPanel {engine} /></Sheet>
         {:else if sheet === 'layers'}

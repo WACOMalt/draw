@@ -15,6 +15,7 @@ import {
   type LayerProps,
   type Op,
   type ServerMsg,
+  type Shape,
   type Stroke,
 } from '../../shared/types';
 import { maskKey } from './strokeIndex';
@@ -31,6 +32,8 @@ import { Net } from './net';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
+import { ShapeTool } from './shapeTool';
+import { SHAPE_KINDS } from '../../shared/types';
 import { takeDismissed } from '../dismiss';
 import { slowDevice } from './perf';
 
@@ -139,6 +142,8 @@ function segDist2(ax: number, ay: number, bx: number, by: number, cx: number, cy
 export class Engine {
   readonly comp: Renderer;
   private doc = new Doc();
+  /** The Select and Shapes tools. */
+  readonly shapes: ShapeTool;
   private net: Net;
   private undoStack: UndoEntry[] = [];
   private redoStack: UndoEntry[] = [];
@@ -195,6 +200,18 @@ export class Engine {
     if (k && !frame) links.set(code, k);
     this.link = k ?? (frame ? undefined : links.get(code));
     this.comp = createRenderer(canvas);
+    this.shapes = new ShapeTool({
+      comp: this.comp,
+      doc: this.doc,
+      canvas,
+      sendOp: (op) => this.sendOp(op),
+      pushUndo: (e) => this.pushUndo(e),
+      send: (msg) => void this.net.send(msg),
+      newLayerPlace: () => this.newLayerPlace(),
+      nextName: (prefix) => this.nextName(prefix),
+      activeLayer: () => this.activeLayer(),
+      setActiveLayer: (id) => this.setActiveLayer(id),
+    });
     this.scaleCap = this.comp.profile.maxScale;
     if (!frame) this.comp.onSlow = () => this.slowFrames();
     ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit`;
@@ -232,7 +249,10 @@ export class Engine {
       this.spaceDown = this.altDown = false;
       this.updateCursor();
     });
-    const sweep = window.setInterval(() => this.comp.sweepLive(), 1000);
+    const sweep = window.setInterval(() => {
+      this.comp.sweepLive();
+      this.shapes.sweep();
+    }, 1000);
     this.cleanup.push(() => window.clearInterval(sweep));
     if (frame) this.updateCursor();
   }
@@ -271,6 +291,7 @@ export class Engine {
   destroy(): void {
     window.clearTimeout(this.previewTimer);
     cancelAnimationFrame(this.pathsRaf);
+    this.shapes.destroy();
     this.endStroke();
     this.cleanup.forEach((f) => f());
     this.net.close();
@@ -350,6 +371,7 @@ export class Engine {
     this.updateBrushCursor();
     this.scheduleMarkers();
     this.schedulePaths();
+    this.shapes.scheduleOverlay();
     window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => save(`draw.view.${this.code}`, ed.view), 300);
   }
@@ -426,10 +448,11 @@ export class Engine {
   }
 
   /** Confirmed document state for an off-screen render (exports, previews). */
-  snapshot(): { layers: Layer[]; strokes: Stroke[]; seq: number } {
+  snapshot(): { layers: Layer[]; strokes: Stroke[]; shapes: Shape[]; seq: number } {
     return {
       layers: this.doc.displayLayers(),
       strokes: [...this.doc.strokes.values()].filter((st) => !st.deleted),
+      shapes: [...this.doc.shapes.values()].filter((sh) => !sh.deleted),
       seq: this.doc.seq,
     };
   }
@@ -452,7 +475,7 @@ export class Engine {
 
   // --- finding content ---------------------------------------------------------------------
 
-  /** Paint layers that show (visible, in groups that are all visible). */
+  /** Paint and shape layers that show (visible, in groups that are all visible). */
   private visibleLayerIds(): Set<string> {
     const byId = new Map(ed.layers.map((l) => [l.id, l]));
     return new Set(ed.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(byId, l)).map((l) => l.id));
@@ -574,9 +597,15 @@ export class Engine {
             ? this.altDown
               ? 'zoom-out'
               : 'zoom-in'
-            : 'none';
+            : tool === 'shape'
+              ? 'crosshair'
+              : tool === 'select'
+                ? 'default'
+                : 'none';
+    if (tool === 'select' && this.pointer) this.shapes.hoverAt(this.pointer.x, this.pointer.y);
     this.updateBrushCursor();
     this.schedulePaths(); // the path overlay shows with the stroke eraser only
+    this.shapes.scheduleOverlay();
   }
 
   updateBrushCursor(): void {
@@ -609,8 +638,13 @@ export class Engine {
       if (e.pointerType === 'touch' && !this.stroke && !this.pan) this.pan = { pointerId: e.pointerId, x, y };
       return;
     }
-    if (this.stroke || this.pan || this.picking !== null || this.zooming) return;
+    if (this.stroke || this.pan || this.picking !== null || this.zooming || this.shapes.busy()) return;
     this.engaged = true;
+    // Select tool, a layer transform open but unchanged: a press on a shape outside its box
+    // selects that shape (the transform closes). Else the canvas pans as usual.
+    if (ed.transform && ed.tool === 'select' && e.button === 0 && !this.spaceDown && this.transformIdle() && this.shapes.shapeAt(x, y, e.pointerType === 'touch')) {
+      this.cancelTransform();
+    }
     try {
       this.canvas.setPointerCapture(e.pointerId);
     } catch {
@@ -637,6 +671,7 @@ export class Engine {
       return;
     }
     if (tool === 'strokeEraser' && !eraserEnd) return this.beginSweep(e, x, y);
+    if ((tool === 'select' || tool === 'shape') && !eraserEnd) return this.shapes.down(e, x, y);
     this.beginStroke(e, x, y, eraserEnd);
   }
 
@@ -655,9 +690,17 @@ export class Engine {
       this.updateBrushCursor();
       return;
     }
+    if (this.shapes.busy(e.pointerId)) {
+      this.shapes.move(e, x, y);
+      const [wx, wy] = this.comp.toWorld(x, y);
+      this.sendCursor(wx, wy);
+      return;
+    }
     if (!this.frame) {
       this.pointer = e.pointerType === 'touch' ? null : { x, y };
-      if (this.effectiveTool() === 'strokeEraser') this.hoverAt(x, y);
+      const t = this.effectiveTool();
+      if (t === 'strokeEraser') this.hoverAt(x, y);
+      if ((t === 'select' || t === 'shape') && e.pointerType !== 'touch') this.shapes.hoverAt(x, y);
       const [wx, wy] = this.comp.toWorld(x, y);
       ed.cursor = { x: wx, y: wy };
       this.updateBrushCursor();
@@ -720,6 +763,7 @@ export class Engine {
       }
     }
     if (this.sweep && e.pointerId === this.sweep.pointerId) this.endSweep();
+    if (this.shapes.busy(e.pointerId)) this.shapes.up(e);
     if (this.stroke && e.pointerId === this.stroke.pointerId) {
       // The last pen samples before the release (the release itself has no pressure).
       if (this.stroke.native) this.addNativeSamples(this.stroke, null);
@@ -732,9 +776,10 @@ export class Engine {
       this.engaged = false; // back to page scrolling once the pointer is outside
       return;
     }
-    if (this.stroke || this.sweep) return;
+    if (this.stroke || this.sweep || this.shapes.busy()) return;
     this.pointer = null;
     ed.cursor = null;
+    this.shapes.leave();
     if (this.hover.size) {
       this.hover = new Set();
       this.schedulePaths();
@@ -767,6 +812,8 @@ export class Engine {
         this.ignoredTouches.add(e.pointerId); // pen is drawing; ignore the hand
         return true;
       }
+      // A pinch: whatever the first finger started on a shape is undone.
+      if (this.shapes.busy()) this.shapes.cancel();
       this.pan = null;
       this.picking = null;
       this.zooming = null;
@@ -937,6 +984,9 @@ export class Engine {
     const layer = this.activeLayer();
     if (!layer) return showToast('Add a layer first');
     if (layer.kind === 'group') return showToast('A group holds no paint: select a layer in it');
+    if (layer.kind === 'shape' && !(ed.maskTarget && layer.mask)) {
+      return showToast('A shape layer holds shapes, not paint. Select a paint layer, or add one, to paint.');
+    }
     if (!effectivelyVisible(new Map(ed.layers.map((l) => [l.id, l])), layer)) return showToast('The active layer is hidden');
     const mask = ed.maskTarget && layer.mask ? layer.mask : null;
     if (layer.kind === 'adjust' && !mask) {
@@ -1095,6 +1145,7 @@ export class Engine {
     this.doc.addPending(opId, op);
     this.net.send({ t: 'op', opId, op });
     if (op.type.startsWith('layer.')) this.refreshLayers();
+    else if (op.type.startsWith('shape.')) this.shapes.docChanged();
   }
 
   private pushUndo(e: Omit<UndoEntry, 't'>): void {
@@ -1142,6 +1193,7 @@ export class Engine {
     this.comp.setLayers(layers);
     if (!layers.some((l) => l.id === ed.activeLayerId)) ed.activeLayerId = layers.at(-1)?.id ?? null;
     if (ed.maskTarget && !layers.find((l) => l.id === ed.activeLayerId)?.mask) this.setMaskTarget(false);
+    this.shapes.docChanged();
     this.scheduleMarkers();
     this.schedulePaths();
   }
@@ -1486,6 +1538,10 @@ export class Engine {
 
   private beginSweep(e: PointerEvent, x: number, y: number): void {
     if (!ed.canEdit) return showToast('View only: you can look around but not erase');
+    const a = this.activeLayer();
+    if (!ed.strokeEraserAll && a?.kind === 'shape' && !ed.maskTarget) {
+      return showToast('A shape layer holds shapes, not strokes. Select a paint layer, or remove shapes with the Select tool.');
+    }
     const w = this.comp.toWorld(x, y);
     this.sweep = { pointerId: e.pointerId, last: w, removed: [], gone: new Set() };
     this.pointer = { x, y };
@@ -1623,6 +1679,11 @@ export class Engine {
       if (st.mask) masks = u;
       else paint = u;
     }
+    for (const [sid, sh] of this.doc.shapes) {
+      const b = this.doc.shapeBounds.get(sid);
+      if (!b || sh.deleted || !ids.has(sh.layerId)) continue;
+      paint = paint ? { x0: Math.min(paint.x0, b.x0), y0: Math.min(paint.y0, b.y0), x1: Math.max(paint.x1, b.x1), y1: Math.max(paint.y1, b.y1) } : b;
+    }
     return paint ?? masks;
   }
 
@@ -1632,16 +1693,54 @@ export class Engine {
     const l = this.activeLayer();
     if (!l) return;
     if (!this.contentOf(l.id)) return showToast('Nothing to transform on this layer');
+    this.shapes.cancel();
+    this.autoTransform = false;
+    this.transformM = null;
     ed.transform = { id: l.id };
+  }
+
+  /** The Select tool opened the transform (on a paint layer or a group): it closes the same way. */
+  private autoTransform = false;
+  /** The transform the overlay shows now (null: none yet, the same as no change). */
+  private transformM: Affine | null = null;
+
+  /** The open transform has no change yet: closing it loses nothing. */
+  private transformIdle(): boolean {
+    const m = this.transformM;
+    return !m || m.every((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) < 1e-12);
+  }
+
+  /**
+   * The Select tool on a paint layer or a group shows the layer transform (the whole layer is the
+   * selection); on a shape layer it selects shapes. Runs when the tool, the active layer or the
+   * transform changes. An unchanged transform closes when it no longer fits; a changed one stays
+   * until applied or cancelled.
+   */
+  syncSelect(): void {
+    if (this.frame) return;
+    const a = this.activeLayer();
+    const want = ed.tool === 'select' && ed.canEdit && !!a && a.kind !== 'shape' && a.kind !== 'adjust' && !this.transformOp;
+    if (ed.transform) {
+      if (this.autoTransform && (!want || ed.transform.id !== a?.id) && this.transformIdle()) this.cancelTransform();
+      return;
+    }
+    if (want && a && this.contentOf(a.id)) {
+      this.shapes.cancel();
+      this.transformM = null;
+      this.autoTransform = true;
+      ed.transform = { id: a.id };
+    }
   }
 
   /** Live preview while the handles move (no op until apply). */
   previewTransform(m: Affine): void {
+    this.transformM = m;
     if (ed.transform) this.comp.setTransformPreview({ id: ed.transform.id, m });
   }
 
   cancelTransform(): void {
     ed.transform = null;
+    this.transformM = null;
     this.comp.setTransformPreview(null);
   }
 
@@ -1649,6 +1748,7 @@ export class Engine {
   applyTransform(m: Affine): void {
     const t = ed.transform;
     ed.transform = null;
+    this.transformM = null;
     const inv = invert(m);
     const identity = m.every((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) < 1e-12);
     if (!t || !inv || identity || !ed.canEdit) {
@@ -1681,8 +1781,9 @@ export class Engine {
         ed.denied = null;
         if (m.grant) grants.set(this.code, m.grant);
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
-        this.doc.reset(m.seq, m.layers, m.strokes);
+        this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? []);
         this.comp.resetStrokes(m.strokes, m.seq);
+        this.comp.resetShapes(m.shapes ?? []);
         ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
         ed.strokeCount = this.doc.strokes.size;
         // Ops from before a reconnect have no echo yet. The server drops duplicates.
@@ -1707,11 +1808,15 @@ export class Engine {
             this.comp.addStroke(st, m.seq);
           }
           for (const st of changes.added) this.comp.addStroke(st, m.seq);
+          for (const sh of changes.shapes) this.comp.putShape(sh, m.seq);
+          for (const id of changes.shapesGone) this.comp.removeShape(id, m.seq);
           this.comp.advanceSeq(m.seq);
-          this.refreshLayers();
+          if (op.type.startsWith('shape.')) this.shapes.docChanged();
+          else this.refreshLayers();
           if (op.type === 'layer.transform' && m.by === ed.clientId && this.transformOp === op.id) {
             this.transformOp = null;
             this.comp.settleTransformPreview();
+            this.syncSelect();
           }
           this.scheduleMarkers();
         } else if (op.type === 'stroke.add' || op.type === 'stroke.restore') {
@@ -1740,6 +1845,7 @@ export class Engine {
         if (p?.op.type === 'layer.transform' && this.transformOp === p.op.id) {
           this.transformOp = null;
           this.comp.setTransformPreview(null);
+          this.syncSelect();
         }
         if (!/duplicate|no such stroke|not deleted/.test(m.reason)) showToast(`Change rejected: ${m.reason}`);
         this.refreshLayers();
@@ -1758,6 +1864,9 @@ export class Engine {
       case 'live.end':
         this.comp.liveEnd(m.id);
         break;
+      case 'shape.live':
+        this.shapes.remoteDrafts(m.by, m.shapes);
+        break;
       case 'cursor': {
         const peer = ed.peers.find((p) => p.id === m.by);
         if (peer) {
@@ -1774,6 +1883,7 @@ export class Engine {
         ed.peers = ed.peers.filter((p) => p.id !== m.id);
         for (const id of this.livesByPeer.get(m.id) ?? []) this.comp.liveEnd(id);
         this.livesByPeer.delete(m.id);
+        this.shapes.dropRemote(m.id);
         break;
       case 'access':
         if (m.role !== ed.role) showToast(m.role === 'viewer' ? 'You can now only view this canvas' : m.role === 'owner' ? 'You own this canvas now' : 'You can now edit this canvas');
@@ -1833,7 +1943,7 @@ export class Engine {
         e.preventDefault();
         this.redo();
       } else if (key === 't') {
-        // Ctrl+T (browsers keep it for a new tab; the desktop apps and V work everywhere).
+        // Ctrl+T (browsers keep it for a new tab; the desktop apps and the Select tool work everywhere).
         e.preventDefault();
         this.startTransform();
       } else if (key === 'g') {
@@ -1859,6 +1969,27 @@ export class Engine {
       }
       return;
     }
+    // Shapes: delete, deselect, nudge. Enter (like a double-click) is kept for point editing.
+    if ((ed.tool === 'select' || ed.tool === 'shape') && !ed.transform) {
+      if (e.key === 'Escape' && !e.defaultPrevented && this.shapes.escape()) return e.preventDefault();
+      if (ed.selection.length) {
+        if (e.key === 'Delete' || e.key === 'Backspace') {
+          e.preventDefault();
+          return this.shapes.remove();
+        }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          return showToast('Point editing comes in a later version');
+        }
+        const arrows: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+        const a = arrows[e.key];
+        if (a) {
+          e.preventDefault();
+          const k = e.shiftKey ? 10 : 1;
+          return this.shapes.nudge(a[0] * k, a[1] * k);
+        }
+      }
+    }
     const b = ed.activeBrush;
     switch (e.code) {
       case 'BracketLeft':
@@ -1876,9 +2007,12 @@ export class Engine {
       else b.opacity = v;
       return;
     }
-    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', h: 'hand', z: 'zoom' };
-    if (key === 'v') {
-      this.startTransform();
+    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', v: 'select', u: 'shape', h: 'hand', z: 'zoom' };
+    if (key === 'u' && e.shiftKey) {
+      // Shift+U: the next kind of shape.
+      ed.shapeKind = SHAPE_KINDS[(SHAPE_KINDS.indexOf(ed.shapeKind) + 1) % SHAPE_KINDS.length];
+      ed.tool = 'shape';
+      this.updateCursor();
     } else if (tools[key]) {
       ed.tool = tools[key];
       this.updateCursor();
@@ -1918,8 +2052,8 @@ export class Engine {
     const seq = this.doc.seq;
     this.previewAt = Date.now();
     try {
-      const { layers, strokes } = this.snapshot();
-      const png = await renderPng(layers, strokes, seq, frame, W, H);
+      const { layers, strokes, shapes } = this.snapshot();
+      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes);
       if (!png || png.size > maxBytes) return;
       const bmp = await createImageBitmap(png);
       const ok = bmp.width === W && bmp.height === H;
@@ -1947,15 +2081,15 @@ export class Engine {
     const all = this.contentBounds();
     if (all) {
       try {
-        const { layers, strokes, seq } = this.snapshot();
-        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512);
+        const { layers, strokes, shapes, seq } = this.snapshot();
+        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512, shapes);
         if (png) preview = await blobToDataUrl(png);
       } catch (e) {
         console.warn('bdraw preview', e);
       }
     }
     const source = { key: this.code, url: `${PUBLIC_ORIGIN}/s/${this.code}` };
-    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview);
+    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview, this.doc.shapes.values());
     await saveBlob(await encodeBdraw(file), `${this.code}.${BDRAW_EXT}`, { name: 'Draw canvas', extensions: [BDRAW_EXT] });
   }
 }

@@ -2,7 +2,8 @@
   // The layers panel: a tree, top layer first, groups as folders (Photoshop style). A row's grip
   // drags it (mouse, pen or finger): drop on the upper or lower part of a row to go above or below
   // it, on the middle of a group to go into it. Groups open and close with their arrow.
-  import { ADJUST_TYPES, BLEND_MODES, LIMITS, type Layer, type LayerBlend } from '../../shared/types';
+  import { ADJUST_TYPES, BLEND_MODES, LIMITS, type Layer, type LayerBlend, type Shape } from '../../shared/types';
+  import { SHAPE_LABEL } from '../engine/shapeTool';
   import { layerTree, subtreeIds, type LayerNode } from '../../shared/layers';
   import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
@@ -29,7 +30,8 @@
       for (let i = nodes.length - 1; i >= 0; i--) {
         const n = nodes[i];
         const group = n.layer.kind === 'group';
-        const open = group && !ed.collapsed.has(n.layer.id);
+        // Groups and shape layers open and close (a shape layer shows its shapes).
+        const open = (group || n.layer.kind === 'shape') && !ed.collapsed.has(n.layer.id);
         out.push({ layer: n.layer, depth, group, open });
         if (open) walk(n.children, depth + 1);
       }
@@ -114,6 +116,35 @@
   }
 
   const peersOn = (layerId: string) => ed.peers.filter((p) => p.layerId === layerId);
+
+  /** The shapes of each shape layer, top first (as the layers). */
+  const shapesBy = $derived.by(() => {
+    const out = new Map<string, Shape[]>();
+    for (const s of ed.shapes) {
+      let list = out.get(s.layerId);
+      if (!list) out.set(s.layerId, (list = []));
+      list.unshift(s);
+    }
+    return out;
+  });
+  let editingShape = $state<string | null>(null);
+
+  /** A shape row: selects the shape (Shift: adds or removes it), with the Select tool. */
+  function pickShape(e: PointerEvent, s: Shape) {
+    if (!engine) return;
+    const ids = e.shiftKey ? (ed.selection.includes(s.id) ? ed.selection.filter((id) => id !== s.id) : [...ed.selection, s.id]) : [s.id];
+    if (ed.tool !== 'select' && ed.tool !== 'shape') {
+      ed.tool = 'select';
+      engine.updateCursor();
+    }
+    engine.shapes.select(ids);
+  }
+
+  function renameShape(id: string, value: string) {
+    editingShape = null;
+    const name = value.trim().slice(0, LIMITS.maxShapeName);
+    if (name) engine?.shapes.rename(id, name);
+  }
 
   // --- drag and drop -----------------------------------------------------------------------------
 
@@ -209,6 +240,7 @@
         onpointerdown={() => {
           engine?.setActiveLayer(layer.id);
           engine?.setMaskTarget(false);
+          engine?.shapes.layerPicked(layer.id);
         }}
       >
         <span class="grip" title="Drag to move (into a group: drop on its middle)" role="button" tabindex="-1" onpointerdown={(e) => grab(e, layer.id)}>
@@ -223,11 +255,11 @@
         >
           <Icon name={layer.visible ? 'eye' : 'eyeoff'} />
         </button>
-        {#if row.group}
+        {#if row.group || layer.kind === 'shape'}
           <button
             class="icon chev"
             class:open={row.open}
-            title={row.open ? 'Close the group' : 'Open the group'}
+            title={row.group ? (row.open ? 'Close the group' : 'Open the group') : row.open ? 'Hide the shapes' : 'Show the shapes'}
             onpointerdown={(e) => e.stopPropagation()}
             onclick={() => toggleOpen(layer.id)}
           >
@@ -248,6 +280,7 @@
         {:else}
           <span class="name" class:hidden={!layer.visible} class:target={isActive && !ed.maskTarget} role="button" tabindex="-1" ondblclick={() => (editing = layer.id)} title="Double-click to rename">
             {#if layer.kind === 'adjust'}<span class="kind" title="Adjustment layer"><Icon name="adjust" /></span>{/if}
+            {#if layer.kind === 'shape'}<span class="kind" title="Shape layer: holds shapes"><Icon name="shapes" /></span>{/if}
             {#if row.group}<span class="kind" title="Group"><Icon name="folder" /></span>{/if}
             {layer.name}
           </span>
@@ -276,6 +309,48 @@
           {#if layer.opacity < 1}<span class="tag">{Math.round(layer.opacity * 100)}%</span>{/if}
         </span>
       </li>
+      {#if layer.kind === 'shape' && row.open}
+        {#each shapesBy.get(layer.id) ?? [] as sh (sh.id)}
+          <li class="shape" class:active={ed.selection.includes(sh.id)} style:--depth={row.depth + 1} onpointerdown={(e) => pickShape(e, sh)}>
+            <span class="kind"><Icon name={sh.kind} /></span>
+            {#if editingShape === sh.id}
+              <input
+                type="text"
+                value={sh.name}
+                use:focus
+                onpointerdown={(e) => e.stopPropagation()}
+                onblur={(e) => renameShape(sh.id, e.currentTarget.value)}
+                onkeydown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === 'Enter') e.currentTarget.blur();
+                  if (e.key === 'Escape') editingShape = null;
+                }}
+              />
+            {:else}
+              <span class="name" class:hidden={!layer.visible} role="button" tabindex="-1" ondblclick={() => (editingShape = sh.id)} title="Double-click to rename">
+                {sh.name || SHAPE_LABEL[sh.kind]}
+              </span>
+            {/if}
+            <span
+              class="chip"
+              class:outline={!sh.fill}
+              style:background={sh.fill ?? 'transparent'}
+              style:border-color={sh.stroke ?? (sh.fill ? '#000' : 'var(--text-faint)')}
+              title="Fill {sh.fill ?? 'none'} · stroke {sh.stroke ?? 'none'}"
+            ></span>
+            <button
+              class="icon del"
+              title="Delete the shape (Delete)"
+              aria-label="Delete {sh.name}"
+              disabled={!ed.canEdit}
+              onpointerdown={(e) => e.stopPropagation()}
+              onclick={() => engine?.shapes.remove([sh.id])}
+            >
+              <Icon name="trash" />
+            </button>
+          </li>
+        {/each}
+      {/if}
     {/each}
   </ul>
 
@@ -524,6 +599,33 @@
     height: 22px;
     flex: none;
   }
+  li.shape {
+    height: 28px;
+    padding-left: calc(30px + var(--depth, 0) * 14px);
+  }
+  li.shape .kind {
+    margin-right: 0;
+  }
+  .chip {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 2px solid #000;
+  }
+  .chip.outline {
+    border-width: 2px;
+  }
+  .del {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    visibility: hidden;
+  }
+  li.shape:hover .del,
+  li.shape.active .del {
+    visibility: visible;
+  }
   .maskchip.off {
     opacity: 0.4;
   }
@@ -611,6 +713,14 @@
   @media (pointer: coarse) {
     li {
       height: 46px;
+    }
+    li.shape {
+      height: 40px;
+    }
+    .del {
+      visibility: visible;
+      width: 36px;
+      height: 36px;
     }
     .grip {
       width: 26px;

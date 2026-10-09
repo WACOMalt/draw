@@ -9,6 +9,8 @@ import {
   type Op,
   type Peer,
   type ServerMsg,
+  type Shape,
+  type ShapeInput,
   type Stroke,
 } from '../shared/types';
 import {
@@ -19,8 +21,10 @@ import {
   validateNumber,
   validateOp,
   validatePoints,
+  validateShapeInput,
   validateString,
 } from '../shared/validate';
+import { transformShapeMatrix } from '../shared/shapes';
 import { docFeatures } from '../shared/features';
 import { depthOf, duplicateOf, effectivelyDeleted, subtreeHeight, subtreeIds, transformStroke } from '../shared/layers';
 import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
@@ -82,6 +86,7 @@ export class Session {
   seq = 0;
   layers = new Map<string, Layer>();
   strokes = new Map<string, Stroke>();
+  shapes = new Map<string, Shape>();
   clients = new Map<string, Client>();
   unloadTimer: NodeJS.Timeout | null = null;
   /** When the last link preview was stored (rate limit). */
@@ -115,13 +120,19 @@ export class Session {
   }
 
   /**
-   * Fills a new, empty canvas from a .bdraw file: layer.add then stroke.add ops, each through
-   * the same checks as a live op. Entries that fail are skipped and counted.
+   * Fills a new, empty canvas from a .bdraw file: layer.add, stroke.add, then shape.add ops, each
+   * through the same checks as a live op. Entries that fail are skipped and counted.
    */
-  static importDoc(store: Store, row: CanvasRow, layers: unknown[], strokes: unknown[]): { layers: number; strokes: number; skipped: number } {
+  static importDoc(
+    store: Store,
+    row: CanvasRow,
+    layers: unknown[],
+    strokes: unknown[],
+    shapes: unknown[] = [],
+  ): { layers: number; strokes: number; shapes: number; skipped: number } {
     const s = new Session(row.code, store, row);
-    const n = { layers: 0, strokes: 0, skipped: 0 };
-    const tryCommit = (op: () => Op, by: string, kind: 'layers' | 'strokes') => {
+    const n = { layers: 0, strokes: 0, shapes: 0, skipped: 0 };
+    const tryCommit = (op: () => Op, by: string, kind: 'layers' | 'strokes' | 'shapes') => {
       try {
         s.commit(op(), by);
         n[kind]++;
@@ -151,6 +162,12 @@ export class Session {
         const by = typeof author === 'string' && /^[\w-]{1,40}$/.test(author) ? author : 'import';
         tryCommit(() => validateOp({ type: 'stroke.add', stroke: st }), by, 'strokes');
       }
+      for (const sh of shapes) {
+        if (field(sh, 'deleted') === true) continue;
+        const author = field(sh, 'author');
+        const by = typeof author === 'string' && /^[\w-]{1,40}$/.test(author) ? author : 'import';
+        tryCommit(() => validateOp({ type: 'shape.add', shape: sh }), by, 'shapes');
+      }
     });
     return n;
   }
@@ -172,6 +189,7 @@ export class Session {
         if (!layer || effectivelyDeleted(this.layers, layer)) throw new OpError('no such layer');
         if (layer.kind === 'group') throw new OpError('groups hold no paint');
         if (layer.kind === 'adjust' && !op.stroke.mask) throw new OpError('adjustment layers hold no paint');
+        if (layer.kind === 'shape' && !op.stroke.mask) throw new OpError('shape layers hold shapes, not paint');
         if (this.strokes.has(op.stroke.id)) throw new OpError('duplicate stroke');
         const stroke: Stroke = { ...op.stroke, seq, author: by };
         this.strokes.set(stroke.id, stroke);
@@ -219,7 +237,15 @@ export class Session {
           if (!t) throw new OpError('the transform goes out of range');
           changes.push([st, t]);
         }
+        const moved: [Shape, Shape['m']][] = [];
+        for (const sh of this.shapes.values()) {
+          if (!ids.has(sh.layerId)) continue;
+          const m = transformShapeMatrix(sh, op.m, LIMITS.maxCoord);
+          if (!m) throw new OpError('the transform goes out of range');
+          moved.push([sh, m]);
+        }
         for (const [st, t] of changes) Object.assign(st, t);
+        for (const [sh, m] of moved) sh.m = m;
         return op;
       }
       case 'layer.duplicate': {
@@ -227,12 +253,46 @@ export class Session {
         if (!src || effectivelyDeleted(this.layers, src)) throw new OpError('no such layer');
         if (this.layers.has(op.newId)) throw new OpError('duplicate layer');
         this.checkParent(op.parent, subtreeHeight(this.layers.values(), src.id));
-        const copy = duplicateOf(this.layers, this.strokes.values(), op);
+        const copy = duplicateOf(this.layers, this.strokes.values(), op, this.shapes.values());
         if (this.liveLayers() + copy.layers.length > LIMITS.maxLayers) throw new OpError('too many layers');
-        if (copy.layers.some((l) => this.layers.has(l.id)) || copy.strokes.some((st) => this.strokes.has(st.id))) throw new OpError('duplicate ids');
+        if (this.liveShapes() + copy.shapes.length > LIMITS.maxShapes) throw new OpError('too many shapes');
+        if (copy.layers.some((l) => this.layers.has(l.id)) || copy.strokes.some((st) => this.strokes.has(st.id)) || copy.shapes.some((sh) => this.shapes.has(sh.id))) {
+          throw new OpError('duplicate ids');
+        }
         for (const l of copy.layers) this.layers.set(l.id, l);
         for (const st of copy.strokes) this.strokes.set(st.id, st);
+        for (const sh of copy.shapes) this.shapes.set(sh.id, sh);
         return op;
+      }
+      case 'shape.add': {
+        this.shapeLayer(op.shape.layerId);
+        if (this.shapes.has(op.shape.id)) throw new OpError('duplicate shape');
+        if (this.liveShapes() >= LIMITS.maxShapes) throw new OpError('too many shapes');
+        const shape: Shape = { ...op.shape, author: by, seq };
+        this.shapes.set(shape.id, shape);
+        return { type: 'shape.add', shape };
+      }
+      case 'shape.update': {
+        const old = this.shapes.get(op.id);
+        if (!old || old.deleted) throw new OpError('no such shape');
+        const { author, seq: added, deleted: _d, ...input } = old;
+        // The result must be a whole, valid shape of its kind (throws ValidationError if not).
+        const next = validateShapeInput({ ...input, ...op.props } satisfies ShapeInput);
+        this.shapes.set(op.id, { ...next, author, seq: added });
+        return op;
+      }
+      case 'shape.remove': {
+        const sh = this.shapes.get(op.id);
+        if (!sh || sh.deleted) throw new OpError('no such shape');
+        sh.deleted = true;
+        return op;
+      }
+      case 'shape.restore': {
+        const sh = this.shapes.get(op.id);
+        if (!sh || !sh.deleted) throw new OpError('shape not deleted');
+        if (this.liveShapes() >= LIMITS.maxShapes) throw new OpError('too many shapes');
+        delete sh.deleted;
+        return { type: 'shape.restore', id: op.id, shape: sh };
       }
       case 'layer.remove': {
         const l = this.layers.get(op.id);
@@ -247,6 +307,20 @@ export class Session {
         return op;
       }
     }
+  }
+
+  /** Throws unless `id` is a live shape layer. */
+  private shapeLayer(id: string): void {
+    const l = this.layers.get(id);
+    if (!l || effectivelyDeleted(this.layers, l)) throw new OpError('no such layer');
+    if (l.kind !== 'shape') throw new OpError('shapes go on shape layers');
+  }
+
+  /** Shapes that count against the limit (deleted ones do not). */
+  private liveShapes(): number {
+    let n = 0;
+    for (const sh of this.shapes.values()) if (!sh.deleted) n++;
+    return n;
   }
 
   /** Layers that count against the limit: not deleted, and not inside a deleted group. */
@@ -271,8 +345,8 @@ export class Session {
     const seq = this.seq + 1;
     const applied = this.apply(op, by, seq);
     this.seq = seq;
-    // Persist restores without the stroke body: replay already has it.
-    const stored: AppliedOp = applied.type === 'stroke.restore' ? (op as AppliedOp) : applied;
+    // Persist restores without the stroke or shape body: replay already has it.
+    const stored: AppliedOp = applied.type === 'stroke.restore' || applied.type === 'shape.restore' ? (op as AppliedOp) : applied;
     this.store.appendOp(this.code, seq, by, stored);
     this.broadcast({ t: 'op', seq, by, opId, op: applied });
   }
@@ -332,6 +406,16 @@ export class Session {
       case 'live.end':
         if (typeof msg.id === 'string') this.broadcast({ t: 'live.end', by: client.id, id: msg.id }, client);
         return;
+      case 'shape.live': {
+        if (!atLeast(client.role, 'editor') || !client.live.take()) return;
+        try {
+          if (!Array.isArray(msg.shapes) || msg.shapes.length > LIMITS.maxLiveShapes) return;
+          this.broadcast({ t: 'shape.live', by: client.id, shapes: msg.shapes.map(validateShapeInput) }, client);
+        } catch {
+          // Drop malformed live data. It is not persisted.
+        }
+        return;
+      }
       case 'preview':
         this.takePreview(client, msg);
         return;
@@ -439,6 +523,7 @@ export class Session {
         seq: this.seq,
         layers: [...this.layers.values()],
         strokes: [...this.strokes.values()].filter((s) => !s.deleted),
+        shapes: [...this.shapes.values()].filter((s) => !s.deleted),
         peers,
         role: client.role,
         canvas: this.info(client),

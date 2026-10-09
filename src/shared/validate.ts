@@ -5,7 +5,12 @@ import {
   BLEND_MODES,
   BRUSH_TIPS,
   GRAINS,
+  LAYER_KINDS,
   LIMITS,
+  LINE_CAPS,
+  LINE_JOINS,
+  SHAPE_KINDS,
+  STROKE_ALIGNS,
   type Adjust,
   type Affine,
   type BlendMode,
@@ -15,8 +20,11 @@ import {
   type LayerMask,
   type LayerProps,
   type Op,
+  type ShapeInput,
+  type ShapeProps,
 } from './types';
 import { validAffine } from './layers';
+import { cornersWithin } from './shapes';
 
 export class ValidationError extends Error {}
 
@@ -207,7 +215,7 @@ export function validateOp(v: unknown): Op {
       return { type: o.type, id: id(o.id) };
     case 'layer.add': {
       const l = obj(o.layer, 'layer');
-      const kind = l.kind === undefined ? undefined : oneOf(l.kind, ['paint', 'adjust', 'group'] as const, 'layer.kind');
+      const kind = l.kind === undefined ? undefined : oneOf(l.kind, LAYER_KINDS, 'layer.kind');
       const props = layerProps(l, false) as LayerProps;
       if (kind === 'adjust' && !props.adjust) fail('adjustment layer without adjust');
       if (props.blend === 'pass' && kind !== 'group') fail('pass through is for groups');
@@ -218,6 +226,13 @@ export function validateOp(v: unknown): Op {
     case 'layer.transform':
       if (!validAffine(o.m)) fail('bad transform');
       return { type: 'layer.transform', id: id(o.id), m: [...(o.m as Affine)] as Affine };
+    case 'shape.add':
+      return { type: 'shape.add', shape: validateShapeInput(o.shape) };
+    case 'shape.update':
+      return { type: 'shape.update', id: id(o.id), props: shapeProps(o.props, true) };
+    case 'shape.remove':
+    case 'shape.restore':
+      return { type: o.type, id: id(o.id) };
     case 'layer.duplicate':
       return {
         type: 'layer.duplicate',
@@ -230,6 +245,96 @@ export function validateOp(v: unknown): Op {
     default:
       fail('unknown op type');
   }
+}
+
+// --- shapes ------------------------------------------------------------------------------------
+
+const len = (v: unknown, what: string) => num(v, 0, LIMITS.maxCoord, what);
+const coord = (v: unknown, what: string) => num(v, -LIMITS.maxCoord, LIMITS.maxCoord, what);
+
+function tuple4(v: unknown, f: (x: unknown, what: string) => number, what: string): [number, number, number, number] {
+  if (!Array.isArray(v) || v.length !== 4) fail(`bad ${what}`);
+  return [f(v[0], what), f(v[1], what), f(v[2], what), f(v[3], what)];
+}
+
+const colorOrNull = (v: unknown) => (v === null ? null : validateColor(v));
+
+/** Shape props, range checks only. `partial`: only the props present, at least one. */
+function shapeProps(v: unknown, partial: boolean): Partial<ShapeProps> {
+  const p = obj(v, 'props');
+  const out: Partial<ShapeProps> = {};
+  const want = (k: keyof ShapeProps) => p[k] !== undefined || !partial;
+  if (want('name')) out.name = str(p.name, LIMITS.maxShapeName, 'name');
+  if (want('z')) out.z = num(p.z, -1e12, 1e12, 'z');
+  if (want('w')) out.w = len(p.w, 'w');
+  if (want('h')) out.h = len(p.h, 'h');
+  if (want('m')) {
+    if (!validAffine(p.m)) fail('bad m');
+    out.m = [...(p.m as number[])] as ShapeProps['m'];
+  }
+  if (want('fill')) out.fill = colorOrNull(p.fill);
+  if (want('stroke')) out.stroke = colorOrNull(p.stroke);
+  if (want('strokeWidth')) out.strokeWidth = len(p.strokeWidth, 'strokeWidth');
+  if (want('align')) out.align = oneOf(p.align, STROKE_ALIGNS, 'align');
+  if (want('cap')) out.cap = oneOf(p.cap, LINE_CAPS, 'cap');
+  if (want('join')) out.join = oneOf(p.join, LINE_JOINS, 'join');
+  // Settings of one kind or another: optional here, checked against the kind in validateShapeInput.
+  if (p.radii !== undefined) out.radii = tuple4(p.radii, len, 'radii');
+  if (p.radiiLinked !== undefined) out.radiiLinked = bool(p.radiiLinked, 'radiiLinked');
+  const corners = (x: unknown, what: string) => {
+    const n = num(x, LIMITS.minCorners, LIMITS.maxCorners, what);
+    if (!Number.isInteger(n)) fail(`bad ${what}`);
+    return n;
+  };
+  if (p.sides !== undefined) out.sides = corners(p.sides, 'sides');
+  if (p.points !== undefined) out.points = corners(p.points, 'points');
+  if (p.innerRatio !== undefined) out.innerRatio = num(p.innerRatio, 0.01, 1, 'innerRatio');
+  if (p.rounding !== undefined) out.rounding = len(p.rounding, 'rounding');
+  if (p.line !== undefined) out.line = tuple4(p.line, coord, 'line');
+  if (partial && Object.keys(out).length === 0) fail('empty props');
+  return out;
+}
+
+/**
+ * A whole shape: every common prop, and the settings its kind needs (settings of other kinds are
+ * dropped). Its frame must stay within LIMITS.maxCoord. The server runs this on shape.add, and
+ * on the merged result of every shape.update.
+ */
+export function validateShapeInput(v: unknown): ShapeInput {
+  const s = obj(v, 'shape');
+  const kind = oneOf(s.kind, SHAPE_KINDS, 'shape.kind');
+  const p = shapeProps(s, false) as ShapeProps;
+  const out: ShapeInput = {
+    id: id(s.id),
+    layerId: id(s.layerId, 'layerId'),
+    kind,
+    name: p.name,
+    z: p.z,
+    w: p.w,
+    h: p.h,
+    m: p.m,
+    fill: kind === 'line' ? null : p.fill,
+    stroke: p.stroke,
+    strokeWidth: p.strokeWidth,
+    align: kind === 'line' ? 'center' : p.align,
+    cap: p.cap,
+    join: p.join,
+  };
+  const need = <K extends keyof ShapeProps>(k: K): NonNullable<ShapeProps[K]> => {
+    if (p[k] === undefined) fail(`${kind} needs ${k}`);
+    return p[k] as NonNullable<ShapeProps[K]>;
+  };
+  if (kind === 'rect') {
+    out.radii = need('radii');
+    if (p.radiiLinked !== undefined) out.radiiLinked = p.radiiLinked;
+  } else if (kind === 'polygon') out.sides = need('sides');
+  else if (kind === 'star') {
+    out.points = need('points');
+    out.innerRatio = need('innerRatio');
+  } else if (kind === 'line') out.line = need('line');
+  if ((kind === 'polygon' || kind === 'star') && p.rounding !== undefined) out.rounding = p.rounding;
+  if (!cornersWithin(out, LIMITS.maxCoord)) fail('shape out of range');
+  return out;
 }
 
 export { id as validateId, num as validateNumber, str as validateString };

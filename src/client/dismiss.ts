@@ -45,6 +45,8 @@ export function dismiss(node: HTMLElement, opts: DismissOptions) {
   };
   const key = (e: KeyboardEvent) => {
     if (!o.open || e.key !== 'Escape') return;
+    // Handled: the canvas does not also take this Esc (it would deselect shapes).
+    e.preventDefault();
     const a = document.activeElement;
     if (a instanceof HTMLElement && node.contains(a)) a.blur();
     o.close();
@@ -61,7 +63,8 @@ export function dismiss(node: HTMLElement, opts: DismissOptions) {
   track();
   // Capture phase: runs before the canvas, which keeps its pointer events to itself.
   window.addEventListener('pointerdown', down, true);
-  window.addEventListener('keydown', key);
+  // Capture phase too, so the Esc is marked handled before the engine sees it.
+  window.addEventListener('keydown', key, true);
   return {
     update(next: DismissOptions) {
       o = next;
@@ -69,7 +72,7 @@ export function dismiss(node: HTMLElement, opts: DismissOptions) {
     },
     destroy() {
       window.removeEventListener('pointerdown', down, true);
-      window.removeEventListener('keydown', key);
+      window.removeEventListener('keydown', key, true);
       release?.();
     },
   };

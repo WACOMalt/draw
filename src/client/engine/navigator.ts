@@ -68,15 +68,26 @@ function gap(a: Bounds, b: Bounds): number {
   return Math.hypot(dx, dy);
 }
 
+/** World bounds of every stroke (not on a mask) and every shape on the visible layers. */
+function* content(doc: Doc, visibleLayers: Set<string>): Generator<Bounds> {
+  for (const [id, s] of doc.strokes) {
+    if (s.mask || !visibleLayers.has(s.layerId)) continue;
+    const b = doc.bounds.get(id);
+    if (b) yield b;
+  }
+  for (const [id, s] of doc.shapes) {
+    if (s.deleted || !visibleLayers.has(s.layerId)) continue;
+    const b = doc.shapeBounds.get(id);
+    if (b) yield b;
+  }
+}
+
 export function computeMarkers(doc: Doc, visibleLayers: Set<string>, view: ViewState, w: number, h: number): Marker[] {
   const z = view.zoom;
   const tiny: Tiny[] = [];
   const sectors = Array.from({ length: 8 }, () => ({ n: 0, nearest: Infinity, items: [] as Bounds[], dists: [] as number[] }));
 
-  for (const [id, s] of doc.strokes) {
-    if (s.mask || !visibleLayers.has(s.layerId)) continue;
-    const b = doc.bounds.get(id);
-    if (!b) continue;
+  for (const b of content(doc, visibleLayers)) {
     const sx0 = (b.x0 - view.x) * z, sx1 = (b.x1 - view.x) * z;
     const sy0 = (b.y0 - view.y) * z, sy1 = (b.y1 - view.y) * z;
     if (sx1 >= 0 && sx0 <= w && sy1 >= 0 && sy0 <= h) {
@@ -186,10 +197,6 @@ function groupTiny(tiny: Tiny[], cell: number, dropVisible: boolean): Group[] {
 
 export function unionAll(doc: Doc, visibleLayers: Set<string>): Bounds | null {
   let all: Bounds | null = null;
-  for (const [id, s] of doc.strokes) {
-    if (s.mask || !visibleLayers.has(s.layerId)) continue;
-    const b = doc.bounds.get(id);
-    if (b) all = all ? union(all, b) : b;
-  }
+  for (const b of content(doc, visibleLayers)) all = all ? union(all, b) : b;
   return all;
 }

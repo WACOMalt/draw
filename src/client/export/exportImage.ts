@@ -1,7 +1,7 @@
 // The large image export: a world rectangle at a chosen pixel size, rendered in pieces by an
 // off-screen renderer and streamed into a PNG or a tiled (Big)TIFF file.
 
-import type { Layer, Stroke } from '../../shared/types';
+import type { Layer, Shape, Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { PngWriter } from './png';
 import { PIECE, RegionRenderer } from './region';
@@ -13,6 +13,7 @@ export type ImageFormat = 'png' | 'tiff';
 export interface ExportJob {
   layers: Layer[];
   strokes: Stroke[];
+  shapes: Shape[];
   seq: number;
   bounds: Bounds;
   width: number;
@@ -35,7 +36,7 @@ const breathe = () => new Promise((r) => setTimeout(r, 0));
 export async function exportImage(job: ExportJob): Promise<void> {
   const { bounds, width, height, sink, signal } = job;
   const scale = width / (bounds.x1 - bounds.x0);
-  const rr = new RegionRenderer(job.layers, job.strokes, job.seq);
+  const rr = new RegionRenderer(job.layers, job.strokes, job.seq, job.shapes);
   const at = (px: number, py: number): [number, number] => [bounds.x0 + px / scale, bounds.y0 + py / scale];
   let piece = 0;
   try {

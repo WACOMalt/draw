@@ -40,7 +40,7 @@ export interface ApiContext {
   /** After a rename: moves the live session to the new code and re-checks everyone. */
   moveCanvas(from: string, to: string): void;
   /** Fills a new canvas from a .bdraw file (Session.importDoc). */
-  importDoc(row: CanvasRow, layers: unknown[], strokes: unknown[]): { layers: number; strokes: number; skipped: number };
+  importDoc(row: CanvasRow, layers: unknown[], strokes: unknown[], shapes: unknown[]): { layers: number; strokes: number; shapes: number; skipped: number };
   /** Proof-of-work captcha for registration and password reset emails (captcha.ts). */
   captcha: Captcha;
   /**
@@ -361,7 +361,7 @@ const importCanvas: Handler = async (ctx, req) => {
     return err(400, 'bad_request');
   }
   // Read the whole file before anything is made, so a bad file leaves nothing behind.
-  let file: { format?: unknown; version?: unknown; layers?: unknown; strokes?: unknown };
+  let file: { format?: unknown; version?: unknown; layers?: unknown; strokes?: unknown; shapes?: unknown };
   try {
     const bytes = req.bytes ?? Buffer.alloc(0);
     const text = isGzip(bytes) ? zlib.gunzipSync(bytes, { maxOutputLength: IMPORT_MAX_INFLATED }).toString('utf8') : bytes.toString('utf8');
@@ -375,7 +375,7 @@ const importCanvas: Handler = async (ctx, req) => {
   const r = makeCanvas(ctx, req, opts);
   if ('res' in r) return r.res;
   try {
-    const n = ctx.importDoc(r.row, file.layers, file.strokes);
+    const n = ctx.importDoc(r.row, file.layers, file.strokes, Array.isArray(file.shapes) ? file.shapes : []);
     return ok({ key: r.row.code, link: r.link, ...n }, 201);
   } catch (e) {
     ctx.store.deleteCanvas(r.row.code);

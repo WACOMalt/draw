@@ -19,6 +19,7 @@
     title = '',
     wide = false,
     oninput,
+    onchange,
   }: {
     label: string;
     value: number;
@@ -32,6 +33,8 @@
     /** Stretch the slider to the available width (sheet layout). */
     wide?: boolean;
     oninput?: (v: number) => void;
+    /** The change is done: the drag ended, a key or the number field set the value. */
+    onchange?: (v: number) => void;
   } = $props();
 
   // Position 0..1 on the track. Log scale maps it to min..max exponentially: fine steps at the
@@ -103,8 +106,10 @@
     if (!drag || e.pointerId !== drag.id) return;
     // A tap that did not move: set the value there.
     if (e.type === 'pointerup' && !drag.live) set(fromPos(posAt(e.clientX)));
+    const changed = drag.live || e.type === 'pointerup';
     drag = null;
     active = false;
+    if (changed) onchange?.(value);
   }
 
   function key(e: KeyboardEvent) {
@@ -112,12 +117,13 @@
     let p: number | null = null;
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') p = log ? pos + 0.01 * big : null;
     else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') p = log ? pos - 0.01 * big : null;
-    else if (e.key === 'Home') return e.preventDefault(), set(min);
-    else if (e.key === 'End') return e.preventDefault(), set(max);
+    else if (e.key === 'Home') return e.preventDefault(), set(min), onchange?.(value);
+    else if (e.key === 'End') return e.preventDefault(), set(max), onchange?.(value);
     else return;
     e.preventDefault();
     if (p !== null) set(fromPos(p));
     else set(value + (e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 1 : -1) * step * big);
+    onchange?.(value);
   }
 </script>
 
@@ -150,7 +156,10 @@
     step="any"
     min={percent ? min * 100 : min}
     max={percent ? max * 100 : max}
-    onchange={(e) => set(percent ? +e.currentTarget.value / 100 : +e.currentTarget.value)}
+    onchange={(e) => {
+      set(percent ? +e.currentTarget.value / 100 : +e.currentTarget.value);
+      onchange?.(value);
+    }}
   />
   {#if percent}<span class="unit">%</span>{/if}
 </div>
