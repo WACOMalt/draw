@@ -11,6 +11,7 @@ import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
 import { createPrograms, type Program, type Programs } from './programs';
+import { perfProfile, type PerfProfile } from '../perf';
 
 /** Two screen buffers: `a` holds the composite so far, `b` receives the next blend pass. */
 interface Pair {
@@ -29,8 +30,13 @@ interface Grid {
   Y: (ty: number) => number;
 }
 
-/** Floats per dab instance on the GPU: cx, cy, rv, a, r, rot. */
-const INST = 6;
+/**
+ * Floats per dab instance on the GPU: cx, cy, rv, a, r, rot, then r, g, b, hardness (paintDabs).
+ * Color and hardness per dab let a run of strokes share one draw call (drawStrokes).
+ */
+const INST = 10;
+/** Most dabs in one batched draw call. */
+const MAX_BATCH = 65536;
 
 interface Target {
   tex: WebGLTexture;
@@ -102,8 +108,9 @@ interface Live {
 }
 
 const PREFETCH = 1;
-/** Coarser levels kept ready around the view, for zoom out and pan (see render). */
-const COARSE_LEVELS = 2;
+/** Slow-device check: frames while the view moves, and the median interval that is too slow. */
+const SPEED_FRAMES = 60;
+const SLOW_MS = 34;
 
 /** Tiles from (tx0, ty0) to (tx1, ty1), inclusive, at one level of detail. */
 interface TileRange {
@@ -113,17 +120,23 @@ interface TileRange {
   tx1: number;
   ty1: number;
 }
+/** JavaScript time for tiles per frame: while the view moves or a stroke is drawn, and when still. */
 const TILE_BUDGET_MS = 6;
+const TILE_BUDGET_STILL_MS = 12;
 /**
  * GPU work for tiles per frame, in device pixels of dab area (plus a fixed cost per dab and per
  * draw call). JavaScript time does not show GPU cost: a phone can queue far more fill than fits
  * in a frame, and then Chromium blocks the page until its GPU command buffer drains (the whole
- * UI freezes). The budget adapts to the measured frame interval.
+ * UI freezes). Two budgets adapt to the measured frame interval: one while the view moves or a
+ * stroke is drawn (aims at 60 fps), one while all is still (aims at 25 fps: tiles finish sooner,
+ * and nothing moves that could stutter). A slow GPU that cannot reach 60 fps even without tiles
+ * used to cut the only budget to the minimum, and a phone took minutes to draw a canvas.
  */
 const FILL_MIN = 2e5;
 const FILL_MAX = 6e7;
-/** Share of the fill budget while the view moves: panning and zooming stay smooth. */
-const MOVING_SHARE = 0.35;
+const MOVING_TARGET_MS = 20;
+const STILL_TARGET_MS = 40;
+/** The view counts as moving this long after a change. */
 const MOVING_MS = 150;
 /** Radius in px above which dabs are virtualized to keep float32 exact. */
 const HUGE_PX = 1e6;
@@ -194,6 +207,7 @@ export class GLRenderer implements Renderer {
   private maxTiles: number;
   private hardMaxTiles: number;
   private fillBudget: number;
+  private fillMoving: number;
   private lastFrameAt = 0;
   private lastViewChange = 0;
   /** The previous frame drew tiles: its interval says how much GPU work fits. */
@@ -209,11 +223,13 @@ export class GLRenderer implements Renderer {
     private canvas: HTMLCanvasElement,
     private gl: WebGL2RenderingContext,
     private offline = false,
+    readonly profile: PerfProfile = perfProfile(gl),
   ) {
-    const coarse = matchMedia('(pointer: coarse)').matches;
-    this.maxTiles = coarse ? 192 : 512;
-    this.hardMaxTiles = coarse ? 400 : 1200; // about 200 MB and 600 MB of RGBA16F tiles
-    this.fillBudget = coarse ? 1.5e6 : 8e6;
+    // A 256 px tile is 512 KB in RGBA16F, 256 KB in RGBA8.
+    this.maxTiles = profile.maxTiles;
+    this.hardMaxTiles = profile.hardMaxTiles;
+    this.fillBudget = profile.fill;
+    this.fillMoving = profile.fill * 0.35;
     this.initGL();
     const lost = (e: Event) => {
       e.preventDefault();
@@ -237,7 +253,8 @@ export class GLRenderer implements Renderer {
   /** Creates every GL resource. Runs at start and after a lost context comes back. */
   private initGL(): void {
     const gl = this.gl;
-    const floatOk = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+    // The light profile asks for 8-bit buffers: half the memory and bandwidth.
+    const floatOk = this.profile.bits === 16 && !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
     this.fmt = floatOk
       ? { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT }
       : { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE };
@@ -281,6 +298,9 @@ export class GLRenderer implements Renderer {
     gl.enableVertexAttribArray(3);
     gl.vertexAttribPointer(3, 1, gl.FLOAT, false, stride, 20);
     gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4);
+    gl.vertexAttribPointer(4, 4, gl.FLOAT, false, stride, 24);
+    gl.vertexAttribDivisor(4, 1);
     gl.bindVertexArray(null);
 
     // Tips and grains upload on first use (tips.ts generates them on the CPU).
@@ -654,16 +674,30 @@ export class GLRenderer implements Renderer {
     return [m((sx - ox) * scale), m((sy - oy) * scale), period];
   }
 
-  /** Draws n prepared instances into the bound target. The caller sets the blend state. */
-  private drawDabs(n: number, brush: Brush, w: number, h: number, grain: [number, number, number] | null): void {
+  /** Sets the color and hardness of instances from..to-1 (see INST). */
+  private paintDabs(from: number, to: number, brush: Brush): void {
+    const [r, g, b] = hexToRgb(brush.color);
+    const f = this.inst;
+    for (let i = from; i < to; i++) {
+      const o = i * INST;
+      f[o + 6] = r;
+      f[o + 7] = g;
+      f[o + 8] = b;
+      f[o + 9] = brush.hardness;
+    }
+  }
+
+  /**
+   * Draws n prepared instances into the bound target. The caller sets the blend state. `painted`:
+   * the instances have their own color and hardness already (a batch); else the brush's apply.
+   */
+  private drawDabs(n: number, brush: Brush, w: number, h: number, grain: [number, number, number] | null, painted = false): void {
     if (n === 0) return;
+    if (!painted) this.paintDabs(0, n, brush);
     const gl = this.gl;
     const p = this.progs.dab;
     gl.useProgram(p.prog);
     gl.uniform2f(p.u.uTarget, w, h);
-    const [r, g, b] = hexToRgb(brush.color);
-    gl.uniform3f(p.u.uColor, r, g, b);
-    gl.uniform1f(p.u.uHardness, brush.hardness);
     const shape = brushShape(brush);
     const tip = shape.tip === 'round' ? -1 : tipIndex(shape.tip);
     if (tip >= 0 && !this.tipsReady.has(tip)) {
@@ -758,57 +792,116 @@ export class GLRenderer implements Renderer {
     return this.tilePool.pop() ?? this.makeTarget(TILE, TILE);
   }
 
-  /** Draws one stroke into a tile target. */
-  /** Draws one stroke into a tile target. Returns an estimate of the GPU work (see FILL_MIN). */
-  private drawStroke(target: Target, rec: StrokeRec, wx0: number, wy0: number, scale: number): number {
+  /**
+   * Puts the dabs of a stroke that touch a w × h target at instances from `at` on, with their
+   * color and hardness. A stroke that covers about one pixel here becomes one dot instead of
+   * every dab (that dot has no tip, rotation or grain: it stands for a whole tiny stroke).
+   * Returns the instances added, a fill estimate (the quad of each dab, true radius capped at the
+   * tile, at least 16 px), and the brush that draws them.
+   */
+  private stageStroke(rec: StrokeRec, at: number, wx0: number, wy0: number, scale: number, w: number, h: number): { n: number; fill: number; brush: Brush; dot: boolean } {
     const b = rec.stroke.brush;
-    const w = target.w, h = target.h;
+    const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2;
     let n = 0;
-    const sw = (rec.x1 - rec.x0) * scale;
-    const sh = (rec.y1 - rec.y0) * scale;
-    if (sw < 2 && sh < 2) {
-      // The whole stroke covers about one pixel here: one dot instead of every dab.
-      this.reserve(1);
+    if (dot) {
+      this.reserve(at + 1);
       const r = Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2;
-      if (this.putDab(0, (rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, r, 1, 0, wx0, wy0, scale, w, h)) n = 1;
+      if (this.putDab(at, (rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, r, 1, 0, wx0, wy0, scale, w, h)) n = 1;
     } else {
       const { dabs, chunks, count } = strokeDabs(rec);
       const wx1 = wx0 + w / scale, wy1 = wy0 + h / scale;
-      this.reserve(count);
+      this.reserve(at + count);
       for (let c = 0; c * DAB_CHUNK < count; c++) {
         const co = c * 4;
         if (chunks[co + 2] <= wx0 || chunks[co] >= wx1 || chunks[co + 3] <= wy0 || chunks[co + 1] >= wy1) continue;
         const end = Math.min(count, (c + 1) * DAB_CHUNK);
         for (let i = c * DAB_CHUNK; i < end; i++) {
           const o = i * DAB_STRIDE;
-          if (this.putDab(n, dabs[o], dabs[o + 1], dabs[o + 2], dabs[o + 3], dabs[o + 4], wx0, wy0, scale, w, h)) n++;
+          if (this.putDab(at + n, dabs[o], dabs[o + 1], dabs[o + 2], dabs[o + 3], dabs[o + 4], wx0, wy0, scale, w, h)) n++;
         }
       }
     }
-    if (n === 0) return 0;
-    // Fill estimate: the quad of each dab (true radius, capped at the tile), at least 16 px.
-    let work = 2000; // the draw call
-    const f = this.inst;
-    for (let i = 0; i < n; i++) {
-      const r = Math.min(f[i * INST + 4], TILE) + 1;
-      work += Math.max(16, 4 * r * r);
-    }
-    const erase = b.tool === 'erase';
-    // The one-dot shortcut has no tip, rotation or grain: it stands for a whole tiny stroke.
-    const dot = sw < 2 && sh < 2;
     const brush = dot ? { ...b, tip: undefined, roundness: undefined } : b;
+    if (n === 0) return { n, fill: 0, brush, dot };
+    let fill = 0;
+    const f = this.inst;
+    for (let i = at; i < at + n; i++) {
+      const r = Math.min(f[i * INST + 4], TILE) + 1;
+      fill += Math.max(16, 4 * r * r);
+    }
+    this.paintDabs(at, at + n, brush);
+    return { n, fill, brush, dot };
+  }
+
+  /**
+   * Strokes with the same key draw the same way apart from color and hardness, so a run of them
+   * shares one draw call. Null: the stroke needs a call of its own (below full opacity it goes
+   * through a stroke buffer; grain has a per-stroke origin).
+   */
+  private batchKey(rec: StrokeRec, scale: number): string | null {
+    const b = rec.stroke.brush;
+    if (b.opacity < 1 || (b.grain && (b.grainStrength ?? 0.5))) return null;
+    const erase = b.tool === 'erase' ? 'e' : 'p';
+    if ((rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2) return `${erase}|round|1`;
+    const s = brushShape(b);
+    return `${erase}|${s.tip}|${s.roundness}`;
+  }
+
+  /**
+   * Draws list[from], list[from + 1], ... into a tile target until `budget` is spent (at least
+   * one stroke). Runs of strokes with the same batchKey go in one draw call: a tile crossed by
+   * hundreds of strokes took hundreds of calls, and on a phone the cost per call, not the pixels,
+   * set the speed. The dabs keep their order, so the result is the same. Returns the work spent
+   * and the next index.
+   */
+  private drawStrokes(target: Target, list: StrokeRec[], from: number, wx0: number, wy0: number, scale: number, budget: number): { work: number; next: number } {
+    let work = 0;
+    let i = from;
+    const w = target.w, h = target.h;
+    do {
+      const key = this.batchKey(list[i], scale);
+      if (key === null) {
+        work += this.drawStroke(target, list[i++], wx0, wy0, scale);
+        continue;
+      }
+      let n = 0;
+      let brush: Brush | null = null;
+      while (i < list.length && (n === 0 || (work < budget && n < MAX_BATCH)) && this.batchKey(list[i], scale) === key) {
+        const s = this.stageStroke(list[i++], n, wx0, wy0, scale, w, h);
+        if (!s.n) continue;
+        n += s.n;
+        work += s.fill;
+        brush ??= s.brush;
+      }
+      if (n === 0) continue;
+      work += 2000; // the draw call
+      this.bindTarget(target);
+      this.blendFor(key[0] === 'e');
+      this.drawDabs(n, brush!, w, h, null, true);
+    } while (i < list.length && work < budget);
+    return { work, next: i };
+  }
+
+  /** Draws one stroke into a tile target, in a call of its own. Returns the work spent. */
+  private drawStroke(target: Target, rec: StrokeRec, wx0: number, wy0: number, scale: number): number {
+    const b = rec.stroke.brush;
+    const w = target.w, h = target.h;
+    const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
+    if (n === 0) return 0;
+    let work = 2000 + fill; // the draw call and the dabs
+    const erase = b.tool === 'erase';
     const grain = dot ? null : this.grainFor(b, rec.stroke.pts[0], rec.stroke.pts[1], wx0, wy0, scale);
     if (b.opacity >= 1) {
       // Source-over and destination-out are associative: at full opacity the dabs can go
       // straight onto the tile with the same result as a separate stroke buffer.
       this.bindTarget(target);
       this.blendFor(erase);
-      this.drawDabs(n, brush, w, h, grain);
+      this.drawDabs(n, brush, w, h, grain, true);
     } else {
       this.bindTarget(this.strokeT);
       this.clear();
       this.blendFor(false);
-      this.drawDabs(n, brush, w, h, grain);
+      this.drawDabs(n, brush, w, h, grain, true);
       this.bindTarget(target);
       this.blendFor(erase);
       this.copy(this.strokeT.tex, target, [0, 0, w, h], b.opacity);
@@ -850,9 +943,9 @@ export class GLRenderer implements Renderer {
       }
       const job = t.job;
       // At least one stroke per call, so a tile always moves forward.
-      do {
-        work += this.drawStroke(job.target, job.list[job.next++], wx0, wy0, scale);
-      } while (job.next < job.list.length && work < budget);
+      const done = this.drawStrokes(job.target, job.list, job.next, wx0, wy0, scale, budget - work);
+      work += done.work;
+      job.next = done.next;
       if (job.next < job.list.length) return work;
       if (t.target) this.tilePool.push(t.target);
       t.target = job.target;
@@ -863,7 +956,7 @@ export class GLRenderer implements Renderer {
         this.bindTarget(t.target);
         this.clear();
       }
-      for (const rec of t.append) work += this.drawStroke(t.target, rec, wx0, wy0, scale);
+      if (t.append.length) work += this.drawStrokes(t.target, t.append, 0, wx0, wy0, scale, Infinity).work;
     }
     this.finishTile(t);
     return work;
@@ -911,6 +1004,43 @@ export class GLRenderer implements Renderer {
 
   // --- frame ---------------------------------------------------------------------------------------
 
+  /** Called when panning and zooming run under 30 fps (see watchSpeed). */
+  onSlow: (() => void) | null = null;
+  private moveFrames: number[] = [];
+
+  /**
+   * Collects the frame intervals while the view moves (tiles get a small share then, so these
+   * frames are mostly compositing). A median above SLOW_MS over SPEED_FRAMES frames calls onSlow.
+   */
+  private watchSpeed(interval: number, now: number): void {
+    if (this.offline || !this.onSlow || interval > 250 || now - this.lastViewChange > MOVING_MS) return;
+    this.moveFrames.push(interval);
+    if (this.moveFrames.length < SPEED_FRAMES) return;
+    const sorted = this.moveFrames.sort((a, b) => a - b);
+    const median = sorted[sorted.length >> 1];
+    this.moveFrames = [];
+    if (median > SLOW_MS) this.onSlow();
+  }
+
+  /** For performance checks (__draw.engine.comp.stats() in the console): tiles in GPU memory, pending work. */
+  stats(): { frames: number; tiles: number; viewPending: boolean; pending: boolean; fill: number; fillMoving: number; scale: number; bits: number; profile: string } {
+    let tiles = 0;
+    for (const t of this.tiles.values()) tiles += t.target ? 1 : 0;
+    return {
+      frames: this.frame,
+      tiles,
+      viewPending: this.lastViewPending,
+      pending: this.lastPendingWork,
+      fill: Math.round(this.fillBudget),
+      fillMoving: Math.round(this.fillMoving),
+      scale: this.dpr,
+      bits: this.precision,
+      profile: this.profile.name,
+    };
+  }
+  private lastPendingWork = true;
+  private lastViewPending = true;
+
   /** Offline: the last render stopped before all tiles were done. */
   private lastPending = false;
 
@@ -946,13 +1076,24 @@ export class GLRenderer implements Renderer {
     const start = performance.now();
     const interval = start - this.lastFrameAt;
     this.lastFrameAt = start;
-    if (this.tileWorkLastFrame && interval < 100) {
-      if (interval > 22) this.fillBudget = Math.max(FILL_MIN, this.fillBudget * 0.75);
-      else if (interval < 17.5) this.fillBudget = Math.min(FILL_MAX, this.fillBudget * 1.1);
+    this.watchSpeed(interval, start);
+    // Moving: the view changed just now, or this device draws a stroke (it must stay smooth).
+    let drawing = false;
+    for (const l of this.live.values()) if (!l.remote && !l.ended) drawing = true;
+    const moving = start - this.lastViewChange < MOVING_MS || drawing;
+    const target = moving ? MOVING_TARGET_MS : STILL_TARGET_MS;
+    if (this.tileWorkLastFrame && interval < 150) {
+      const b = moving ? this.fillMoving : this.fillBudget;
+      const next = interval > target * 1.15 ? Math.max(FILL_MIN, b * 0.75) : interval < target * 0.85 ? Math.min(FILL_MAX, b * 1.1) : b;
+      if (moving) this.fillMoving = next;
+      else this.fillBudget = next;
     }
-    const fill = start - this.lastViewChange < MOVING_MS ? this.fillBudget * MOVING_SHARE : this.fillBudget;
+    const fill = moving ? this.fillMoving : this.fillBudget;
+    const jsBudget = moving ? TILE_BUDGET_MS : TILE_BUDGET_STILL_MS;
     let spent = 0;
     let pending = false;
+    /** Work left in the view and its prefetch ring (not just in the coarser levels). */
+    let viewPending = false;
     // First the view and a ring of PREFETCH tiles. Then COARSE_LEVELS coarser levels, centered:
     // one level up over 2× the view, two levels up over 4×. After a zoom out by 2 or 4 that is
     // the whole screen, and a pan shows stretched content at once instead of blank tiles. Each
@@ -962,7 +1103,7 @@ export class GLRenderer implements Renderer {
     const ring = this.offline ? 0 : PREFETCH;
     const ranges: TileRange[] = [{ lod, tx0: tx0 - ring, ty0: ty0 - ring, tx1: tx1 + ring, ty1: ty1 + ring }];
     let total = area(ranges[0]);
-    for (let up = 1; up <= (this.offline ? 0 : COARSE_LEVELS) && lod + up <= MAX_LOD; up++) {
+    for (let up = 1; up <= (this.offline ? 0 : this.profile.coarseLevels) && lod + up <= MAX_LOD; up++) {
       const ctw = tileWorld(lod + up);
       const m = (2 ** up - 1) / 2; // margin on each side, in views: 2× the view, then 4×
       const coarse = {
@@ -988,8 +1129,9 @@ export class GLRenderer implements Renderer {
           const key = tileKey(layer, r.lod, tx, ty);
           let t = this.tiles.get(key);
           if (!this.needsWork(t)) continue;
-          if (!this.offline && (spent >= fill || performance.now() - start > TILE_BUDGET_MS)) {
+          if (!this.offline && (spent >= fill || performance.now() - start > jsBudget)) {
             pending = true;
+            if (r === ranges[0]) viewPending = true;
             break outer;
           }
           if (!t) {
@@ -1002,6 +1144,8 @@ export class GLRenderer implements Renderer {
       }
     }
     this.tileWorkLastFrame = spent > 0;
+    this.lastPendingWork = pending;
+    this.lastViewPending = viewPending;
     // A committed stroke's buffer can go once the tiles show it.
     if (!pending) {
       for (const l of [...this.live.values()]) if (l.commitSeq !== null && l.commitSeq <= this.appliedSeq) this.liveCancel(l.id);

@@ -3,9 +3,10 @@
   import Icon from './Icon.svelte';
   import { dismiss } from '../dismiss';
 
-  // Bottom sheet for the phone layout. A press anywhere outside closes it (the bottom bar
-  // switches sheets itself). The dim backdrop lets presses through: a finger on the canvas
-  // closes the sheet and pans, and two fingers pinch-zoom at once.
+  // Bottom sheet for the phone layout. Android's Back closes it, and so does a press anywhere
+  // outside (dismiss.ts, back.ts; the bottom bar switches sheets itself). The dim backdrop lets
+  // presses through: a finger on the canvas closes the sheet and pans, and two fingers
+  // pinch-zoom at once.
   let { title, onClose, children, tall = false }: { title: string; onClose: () => void; children: Snippet; tall?: boolean } = $props();
 </script>
 

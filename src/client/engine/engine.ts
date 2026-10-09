@@ -32,6 +32,7 @@ import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { takeDismissed } from '../dismiss';
+import { slowDevice } from './perf';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
 // This range stays precise for drawings within about 1e4 world units of where you work.
@@ -194,6 +195,8 @@ export class Engine {
     if (k && !frame) links.set(code, k);
     this.link = k ?? (frame ? undefined : links.get(code));
     this.comp = createRenderer(canvas);
+    this.scaleCap = this.comp.profile.maxScale;
+    if (!frame) this.comp.onSlow = () => this.slowFrames();
     ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit`;
     this.rect = canvas.getBoundingClientRect();
     this.restoreView();
@@ -281,11 +284,28 @@ export class Engine {
 
   // --- view -------------------------------------------------------------------------------
 
+  /**
+   * Highest canvas pixel ratio: the profile's (perf.ts), lowered step by step while panning and
+   * zooming stay slow (onSlow). The screen's own ratio still sets the CSS layout.
+   */
+  private scaleCap = Infinity;
+
+  /** The renderer says frames are slow while the view moves: render fewer pixels. */
+  private slowFrames(): void {
+    const now = Math.min(window.devicePixelRatio || 1, this.scaleCap);
+    const next = [2, 1.5, 1.25, 1].find((s) => s < now - 0.01);
+    if (!next) return;
+    this.scaleCap = next;
+    slowDevice(); // the next start uses the light profile (8-bit tiles too)
+    console.info(`draw: slow frames, render scale ${now} -> ${next}`);
+    this.resize();
+  }
+
   private resize(): void {
     this.rect = this.canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, this.scaleCap);
     this.comp.resize(this.rect.width, this.rect.height, dpr);
-    ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit · ${+dpr.toFixed(2)}×`;
+    ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit · ${+dpr.toFixed(2)}×${this.comp.profile.name === 'full' ? '' : ` · ${this.comp.profile.name}`}`;
     // An embed keeps its frame filling the box until the viewer moves the view.
     if (this.frame && !this.moved) return this.showFrame();
     this.syncView();
@@ -1878,10 +1898,12 @@ export class Engine {
   /**
    * Link preview (Discord, X, ...): editors render everything on the visible layers into a
    * PREVIEW_LIMITS image and send it, `delay` ms after the last change, at most every 90 s, and
-   * only when the server's preview is older. The server keeps the newest (session.ts).
+   * only when the server's preview is older. The server keeps the newest (session.ts). Not on
+   * phones and tablets: rendering the whole canvas froze a phone for seconds. Desktop editors
+   * keep the preview current.
    */
   private schedulePreview(delay: number): void {
-    if (this.frame || !ed.canEdit || this.comp.kind !== 'webgl2') return;
+    if (this.frame || !ed.canEdit || this.comp.kind !== 'webgl2' || this.comp.profile.name !== 'full') return;
     window.clearTimeout(this.previewTimer);
     const wait = Math.max(delay, this.previewAt + 90_000 - Date.now());
     this.previewTimer = window.setTimeout(() => void this.sendPreview(), wait);

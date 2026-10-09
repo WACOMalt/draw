@@ -74,12 +74,15 @@ layout(location = 0) in vec2 aCorner;   // 0..1
 layout(location = 1) in vec4 aDab;      // cx, cy, rv, alpha
 layout(location = 2) in float aR;       // true radius in px
 layout(location = 3) in float aRot;     // tip rotation, radians
+layout(location = 4) in vec4 aPaint;    // r, g, b, hardness (per dab: strokes share draw calls)
 uniform vec2 uTarget;
 out vec2 vLocal;
 flat out float vRv;
 flat out float vR;
 flat out float vA;
 flat out float vRot;
+flat out vec3 vColor;
+flat out float vHardness;
 void main() {
   float ext = aDab.z + 1.0;               // one pixel margin for the antialiased edge
   vLocal = (aCorner * 2.0 - 1.0) * ext;
@@ -87,6 +90,8 @@ void main() {
   vR = aR;
   vA = aDab.w;
   vRot = aRot;
+  vColor = aPaint.rgb;
+  vHardness = aPaint.a;
   vec2 p = aDab.xy + vLocal;
   gl_Position = vec4(p / uTarget * 2.0 - 1.0, 0.0, 1.0);
 }`;
@@ -105,8 +110,8 @@ flat in float vRv;
 flat in float vR;
 flat in float vA;
 flat in float vRot;
-uniform vec3 uColor;
-uniform float uHardness;
+flat in vec3 vColor;
+flat in float vHardness;
 uniform int uTip;
 uniform float uRoundness;
 uniform sampler2DArray uTips;
@@ -128,8 +133,8 @@ void main() {
     if (edge <= -0.5) discard;
     float t = clamp(1.0 - edge / vR, 0.0, 1.0); // 0 at the center, 1 at the edge
     a = 1.0;
-    if (t > uHardness) {
-      float x = (t - uHardness) / max(1.0 - uHardness, 1e-6);
+    if (t > vHardness) {
+      float x = (t - vHardness) / max(1.0 - vHardness, 1e-6);
       a = 0.5 + 0.5 * cos(PI * x);
     }
     a *= clamp(edge + 0.5, 0.0, 1.0);    // one pixel of antialiasing
@@ -144,7 +149,7 @@ void main() {
   }
   a *= vA;
   if (a <= 0.0) discard;
-  o = vec4(uColor * a, a);
+  o = vec4(vColor * a, a);
 }`;
 
 /** Layer blend modes (W3C Compositing and Blending Level 1), premultiplied in and out. */
@@ -331,8 +336,6 @@ export function createPrograms(gl: WebGL2RenderingContext) {
     adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity']),
     dab: link(gl, DAB_VS, DAB_FS, [
       'uTarget',
-      'uColor',
-      'uHardness',
       'uTip',
       'uRoundness',
       'uTips',

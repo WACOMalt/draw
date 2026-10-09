@@ -1,6 +1,8 @@
-// Popups (popovers, menus, phone sheets) close when the person presses anywhere outside them, or
-// presses Escape. Use it on the element that holds the popup AND the button that opens it, so a
-// press on that button toggles as before:
+import { closeOnBack } from './back';
+
+// Popups (popovers, menus, phone sheets) close when the person presses anywhere outside them,
+// presses Escape, or uses Android's Back (back.ts). Use it on the element that holds the popup AND
+// the button that opens it, so a press on that button toggles as before:
 //
 //   <span use:dismiss={{ open, close: () => (open = false) }}>
 //
@@ -47,16 +49,28 @@ export function dismiss(node: HTMLElement, opts: DismissOptions) {
     if (a instanceof HTMLElement && node.contains(a)) a.blur();
     o.close();
   };
+  // Android's Back closes it too, while it is open.
+  let release: (() => void) | null = null;
+  const track = () => {
+    if (o.open && !release) release = closeOnBack(() => o.close());
+    else if (!o.open && release) {
+      release();
+      release = null;
+    }
+  };
+  track();
   // Capture phase: runs before the canvas, which keeps its pointer events to itself.
   window.addEventListener('pointerdown', down, true);
   window.addEventListener('keydown', key);
   return {
     update(next: DismissOptions) {
       o = next;
+      track();
     },
     destroy() {
       window.removeEventListener('pointerdown', down, true);
       window.removeEventListener('keydown', key);
+      release?.();
     },
   };
 }

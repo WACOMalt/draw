@@ -1,8 +1,11 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
+  import { onMount, type Snippet } from 'svelte';
   import Icon from './Icon.svelte';
+  import { closeOnBack } from '../back';
 
   let { title, onClose, children, wide = false }: { title: string; onClose: () => void; children: Snippet; wide?: boolean } = $props();
+  // Android's Back closes the dialog.
+  onMount(() => closeOnBack(() => onClose()));
 </script>
 
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onClose()} />

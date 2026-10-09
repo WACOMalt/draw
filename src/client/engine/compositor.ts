@@ -6,6 +6,7 @@ import type { Affine, BlendMode, Brush, Layer, LayerBlend, Stroke } from '../../
 import { compose, effectivelyVisible, layerTree, type LayerNode } from '../../shared/layers';
 import { LUT_SIZE, hueSat, toneLut } from './adjust';
 import type { Renderer, ViewState } from './renderer';
+import { perfProfile } from './perf';
 import { DabPainter, StampCache } from './stamp';
 import { maskKey } from './strokeIndex';
 import TileWorker from './tile.worker?worker';
@@ -81,6 +82,8 @@ interface Live {
 
 export class Canvas2DRenderer implements Renderer {
   readonly kind = 'canvas2d';
+  readonly profile = perfProfile(null);
+  onSlow: (() => void) | null = null;
   readonly precision = 8;
   readonly view: ViewState = { x: 0, y: 0, zoom: 1 };
   private ctx: CanvasRenderingContext2D;

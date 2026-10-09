@@ -10,6 +10,7 @@
   import type { Affine } from '../../shared/types';
   import type { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
+  import { closeOnBack } from '../back';
   import Icon from './Icon.svelte';
 
   let { engine, id }: { engine: Engine; id: string } = $props();
@@ -171,7 +172,12 @@
       }
     };
     window.addEventListener('keydown', key, true);
-    return () => window.removeEventListener('keydown', key, true);
+    // Android's Back cancels, like Esc.
+    const release = closeOnBack(() => engine.cancelTransform());
+    return () => {
+      window.removeEventListener('keydown', key, true);
+      release();
+    };
   });
 
   const pct = (v: number) => `${Math.round(Math.abs(v) * 100)}%`;

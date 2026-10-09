@@ -3,6 +3,7 @@
 // - Canvas2DRenderer: Canvas 2D + tile worker, 8-bit (fallback without WebGL2)
 
 import type { Affine, Brush, Layer, Stroke } from '../../shared/types';
+import type { PerfProfile } from './perf';
 
 export interface ViewState {
   x: number; // world coordinate at the left edge of the canvas
@@ -14,6 +15,10 @@ export interface Renderer {
   readonly kind: 'webgl2' | 'canvas2d';
   /** Bits per channel of the internal buffers (16 = half float). */
   readonly precision: 8 | 16;
+  /** How much work this device gets (perf.ts). The engine caps the pixel ratio at maxScale. */
+  readonly profile: PerfProfile;
+  /** Set by the engine: the renderer calls it when panning and zooming run slowly. */
+  onSlow: (() => void) | null;
   readonly view: ViewState;
   readonly size: { w: number; h: number };
   destroy(): void;

@@ -2,6 +2,7 @@
 // renderer that holds its own copy of the document. Used by the large image export, the
 // .bdraw preview, and the link preview image.
 
+import { FULL_PROFILE } from '../engine/perf';
 import type { Layer, Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { GLRenderer } from '../engine/gl/glRenderer';
@@ -19,7 +20,7 @@ export class RegionRenderer {
   constructor(layers: Layer[], strokes: Stroke[], seq: number) {
     const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false });
     if (!gl) throw new Error('WebGL2 is not available');
-    this.r = new GLRenderer(this.canvas, gl, true);
+    this.r = new GLRenderer(this.canvas, gl, true, FULL_PROFILE);
     this.r.setLayers(layers);
     this.r.resetStrokes(strokes, seq);
   }
