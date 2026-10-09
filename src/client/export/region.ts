@@ -16,11 +16,20 @@ export class RegionRenderer {
   private w = 0;
   private h = 0;
 
-  /** Throws when WebGL2 is not available. */
-  constructor(layers: Layer[], strokes: Stroke[], seq: number) {
+  /**
+   * Throws when WebGL2 is not available. `transparent`: no paper; the pixels keep their alpha
+   * (straight, not premultiplied).
+   */
+  constructor(
+    layers: Layer[],
+    strokes: Stroke[],
+    seq: number,
+    private transparent = false,
+  ) {
     const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false });
     if (!gl) throw new Error('WebGL2 is not available');
     this.r = new GLRenderer(this.canvas, gl, true, FULL_PROFILE);
+    this.r.transparent = transparent;
     this.r.setLayers(layers);
     this.r.resetStrokes(strokes, seq);
   }
@@ -37,7 +46,7 @@ export class RegionRenderer {
     }
     this.r.setView(x, y, scale);
     this.r.renderSync();
-    const px = this.r.readRGBA();
+    const px = this.r.readRGBA(this.transparent);
     if (!px) throw new Error('The graphics context was lost');
     return px;
   }

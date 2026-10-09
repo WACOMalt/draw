@@ -1,4 +1,4 @@
-// Tiled TIFF writer: 256 × 256 tiles, RGB 8 bits, Deflate with the horizontal predictor.
+// Tiled TIFF writer: 256 × 256 tiles, RGB (or RGBA with unassociated alpha) 8 bits, Deflate with the horizontal predictor.
 // Tiles go to the sink as they are made, in any order; the directory (IFD) with every tile's
 // offset goes at the end, and the header is patched to point to it.
 // Classic TIFF has 32-bit offsets (files up to 4 GB). Past that it is BigTIFF (64-bit offsets),
@@ -13,8 +13,8 @@ const CLASSIC_LIMIT = 4 * 2 ** 30 - 64 * 2 ** 20;
 export const TIFF_MAX_SIDE = 2 ** 32 - 1;
 
 /** Classic TIFF is enough when even the uncompressed image fits in 4 GB. */
-export function needsBigTiff(width: number, height: number): boolean {
-  return width * height * 3 > CLASSIC_LIMIT;
+export function needsBigTiff(width: number, height: number, alpha = false): boolean {
+  return width * height * (alpha ? 4 : 3) > CLASSIC_LIMIT;
 }
 
 async function deflate(data: Uint8Array): Promise<Uint8Array> {
@@ -33,8 +33,10 @@ export class TiffWriter {
     private sink: Sink,
     private width: number,
     private height: number,
+    /** Keep the alpha channel (a transparent background): RGBA instead of RGB. */
+    private alpha = false,
   ) {
-    this.big = needsBigTiff(width, height);
+    this.big = needsBigTiff(width, height, alpha);
     this.tilesX = Math.ceil(width / TIFF_TILE);
     this.tilesY = Math.ceil(height / TIFF_TILE);
     const n = this.tilesX * this.tilesY;
@@ -64,20 +66,22 @@ export class TiffWriter {
     const compressed: { index: number; data: Promise<Uint8Array> }[] = [];
     for (let ty = 0; ty * T < h; ty++) {
       for (let tx = 0; tx * T < w; tx++) {
-        const tile = new Uint8Array(T * T * 3);
+        const ch = this.alpha ? 4 : 3;
+        const tile = new Uint8Array(T * T * ch);
         for (let y = 0; y < T; y++) {
           const sy = Math.min(h - 1, ty * T + y);
-          let di = y * T * 3;
-          for (let x = 0; x < T; x++, di += 3) {
+          let di = y * T * ch;
+          for (let x = 0; x < T; x++, di += ch) {
             const sx = Math.min(w - 1, tx * T + x);
             const si = (sy * w + sx) * 4;
             tile[di] = rgba[si];
             tile[di + 1] = rgba[si + 1];
             tile[di + 2] = rgba[si + 2];
+            if (ch === 4) tile[di + 3] = rgba[si + 3];
           }
           // Predictor 2: each byte minus the same channel to its left, right to left.
-          const row = y * T * 3;
-          for (let i = row + T * 3 - 1; i >= row + 3; i--) tile[i] = (tile[i] - tile[i - 3]) & 255;
+          const row = y * T * ch;
+          for (let i = row + T * ch - 1; i >= row + ch; i--) tile[i] = (tile[i] - tile[i - ch]) & 255;
         }
         const index = (py / T + ty) * this.tilesX + (px / T + tx);
         compressed.push({ index, data: deflate(tile) });
@@ -111,7 +115,8 @@ export class TiffWriter {
       if (this.sink.size % 2) await this.sink.write(new Uint8Array(1));
       return at;
     };
-    const bits = new Uint8Array([8, 0, 8, 0, 8, 0]);
+    const ch = this.alpha ? 4 : 3;
+    const bits = new Uint8Array(ch * 2).map((_, i) => (i % 2 ? 0 : 8));
     const software = new TextEncoder().encode('Draw (draw.bsums.xyz)\0');
     const res = new Uint8Array([72, 0, 0, 0, 1, 0, 0, 0]); // 72/1
     const offsetsAt = n * inline > inline ? await place(longs(this.offsets)) : -1;
@@ -126,10 +131,10 @@ export class TiffWriter {
     const entries: Entry[] = [
       [256, LONG, 1, this.width],
       [257, LONG, 1, this.height],
-      [258, SHORT, 3, bitsAt >= 0 ? bitsAt : bits],
+      [258, SHORT, ch, bitsAt >= 0 ? bitsAt : bits],
       [259, SHORT, 1, 8], // Deflate
       [262, SHORT, 1, 2], // RGB
-      [277, SHORT, 1, 3],
+      [277, SHORT, 1, ch],
       [282, RATIONAL, 1, resAt >= 0 ? resAt : res],
       [283, RATIONAL, 1, resAt >= 0 ? resAt : res],
       [284, SHORT, 1, 1], // chunky
@@ -140,6 +145,7 @@ export class TiffWriter {
       [323, SHORT, 1, TIFF_TILE],
       [324, offType, n, offsetsAt >= 0 ? offsetsAt : longs(this.offsets)],
       [325, offType, n, countsAt >= 0 ? countsAt : longs(this.counts)],
+      ...(this.alpha ? [[338, SHORT, 1, 2] as Entry] : []), // ExtraSamples: unassociated alpha
     ];
     const entrySize = big ? 20 : 12;
     const ifd = new Uint8Array((big ? 8 : 2) + entries.length * entrySize + (big ? 8 : 4));

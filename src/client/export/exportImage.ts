@@ -18,6 +18,8 @@ export interface ExportJob {
   width: number;
   height: number;
   format: ImageFormat;
+  /** No paper: the file keeps an alpha channel (RGBA PNG, or TIFF with unassociated alpha). */
+  transparent: boolean;
   sink: Sink;
   /** done: 0..1; piece: pieces rendered so far, of `pieces`. */
   onProgress: (done: number, piece: number, pieces: number) => void;
@@ -35,13 +37,13 @@ const breathe = () => new Promise((r) => setTimeout(r, 0));
 export async function exportImage(job: ExportJob): Promise<void> {
   const { bounds, width, height, sink, signal } = job;
   const scale = width / (bounds.x1 - bounds.x0);
-  const rr = new RegionRenderer(job.layers, job.strokes, job.seq);
+  const rr = new RegionRenderer(job.layers, job.strokes, job.seq, job.transparent);
   const at = (px: number, py: number): [number, number] => [bounds.x0 + px / scale, bounds.y0 + py / scale];
   let piece = 0;
   try {
     if (job.format === 'png') {
       const pieces = Math.ceil(height / STRIP) * Math.ceil(width / PIECE);
-      const png = new PngWriter(sink, width, height);
+      const png = new PngWriter(sink, width, height, job.transparent);
       await png.begin();
       const strip = new Uint8ClampedArray(width * STRIP * 4);
       for (let y = 0; y < height; y += STRIP) {
@@ -60,7 +62,7 @@ export async function exportImage(job: ExportJob): Promise<void> {
       await png.end();
     } else {
       const pieces = Math.ceil(height / PIECE) * Math.ceil(width / PIECE);
-      const tiff = new TiffWriter(sink, width, height);
+      const tiff = new TiffWriter(sink, width, height, job.transparent);
       await tiff.begin();
       // Pieces are whole tiles (PIECE is a multiple of TIFF_TILE).
       for (let y = 0; y < height; y += PIECE) {
@@ -87,7 +89,7 @@ export async function exportImage(job: ExportJob): Promise<void> {
 }
 
 /** A rough upper bound of the file size (drawings compress far better than this). */
-export function rawSize(width: number, height: number): number {
-  return width * height * 3;
+export function rawSize(width: number, height: number, alpha = false): number {
+  return width * height * (alpha ? 4 : 3);
 }
 

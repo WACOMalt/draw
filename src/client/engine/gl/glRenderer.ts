@@ -158,6 +158,8 @@ export class GLRenderer implements Renderer {
   precision: 8 | 16 = 8;
   readonly view: ViewState = { x: 0, y: 0, zoom: 1 };
   paper = '#ffffff';
+  /** Exports with a transparent background: the stack starts empty instead of with the paper. */
+  transparent = false;
 
   private progs!: Programs;
   private quadVbo!: WebGLBuffer;
@@ -453,7 +455,11 @@ export class GLRenderer implements Renderer {
   }
 
   /** The composited view as 8-bit RGBA, top row first (alpha is always 255). */
-  readRGBA(): Uint8ClampedArray<ArrayBuffer> | null {
+  /**
+   * The composite as 8-bit RGBA, top row first. `alpha`: keep the alpha channel (a transparent
+   * export), with the colors un-premultiplied; otherwise the pixels are opaque.
+   */
+  readRGBA(alpha = false): Uint8ClampedArray<ArrayBuffer> | null {
     if (this.lost) return null;
     const gl = this.gl;
     const w = this.compA.w, h = this.compA.h;
@@ -464,7 +470,17 @@ export class GLRenderer implements Renderer {
     const px = new Uint8ClampedArray(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
     this.freeTarget(out);
-    for (let i = 3; i < px.length; i += 4) px[i] = 255;
+    if (!alpha) {
+      for (let i = 3; i < px.length; i += 4) px[i] = 255;
+      return px;
+    }
+    for (let i = 0; i < px.length; i += 4) {
+      const a = px[i + 3];
+      if (a === 0 || a === 255) continue;
+      px[i] = (px[i] * 255) / a;
+      px[i + 1] = (px[i + 1] * 255) / a;
+      px[i + 2] = (px[i + 2] * 255) / a;
+    }
     return px;
   }
 
@@ -1187,7 +1203,8 @@ export class GLRenderer implements Renderer {
     let main: Pair = { a: this.compA, b: this.compB };
     this.bindTarget(main.a);
     const [pr, pg, pb] = hexToRgb(this.paper);
-    this.clear(pr, pg, pb, 1);
+    if (this.transparent) this.clear(0, 0, 0, 0);
+    else this.clear(pr, pg, pb, 1);
     main = this.compositeNodes(this.tree, main, grid, 0);
     this.compA = main.a;
     this.compB = main.b;
