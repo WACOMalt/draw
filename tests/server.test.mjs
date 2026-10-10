@@ -688,7 +688,97 @@ try {
     const imp = await sb.upload(Buffer.from(JSON.stringify(file)), {});
     const iw = await first(await new Browser().join(imp.data.key));
     check(imp.status === 201 && imp.data.shapes === 1 && imp.data.skipped === 1 && iw.shapes[0]?.author === 'someone', 'shapes: a .bdraw with shapes imports (author kept, a bad shape skipped)');
-    check((await sb.upload(Buffer.from(JSON.stringify({ ...file, version: 4 })), {})).data?.error === 'file_too_new', 'shapes: a newer .bdraw version is refused');
+    check((await sb.upload(Buffer.from(JSON.stringify({ ...file, version: 99 })), {})).data?.error === 'file_too_new', 'shapes: a newer .bdraw version is refused');
+  }
+
+  // --- paths, point editing, shapes made paint ----------------------------------------------------
+  {
+    const pb = new Browser();
+    await account(pb, 'paths@example.com', 'Path Tester');
+    const pc = (await pb.api('POST', '/api/sessions', { name: 'paths-test' })).data.key;
+    const o = await pb.join(pc);
+    const w = await first(o);
+    const L1 = layerId(w);
+    let opn = 600;
+    const tryOp = async (op) => {
+      const n = opn++;
+      o.send({ t: 'op', opId: `p${n}xxxxx`, op });
+      return o.next((m) => (m.t === 'reject' || m.t === 'op') && m.opId === `p${n}xxxxx`, 2000);
+    };
+    const style = { fill: '#2a9d8f', stroke: '#1d3557', strokeWidth: 4, align: 'center', cap: 'round', join: 'round' };
+    const tri = { closed: true, pts: [0, 0, 0, 0, 0, 0, 0, 100, 0, 100, 0, 100, 0, 0, 50, 80, 30, 60, 70, 100, 2] };
+    const path = (id, extra = {}) => ({ id, layerId: 'pathLAYER1', kind: 'path', name: 'Path 1', z: 1, w: 100, h: 80, m: [1, 0, 0, 1, 5, 5], path: [tri], ...style, ...extra });
+    await tryOp({ type: 'layer.add', layer: { id: 'pathLAYER1', kind: 'shape', name: 'Shapes', order: 2, blend: 'normal', opacity: 1, visible: true } });
+    let r = await tryOp({ type: 'shape.add', shape: path('pathSHAPE01') });
+    check(r?.t === 'op' && r.op.shape.path[0].pts.length === 21, 'paths: add a Bezier path');
+    r = await tryOp({ type: 'shape.add', shape: path('pathBAD0001', { path: [{ closed: true, pts: [0, 0, 0, 0, 0, 0, 5] }] }) });
+    check(r?.t === 'reject', 'paths: a point type must be 0, 1 or 2');
+    r = await tryOp({ type: 'shape.add', shape: path('pathBAD0002', { path: [{ closed: false, pts: new Array(7 * 5001).fill(0) }] }) });
+    check(r?.t === 'reject', 'paths: at most 5000 points');
+    r = await tryOp({ type: 'shape.add', shape: path('pathBAD0003', { path: [] }) });
+    check(r?.t === 'reject', 'paths: a path needs a contour');
+
+    // Point editing turns a rectangle into a path; undo turns it back, with its radii.
+    const rect = { id: 'pathRECT001', layerId: 'pathLAYER1', kind: 'rect', name: 'Rectangle 1', z: 2, w: 40, h: 20, m: [1, 0, 0, 1, 0, 0], radii: [5, 5, 5, 5], ...style };
+    await tryOp({ type: 'shape.add', shape: rect });
+    r = await tryOp({ type: 'shape.update', id: 'pathRECT001', props: { kind: 'path', path: [tri], w: 100, h: 80 } });
+    check(r?.t === 'op', 'paths: a shape becomes a path');
+    let w2 = await first(await pb.join(pc));
+    let sh = w2.shapes.find((x) => x.id === 'pathRECT001');
+    check(sh?.kind === 'path' && !sh.radii && sh.path.length === 1, 'paths: the settings of the old kind are dropped');
+    check(w2.features.includes('paths'), 'paths: welcome lists the paths feature');
+    r = await tryOp({ type: 'shape.update', id: 'pathRECT001', props: { kind: 'rect', radii: [5, 5, 5, 5], w: 40, h: 20 } });
+    w2 = await first(await pb.join(pc));
+    sh = w2.shapes.find((x) => x.id === 'pathRECT001');
+    check(r?.t === 'op' && sh?.kind === 'rect' && sh.radii.join() === '5,5,5,5' && !sh.path, 'paths: undo turns the path back into the rectangle');
+    r = await tryOp({ type: 'shape.update', id: 'pathRECT001', props: { kind: 'polygon' } });
+    check(r?.t === 'reject', 'paths: a kind change needs the settings of the new kind');
+
+    // Shapes made paint, in place: the shape layer becomes a paint layer.
+    r = await tryOp({ type: 'shapes.toPaint', key: 'convKEY0001', ids: ['pathSHAPE01'], layerId: 'pathLAYER1' });
+    check(r?.t === 'reject', 'paint: a shape layer becomes paint only with all its shapes');
+    r = await tryOp({ type: 'shapes.toPaint', key: 'convKEY0001', ids: ['pathSHAPE01', 'pathRECT001'], layerId: 'pathLAYER1' });
+    check(r?.t === 'op', 'paint: a shape layer becomes paint');
+    w2 = await first(await pb.join(pc));
+    const vec = w2.strokes.filter((x) => x.layerId === 'pathLAYER1' && x.vector);
+    check(w2.layers.find((l) => l.id === 'pathLAYER1')?.kind === 'paint' && vec.length === 2 && !w2.shapes.some((x) => x.layerId === 'pathLAYER1'), 'paint: its shapes are vector strokes now');
+    check(vec[0].vector.kind === 'path' && vec[1].vector.kind === 'rect' && vec[0].author === w.clientId, 'paint: the strokes keep the shape order and the sender as author');
+    check(w2.features.includes('vectors'), 'paint: welcome lists the vectors feature');
+    const painted = await tryOp(strokeOp('pathLAYER1', 61).op);
+    check(painted?.t === 'op', 'paint: the converted layer takes brush strokes');
+    r = await tryOp({ type: 'shapes.fromPaint', key: 'convKEY0001', ids: ['pathSHAPE01', 'pathRECT001'], layerId: 'pathLAYER1' });
+    check(r?.t === 'reject', 'paint: no undo while the layer has other paint');
+    await tryOp({ type: 'stroke.remove', id: painted.op.stroke.id });
+    r = await tryOp({ type: 'shapes.fromPaint', key: 'convKEY0001', ids: ['pathSHAPE01', 'pathRECT001'], layerId: 'pathLAYER1' });
+    w2 = await first(await pb.join(pc));
+    check(r?.t === 'op' && w2.layers.find((l) => l.id === 'pathLAYER1')?.kind === 'shape' && w2.shapes.filter((x) => x.layerId === 'pathLAYER1').length === 2 && !w2.strokes.some((x) => x.vector), 'paint: the undo brings the shapes and the shape layer back');
+    r = await tryOp({ type: 'shapes.toPaint', key: 'convKEY0001', ids: ['pathSHAPE01', 'pathRECT001'], layerId: 'pathLAYER1' });
+    check(r?.t === 'op', 'paint: the redo uses the same stroke ids again');
+    await tryOp({ type: 'shapes.fromPaint', key: 'convKEY0001', ids: ['pathSHAPE01', 'pathRECT001'], layerId: 'pathLAYER1' });
+
+    // Selected shapes onto a paint layer; a transform moves the vector.
+    r = await tryOp({ type: 'shapes.toPaint', key: 'convKEY0002', ids: ['pathRECT001'], layerId: L1 });
+    check(r?.t === 'op', 'paint: selected shapes go onto a paint layer');
+    await tryOp({ type: 'layer.transform', id: L1, m: [2, 0, 0, 2, 10, 0] });
+    w2 = await first(await pb.join(pc));
+    const moved = w2.strokes.find((x) => x.vector && x.layerId === L1);
+    check(moved?.vector.m.join() === '2,0,0,2,10,0' && moved.pts[0] === 10 && w2.layers.find((l) => l.id === 'pathLAYER1')?.kind === 'shape', 'paint: a layer transform moves the vector; the shape layer stays');
+    r = await tryOp({ type: 'shapes.toPaint', key: 'convKEY0003', ids: ['pathSHAPE01'], layerId: 'pathLAYER1x' });
+    check(r?.t === 'reject', 'paint: the target layer must exist');
+
+    // A .bdraw (version 4) with a path and a vector stroke.
+    const file = {
+      format: 'bdraw', version: 4, app: 'test', savedAt: '',
+      layers: [
+        { id: 'impPATHL01', name: 'Shapes', order: 1, blend: 'normal', opacity: 1, visible: true, deleted: false, kind: 'shape' },
+        { id: 'impPAINT01', name: 'Paint', order: 2, blend: 'normal', opacity: 1, visible: true, deleted: false },
+      ],
+      strokes: [{ ...moved, id: 'impVECTOR1', layerId: 'impPAINT01' }],
+      shapes: [path('impPATH001', { layerId: 'impPATHL01' })],
+    };
+    const imp = await pb.upload(Buffer.from(JSON.stringify(file)), {});
+    const iw = await first(await new Browser().join(imp.data.key));
+    check(imp.status === 201 && imp.data.skipped === 0 && iw.shapes[0]?.kind === 'path' && iw.strokes[0]?.vector?.kind === 'rect', 'paths: a .bdraw with a path and a vector stroke imports');
   }
 
   // --- admins manage every owned canvas like its owner ------------------------------------------
