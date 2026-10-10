@@ -616,7 +616,9 @@
   }
   .stacked {
     position: static;
-    min-height: 0;
+    /* auto, not 0: in the phone sheet (a scrolling flex column) the options must not shrink below
+       their content, or the sections draw over each other. */
+    min-height: auto;
     border-radius: 0;
     box-shadow: none;
     flex-wrap: nowrap;

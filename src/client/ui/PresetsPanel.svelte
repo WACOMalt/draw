@@ -4,7 +4,7 @@
   import { onMount } from 'svelte';
   import type { BrushPreset } from '../../shared/types';
   import { applyPreset, deletePreset, loadPresets, myCreators, savePreset } from '../presets';
-  import { presetThumb } from '../presetThumb';
+  import PresetThumb from './PresetThumb.svelte';
   import { ed, showToast } from '../state.svelte';
 
   let { stacked = false }: { stacked?: boolean } = $props();
@@ -114,7 +114,7 @@
             {#each g.items as p (p.id)}
               <div class="card">
                 <button class="pick" title="Use {p.name}" onclick={() => apply(p)}>
-                  <img src={presetThumb(p.settings)} alt="" width="160" height="56" />
+                  <PresetThumb settings={p.settings} />
                   <span class="name">{p.name}</span>
                 </button>
                 {#if canDelete(p)}
@@ -214,11 +214,6 @@
   }
   .pick:hover {
     border-color: var(--accent);
-  }
-  .pick img {
-    width: 100%;
-    height: auto;
-    aspect-ratio: 160 / 56;
   }
   .name {
     font-size: 11.5px;
