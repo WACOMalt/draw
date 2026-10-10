@@ -65,27 +65,29 @@ void main() {
 /**
  * One brush dab per instance. The CPU computes positions in target pixels in double precision,
  * relative to the target origin, so deep zoom stays exact in float32.
- * Huge dabs (radius over 1e6 px) arrive "virtualized": a closer center and a smaller radius
- * (rv) with the same edge, plus the true radius (r) for the hardness profile.
+ * Huge dabs (radius over 1e6 px) arrive with a quad over the target only (half size rv) and
+ * the edge data of putDab (aEdge, aHuge.x), plus the true radius (r) for the hardness profile.
  */
 const DAB_VS = `#version 300 es
 precision highp float;
 layout(location = 0) in vec2 aCorner;   // 0..1
 layout(location = 1) in vec4 aDab;      // cx, cy, rv, alpha
 layout(location = 2) in float aR;       // true radius in px
-layout(location = 3) in float aRot;     // tip rotation, radians
+layout(location = 3) in vec2 aRot;      // cos and sin of the tip rotation
 layout(location = 4) in vec4 aPaint;    // r, g, b, hardness (per dab: strokes share draw calls)
-layout(location = 5) in vec3 aHuge;     // stand-in of a huge dab: edge offset, true center x, y
+layout(location = 5) in vec3 aHuge;     // huge dab: depth outside the edge (D), true center x, y
+layout(location = 6) in vec3 aEdge;     // huge dab: w x, y, b (b = 0: not huge)
 uniform vec2 uTarget;
 out vec2 vLocal;
 flat out float vRv;
 flat out float vR;
 flat out float vA;
-flat out float vRot;
+flat out vec2 vRot;
 flat out vec3 vColor;
 flat out float vHardness;
-flat out float vOff;
+flat out float vD;
 flat out vec2 vTrue;
+flat out vec3 vEdge;
 void main() {
   float ext = aDab.z + 1.0;               // one pixel margin for the antialiased edge
   vLocal = (aCorner * 2.0 - 1.0) * ext;
@@ -95,8 +97,9 @@ void main() {
   vRot = aRot;
   vColor = aPaint.rgb;
   vHardness = aPaint.a;
-  vOff = aHuge.x;
+  vD = aHuge.x;
   vTrue = aHuge.yz;
+  vEdge = aEdge;
   vec2 p = aDab.xy + vLocal;
   gl_Position = vec4(p / uTarget * 2.0 - 1.0, 0.0, 1.0);
 }`;
@@ -114,11 +117,12 @@ in vec2 vLocal;
 flat in float vRv;
 flat in float vR;
 flat in float vA;
-flat in float vRot;
+flat in vec2 vRot;
 flat in vec3 vColor;
 flat in float vHardness;
-flat in float vOff;
+flat in float vD;
 flat in vec2 vTrue;
+flat in vec3 vEdge;
 uniform int uTip;
 uniform float uRoundness;
 uniform sampler2DArray uTips;
@@ -130,13 +134,19 @@ uniform float uGrainPx;
 out vec4 o;
 const float PI = 3.14159265359;
 void main() {
-  float c = cos(vRot), s = sin(vRot);
+  float c = vRot.x, s = vRot.y;
   vec2 q = vec2(c * vLocal.x + s * vLocal.y, -s * vLocal.x + c * vLocal.y);
   q.y /= uRoundness;
   float a;
   if (uTip < 0) {
-    float d = length(q);
-    float edge = vRv - d + vOff;          // pixels inside the edge (vOff: see putDab)
+    float edge;                           // pixels inside the edge, in dab space
+    if (vEdge.z > 0.0) {
+      // Huge: q is relative to the target center. R - |q + v| = -(|q + v|² - R²) / (|q + v| + R),
+      // with numerator and denominator times b: no huge numbers cancel (see putDab).
+      float b = vEdge.z;
+      float n = b * dot(q, q) + 2.0 * dot(q, vEdge.xy) + vD;
+      edge = -n / (length(vEdge.xy + q * b) + 1.0 - length(vEdge.xy));
+    } else edge = vRv - length(q);
     if (edge <= -0.5) discard;
     float t = clamp(1.0 - edge / vR, 0.0, 1.0); // 0 at the center, 1 at the edge
     a = 1.0;
