@@ -16,6 +16,7 @@
 
 {#if o}
   <svg class="overlay" aria-hidden="true">
+    {#each o.parts as d}<path class="part" {d} />{/each}
     {#each o.outlines as d}<path class="sel" {d} />{/each}
     {#if o.hover}{#each o.hover.outline as d}<path class="hover" {d} />{/each}{/if}
     {#if o.box}
@@ -55,8 +56,12 @@
     <div class="label" style:transform="translate({o.tip.x}px, {o.tip.y}px)">{o.tip.text}</div>
   {/if}
   {#if o.bar && engine}
-    <div class="bar" role="toolbar" aria-label={o.bar.kind === 'pen' ? 'Pen' : 'Points'}>
-      {#if o.bar.kind === 'points'}
+    <div class="bar" role="toolbar" aria-label={o.bar.kind === 'pen' ? 'Pen' : o.bar.kind === 'parts' ? 'Parts' : 'Points'}>
+      {#if o.bar.kind === 'parts'}
+        <span class="info">Parts of {o.bar.label} · {o.bar.selected ? `${o.bar.selected} selected · double-click for its points` : 'click one to select it'}</span>
+        <button disabled={!o.bar.selected} title="Delete the selected parts (Delete)" onclick={() => engine.shapes.remove()}>Delete</button>
+        <button class="primary" title="Back to the whole shape (Esc)" onclick={() => engine.shapes.exitParts()}>Done</button>
+      {:else if o.bar.kind === 'points'}
         <span class="info">{o.bar.selected ? `${o.bar.selected} of ${o.bar.points} points` : `${o.bar.points} points · click one to select it`}</span>
         {#if o.bar.curve === 'spline'}
           <button disabled={!o.bar.selected} title="Corner: a sharp point" onclick={() => engine.shapes.setPointSmoothness(0)}>Corner</button>
@@ -106,6 +111,13 @@
     fill: none;
     stroke: var(--accent);
     stroke-width: 1;
+  }
+  .part {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+    opacity: 0.8;
   }
   .hover {
     fill: none;
@@ -181,6 +193,7 @@
     bottom: 12px;
     z-index: 6;
     transform: translateX(-50%);
+    width: max-content;
     display: flex;
     align-items: center;
     gap: 6px;

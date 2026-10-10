@@ -32,9 +32,18 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, 
     if (brushHasDynamics(s.brush)) f.add('tips');
     if (s.vector) f.add('vectors');
     if (s.vector?.curve === 'spline') f.add('splines');
+    if (s.vector?.kind === 'compound') f.add('compounds');
   }
   for (const s of shapes) {
-    if (s.deleted || s.kind !== 'path') continue;
+    if (s.deleted) continue;
+    if (s.kind === 'compound') {
+      f.add('compounds');
+      for (const p of s.parts ?? []) {
+        if (p.kind === 'path') f.add('paths');
+        if (p.curve === 'spline') f.add('splines');
+      }
+    }
+    if (s.kind !== 'path') continue;
     f.add('paths');
     if (s.curve === 'spline') f.add('splines');
   }

@@ -4,6 +4,7 @@
   // it, on the middle of a group to go into it. Groups open and close with their arrow.
   import { ADJUST_TYPES, BLEND_MODES, LIMITS, type Layer, type LayerBlend, type Shape } from '../../shared/types';
   import { SHAPE_LABEL } from '../engine/shapeTool';
+  import { OP_LABEL, partId } from '../../shared/compound';
   import { layerTree, subtreeIds, type LayerNode } from '../../shared/layers';
   import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
@@ -138,6 +139,20 @@
       engine.updateCursor();
     }
     engine.shapes.select(ids);
+  }
+
+  /** A part row of a compound: parts mode, with the part selected (Shift: adds or removes it). */
+  function pickPart(e: PointerEvent, c: Shape, i: number) {
+    if (!engine) return;
+    e.stopPropagation();
+    if (ed.tool !== 'select') {
+      ed.tool = 'select';
+      engine.updateCursor();
+    }
+    const id = partId(c.id, i);
+    if (ed.partsOf !== c.id) engine.shapes.enterParts(c.id);
+    if (ed.partsOf !== c.id) return;
+    engine.shapes.select(e.shiftKey ? (ed.selection.includes(id) ? ed.selection.filter((s) => s !== id) : [...ed.selection, id]) : [id]);
   }
 
   function renameShape(id: string, value: string) {
@@ -349,6 +364,16 @@
               <Icon name="trash" />
             </button>
           </li>
+          {#if sh.kind === 'compound' && sh.parts}
+            <!-- Its parts, top first: each one's op with the parts below it (the bottom part is the base). -->
+            {#each sh.parts.map((p, i) => ({ p, i })).reverse() as { p, i } (i)}
+              <li class="shape part" class:active={ed.selection.includes(partId(sh.id, i))} style:--depth={row.depth + 2} onpointerdown={(e) => pickPart(e, sh, i)}>
+                <span class="kind"><Icon name={p.kind} /></span>
+                <span class="name" class:hidden={!layer.visible}>{p.name || `${SHAPE_LABEL[p.kind]} ${i + 1}`}</span>
+                <span class="op" title={i ? `${OP_LABEL[p.op]}: how it combines with the parts below` : 'The base: the parts above combine with it'}>{i ? OP_LABEL[p.op] : 'Base'}</span>
+              </li>
+            {/each}
+          {/if}
         {/each}
       {/if}
     {/each}
@@ -616,6 +641,18 @@
   }
   li.shape .kind {
     margin-right: 0;
+  }
+  li.shape.part {
+    height: 24px;
+    font-size: 11px;
+  }
+  .op {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 10px;
   }
   .chip {
     flex: none;

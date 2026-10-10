@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { BRUSH_TIPS, GRAINS, LIMITS, SHAPE_KINDS, type BrushTip, type GrainId, type LineCap, type Shape, type ShapeProps, type StrokeAlign } from '../../shared/types';
+  import { BRUSH_TIPS, COMPOUND_OPS, GRAINS, LIMITS, SHAPE_KINDS, type BrushTip, type CompoundOp, type GrainId, type LineCap, type Shape, type ShapeProps, type StrokeAlign } from '../../shared/types';
   import type { Engine } from '../engine/engine';
   import { SHAPE_LABEL } from '../engine/shapeTool';
   import { centerOnly } from '../../shared/shapes';
+  import { OP_LABEL, partShape, splitPartId } from '../../shared/compound';
   import { ed, type ShapeStyle, type Tool } from '../state.svelte';
   import Icon from './Icon.svelte';
   import PresetsPanel from './PresetsPanel.svelte';
@@ -45,7 +46,38 @@
   // With shapes selected, the controls show the first one and change all of them (where the
   // setting fits the kind). Else they set the style of the next shape. Lengths are screen pixels.
 
-  const selShapes = $derived(ed.selection.map((id) => ed.shapes.find((s) => s.id === id)).filter((s): s is Shape => !!s));
+  const shapeOf = (id: string): Shape | undefined => {
+    const pid = splitPartId(id);
+    if (!pid) return ed.shapes.find((s) => s.id === id);
+    const c = ed.shapes.find((s) => s.id === pid[0]);
+    return c && partShape(c, pid[1], (k) => SHAPE_LABEL[k]);
+  };
+  const selShapes = $derived(ed.selection.map(shapeOf).filter((s): s is Shape => !!s));
+
+  // Compound shapes: combine the selection, or change a compound (its op, release, flatten), or in
+  // parts mode the op of the selected parts.
+  const OP_TITLE: Record<CompoundOp, string> = {
+    unite: 'Unite: the area of all the shapes',
+    subtract: 'Subtract: the bottom shape without the shapes above it',
+    intersect: 'Intersect: only where the shapes overlap',
+    exclude: 'Exclude: where an odd number of shapes overlap',
+  };
+  const wholeSel = $derived(selShapes.filter((s) => !splitPartId(s.id)));
+  const canCombine = $derived(ed.tool === 'select' && !ed.partsOf && wholeSel.length >= 2);
+  const compounds = $derived(ed.partsOf ? [] : wholeSel.filter((s) => s.kind === 'compound'));
+  /** The op of the selected compounds (the op of their parts above the first), or null when mixed. */
+  const compoundOp = $derived.by((): CompoundOp | null => {
+    const ops = new Set(compounds.flatMap((c) => (c.parts ?? []).slice(1).map((p) => p.op)));
+    return ops.size === 1 ? [...ops][0] : null;
+  });
+  const partInfo = $derived.by(() => {
+    if (!ed.partsOf) return null;
+    const c = ed.shapes.find((s) => s.id === ed.partsOf);
+    const idx = ed.selection.map((id) => splitPartId(id)?.[1]).filter((i): i is number => i !== undefined);
+    if (!c?.parts || !idx.length) return null;
+    const ops = new Set(idx.filter((i) => i > 0).map((i) => c.parts![i]?.op));
+    return { first: idx.includes(0) && idx.length === 1, op: ops.size === 1 ? [...ops][0] : null };
+  });
   const first = $derived(selShapes[0] ?? null);
   /** Screen pixels per local unit of a shape. */
   const kOf = (s: Shape) => Math.sqrt(Math.abs(s.m[0] * s.m[3] - s.m[1] * s.m[2])) * ed.view.zoom;
@@ -190,7 +222,7 @@
   {/if}
   {#if showStyle}
     <div class="colorsrow">
-      {#if has('rect', 'ellipse', 'polygon', 'star', 'path')}
+      {#if has('rect', 'ellipse', 'polygon', 'star', 'path', 'compound')}
         <span class="field"><span>Fill</span><ShapeColor big={stacked} label="Fill" value={st.fill} oninput={(v) => setFill(v, true)} onchange={(v) => setFill(v)} /></span>
       {/if}
       <span class="field"><span>Stroke</span><ShapeColor big={stacked} label="Stroke" value={st.stroke} oninput={(v) => setStroke(v, true)} onchange={(v) => setStroke(v)} /></span>
@@ -265,6 +297,38 @@
         />
       {/if}
     {/if}
+    {#if canCombine}
+      <div class="toggles" role="group" aria-label="Combine">
+        <span class="lbl2">Combine</span>
+        {#each COMPOUND_OPS as op}
+          <button class="icon wide" disabled={!ed.canEdit} title="{OP_TITLE[op]}. The shapes stay live: double-click to change them." onclick={() => engine?.shapes.combine(op)}>{OP_LABEL[op]}</button>
+        {/each}
+      </div>
+    {:else if compounds.length && ed.tool === 'select'}
+      <div class="toggles" role="radiogroup" aria-label="Compound">
+        {#each COMPOUND_OPS as op}
+          <button class="icon wide" class:on={compoundOp === op} role="radio" aria-checked={compoundOp === op} disabled={!ed.canEdit} title={OP_TITLE[op]} onclick={() => engine?.shapes.setCompoundOp(op)}>{OP_LABEL[op]}</button>
+        {/each}
+      </div>
+      <div class="toggles">
+        {#if compounds.length === 1}
+          <button class="icon wide" disabled={!ed.canEdit} title="Select and change the shapes in it (or double-click it)" onclick={() => engine?.shapes.enterParts(compounds[0].id)}>Edit parts</button>
+        {/if}
+        <button class="icon wide" disabled={!ed.canEdit} title="Make the parts separate shapes again" onclick={() => engine?.shapes.release()}>Release</button>
+        <button class="icon wide" disabled={!ed.canEdit} title="Make the result one path: the parts are no longer live. Undo turns it back." onclick={() => engine?.shapes.flatten()}>Flatten to one path</button>
+      </div>
+    {:else if partInfo && ed.tool === 'select'}
+      {#if partInfo.first}
+        <span class="lbl2" title="The other parts combine with the bottom part">Bottom part: the base</span>
+      {:else}
+        <div class="toggles" role="radiogroup" aria-label="Part op">
+          <span class="lbl2">Part</span>
+          {#each COMPOUND_OPS as op}
+            <button class="icon wide" class:on={partInfo.op === op} role="radio" aria-checked={partInfo.op === op} disabled={!ed.canEdit} title={OP_TITLE[op]} onclick={() => engine?.shapes.setPartOp(op)}>{OP_LABEL[op]}</button>
+          {/each}
+        </div>
+      {/if}
+    {/if}
     {#if selShapes.length === 1 && selShapes[0].kind === 'path' && ed.tool === 'select'}
       <div class="toggles" role="radiogroup" aria-label="Curve">
         <span class="lbl2">Curve</span>
@@ -290,6 +354,8 @@
           ? 'Click its outline: add a point · Click a point: remove it · Click elsewhere: a new path'
           : 'Click: a corner point · Drag: a curve point with handles'}
     </span>
+  {:else if ed.partsOf && !ed.pointEdit}
+    <span class="hint" use:fullTitle>Parts: click one to select it · Drag: move · Double-click: its points · Delete: remove it · Esc: done</span>
   {:else if ed.pointEdit}
     <span class="hint" use:fullTitle>Drag points and handles · Alt+drag a handle: break it · Double-click a point: corner or smooth · Double-click the outline: add a point · Delete: remove · Enter or Esc: done</span>
   {:else if ed.tool === 'shape'}
@@ -297,7 +363,7 @@
   {:else if ed.transform}
     <span class="hint" use:fullTitle>The whole layer is the selection: drag inside to move, handles to scale, the round handle to rotate. Click a shape to select it.</span>
   {:else if selShapes.length}
-    <span class="hint" use:fullTitle>Drag inside: move · Handles: scale · Just outside a corner: rotate · Double-click: points</span>
+    <span class="hint" use:fullTitle>Drag inside: move · Handles: scale · Just outside a corner: rotate · Double-click: {selShapes.length === 1 && selShapes[0].kind === 'compound' ? 'parts' : 'points'}</span>
   {:else if activeLayer && activeLayer.kind !== 'shape' && activeLayer.kind !== 'adjust'}
     <span class="hint" use:fullTitle>Click a shape to select it. On a paint layer or a group with paint, Select moves, scales and rotates the whole layer.</span>
   {:else}
@@ -314,7 +380,7 @@
       >
       <button
         class="icon wide"
-        disabled={!selShapes.length || !ed.canEdit}
+        disabled={!selShapes.length || !ed.canEdit || !!ed.partsOf}
         title="The selected shapes become paint on a new paint layer above: the brush and the erasers work on them. Undo turns them back."
         onclick={() => engine?.convertShapesToPaint()}>To paint layer</button
       >

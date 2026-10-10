@@ -69,7 +69,9 @@ export interface SelectOverlay {
   /** The smoothness rings of selected spline points: the point, its smoothness, the knob. */
   rings: { x: number; y: number; s: number; kx: number; ky: number; r: number }[];
   /** The floating bar of point editing or of the Pen; `curve`: the path's curve. */
-  bar: { kind: 'points' | 'pen'; points: number; selected: number; curve: 'bezier' | 'spline' } | null;
+  bar: { kind: 'points' | 'pen' | 'parts'; points: number; selected: number; curve: 'bezier' | 'spline'; label?: string } | null;
+  /** Parts mode: the outlines of the compound's parts. */
+  parts: string[];
 }
 export type { BrushSettings } from '../shared/types';
 import type { BrushSettings } from '../shared/types';
@@ -174,6 +176,8 @@ class EditorState {
   keepSelection = $state(prefs.keepSelection);
   /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
   pointEdit = $state<{ id: string; points: string[] } | null>(null);
+  /** Parts mode: the compound shape whose parts can be selected (their ids: "<compound id>~<index>"). */
+  partsOf = $state<string | null>(null);
   /** The Pen is drawing a path (Enter or Done ends it). */
   penDrawing = $state(false);
   /** Selected shapes (ids). */

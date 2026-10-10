@@ -12,6 +12,8 @@ import {
   SHAPE_KINDS,
   STROKE_ALIGNS,
   CURVE_TYPES,
+  COMPOUND_OPS,
+  type CompoundPart,
   type Adjust,
   type Affine,
   type BlendMode,
@@ -295,6 +297,36 @@ function pathContours(v: unknown): PathContour[] {
   });
 }
 
+/** The parts of a compound shape: each a valid shape of its kind (not a line or a compound), with an op. */
+function compoundParts(v: unknown): CompoundPart[] {
+  if (!Array.isArray(v) || v.length < 1 || v.length > LIMITS.maxParts) fail('bad parts');
+  let points = 0;
+  return v.map((x) => {
+    const o = obj(x, 'part');
+    if (o.kind === 'compound' || o.kind === 'line') fail('bad part kind');
+    const op = oneOf(o.op, COMPOUND_OPS, 'part op');
+    const shape = validateShapeInput({
+      ...o,
+      id: 'partpart00',
+      layerId: 'partpart00',
+      name: '',
+      z: 0,
+      fill: null,
+      stroke: null,
+      strokeWidth: 0,
+      align: 'center',
+      cap: 'round',
+      join: 'miter',
+    });
+    for (const c of shape.path ?? []) points += c.pts.length / POINT_STRIDE;
+    if (points > LIMITS.maxPathPoints) fail('too many path points');
+    const { id: _i, layerId: _l, name: _n, z: _z, fill: _f, stroke: _s, strokeWidth: _w, align: _a, cap: _c, join: _j, ...geo } = shape;
+    const part = { ...geo, op } as CompoundPart;
+    if (o.name !== undefined) part.name = str(o.name, LIMITS.maxShapeName, 'part name');
+    return part;
+  });
+}
+
 /** Shape props, range checks only. `partial`: only the props present, at least one. */
 function shapeProps(v: unknown, partial: boolean): ShapeUpdate {
   const p = obj(v, 'props');
@@ -331,6 +363,7 @@ function shapeProps(v: unknown, partial: boolean): ShapeUpdate {
   if (p.line !== undefined) out.line = tuple4(p.line, coord, 'line');
   if (p.path !== undefined) out.path = pathContours(p.path);
   if (p.curve !== undefined) out.curve = oneOf(p.curve, CURVE_TYPES, 'curve');
+  if (p.parts !== undefined) out.parts = compoundParts(p.parts);
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -372,6 +405,7 @@ export function validateShapeInput(v: unknown): ShapeInput {
     out.points = need('points');
     out.innerRatio = need('innerRatio');
   } else if (kind === 'line') out.line = need('line');
+  else if (kind === 'compound') out.parts = need('parts');
   else if (kind === 'path') {
     out.path = need('path');
     if (p.curve === 'spline') out.curve = 'spline';

@@ -13,10 +13,10 @@ export const BDRAW_MIME = 'application/x-bdraw';
 /**
  * 2: layers may have adjust, clip and mask; strokes may have mask and brush dynamics.
  * 3: shape layers and `shapes`. 4: paths (kind 'path') and vector strokes (`vector`). 5: spline
- * paths (`curve: 'spline'`). A file is written with the lowest version that holds it, so older
- * servers accept what they can read.
+ * paths (`curve: 'spline'`). 6: compound shapes (kind 'compound', `parts`). A file is written
+ * with the lowest version that holds it, so older servers accept what they can read.
  */
-export const BDRAW_VERSION = 5;
+export const BDRAW_VERSION = 6;
 
 export interface BdrawFile {
   format: 'bdraw';
@@ -67,6 +67,7 @@ export function makeBdraw(
 
 /** The lowest version that holds these layers, strokes and shapes. */
 function fileVersion(layers: Layer[], strokes: Stroke[], shapes: Shape[]): number {
+  if (shapes.some((s) => s.kind === 'compound') || strokes.some((s) => s.vector?.kind === 'compound')) return 6;
   if (shapes.some((s) => s.curve === 'spline') || strokes.some((s) => s.vector?.curve === 'spline')) return 5;
   if (shapes.some((s) => s.kind === 'path') || strokes.some((s) => s.vector)) return 4;
   if (shapes.length || layers.some((l) => l.kind === 'shape')) return 3;
