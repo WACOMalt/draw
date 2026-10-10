@@ -12,10 +12,11 @@ export const BDRAW_EXT = 'bdraw';
 export const BDRAW_MIME = 'application/x-bdraw';
 /**
  * 2: layers may have adjust, clip and mask; strokes may have mask and brush dynamics.
- * 3: shape layers and `shapes`. 4: paths (kind 'path') and vector strokes (`vector`). A file is
- * written with the lowest version that holds it, so older servers accept what they can read.
+ * 3: shape layers and `shapes`. 4: paths (kind 'path') and vector strokes (`vector`). 5: spline
+ * paths (`curve: 'spline'`). A file is written with the lowest version that holds it, so older
+ * servers accept what they can read.
  */
-export const BDRAW_VERSION = 4;
+export const BDRAW_VERSION = 5;
 
 export interface BdrawFile {
   format: 'bdraw';
@@ -53,7 +54,7 @@ export function makeBdraw(
   const liveStrokes = [...strokes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.seq - b.seq);
   return {
     format: 'bdraw',
-    version: liveShapes.some((s) => s.kind === 'path') || liveStrokes.some((s) => s.vector) ? 4 : liveShapes.length || live.some((l) => l.kind === 'shape') ? 3 : 2,
+    version: fileVersion(live, liveStrokes, liveShapes),
     app,
     savedAt: new Date().toISOString(),
     ...(preview ? { preview } : {}),
@@ -62,6 +63,14 @@ export function makeBdraw(
     strokes: liveStrokes,
     ...(liveShapes.length ? { shapes: liveShapes } : {}),
   };
+}
+
+/** The lowest version that holds these layers, strokes and shapes. */
+function fileVersion(layers: Layer[], strokes: Stroke[], shapes: Shape[]): number {
+  if (shapes.some((s) => s.curve === 'spline') || strokes.some((s) => s.vector?.curve === 'spline')) return 5;
+  if (shapes.some((s) => s.kind === 'path') || strokes.some((s) => s.vector)) return 4;
+  if (shapes.length || layers.some((l) => l.kind === 'shape')) return 3;
+  return 2;
 }
 
 export const isGzip = (b: Uint8Array) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;

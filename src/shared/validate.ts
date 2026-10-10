@@ -11,6 +11,7 @@ import {
   LINE_JOINS,
   SHAPE_KINDS,
   STROKE_ALIGNS,
+  CURVE_TYPES,
   type Adjust,
   type Affine,
   type BlendMode,
@@ -285,11 +286,10 @@ function pathContours(v: unknown): PathContour[] {
     if (total > LIMITS.maxPathPoints) fail('too many path points');
     const out = new Array<number>(pts.length);
     for (let i = 0; i < pts.length; i++) {
-      if (i % POINT_STRIDE === POINT_STRIDE - 1) {
-        const t = pts[i];
-        if (typeof t !== 'number' || !Number.isInteger(t) || t < 0 || t >= POINT_TYPES.length) fail('bad point type');
-        out[i] = t;
-      } else out[i] = coord(pts[i], 'path point');
+      // The last number: a point type (Bezier) or a smoothness (spline). validateShapeInput
+      // checks it against the curve of the whole shape.
+      if (i % POINT_STRIDE === POINT_STRIDE - 1) out[i] = num(pts[i], -1, POINT_TYPES.length - 1, 'point type');
+      else out[i] = coord(pts[i], 'path point');
     }
     return { closed: bool(o.closed, 'path closed'), pts: out };
   });
@@ -330,6 +330,7 @@ function shapeProps(v: unknown, partial: boolean): ShapeUpdate {
   if (p.rounding !== undefined) out.rounding = len(p.rounding, 'rounding');
   if (p.line !== undefined) out.line = tuple4(p.line, coord, 'line');
   if (p.path !== undefined) out.path = pathContours(p.path);
+  if (p.curve !== undefined) out.curve = oneOf(p.curve, CURVE_TYPES, 'curve');
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -371,7 +372,17 @@ export function validateShapeInput(v: unknown): ShapeInput {
     out.points = need('points');
     out.innerRatio = need('innerRatio');
   } else if (kind === 'line') out.line = need('line');
-  else if (kind === 'path') out.path = need('path');
+  else if (kind === 'path') {
+    out.path = need('path');
+    if (p.curve === 'spline') out.curve = 'spline';
+    // Bezier points have a type 0, 1 or 2; spline points a smoothness, -1 to 1.
+    for (const c of out.path) {
+      for (let i = POINT_STRIDE - 1; i < c.pts.length; i += POINT_STRIDE) {
+        const v = c.pts[i];
+        if (out.curve === 'spline' ? v > 1 : !Number.isInteger(v) || v < 0) fail('bad point type');
+      }
+    }
+  }
   if ((kind === 'polygon' || kind === 'star') && p.rounding !== undefined) out.rounding = p.rounding;
   if (!cornersWithin(out, LIMITS.maxCoord)) fail('shape out of range');
   return stripForKind(out);

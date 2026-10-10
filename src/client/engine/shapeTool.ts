@@ -36,7 +36,13 @@ import {
 } from '../../shared/types';
 import {
   CORNER,
+  SMOOTH,
   SYMMETRIC,
+  bezierToSpline,
+  clonePath,
+  setSmoothness,
+  smoothOf,
+  toggleSplinePoint,
   allKeys,
   count,
   getPt,
@@ -75,7 +81,7 @@ export interface ShapeHost {
 type Pt = [number, number];
 
 /** The props a gesture or an edit may change, compared to make the ops. */
-const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
+const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'curve', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
 
 const LIVE_MS = 40;
 /** Movement (CSS px) before a press counts as a drag: smaller jitters change nothing. */
@@ -131,7 +137,7 @@ interface Create {
 interface PointDrag {
   pointerId: number;
   touch: boolean;
-  kind: 'handle' | 'anchor' | 'marquee';
+  kind: 'handle' | 'anchor' | 'marquee' | 'ring';
   s0: Pt;
   s1: Pt;
   p0: Pt;
@@ -147,6 +153,7 @@ interface PointDrag {
 /** The Pen's path in progress: points in world units relative to `o` (the first point). */
 interface PenPath {
   id: string;
+  curve: 'bezier' | 'spline';
   layerId: string;
   createdLayer: string | null;
   z: number;
@@ -172,6 +179,8 @@ export class ShapeTool {
   private pdrag: PointDrag | null = null;
   private pen: PenPath | null = null;
   private penDrag: { pointerId: number; s0: Pt; idx: number; moved: boolean; closing: boolean } | null = null;
+  /** The point whose ring knob is dragged (point editing of a spline). */
+  private ringKey: PKey | null = null;
   /** The shapes before an options bar drag started (editSelected). */
   private editOrig: Map<string, Shape> | null = null;
   private hover: Shape | null = null;
@@ -182,6 +191,8 @@ export class ShapeTool {
   private lastClick = { t: 0, x: 0, y: 0 };
   /** Shapes as the user sees them, cached until the document or the drafts change. */
   private viewCache: Map<string, Shape> | null = null;
+  /** Touch screen: bigger targets (the smoothness ring). */
+  private coarse = matchMedia('(pointer: coarse)').matches;
   /** Peers' drafts: when each last arrived (stale ones are dropped). */
   private remote = new Map<string, number>();
 
@@ -1032,7 +1043,7 @@ export class ShapeTool {
     const pe = ed.pointEdit;
     const s = pe ? this.current(pe.id) : undefined;
     if (!pe || !s || s.deleted) return null;
-    return { s, path: toPath(s) };
+    return { s, path: editPath(s) };
   }
 
   /** Local units of a shape to screen pixels. */
@@ -1069,15 +1080,27 @@ export class ShapeTool {
   }
 
   /** What is under a screen point in point editing: a handle of a selected point, a point, or a segment. */
-  private pointHit(x: number, y: number, touch: boolean): { kind: 'handle'; key: PKey; which: 'in' | 'out' } | { kind: 'anchor'; key: PKey } | { kind: 'segment'; c: number; seg: number; t: number } | null {
+  private pointHit(
+    x: number,
+    y: number,
+    touch: boolean,
+  ): { kind: 'handle'; key: PKey; which: 'in' | 'out' } | { kind: 'ring'; key: PKey } | { kind: 'anchor'; key: PKey } | { kind: 'segment'; c: number; seg: number; t: number } | null {
     const ps = this.pointShape();
     if (!ps) return null;
     const r = touch ? 16 : 6;
     const sc = this.localToScreen(ps.s);
+    const spline = ps.s.kind === 'path' && ps.s.curve === 'spline';
     for (const ks of ed.pointEdit!.points) {
       const k = parseKey(ks);
       if (!ps.path[k.c] || k.i >= count(ps.path[k.c])) continue;
       const v = getPt(ps.path, k);
+      if (spline) {
+        // The smoothness ring's knob.
+        const [ax, ay] = sc(v.x, v.y);
+        const [kx, ky] = ringKnob(ax, ay, smoothOf(ps.path, k), this.coarse);
+        if (Math.hypot(x - kx, y - ky) <= r) return { kind: 'ring', key: k };
+        continue;
+      }
       for (const which of ['out', 'in'] as const) {
         const [hx, hy] = which === 'in' ? [v.ix, v.iy] : [v.ox, v.oy];
         if (hx === v.x && hy === v.y) continue;
@@ -1090,7 +1113,7 @@ export class ShapeTool {
       const [sx, sy] = sc(v.x, v.y);
       if (Math.hypot(x - sx, y - sy) <= r) return { kind: 'anchor', key: k };
     }
-    const near = nearestOnPath(ps.path, sc, x, y);
+    const near = nearestOnPath(ps.path, sc, x, y, curveOf(ps.s));
     if (near && near.d <= r) return { kind: 'segment', c: near.c, seg: near.seg, t: near.t };
     return null;
   }
@@ -1102,13 +1125,14 @@ export class ShapeTool {
     const hit = this.pointHit(x, y, touch);
     const pe = ed.pointEdit!;
     if (dbl && hit?.kind === 'anchor') {
-      // Double-click a point: corner ↔ smooth.
-      this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, toggleSmooth(ps.path, hit.key))]);
+      // Double-click a point: corner ↔ smooth (a spline point: corner ↔ through).
+      const next = curveOf(ps.s) === 'spline' ? toggleSplinePoint(ps.path, hit.key) : toggleSmooth(ps.path, hit.key);
+      this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, next)]);
       return;
     }
     if (dbl && hit?.kind === 'segment') {
       // Double-click a segment: a new point there.
-      const { path, key } = insertPoint(ps.path, hit.c, hit.seg, hit.t);
+      const { path, key } = insertPoint(ps.path, hit.c, hit.seg, hit.t, curveOf(ps.s));
       this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, path)]);
       this.setPoints([keyOf(key)]);
       return;
@@ -1116,6 +1140,12 @@ export class ShapeTool {
     const base = { pointerId: e.pointerId, touch, s0: [x, y] as Pt, p0: this.toWorld(x, y), shape: ps.s, path: ps.path, moved: false };
     if (hit?.kind === 'handle') {
       this.pdrag = { ...base, kind: 'handle', keys: [hit.key], which: hit.which, s1: [x, y], add: false };
+      return;
+    }
+    if (hit?.kind === 'ring') {
+      // The ring's knob sets the smoothness of every selected point.
+      this.pdrag = { ...base, kind: 'ring', keys: pe.points.map(parseKey), which: 'out', s1: [x, y], add: false };
+      this.ringKey = hit.key;
       return;
     }
     if (hit?.kind === 'anchor') {
@@ -1148,6 +1178,16 @@ export class ShapeTool {
       }
       const a = apply(inv, ...g.p0), b = apply(inv, ...p);
       this.setDrafts([this.withPath(g.shape, moveAnchors(g.path, g.keys, b[0] - a[0], b[1] - a[1]))]);
+      return;
+    }
+    if (g.kind === 'ring') {
+      // The knob's angle from the top: clockwise is soft, counterclockwise goes through.
+      const v = getPt(g.path, this.ringKey!);
+      const [ax, ay] = this.localToScreen(g.shape)(v.x, v.y);
+      let sm = Math.max(-1, Math.min(1, Math.atan2(x - ax, -(y - ay)) / Math.PI));
+      if (shift) sm = Math.round(sm * 4) / 4;
+      if (Math.abs(sm) < 0.04) sm = 0; // a corner is easy to hit
+      this.setDrafts([this.withPath(g.shape, setSmoothness(g.path, g.keys, sm))]);
       return;
     }
     const k = g.keys[0];
@@ -1197,13 +1237,39 @@ export class ShapeTool {
     this.clearDrafts();
   }
 
-  /** The type of the selected points (the options bar and the point bar): corner, smooth or symmetric. */
+  /**
+   * The type of the selected points (the point bar): corner, smooth or symmetric. On a spline:
+   * CORNER is a sharp point (0), SMOOTH goes through it round (-1).
+   */
   setPointType(t: number): void {
     const ps = this.pointShape();
     if (!ps || !ed.canEdit) return;
     const keys = ed.pointEdit!.points.map(parseKey);
     if (!keys.length) return showToast('Select points first');
-    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, setType(ps.path, keys, t))]);
+    const next = curveOf(ps.s) === 'spline' ? setSmoothness(ps.path, keys, t === CORNER ? 0 : -1) : setType(ps.path, keys, t);
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, next)]);
+  }
+
+  /** The smoothness of the selected spline points (the point bar: Soft is 1). */
+  setPointSmoothness(v: number): void {
+    const ps = this.pointShape();
+    if (!ps || !ed.canEdit || curveOf(ps.s) !== 'spline') return;
+    const keys = ed.pointEdit!.points.map(parseKey);
+    if (!keys.length) return showToast('Select points first');
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, setSmoothness(ps.path, keys, v))]);
+  }
+
+  /**
+   * The curve of a path (point editing, or one selected shape): Bezier points become spline
+   * points through the same anchors; a spline becomes Bezier curves that follow it closely.
+   */
+  setCurve(curve: 'bezier' | 'spline'): void {
+    const id = ed.pointEdit?.id ?? (ed.selection.length === 1 ? ed.selection[0] : null);
+    const s = id ? this.current(id) : null;
+    if (!s || !ed.canEdit || curveOf(s) === curve) return;
+    const path = curve === 'spline' ? bezierToSpline(toPath(s)) : toPath(s);
+    this.commit(new Map([[s.id, s]]), [stripForKind(fitPathFrame({ ...s, kind: 'path', path, curve }))]);
+    if (ed.pointEdit) this.setPoints([]);
   }
 
   /** Removes the selected points; a shape left without a segment goes. */
@@ -1257,7 +1323,7 @@ export class ShapeTool {
         return;
       }
       const lx = p[0] - pen.o[0], ly = p[1] - pen.o[1];
-      pen.c.pts.push(lx, ly, lx, ly, lx, ly, CORNER);
+      pen.c.pts.push(lx, ly, lx, ly, lx, ly, pen.curve === 'spline' ? ed.penStyle.smooth : CORNER);
       this.penDrag = { pointerId: e.pointerId, s0: [x, y], idx: n, moved: false, closing: false };
       this.penDraft();
       return;
@@ -1265,7 +1331,7 @@ export class ShapeTool {
     // Not drawing: a click on the selected shape's outline or points edits it.
     const sel = this.selected();
     if (sel.length === 1) {
-      const s = sel[0], path = toPath(s);
+      const s = sel[0], path = editPath(s);
       const sc = this.localToScreen(s);
       for (const k of allKeys(path)) {
         const v = getPt(path, k);
@@ -1277,9 +1343,9 @@ export class ShapeTool {
           return;
         }
       }
-      const near = nearestOnPath(path, sc, x, y);
+      const near = nearestOnPath(path, sc, x, y, curveOf(s));
       if (near && near.d <= r) {
-        const { path: next, key } = insertPoint(path, near.c, near.seg, near.t);
+        const { path: next, key } = insertPoint(path, near.c, near.seg, near.t, curveOf(s));
         this.commit(new Map([[s.id, s]]), [this.withPath(s, next)]);
         ed.pointEdit = { id: s.id, points: [keyOf(key)] };
         this.scheduleOverlay();
@@ -1291,7 +1357,8 @@ export class ShapeTool {
     if (!target) return;
     let z = 0;
     for (const s of this.view().values()) if (s.layerId === target.layerId && !s.deleted) z = Math.max(z, s.z);
-    this.pen = { id: newId(), layerId: target.layerId, createdLayer: target.created, z: z + 1, o: p, c: { closed: false, pts: [0, 0, 0, 0, 0, 0, CORNER] } };
+    const curve = ed.penStyle.curve === 'spline' ? 'spline' : 'bezier';
+    this.pen = { id: newId(), layerId: target.layerId, createdLayer: target.created, z: z + 1, o: p, curve, c: { closed: false, pts: [0, 0, 0, 0, 0, 0, curve === 'spline' ? ed.penStyle.smooth : CORNER] } };
     ed.penDrawing = true;
     ed.selection = [];
     ed.pointEdit = null;
@@ -1307,6 +1374,12 @@ export class ShapeTool {
     const p = this.toWorld(x, y);
     const lx = p[0] - pen.o[0], ly = p[1] - pen.o[1];
     const o = d.idx * POINT_STRIDE, a = pen.c.pts;
+    if (pen.curve === 'spline') {
+      // A spline point has no handles: the drag moves it (not the first one, when closing).
+      if (!d.closing) a.splice(o, 6, lx, ly, lx, ly, lx, ly);
+      this.penDraft();
+      return;
+    }
     const px = a[o], py = a[o + 1];
     if (d.closing) {
       // Closing: the drag shapes the curve into the first point (its incoming handle).
@@ -1357,6 +1430,7 @@ export class ShapeTool {
         align: st.align,
         cap: st.cap,
         join: 'round',
+        ...(pen.curve === 'spline' ? { curve: 'spline' as const } : {}),
         author: '',
         seq: Infinity,
       },
@@ -1483,6 +1557,7 @@ export class ShapeTool {
       readout: null,
       anchors: [],
       knobs: [],
+      rings: [],
       rubber: null,
       tip: null,
       bar: null,
@@ -1517,7 +1592,7 @@ export class ShapeTool {
   }
 
   /** Anchors and handles of a path on screen; `sel` are selected points (their handles show). */
-  private pathMarks(o: SelectOverlay, path: PathContour[], sc: (x: number, y: number) => Pt, sel: Set<string>, handlesOf: Set<string>): void {
+  private pathMarks(o: SelectOverlay, path: PathContour[], sc: (x: number, y: number) => Pt, sel: Set<string>, handlesOf: Set<string>, spline = false): void {
     const { w, h } = this.host.comp.size;
     const on = ([x, y]: Pt) => x > -60 && y > -60 && x < w + 60 && y < h + 60;
     for (const k of allKeys(path)) {
@@ -1532,6 +1607,10 @@ export class ShapeTool {
         }
       }
       if (on(a)) o.anchors.push({ x: a[0], y: a[1], smooth: v.t !== CORNER, sel: sel.has(ks) });
+      if (spline && sel.has(ks) && on(a)) {
+        const [kx, ky] = ringKnob(a[0], a[1], v.t, this.coarse);
+        o.rings.push({ x: a[0], y: a[1], s: v.t, kx, ky, r: ringRadius(this.coarse) });
+      }
     }
   }
 
@@ -1539,13 +1618,13 @@ export class ShapeTool {
     const ps = this.pointShape();
     if (!ps) return o;
     const shown = this.drafts.get(ps.s.id) ?? ps.s;
-    const path = toPath(shown);
+    const path = editPath(shown);
     o.outlines = this.outline(shown);
     const sel = new Set(ed.pointEdit!.points);
-    this.pathMarks(o, path, this.localToScreen(shown), sel, sel);
+    this.pathMarks(o, path, this.localToScreen(shown), sel, sel, curveOf(shown) === 'spline');
     const g = this.pdrag;
     if (g?.kind === 'marquee' && g.moved) o.marquee = [Math.min(g.s0[0], g.s1[0]), Math.min(g.s0[1], g.s1[1]), Math.abs(g.s1[0] - g.s0[0]), Math.abs(g.s1[1] - g.s0[1])];
-    o.bar = { kind: 'points', points: allKeys(path).length, selected: sel.size };
+    o.bar = { kind: 'points', points: allKeys(path).length, selected: sel.size, curve: curveOf(shown) ?? 'bezier' };
     return o;
   }
 
@@ -1557,7 +1636,7 @@ export class ShapeTool {
     if (s) o.outlines = this.outline(s);
     const last = new Set([keyOf({ c: 0, i: n - 1 })]);
     if (this.penDrag?.closing) last.add('0:0');
-    this.pathMarks(o, [pen.c], sc, last, last);
+    this.pathMarks(o, [pen.c], sc, pen.curve === 'spline' ? new Set() : last, last, pen.curve === 'spline');
     // The next segment, from the last point to the pointer (it bends with the last out handle).
     if (this.pointer && !this.penDrag && !pen.c.closed) {
       const v = getPt([pen.c], { c: 0, i: n - 1 });
@@ -1568,7 +1647,7 @@ export class ShapeTool {
       const [fx, fy] = sc(pen.c.pts[0], pen.c.pts[1]);
       if (n >= 2 && Math.hypot(px - fx, py - fy) <= 10) o.tip = { text: 'Click the first point to close the shape', x: fx + 16, y: fy + 18 };
     }
-    o.bar = { kind: 'pen', points: n, selected: 0 };
+    o.bar = { kind: 'pen', points: n, selected: 0, curve: pen.curve };
     return o;
   }
 
@@ -1606,6 +1685,23 @@ export class ShapeTool {
 }
 
 // --- helpers ---------------------------------------------------------------------------------------
+
+/** The curve of a shape's path (non-path shapes become Bezier paths). */
+const curveOf = (s: Shape) => (s.kind === 'path' ? s.curve : undefined);
+
+/** The path that point editing changes: a path's own points, or any other shape as a Bezier path. */
+function editPath(s: Shape): PathContour[] {
+  return s.kind === 'path' ? clonePath(s.path ?? []) : toPath(s);
+}
+
+/** Radius of the smoothness ring around a selected spline point (CSS px). */
+export const ringRadius = (touch: boolean) => (touch ? 30 : 20);
+
+/** Where the ring's knob is: at the top for a corner, clockwise up to the bottom for soft (1), counterclockwise for through (-1). */
+export function ringKnob(x: number, y: number, smooth: number, touch: boolean): Pt {
+  const a = smooth * Math.PI, r = ringRadius(touch);
+  return [x + r * Math.sin(a), y - r * Math.cos(a)];
+}
 
 /** Shapes with radius dots: rectangles (a radius per corner), polygons and stars (one rounding). */
 const hasRadiusDots = (s: Shape) => s.kind === 'rect' || s.kind === 'polygon' || s.kind === 'star';

@@ -245,6 +245,33 @@
         <Slider wide={stacked} label="Rounding" value={st.rounding} min={0} max={500} step={0.1} log width={70} title="Corner rounding, in screen pixels" oninput={(v) => setRounding(v, true)} onchange={(v) => setRounding(v)} />
       {/if}
     {/key}
+    {#if ed.tool === 'pen' && !selShapes.length}
+      <div class="toggles" role="radiogroup" aria-label="New points">
+        <span class="lbl2">New points</span>
+        <button class="icon wide" class:on={ed.penStyle.curve !== 'spline'} role="radio" aria-checked={ed.penStyle.curve !== 'spline'} title="Bezier: click for corners, drag for curves with handles" onclick={() => (ed.penStyle.curve = 'bezier')}>Bezier</button>
+        <button class="icon wide" class:on={ed.penStyle.curve === 'spline'} role="radio" aria-checked={ed.penStyle.curve === 'spline'} title="Spline: a smooth curve through or near the points, without handles" onclick={() => (ed.penStyle.curve = 'spline')}>Spline</button>
+      </div>
+      {#if ed.penStyle.curve === 'spline'}
+        <Slider
+          wide={stacked}
+          label="Smoothness"
+          bind:value={ed.penStyle.smooth}
+          min={-1}
+          max={1}
+          step={0.05}
+          percent
+          width={80}
+          title="New points: -100% the curve goes through them, round · 0 a sharp corner · 100% the curve bends toward them (soft)"
+        />
+      {/if}
+    {/if}
+    {#if selShapes.length === 1 && selShapes[0].kind === 'path' && ed.tool === 'select'}
+      <div class="toggles" role="radiogroup" aria-label="Curve">
+        <span class="lbl2">Curve</span>
+        <button class="icon wide" class:on={selShapes[0].curve !== 'spline'} role="radio" aria-checked={selShapes[0].curve !== 'spline'} title="Bezier: points with handles" onclick={() => engine?.shapes.setCurve('bezier')}>Bezier</button>
+        <button class="icon wide" class:on={selShapes[0].curve === 'spline'} role="radio" aria-checked={selShapes[0].curve === 'spline'} title="Spline: smooth curves through or near the points (double-click to set each point)" onclick={() => engine?.shapes.setCurve('spline')}>Spline</button>
+      </div>
+    {/if}
     {#if capped}
       <div class="toggles" role="radiogroup" aria-label="Line caps">
         {#each CAPS as [c, label]}
@@ -255,7 +282,9 @@
   {/if}
   {#if ed.tool === 'pen'}
     <span class="hint" use:fullTitle>
-      {ed.penDrawing
+      {ed.penDrawing && ed.penStyle.curve === 'spline'
+        ? 'Click: a point · Drag: place it · Click the first point: close · Enter: finish · Backspace: last point · Double-click a point later to set its smoothness'
+        : ed.penDrawing
         ? 'Click: a corner · Drag: a curve point · Alt+drag: break the handles · Click the first point: close · Enter: finish · Backspace: last point'
         : selShapes.length === 1
           ? 'Click its outline: add a point · Click a point: remove it · Click elsewhere: a new path'
@@ -453,6 +482,11 @@
   }
   .stacked .hint {
     white-space: normal;
+  }
+  .lbl2 {
+    color: var(--text-dim);
+    margin-right: 4px;
+    align-self: center;
   }
   .kindname {
     display: inline-flex;

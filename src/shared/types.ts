@@ -178,6 +178,16 @@ export interface PathContour {
 }
 export const POINT_STRIDE = 7;
 /**
+ * The curve of a path, one for all its points. bezier: each point has two handles. spline: an
+ * x-spline (Blanc and Schlick, 1995) through or near its points, without handles: the 7th number
+ * of a point is its smoothness, -1 to 1. Negative: the curve goes through the point, round at -1.
+ * 0: a sharp corner at the point. Positive: the curve bends toward the point without touching it
+ * (soft), most at 1. The handle numbers of a spline point repeat its anchor.
+ */
+export const CURVE_TYPES = ['bezier', 'spline'] as const;
+export type CurveType = (typeof CURVE_TYPES)[number];
+
+/**
  * corner: the two handles move on their own. smooth: the handles stay on one line (each keeps
  * its length). symmetric: the handles stay on one line with the same length.
  */
@@ -216,6 +226,8 @@ export interface ShapeProps {
   rounding?: number;
   line?: [number, number, number, number];
   path?: PathContour[];
+  /** The curve of a path (absent: bezier). */
+  curve?: CurveType;
   /** #rrggbb, or null: no fill. Lines have no fill. */
   fill: string | null;
   /** #rrggbb, or null: no stroke. */
@@ -247,7 +259,7 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =

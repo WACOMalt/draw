@@ -14,8 +14,12 @@ import type { Marker } from './engine/navigator';
  */
 export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'select' | 'pen' | 'shape' | 'hand' | 'zoom';
 
-/** The style of new Pen paths (lengths in screen pixels, as ShapeStyle). */
-export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'strokeWidth' | 'align' | 'cap'>;
+/**
+ * The style of new Pen paths (lengths in screen pixels, as ShapeStyle), their curve, and the
+ * smoothness of new spline points (-1 through, 0 corner, 1 soft).
+ */
+export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'strokeWidth' | 'align' | 'cap'> & { curve: 'bezier' | 'spline'; smooth: number };
+const PEN_STYLE: PenStyle = { fill: null, stroke: '#1d3557', strokeWidth: 3, align: 'center', cap: 'round', curve: 'bezier', smooth: 0.5 };
 
 /**
  * Settings for new shapes (the options bar edits the selected shapes instead, when there are
@@ -62,8 +66,10 @@ export interface SelectOverlay {
   rubber: string | null;
   /** A hint near the pointer, as "Click the first point to close the shape". */
   tip: { text: string; x: number; y: number } | null;
-  /** The floating bar of point editing or of the Pen. */
-  bar: { kind: 'points' | 'pen'; points: number; selected: number } | null;
+  /** The smoothness rings of selected spline points: the point, its smoothness, the knob. */
+  rings: { x: number; y: number; s: number; kx: number; ky: number; r: number }[];
+  /** The floating bar of point editing or of the Pen; `curve`: the path's curve. */
+  bar: { kind: 'points' | 'pen'; points: number; selected: number; curve: 'bezier' | 'spline' } | null;
 }
 export type { BrushSettings } from '../shared/types';
 import type { BrushSettings } from '../shared/types';
@@ -140,7 +146,7 @@ const prefs = load('draw.prefs', {
   swatches: [] as string[],
   shapeKind: 'rect' as ShapeKind,
   shapeStyle: {} as Partial<ShapeStyle>,
-  penStyle: { fill: null, stroke: '#1d3557', strokeWidth: 3, align: 'center', cap: 'round' } as PenStyle,
+  penStyle: {} as Partial<PenStyle>,
   /** Clicks on empty canvas keep the selection (only Esc and Deselect clear it). */
   keepSelection: false,
 });
@@ -164,7 +170,7 @@ class EditorState {
   color = $state(prefs.color);
   shapeKind = $state<ShapeKind>(prefs.shapeKind);
   shapeStyle = $state<ShapeStyle>({ ...SHAPE_STYLE, ...prefs.shapeStyle });
-  penStyle = $state<PenStyle>({ ...prefs.penStyle });
+  penStyle = $state<PenStyle>({ ...PEN_STYLE, ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);
   /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
   pointEdit = $state<{ id: string; points: string[] } | null>(null);

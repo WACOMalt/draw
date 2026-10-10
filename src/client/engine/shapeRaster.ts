@@ -95,10 +95,17 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
     const outline = new Path2D();
     for (const c of cs) {
       outline.moveTo(c.x, c.y);
+      let x = c.x, y = c.y;
       for (const g of c.segs) {
         if (g.t === 'L') outline.lineTo(g.x, g.y);
         else if (g.t === 'C') outline.bezierCurveTo(g.x1, g.y1, g.x2, g.y2, g.x, g.y);
-        else outline.ellipse(g.cx, g.cy, Math.abs(g.rx), Math.abs(g.ry), 0, g.a0, g.a1, g.a1 < g.a0);
+        else if (g.t === 'X') {
+          // Canvas has no x-splines: short lines, fine enough on this target.
+          const f = flattenContour({ x, y, closed: false, segs: [g] }, A, TOL);
+          for (let i = 2; i < f.pts.length; i += 2) outline.lineTo(f.pts[i], f.pts[i + 1]);
+        } else outline.ellipse(g.cx, g.cy, Math.abs(g.rx), Math.abs(g.ry), 0, g.a0, g.a1, g.a1 < g.a0);
+        if (g.t !== 'A') [x, y] = [g.x, g.y];
+        else [x, y] = [g.cx + g.rx * Math.cos(g.a1), g.cy + g.ry * Math.sin(g.a1)];
       }
       if (c.closed) outline.closePath();
     }
