@@ -371,12 +371,23 @@ export interface CanvasInfo {
   expiresAt: number | null;
   /** This browser created the temporary canvas and may claim it by logging in. */
   canClaim: boolean;
+  /** A canvas on this device, with no server (client/local). */
+  local?: boolean;
 }
 
 /** Link preview images: size of the PNG, and the gap between two from the same canvas. */
 export const PREVIEW_LIMITS = { width: 1200, height: 630, maxBytes: 1_500_000, minIntervalMs: 60_000 } as const;
 
-export type DeniedReason = 'no_access' | 'login_required' | 'password_required' | 'password_wrong' | 'expired' | 'deleted';
+export type DeniedReason =
+  | 'no_access'
+  | 'login_required'
+  | 'password_required'
+  | 'password_wrong'
+  | 'expired'
+  | 'deleted'
+  /** Canvases on the device (client/local): open in another window, or storage failed. */
+  | 'open_elsewhere'
+  | 'storage_failed';
 
 export type ClientMsg =
   | {

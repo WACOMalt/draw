@@ -2,11 +2,19 @@
   import { normalizeName } from '../../shared/types';
   import { PUBLIC_ORIGIN } from '../config';
   import { createCanvas } from '../files';
-  import { ed } from '../state.svelte';
+  import { ed, showToast } from '../state.svelte';
+  import { createLocal } from '../local/store';
+  import { createLocalFromFile, defaultName } from '../local/import';
 
   // Makes a canvas, empty or from a .bdraw file. Accounts choose a name (empty: a random code)
-  // and private or public; without an account the canvas is temporary.
-  let { file, onCreated }: { file?: Blob; onCreated: (key: string) => void } = $props();
+  // and private or public; without an account the canvas is temporary. With onLocal, it can also
+  // make a canvas on this device only (local/), and does so when the server cannot be reached.
+  let {
+    file,
+    fileName,
+    onCreated,
+    onLocal,
+  }: { file?: Blob; fileName?: string; onCreated: (key: string) => void; onLocal?: (id: string) => void } = $props();
 
   let name = $state('');
   let busy = $state(false);
@@ -22,9 +30,31 @@
     const r = await createCanvas({ ...(access ? { access } : {}), ...(ed.user && preview ? { name } : {}) }, file);
     busy = false;
     if ('key' in r) return onCreated(r.key);
+    if (r.code === 'network' && onLocal) return onDevice(true);
     if (r.code === 'login_required') return void (ed.auth = 'login');
     if (r.code === 'name_taken') taken = r.taken ?? preview;
     else error = r.error;
+  }
+
+  /** A canvas on this device only. `offline`: the server could not be reached. */
+  async function onDevice(offline = false) {
+    if (!onLocal) return;
+    busy = true;
+    error = '';
+    try {
+      let id: string;
+      if (file) {
+        const r = await createLocalFromFile(fileName?.replace(/\.bdraw$/i, '') || defaultName(), file);
+        if (r.skipped) showToast(`${r.skipped} damaged ${r.skipped === 1 ? 'item was' : 'items were'} left out`);
+        id = r.id;
+      } else id = (await createLocal(defaultName())).id;
+      if (offline) showToast('No connection: the canvas is on this device. Put it online later to share it.');
+      onLocal(id);
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'The canvas could not be made on this device.';
+    } finally {
+      busy = false;
+    }
   }
 </script>
 
@@ -55,9 +85,18 @@
     <button class="linklike" onclick={() => (ed.auth = 'register')}>create one</button>.
   </p>
 {/if}
+{#if onLocal}
+  <button class="device" disabled={busy} onclick={() => onDevice()}>{file ? 'Open on this device only' : 'New canvas on this device'}</button>
+  <p class="hint">Works without a connection. Only this device has it, until you put it online to share it.</p>
+{/if}
 {#if error}<p class="error">{error}</p>{/if}
 
 <style>
+  .device {
+    width: 100%;
+    margin-top: 12px;
+    padding: 8px;
+  }
   .named input {
     width: 100%;
     font-size: 15px;

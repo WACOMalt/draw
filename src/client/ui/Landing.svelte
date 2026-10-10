@@ -9,6 +9,7 @@
   import AccountButton from './AccountButton.svelte';
   import Icon from './Icon.svelte';
   import NewCanvasForm from './NewCanvasForm.svelte';
+  import { deleteLocal, listLocal, type LocalCanvas } from '../local/store';
 
   interface Summary {
     key: string;
@@ -17,12 +18,21 @@
     owner: string | null;
   }
 
-  let { onOpen }: { onOpen: (key: string, link?: string) => void } = $props();
+  let { onOpen, onOpenLocal }: { onOpen: (key: string, link?: string) => void; onOpenLocal: (id: string) => void } = $props();
   let join = $state('');
   let error = $state('');
   let busy = $state(false);
   let recent = $state<Recent[]>(loadRecent());
   let mine = $state<{ owned: Summary[]; shared: Summary[] } | null>(null);
+  /** Canvases on this device only (local/). */
+  let onDevice = $state<LocalCanvas[]>([]);
+  void listLocal().then((l) => (onDevice = l));
+
+  async function deleteOnDevice(c: LocalCanvas) {
+    if (!confirm(`Delete "${c.name}" from this device? Only this device has it: it cannot be brought back.`)) return;
+    await deleteLocal(c.id);
+    onDevice = await listLocal();
+  }
 
   // The account's canvases, whenever someone logs in.
   $effect(() => {
@@ -76,7 +86,7 @@
     <h1><span class="dot"></span>Draw</h1>
     <p class="sub">An infinite canvas you share with a link.</p>
 
-    <NewCanvasForm onCreated={(key) => onOpen(key)} />
+    <NewCanvasForm onCreated={(key) => onOpen(key)} onLocal={onOpenLocal} />
 
     <button class="open" onclick={pickFile}><Icon name="open" /> Open a .bdraw file</button>
 
@@ -107,6 +117,19 @@
           <li>
             <a href="/s/{c.key}" onclick={(e) => (e.preventDefault(), onOpen(c.key))}><span class="mono">{c.key}</span></a>
             <span class="when">{c.role === 'viewer' ? 'view' : 'edit'} · {c.owner}</span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if onDevice.length}
+      <div class="or"><span>only on this device</span></div>
+      <ul class="recent">
+        {#each onDevice as c (c.id)}
+          <li>
+            <a href="/l/{c.id}" onclick={(e) => (e.preventDefault(), onOpenLocal(c.id))}><span class="name">{c.name}</span></a>
+            <span class="when">{ago(c.updated)}</span>
+            <button class="icon x" title="Delete from this device" aria-label="Delete {c.name}" onclick={() => deleteOnDevice(c)}>×</button>
           </li>
         {/each}
       </ul>
@@ -254,8 +277,12 @@
     color: var(--text);
     text-decoration: none;
   }
-  .recent a:hover .mono {
+  .recent a:hover .mono,
+  .recent a:hover .name {
     color: var(--accent);
+  }
+  .name {
+    color: var(--text-dim);
   }
   .when {
     color: var(--text-faint);
