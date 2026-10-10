@@ -19,7 +19,7 @@ import {
   type Stroke,
 } from '../../shared/types';
 import { maskKey } from './strokeIndex';
-import { ed, save, showToast, type Tool } from '../state.svelte';
+import { DRAW_KINDS, ed, save, showToast, type Tool } from '../state.svelte';
 import { createRenderer } from './createRenderer';
 import type { Renderer } from './renderer';
 import { Doc, type Bounds } from './doc';
@@ -33,7 +33,6 @@ import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { ShapeTool } from './shapeTool';
-import { SHAPE_KINDS } from '../../shared/types';
 import { takeDismissed } from '../dismiss';
 import { slowDevice } from './perf';
 
@@ -2039,7 +2038,7 @@ export class Engine {
     const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', v: 'select', p: 'pen', u: 'shape', h: 'hand', z: 'zoom' };
     if (key === 'u' && e.shiftKey) {
       // Shift+U: the next kind of shape.
-      ed.shapeKind = SHAPE_KINDS[(SHAPE_KINDS.indexOf(ed.shapeKind) + 1) % SHAPE_KINDS.length];
+      ed.shapeKind = DRAW_KINDS[(DRAW_KINDS.indexOf(ed.shapeKind) + 1) % DRAW_KINDS.length];
       this.shapes.deselect();
       ed.tool = 'shape';
       this.updateCursor();

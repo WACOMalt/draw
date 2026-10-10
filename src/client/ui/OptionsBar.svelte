@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { BRUSH_TIPS, COMPOUND_OPS, GRAINS, LIMITS, SHAPE_KINDS, type BrushTip, type CompoundOp, type GrainId, type LineCap, type Shape, type ShapeProps, type StrokeAlign } from '../../shared/types';
+  import { ARROW_KINDS, BRUSH_TIPS, COMPOUND_OPS, CUSTOM_SHAPES, GRAINS, LIMITS, type ArrowKind, type BrushTip, type CompoundOp, type CustomShape, type GrainId, type LineCap, type Shape, type ShapeProps, type StrokeAlign } from '../../shared/types';
   import type { Engine } from '../engine/engine';
-  import { SHAPE_LABEL } from '../engine/shapeTool';
+  import { CUSTOM_LABEL, SHAPE_LABEL, shapeLabel } from '../engine/shapeTool';
+  import PresetIcon from './PresetIcon.svelte';
   import { centerOnly } from '../../shared/shapes';
   import { OP_LABEL, partShape, splitPartId } from '../../shared/compound';
-  import { ed, type ShapeStyle, type Tool } from '../state.svelte';
+  import { DRAW_KINDS, ed, type ShapeStyle, type Tool } from '../state.svelte';
   import Icon from './Icon.svelte';
   import PresetsPanel from './PresetsPanel.svelte';
   import ShapeColor from './ShapeColor.svelte';
@@ -98,6 +99,11 @@
       points: first.points ?? ed.shapeStyle.points,
       innerRatio: first.innerRatio ?? ed.shapeStyle.innerRatio,
       rounding: (first.rounding ?? 0) * k,
+      arc: first.arc ?? [0, 0],
+      hole: first.hole ?? 0,
+      preset: first.preset ?? ed.shapeStyle.preset,
+      dash: first.dash ?? [],
+      arrows: first.arrows ?? ['none', 'none'],
     };
   });
   const showStyle = $derived(ed.tool === 'shape' || ed.tool === 'pen' || selShapes.length > 0);
@@ -115,7 +121,7 @@
   function setShape(style: Partial<ShapeStyle>, fn: (s: Shape, k: number) => Partial<ShapeProps> | null, live = false) {
     // The Pen keeps a style of its own (its paths start without a fill).
     if (ed.tool === 'pen') {
-      for (const k of ['fill', 'stroke', 'strokeWidth', 'align', 'cap'] as const) if (k in style) (ed.penStyle as Record<string, unknown>)[k] = style[k];
+      for (const k of ['fill', 'stroke', 'strokeWidth', 'align', 'cap', 'dash', 'arrows'] as const) if (k in style) (ed.penStyle as Record<string, unknown>)[k] = style[k];
     } else Object.assign(ed.shapeStyle, style);
     if (selShapes.length) engine?.shapes.editSelected((s) => fn(s, kOf(s)), live);
   }
@@ -145,6 +151,38 @@
   const setPoints = (n: number, live = false) => setShape({ points: n }, (s) => (s.kind === 'star' ? { points: Math.round(n) } : null), live);
   const setInner = (v: number, live = false) => setShape({ innerRatio: v }, (s) => (s.kind === 'star' ? { innerRatio: v } : null), live);
   const setRounding = (px: number, live = false) => setShape({ rounding: px }, (s, k) => (s.kind === 'polygon' || s.kind === 'star' ? { rounding: px / k } : null), live);
+  // Ellipse arcs: degrees, 0 at the right, clockwise. The same start and end: the whole ellipse.
+  function setArc(i: 0 | 1, deg: number) {
+    const v = Math.max(-360, Math.min(360, Math.round(deg * 10) / 10));
+    const next = (a: [number, number]) => (i === 0 ? [v, a[1]] : [a[0], v]) as [number, number];
+    setShape({ arc: next(st.arc) }, (s) => (s.kind === 'ellipse' ? { arc: next(s.arc ?? [0, 0]) } : null));
+  }
+  const arcEnd = $derived(st.arc[0] === st.arc[1] ? st.arc[0] + 360 : st.arc[1]);
+  const setHole = (v: number, live = false) => setShape({ hole: v }, (s) => (s.kind === 'ellipse' ? { hole: v } : null), live);
+  let presetOpen = $state(false);
+  const setPreset = (p: CustomShape) => {
+    presetOpen = false;
+    setShape({ preset: p }, (s) => (s.kind === 'custom' ? { preset: p } : null));
+  };
+  // Dashes: patterns in stroke widths. Dots are dashes of no length with round caps.
+  const DASHES: [string, string, number[]][] = [
+    ['solid', 'Solid', []],
+    ['dashed', 'Dashed', [3, 2]],
+    ['long', 'Long dash', [6, 3]],
+    ['dotted', 'Dotted', [0, 2]],
+  ];
+  const dashId = $derived(DASHES.find(([, , d]) => d.join() === st.dash.join())?.[0] ?? 'custom');
+  const dashable = $derived(selShapes.length ? selShapes.some((s) => s.kind !== 'compound') : true);
+  function setDash(id: string) {
+    const d = DASHES.find(([x]) => x === id)?.[2] ?? [];
+    const dots = d.length > 0 && d[0] === 0;
+    setShape({ dash: d, ...(dots ? { cap: 'round' as LineCap } : {}) }, (s) => (s.kind === 'compound' ? null : { dash: d, ...(dots ? { cap: 'round' as LineCap } : {}) }));
+  }
+  const ARROW_LABEL: Record<ArrowKind, string> = { none: 'None', arrow: 'Arrow', open: 'Open arrow', circle: 'Circle', bar: 'Bar' };
+  function setArrow(i: 0 | 1, a: ArrowKind) {
+    const next = (x: [ArrowKind, ArrowKind]) => (i === 0 ? [a, x[1]] : [x[0], a]) as [ArrowKind, ArrowKind];
+    setShape({ arrows: next(st.arrows) }, (s) => (centerOnly(s) ? { arrows: next(s.arrows ?? ['none', 'none']) } : null));
+  }
   const ALIGNS: [StrokeAlign, string][] = [['inside', 'Inside'], ['center', 'Center'], ['outside', 'Outside']];
   const CAPS: [LineCap, string][] = [['butt', 'Butt'], ['round', 'Round'], ['square', 'Square']];
   const activeLayer = $derived(ed.layers.find((l) => l.id === ed.activeLayerId) ?? null);
@@ -190,7 +228,7 @@
 {#snippet shapeOpts()}
   {#if ed.tool === 'shape' && stacked}
     <div class="kinds" role="radiogroup" aria-label="Shape">
-      {#each SHAPE_KINDS as k}
+      {#each DRAW_KINDS as k}
         <button
           class="icon chip"
           class:on={ed.shapeKind === k}
@@ -209,7 +247,7 @@
     </div>
   {/if}
   {#if ed.tool === 'shape' && !stacked}
-    <span class="kindname"><Icon name={ed.shapeKind} />{SHAPE_LABEL[ed.shapeKind]}</span>
+    <span class="kindname">{#if ed.shapeKind === 'custom'}<PresetIcon preset={ed.shapeStyle.preset} />{CUSTOM_LABEL[ed.shapeStyle.preset]}{:else}<Icon name={ed.shapeKind} />{SHAPE_LABEL[ed.shapeKind]}{/if}</span>
   {/if}
   {#if ed.pointEdit && !stacked}
     <span class="kindname">Points</span>
@@ -217,12 +255,12 @@
   {#if selShapes.length && !stacked}
     <!-- With a selection, the options below change it (also with the Shapes tool). -->
     <span class="selname" title="The options change the selected shapes">
-      {ed.tool === 'shape' || ed.tool === 'pen' ? 'Editing: ' : ''}{selShapes.length === 1 ? selShapes[0].name || SHAPE_LABEL[selShapes[0].kind] : `${selShapes.length} shapes`}
+      {ed.tool === 'shape' || ed.tool === 'pen' ? 'Editing: ' : ''}{selShapes.length === 1 ? selShapes[0].name || shapeLabel(selShapes[0]) : `${selShapes.length} shapes`}
     </span>
   {/if}
   {#if showStyle}
     <div class="colorsrow">
-      {#if has('rect', 'ellipse', 'polygon', 'star', 'path', 'compound')}
+      {#if has('rect', 'ellipse', 'polygon', 'star', 'path', 'compound', 'custom')}
         <span class="field"><span>Fill</span><ShapeColor big={stacked} label="Fill" value={st.fill} oninput={(v) => setFill(v, true)} onchange={(v) => setFill(v)} /></span>
       {/if}
       <span class="field"><span>Stroke</span><ShapeColor big={stacked} label="Stroke" value={st.stroke} oninput={(v) => setStroke(v, true)} onchange={(v) => setStroke(v)} /></span>
@@ -277,6 +315,62 @@
         <Slider wide={stacked} label="Rounding" value={st.rounding} min={0} max={500} step={0.1} log width={70} title="Corner rounding, in screen pixels" oninput={(v) => setRounding(v, true)} onchange={(v) => setRounding(v)} />
       {/if}
     {/key}
+    {#if kind === 'ellipse' || (selShapes.length && has('ellipse'))}
+      <span class="field" title="A pie slice: the start and end angle, in degrees (0 is right, clockwise). The same angle twice: the whole ellipse.">
+        <span>Arc</span>
+        <input type="number" class="num" step="any" value={round(st.arc[0])} aria-label="Arc start, degrees" onchange={(e) => setArc(0, +e.currentTarget.value || 0)} />°
+        <span>to</span>
+        <input type="number" class="num" step="any" value={round(arcEnd)} aria-label="Arc end, degrees" onchange={(e) => setArc(1, +e.currentTarget.value || 0)} />°
+      </span>
+      {#key `${first?.id}:${ed.selection.length}`}
+        <Slider wide={stacked} label="Hole" value={st.hole} min={0} max={0.99} step={0.01} percent width={70} title="An inner ellipse cut out (a ring), as a percent of the size" oninput={(v) => setHole(v, true)} onchange={(v) => setHole(v)} />
+      {/key}
+    {/if}
+    {#if (kind === 'custom' || (selShapes.length && has('custom'))) && stacked}
+      <!-- The phone sheet has room: the outlines as a grid, not a popover. -->
+      <div class="presetgrid" role="radiogroup" aria-label="Custom shape">
+        {#each CUSTOM_SHAPES as p}
+          <button class="icon chip" role="radio" aria-checked={st.preset === p} class:on={st.preset === p} title={CUSTOM_LABEL[p]} aria-label={CUSTOM_LABEL[p]} onclick={() => setPreset(p)}><PresetIcon preset={p} size={20} /></button>
+        {/each}
+      </div>
+    {:else if kind === 'custom' || (selShapes.length && has('custom'))}
+      <span class="field popwrap" use:dismiss={{ open: presetOpen, close: () => (presetOpen = false) }}>
+        <span>Shape</span>
+        <button class="icon wide" class:on={presetOpen} aria-haspopup="menu" aria-expanded={presetOpen} onclick={() => (presetOpen = !presetOpen)}>
+          <PresetIcon preset={st.preset} />{CUSTOM_LABEL[st.preset]} ▾
+        </button>
+        {#if presetOpen}
+          <div class="pop left presets" role="menu" data-over-canvas>
+            {#each CUSTOM_SHAPES as p}
+              <button class="icon cell" role="menuitem" class:on={st.preset === p} title={CUSTOM_LABEL[p]} aria-label={CUSTOM_LABEL[p]} onclick={() => setPreset(p)}><PresetIcon preset={p} size={22} /></button>
+            {/each}
+          </div>
+        {/if}
+      </span>
+    {/if}
+    {#if capped}
+      <label class="field" title="What the start of the line shows">
+        <span>Start</span>
+        <select value={st.arrows[0]} onchange={(e) => setArrow(0, e.currentTarget.value as ArrowKind)}>
+          {#each ARROW_KINDS as a}<option value={a}>{ARROW_LABEL[a]}</option>{/each}
+        </select>
+      </label>
+      <label class="field" title="What the end of the line shows">
+        <span>End</span>
+        <select value={st.arrows[1]} onchange={(e) => setArrow(1, e.currentTarget.value as ArrowKind)}>
+          {#each ARROW_KINDS as a}<option value={a}>{ARROW_LABEL[a]}</option>{/each}
+        </select>
+      </label>
+    {/if}
+    {#if dashable}
+      <label class="field" title="Dashes, in stroke widths: they scale with the stroke">
+        <span>Dash</span>
+        <select value={dashId} onchange={(e) => setDash(e.currentTarget.value)}>
+          {#each DASHES as [id, label]}<option value={id}>{label}</option>{/each}
+          {#if dashId === 'custom'}<option value="custom" disabled>Custom</option>{/if}
+        </select>
+      </label>
+    {/if}
     {#if ed.tool === 'pen' && !selShapes.length}
       <div class="toggles" role="radiogroup" aria-label="New points">
         <span class="lbl2">New points</span>
@@ -336,7 +430,7 @@
         <button class="icon wide" class:on={selShapes[0].curve === 'spline'} role="radio" aria-checked={selShapes[0].curve === 'spline'} title="Spline: smooth curves through or near the points (double-click to set each point)" onclick={() => engine?.shapes.setCurve('spline')}>Spline</button>
       </div>
     {/if}
-    {#if capped}
+    {#if capped || (dashable && st.dash.length > 0)}
       <div class="toggles" role="radiogroup" aria-label="Line caps">
         {#each CAPS as [c, label]}
           <button class="icon wide" class:on={st.cap === c} role="radio" aria-checked={st.cap === c} title="{label} line ends" onclick={() => setCap(c)}>{label}</button>
@@ -641,6 +735,31 @@
   .pop.left {
     left: 0;
     right: auto;
+  }
+  .presetgrid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 4px;
+  }
+  .presetgrid .chip {
+    width: auto;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .pop.presets {
+    display: grid;
+    grid-template-columns: repeat(6, 36px);
+    gap: 4px;
+    padding: 8px;
+  }
+  .pop.presets .cell {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .pop {
     position: absolute;

@@ -1,7 +1,7 @@
 // Reactive editor state shared by the Svelte UI and the engine.
 
 import { DEFAULT_BRUSH } from '../shared/brush';
-import type { Brush, CanvasInfo, DeniedReason, Layer, LineCap, Role, Shape, ShapeKind, StrokeAlign } from '../shared/types';
+import type { ArrowKind, Brush, CanvasInfo, CustomShape, DeniedReason, Layer, LineCap, Role, Shape, ShapeKind, StrokeAlign } from '../shared/types';
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
@@ -18,8 +18,12 @@ export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'select'
  * The style of new Pen paths (lengths in screen pixels, as ShapeStyle), their curve, and the
  * smoothness of new spline points (-1 through, 0 corner, 1 soft).
  */
-export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'strokeWidth' | 'align' | 'cap'> & { curve: 'bezier' | 'spline'; smooth: number };
-const PEN_STYLE: PenStyle = { fill: null, stroke: '#1d3557', strokeWidth: 3, align: 'center', cap: 'round', curve: 'bezier', smooth: 0.5 };
+export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'strokeWidth' | 'align' | 'cap' | 'dash' | 'arrows'> & { curve: 'bezier' | 'spline'; smooth: number };
+const PEN_STYLE: PenStyle = { fill: null, stroke: '#1d3557', strokeWidth: 3, align: 'center', cap: 'round', dash: [], arrows: ['none', 'none'], curve: 'bezier', smooth: 0.5 };
+
+/** The kinds the Shapes tool draws (paths come from the Pen, compounds from Combine). */
+export const DRAW_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'custom'] as const satisfies readonly ShapeKind[];
+export type DrawKind = (typeof DRAW_KINDS)[number];
 
 /**
  * Settings for new shapes (the options bar edits the selected shapes instead, when there are
@@ -39,6 +43,15 @@ export interface ShapeStyle {
   innerRatio: number;
   /** Polygon and star corners. */
   rounding: number;
+  /** Ellipse: the start and end angle of a pie slice in degrees (the same: the whole ellipse), and the hole (0 to 0.99). */
+  arc: [number, number];
+  hole: number;
+  /** Custom shape: its outline. */
+  preset: CustomShape;
+  /** Dash pattern in stroke widths (empty: solid). */
+  dash: number[];
+  /** Lines: what the start and the end show. */
+  arrows: [ArrowKind, ArrowKind];
 }
 
 /** What the Select tool shows over the canvas (CSS px in the stage). shapeTool.ts makes it. */
@@ -131,6 +144,11 @@ const SHAPE_STYLE: ShapeStyle = {
   points: 5,
   innerRatio: 0.45,
   rounding: 0,
+  arc: [0, 0],
+  hole: 0,
+  preset: 'heart',
+  dash: [],
+  arrows: ['none', 'none'],
 };
 const prefs = load('draw.prefs', {
   name: `${pick(ADJ)} ${pick(NOUN)}`,
@@ -146,7 +164,7 @@ const prefs = load('draw.prefs', {
   fg: '#1e1e1e',
   bg: '#ffffff',
   swatches: [] as string[],
-  shapeKind: 'rect' as ShapeKind,
+  shapeKind: 'rect' as DrawKind,
   shapeStyle: {} as Partial<ShapeStyle>,
   penStyle: {} as Partial<PenStyle>,
   /** Clicks on empty canvas keep the selection (only Esc and Deselect clear it). */
@@ -170,7 +188,8 @@ class EditorState {
   swatches = $state<string[]>(prefs.swatches);
   name = $state(prefs.name);
   color = $state(prefs.color);
-  shapeKind = $state<ShapeKind>(prefs.shapeKind);
+  // Kinds that are not drawn (saved by an older version) fall back to the rectangle.
+  shapeKind = $state<DrawKind>((DRAW_KINDS as readonly string[]).includes(prefs.shapeKind) ? prefs.shapeKind : 'rect');
   shapeStyle = $state<ShapeStyle>({ ...SHAPE_STYLE, ...prefs.shapeStyle });
   penStyle = $state<PenStyle>({ ...PEN_STYLE, ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);

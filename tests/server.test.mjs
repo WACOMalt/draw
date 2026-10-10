@@ -866,6 +866,80 @@ try {
     check(imp.status === 201 && imp.data.skipped === 0 && iw.shapes[0]?.parts?.length === 3 && iw.strokes[0]?.vector?.kind === 'compound', 'compounds: a .bdraw with compounds imports');
   }
 
+  // --- ellipse arcs and holes, custom shapes, dashes and arrowheads ------------------------------
+  {
+    const eb = new Browser();
+    await account(eb, 'styles@example.com', 'Style Tester');
+    const ec = (await eb.api('POST', '/api/sessions', { name: 'styles-test' })).data.key;
+    const o = await eb.join(ec);
+    await first(o);
+    let opn = 1200;
+    const tryOp = async (op) => {
+      const n = opn++;
+      o.send({ t: 'op', opId: `e${n}xxxxx`, op });
+      return o.next((m) => (m.t === 'reject' || m.t === 'op') && m.opId === `e${n}xxxxx`, 2000);
+    };
+    const style = { fill: '#2a9d8f', stroke: '#1d3557', strokeWidth: 4, align: 'center', cap: 'round', join: 'round' };
+    const shape = (id, kind, extra = {}) => ({ id, layerId: 'styLAYER01', kind, name: 'S', z: 1, w: 100, h: 100, m: [1, 0, 0, 1, 0, 0], ...style, ...extra });
+    const welcome = async () => first(await eb.join(ec));
+    await tryOp({ type: 'layer.add', layer: { id: 'styLAYER01', kind: 'shape', name: 'Shapes', order: 2, blend: 'normal', opacity: 1, visible: true } });
+
+    let r = await tryOp({ type: 'shape.add', shape: shape('styELL0001', 'ellipse', { arc: [0, 270], hole: 0.5 }) });
+    check(r?.t === 'op' && r.op.shape.arc.join() === '0,270' && r.op.shape.hole === 0.5, 'arcs: an ellipse with an arc and a hole');
+    r = await tryOp({ type: 'shape.add', shape: shape('styELL0002', 'ellipse', { arc: [90, 450 - 360], hole: 0 }) });
+    check(r?.t === 'op' && r.op.shape.arc === undefined && r.op.shape.hole === undefined, 'arcs: a whole turn and no hole are left out');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0001', 'ellipse', { hole: 1 }) });
+    check(r?.t === 'reject', 'arcs: a hole of 100% is refused');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0002', 'ellipse', { arc: [0, 90, 180] }) });
+    check(r?.t === 'reject', 'arcs: an arc has a start and an end');
+    r = await tryOp({ type: 'shape.add', shape: shape('styRECT001', 'rect', { radii: [0, 0, 0, 0], arc: [0, 90] }) });
+    check(r?.t === 'op' && r.op.shape.arc === undefined, 'arcs: other kinds drop the arc');
+    let w = await welcome();
+    check(w.features.includes('arcs') && !w.features.includes('custom'), 'arcs: welcome lists the arcs feature');
+
+    r = await tryOp({ type: 'shape.add', shape: shape('styCUST001', 'custom', { preset: 'heart' }) });
+    check(r?.t === 'op' && r.op.shape.preset === 'heart', 'custom: add a custom shape');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0003', 'custom') });
+    check(r?.t === 'reject', 'custom: a custom shape needs its preset');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0004', 'custom', { preset: 'unicorn' }) });
+    check(r?.t === 'reject', 'custom: an unknown preset is refused');
+    r = await tryOp({ type: 'shape.update', id: 'styCUST001', props: { preset: 'cloud' } });
+    check(r?.t === 'op', 'custom: change the preset');
+    w = await welcome();
+    check(w.features.includes('custom') && w.shapes.find((x) => x.id === 'styCUST001')?.preset === 'cloud', 'custom: welcome lists the custom feature');
+
+    r = await tryOp({ type: 'shape.add', shape: shape('styLINE001', 'line', { line: [0, 0, 100, 0], dash: [3, 2], arrows: ['none', 'arrow'] }) });
+    check(r?.t === 'op' && r.op.shape.dash.join() === '3,2' && r.op.shape.arrows.join() === 'none,arrow', 'dashes: a dashed line with an arrowhead');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0005', 'rect', { radii: [0, 0, 0, 0], dash: [1, 1, 1, 1, 1, 1, 1, 1, 1] }) });
+    check(r?.t === 'reject', 'dashes: at most 8 numbers');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0006', 'rect', { radii: [0, 0, 0, 0], dash: [-1, 2] }) });
+    check(r?.t === 'reject', 'dashes: no negative lengths');
+    r = await tryOp({ type: 'shape.add', shape: shape('styBAD0007', 'line', { line: [0, 0, 1, 1], arrows: ['none', 'spear'] }) });
+    check(r?.t === 'reject', 'arrows: an unknown end is refused');
+    w = await welcome();
+    check(w.features.includes('dashes') && w.features.includes('arrows'), 'dashes: welcome lists the dashes and arrows features');
+    r = await tryOp({ type: 'shape.update', id: 'styLINE001', props: { dash: [], arrows: ['none', 'none'] } });
+    w = await welcome();
+    const line = w.shapes.find((x) => x.id === 'styLINE001');
+    check(r?.t === 'op' && line && line.dash === undefined && line.arrows === undefined && !w.features.includes('dashes') && !w.features.includes('arrows'), 'dashes: an empty dash and no arrows turn them off');
+
+    // A compound with a pie part and a custom part.
+    r = await tryOp({ type: 'shape.add', shape: shape('styCOMP001', 'compound', { parts: [{ kind: 'ellipse', op: 'unite', w: 100, h: 100, m: [1, 0, 0, 1, 0, 0], arc: [0, 180] }, { kind: 'custom', op: 'subtract', w: 50, h: 50, m: [1, 0, 0, 1, 25, 25], preset: 'heart' }] }) });
+    check(r?.t === 'op' && r.op.shape.parts[0].arc.join() === '0,180' && r.op.shape.parts[1].preset === 'heart', 'custom: parts of a compound keep their arc and preset');
+
+    // A .bdraw (version 7) with these.
+    w = await welcome();
+    const file = {
+      format: 'bdraw', version: 7, app: 'test', savedAt: '',
+      layers: [{ id: 'impSTYL001', name: 'Shapes', order: 1, blend: 'normal', opacity: 1, visible: true, deleted: false, kind: 'shape' }],
+      strokes: [],
+      shapes: w.shapes.filter((x) => x.layerId === 'styLAYER01').map((x) => ({ ...x, layerId: 'impSTYL001' })),
+    };
+    const imp = await eb.upload(Buffer.from(JSON.stringify(file)), {});
+    const iw = await first(await new Browser().join(imp.data.key));
+    check(imp.status === 201 && imp.data.skipped === 0 && iw.shapes.length === file.shapes.length && iw.features.includes('arcs') && iw.features.includes('custom'), 'custom: a .bdraw with arcs and custom shapes imports');
+  }
+
   // --- admins manage every owned canvas like its owner ------------------------------------------
   const adm = (await funky.api('POST', '/api/sessions', { name: 'admin-test' })).data.key;
   await funky.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'none' });

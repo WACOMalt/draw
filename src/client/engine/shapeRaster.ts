@@ -10,6 +10,7 @@
 
 import { MITER_LIMIT, centerOnly, clipPolygon, compoundRings, flattenContour, maxScale, shapeContours, strokePolygons, type Box, type Contour } from '../../shared/shapes';
 import { joinPieces, outlinePieces, type BoolPart } from '../../shared/boolean';
+import { HEAD_REACH, styledStroke } from '../../shared/strokeStyle';
 import { invert } from '../../shared/layers';
 import type { Affine, Shape } from '../../shared/types';
 
@@ -39,8 +40,9 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
   const align = centerOnly(s) ? 'center' : s.align;
   // Inside and outside strokes draw twice the width on the center line, then cut away half.
   const band = stroke ? (align === 'center' ? s.strokeWidth : 2 * s.strokeWidth) : 0;
-  // How far the stroke reaches past the outline (miter tips and square caps reach further).
-  const reach = (band / 2) * (s.kind !== 'line' && s.join === 'miter' ? MITER_LIMIT : Math.SQRT2);
+  // How far the stroke reaches past the outline (miter tips, square caps and arrowheads reach further).
+  const heads = s.arrows?.some((a) => a !== 'none') ? HEAD_REACH * s.strokeWidth : 0;
+  const reach = Math.max((band / 2) * (s.kind !== 'line' && s.join === 'miter' ? MITER_LIMIT : Math.SQRT2), heads);
   // Every point Canvas gets: the frame (a line: its ends; a path: its anchors and handles too).
   const local = s.kind === 'line' && s.line ? s.line : [0, 0, s.w, 0, s.w, s.h, 0, s.h];
   if (s.kind === 'path') for (const c of s.path ?? []) for (let i = 0; i < c.pts.length; i += 7) local.push(...c.pts.slice(i, i + 6));
@@ -52,8 +54,26 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
   }
   if (s.kind === 'compound') return drawCompound(ctx, s, A, w, h, fill, stroke, align, band);
   const contours = shapeContours(s);
-  const paths = safe ? nativePaths(contours, A, band) : exactPaths(contours, A, band, s, w, h);
-  if (!paths) return;
+  // Arrows and dashes: the stroke follows other contours than the fill, and heads are added.
+  const styled = stroke && (s.dash || s.arrows) ? styledStroke(s, contours, A, [-PAD, -PAD, w + PAD, h + PAD], reach * maxScale(A), TOL) : null;
+  const lines = styled?.lines ?? contours;
+  const paths = safe ? nativePaths(contours, lines, A, band) : exactPaths(contours, lines, A, band, s, w, h);
+  const drawHeads = () => {
+    if (!styled?.heads.length) return;
+    // The arrowheads, in target pixels, in the stroke color.
+    const p = new Path2D();
+    for (const q of styled.heads) {
+      p.moveTo(q[0], q[1]);
+      for (let i = 2; i < q.length; i += 2) p.lineTo(q[i], q[i + 1]);
+      p.closePath();
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = stroke!;
+    ctx.fill(p, 'nonzero');
+    ctx.restore();
+  };
+  if (!paths) return drawHeads();
   ctx.save();
   ctx.setTransform(paths.m[0], paths.m[1], paths.m[2], paths.m[3], paths.m[4], paths.m[5]);
   const drawStroke = () => {
@@ -91,9 +111,26 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
   }
   if (stroke && !(align === 'outside' && fill)) drawStroke();
   ctx.restore();
+  drawHeads();
 
-  /** Canvas paths in local units, drawn through A. */
-  function nativePaths(cs: Contour[], A: Affine, band: number) {
+  /** Canvas paths in local units, drawn through A: the fill outline, and the stroke along `lines`. */
+  function nativePaths(cs: Contour[], lines: Contour[], A: Affine, band: number) {
+    const outline = toPath2D(cs, A);
+    const along = lines === cs ? outline : toPath2D(lines, A);
+    return {
+      m: A,
+      outline,
+      stroke: () => {
+        ctx.lineWidth = band;
+        ctx.lineCap = s.cap;
+        ctx.lineJoin = s.join;
+        ctx.miterLimit = MITER_LIMIT;
+        ctx.stroke(along);
+      },
+    };
+  }
+
+  function toPath2D(cs: Contour[], A: Affine): Path2D {
     const outline = new Path2D();
     for (const c of cs) {
       outline.moveTo(c.x, c.y);
@@ -111,21 +148,11 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
       }
       if (c.closed) outline.closePath();
     }
-    return {
-      m: A,
-      outline,
-      stroke: () => {
-        ctx.lineWidth = band;
-        ctx.lineCap = s.cap;
-        ctx.lineJoin = s.join;
-        ctx.miterLimit = MITER_LIMIT;
-        ctx.stroke(outline);
-      },
-    };
+    return outline;
   }
 
   /** Polygons in target pixels, built and cut in double precision. Null: nothing shows here. */
-  function exactPaths(cs: Contour[], A: Affine, band: number, s: Shape, w: number, h: number) {
+  function exactPaths(cs: Contour[], lines: Contour[], A: Affine, band: number, s: Shape, w: number, h: number) {
     const box: Box = [-PAD, -PAD, w + PAD, h + PAD];
     const outline = new Path2D();
     const strokePath = new Path2D();
@@ -147,7 +174,10 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
         const cut = clipPolygon(p, box);
         if (cut.length >= 6) addPoly(outline, cut);
       }
-      if (band > 0) for (const p of strokePolygons(f, band / 2, s.cap, s.join, A, box, TOL)) addPoly(strokePath, p);
+      if (band > 0 && lines === cs) for (const p of strokePolygons(f, band / 2, s.cap, s.join, A, box, TOL)) addPoly(strokePath, p);
+    }
+    if (band > 0 && lines !== cs) {
+      for (const c of lines) for (const p of strokePolygons(flattenContour(c, A, TOL, box, band / 2), band / 2, s.cap, s.join, A, box, TOL)) addPoly(strokePath, p);
     }
     if (!any) return null;
     return { m: [1, 0, 0, 1, 0, 0] as Affine, outline, stroke: () => ctx.fill(strokePath, 'nonzero') };

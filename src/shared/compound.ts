@@ -10,7 +10,7 @@ export const OP_LABEL: Record<CompoundOp, string> = { unite: 'Unite', subtract: 
 /** Names of new compounds, by the op of their parts. */
 export const OP_NAME: Record<CompoundOp, string> = { unite: 'Union', subtract: 'Subtraction', intersect: 'Intersection', exclude: 'Exclusion' };
 
-const PART_FIELDS = ['radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'path', 'curve'] as const;
+const PART_FIELDS = ['radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'path', 'curve', 'arc', 'hole', 'preset'] as const;
 
 export const partId = (compound: string, i: number) => `${compound}~${i}`;
 

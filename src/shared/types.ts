@@ -156,7 +156,7 @@ export type LayerKind = (typeof LAYER_KINDS)[number];
 // --- vector shapes ---------------------------------------------------------------------------
 
 /** Never remove a kind after a release: old documents would break. Add new ones. */
-export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'path', 'compound'] as const;
+export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'path', 'compound', 'custom'] as const;
 export type ShapeKind = (typeof SHAPE_KINDS)[number];
 export const STROKE_ALIGNS = ['center', 'inside', 'outside'] as const;
 export type StrokeAlign = (typeof STROKE_ALIGNS)[number];
@@ -164,6 +164,15 @@ export const LINE_CAPS = ['butt', 'round', 'square'] as const;
 export type LineCap = (typeof LINE_CAPS)[number];
 export const LINE_JOINS = ['miter', 'round', 'bevel'] as const;
 export type LineJoin = (typeof LINE_JOINS)[number];
+/**
+ * The ends of a line or of an open contour of a path. arrow: a filled triangle. open: a V of two
+ * strokes. circle: a filled dot. bar: a stroke across the end. Their size follows the stroke width.
+ */
+export const ARROW_KINDS = ['none', 'arrow', 'open', 'circle', 'bar'] as const;
+export type ArrowKind = (typeof ARROW_KINDS)[number];
+/** The ready-made outlines of custom shapes (shapes.ts CUSTOM_PATHS). Add new ones; never remove one. */
+export const CUSTOM_SHAPES = ['heart', 'bubble', 'arrow', 'cloud', 'check', 'bolt', 'moon', 'drop', 'plus', 'banner', 'burst', 'frame'] as const;
+export type CustomShape = (typeof CUSTOM_SHAPES)[number];
 
 /**
  * One contour of a path: its points, POINT_STRIDE numbers each, in local units: the anchor
@@ -191,7 +200,7 @@ export type CompoundOp = (typeof COMPOUND_OPS)[number];
  */
 export type CompoundPart = Pick<
   ShapeProps,
-  'w' | 'h' | 'm' | 'radii' | 'radiiLinked' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'path' | 'curve'
+  'w' | 'h' | 'm' | 'radii' | 'radiiLinked' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'path' | 'curve' | 'arc' | 'hole' | 'preset'
 > & { kind: Exclude<ShapeKind, 'line' | 'compound'>; op: CompoundOp; name?: string };
 
 /**
@@ -228,6 +237,11 @@ export type PointType = (typeof POINT_TYPES)[number];
  *   path. The frame is the box of the curve.
  * - compound: `parts`, shapes combined live (unite, subtract, intersect, exclude), in the
  *   compound's local units. The frame is the box of the parts.
+ * - ellipse: `arc`, the start and end angle in degrees (0: right, clockwise on screen): a pie
+ *   slice. `hole`: an inner ellipse cut out, as a fraction of the size (a ring).
+ * - custom: `preset`, a ready-made outline (CUSTOM_SHAPES) scaled to the frame.
+ * Stroke style of any kind: `dash`, a dash pattern in stroke widths (dash, gap, ...). Lines and
+ * open contours of paths: `arrows`, the start and end ends.
  * The polygon and the star fill the frame: their points are scaled to its width and height.
  */
 export interface ShapeProps {
@@ -249,6 +263,16 @@ export interface ShapeProps {
   curve?: CurveType;
   /** The parts of a compound shape, bottom to top. */
   parts?: CompoundPart[];
+  /** An ellipse: the start and end angle of a pie slice, degrees (absent: the whole ellipse). */
+  arc?: [number, number];
+  /** An ellipse: the inner ellipse cut out, 0 to 0.99 of the size (absent: none). */
+  hole?: number;
+  /** A custom shape: its outline. */
+  preset?: CustomShape;
+  /** A dash pattern in stroke widths: dash, gap, dash, gap... (absent: a solid stroke). */
+  dash?: number[];
+  /** A line or an open contour: what its start and its end show (absent: nothing). */
+  arrows?: [ArrowKind, ArrowKind];
   /** #rrggbb, or null: no fill. Lines have no fill. */
   fill: string | null;
   /** #rrggbb, or null: no stroke. */
@@ -280,7 +304,7 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -453,6 +477,9 @@ export const LIMITS = {
   maxContours: 100,
   /** Parts of one compound shape. */
   maxParts: 64,
+  /** Numbers in a dash pattern, and the longest dash or gap (stroke widths). */
+  maxDash: 8,
+  maxDashLength: 1000,
 } as const;
 
 /** Unambiguous alphabet for session codes: no 0/O, 1/I/L. */

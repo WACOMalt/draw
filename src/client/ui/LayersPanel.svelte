@@ -3,7 +3,8 @@
   // drags it (mouse, pen or finger): drop on the upper or lower part of a row to go above or below
   // it, on the middle of a group to go into it. Groups open and close with their arrow.
   import { ADJUST_TYPES, BLEND_MODES, LIMITS, type Layer, type LayerBlend, type Shape } from '../../shared/types';
-  import { SHAPE_LABEL } from '../engine/shapeTool';
+  import { shapeLabel } from '../engine/shapeTool';
+  import PresetIcon from './PresetIcon.svelte';
   import { OP_LABEL, partId } from '../../shared/compound';
   import { layerTree, subtreeIds, type LayerNode } from '../../shared/layers';
   import { Engine } from '../engine/engine';
@@ -327,7 +328,7 @@
       {#if layer.kind === 'shape' && row.open}
         {#each shapesBy.get(layer.id) ?? [] as sh (sh.id)}
           <li class="shape" class:active={ed.selection.includes(sh.id)} style:--depth={row.depth + 1} onpointerdown={(e) => pickShape(e, sh)}>
-            <span class="kind"><Icon name={sh.kind} /></span>
+            <span class="kind">{#if sh.kind === 'custom' && sh.preset}<PresetIcon preset={sh.preset} size={14} />{:else}<Icon name={sh.kind} />{/if}</span>
             {#if editingShape === sh.id}
               <input
                 type="text"
@@ -343,7 +344,7 @@
               />
             {:else}
               <span class="name" class:hidden={!layer.visible} role="button" tabindex="-1" ondblclick={() => (editingShape = sh.id)} title="Double-click to rename">
-                {sh.name || SHAPE_LABEL[sh.kind]}
+                {sh.name || shapeLabel(sh)}
               </span>
             {/if}
             <span
@@ -368,8 +369,8 @@
             <!-- Its parts, top first: each one's op with the parts below it (the bottom part is the base). -->
             {#each sh.parts.map((p, i) => ({ p, i })).reverse() as { p, i } (i)}
               <li class="shape part" class:active={ed.selection.includes(partId(sh.id, i))} style:--depth={row.depth + 2} onpointerdown={(e) => pickPart(e, sh, i)}>
-                <span class="kind"><Icon name={p.kind} /></span>
-                <span class="name" class:hidden={!layer.visible}>{p.name || `${SHAPE_LABEL[p.kind]} ${i + 1}`}</span>
+                <span class="kind">{#if p.kind === 'custom' && p.preset}<PresetIcon preset={p.preset} size={14} />{:else}<Icon name={p.kind} />{/if}</span>
+                <span class="name" class:hidden={!layer.visible}>{p.name || `${shapeLabel(p)} ${i + 1}`}</span>
                 <span class="op" title={i ? `${OP_LABEL[p.op]}: how it combines with the parts below` : 'The base: the parts above combine with it'}>{i ? OP_LABEL[p.op] : 'Base'}</span>
               </li>
             {/each}
