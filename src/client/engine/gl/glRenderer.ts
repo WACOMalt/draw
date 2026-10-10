@@ -35,11 +35,11 @@ interface Grid {
 }
 
 /**
- * Floats per dab instance on the GPU: cx, cy, rv, a, r, rot, then r, g, b, hardness (paintDabs),
- * then the stand-in data of a huge dab (putDab): edge offset, true center x, y. Color and
- * hardness per dab let a run of strokes share one draw call (drawStrokes).
+ * Floats per dab instance on the GPU: cx, cy, rv, a, r, cos and sin of the rotation, then r, g,
+ * b, hardness (paintDabs), then the data of a huge dab (putDab): D, true center x, y, w x, y, b.
+ * Color and hardness per dab let a run of strokes share one draw call (drawStrokes).
  */
-const INST = 13;
+const INST = 17;
 /** Most dabs in one batched draw call. */
 const MAX_BATCH = 65536;
 
@@ -158,7 +158,7 @@ const MOVING_TARGET_MS = 20;
 const STILL_TARGET_MS = 40;
 /** The view counts as moving this long after a change. */
 const MOVING_MS = 150;
-/** Radius in px above which dabs are virtualized to keep float32 exact. */
+/** Radius in px above which the shader gets the edge of a dab relative to the target (putDab). */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
 /**
@@ -330,14 +330,17 @@ export class GLRenderer implements Renderer {
     gl.vertexAttribPointer(2, 1, gl.FLOAT, false, stride, 16);
     gl.vertexAttribDivisor(2, 1);
     gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, stride, 20);
+    gl.vertexAttribPointer(3, 2, gl.FLOAT, false, stride, 20);
     gl.vertexAttribDivisor(3, 1);
     gl.enableVertexAttribArray(4);
-    gl.vertexAttribPointer(4, 4, gl.FLOAT, false, stride, 24);
+    gl.vertexAttribPointer(4, 4, gl.FLOAT, false, stride, 28);
     gl.vertexAttribDivisor(4, 1);
     gl.enableVertexAttribArray(5);
-    gl.vertexAttribPointer(5, 3, gl.FLOAT, false, stride, 40);
+    gl.vertexAttribPointer(5, 3, gl.FLOAT, false, stride, 44);
     gl.vertexAttribDivisor(5, 1);
+    gl.enableVertexAttribArray(6);
+    gl.vertexAttribPointer(6, 3, gl.FLOAT, false, stride, 56);
+    gl.vertexAttribDivisor(6, 1);
     gl.bindVertexArray(null);
 
     // Tips and grains upload on first use (tips.ts generates them on the CPU).
@@ -908,9 +911,10 @@ export class GLRenderer implements Renderer {
   /**
    * Writes one dab into the instance array, in target pixels relative to (ox, oy).
    * All position math is double precision; only the small results go to float32.
+   * `k`: the roundness of the tip (the shader divides the height by it).
    * Returns false when the dab is culled.
    */
-  private putDab(i: number, x: number, y: number, r: number, a: number, rot: number, ox: number, oy: number, scale: number, w: number, h: number): boolean {
+  private putDab(i: number, x: number, y: number, r: number, a: number, rot: number, ox: number, oy: number, scale: number, w: number, h: number, k = 1): boolean {
     let rp = r * scale;
     let cx = (x - ox) * scale;
     let cy = (y - oy) * scale;
@@ -921,28 +925,36 @@ export class GLRenderer implements Renderer {
       rp = 0.5;
     }
     if (a <= 1e-5) return false;
+    // In double precision: float32 sin and cos on a GPU can be off by 1e-5 rad and more, which
+    // moved the edge of a 10^6 px dab by tens of pixels.
+    const c = Math.cos(rot), s = Math.sin(rot);
     let rv = rp;
-    let off = 0, tx = 0, ty = 0;
+    let D = 0, tx = 0, ty = 0, wx = 0, wy = 0, b = 0;
     if (rp > HUGE_PX) {
-      // A stand-in circle of radius HUGE_PX, placed so that its edge lies along the true edge
-      // near the target: float32 keeps the edge exact there. Its center goes no deeper than
-      // half its radius inside; `off` adds the rest of the true depth to the edge distance.
-      // Without it, a target deeper than 2 × HUGE_PX inside the dab fell outside the stand-in,
-      // and a big stroke vanished when zoomed far into it. (tx, ty) is the true center relative
-      // to the stand-in's, for textured tips.
+      // The quad covers only the target, and the shader gets the edge from small numbers (see
+      // DAB_FS), as the Canvas 2D renderer does (stamp.ts, hugeRound). All in dab space (rotated
+      // by -rot, height divided by k: the dab is a circle of radius rp), relative to the target
+      // center: v, the target center relative to the dab center, D = |v| - rp, the depth
+      // outside the edge, w = v / (|v| + rp), b = 1 / (|v| + rp). Float32 cannot hold the edge
+      // relative to a center 10^6 px away or more. A stand-in circle near the edge kept it exact
+      // only on the axes of an elliptical dab, and its curvature put kinks at tile edges.
       const tcx = w / 2, tcy = h / 2;
-      const dx = tcx - cx, dy = tcy - cy;
-      const dist = Math.hypot(dx, dy);
-      const inside = rp - dist; // true edge distance at the target center
-      const ux = dist > 0 ? dx / dist : 1, uy = dist > 0 ? dy / dist : 0;
-      rv = HUGE_PX;
-      const keep = Math.min(inside, rv / 2);
-      off = inside - keep;
-      const vx = tcx - ux * (rv - keep), vy = tcy - uy * (rv - keep);
-      tx = cx - vx;
-      ty = cy - vy;
-      cx = vx;
-      cy = vy;
+      const px = tcx - cx, py = tcy - cy;
+      const vx = c * px + s * py, vy = (-s * px + c * py) / k;
+      const vl = Math.hypot(vx, vy);
+      D = vl - rp;
+      // The edge is further from the target than half its diagonal (dab space stretches by at
+      // most 1 / k): nothing to draw.
+      if (D > Math.hypot(tcx, tcy) / k + 2) return false;
+      b = 1 / (vl + rp);
+      wx = vx * b;
+      wy = vy * b;
+      // (tx, ty): the true center relative to the quad center, for textured tips.
+      tx = cx - tcx;
+      ty = cy - tcy;
+      cx = tcx;
+      cy = tcy;
+      rv = Math.max(tcx, tcy);
     }
     const o = i * INST;
     const f = this.inst;
@@ -951,10 +963,14 @@ export class GLRenderer implements Renderer {
     f[o + 2] = rv;
     f[o + 3] = Math.min(1, a);
     f[o + 4] = rp;
-    f[o + 5] = rot;
-    f[o + 10] = off;
-    f[o + 11] = tx;
-    f[o + 12] = ty;
+    f[o + 5] = c;
+    f[o + 6] = s;
+    f[o + 11] = D;
+    f[o + 12] = tx;
+    f[o + 13] = ty;
+    f[o + 14] = wx;
+    f[o + 15] = wy;
+    f[o + 16] = b;
     return true;
   }
 
@@ -976,10 +992,10 @@ export class GLRenderer implements Renderer {
     const f = this.inst;
     for (let i = from; i < to; i++) {
       const o = i * INST;
-      f[o + 6] = r;
-      f[o + 7] = g;
-      f[o + 8] = b;
-      f[o + 9] = brush.hardness;
+      f[o + 7] = r;
+      f[o + 8] = g;
+      f[o + 9] = b;
+      f[o + 10] = brush.hardness;
     }
   }
 
@@ -1105,6 +1121,7 @@ export class GLRenderer implements Renderer {
       if (this.putDab(at, (rec.x0 + rec.x1) / 2, (rec.y0 + rec.y1) / 2, r, 1, 0, wx0, wy0, scale, w, h)) n = 1;
     } else {
       const { dabs, chunks, count } = strokeDabs(rec);
+      const k = brushShape(b).roundness;
       const wx1 = wx0 + w / scale, wy1 = wy0 + h / scale;
       this.reserve(at + count);
       for (let c = 0; c * DAB_CHUNK < count; c++) {
@@ -1113,7 +1130,7 @@ export class GLRenderer implements Renderer {
         const end = Math.min(count, (c + 1) * DAB_CHUNK);
         for (let i = c * DAB_CHUNK; i < end; i++) {
           const o = i * DAB_STRIDE;
-          if (this.putDab(at + n, dabs[o], dabs[o + 1], dabs[o + 2], dabs[o + 3], dabs[o + 4], wx0, wy0, scale, w, h)) n++;
+          if (this.putDab(at + n, dabs[o], dabs[o + 1], dabs[o + 2], dabs[o + 3], dabs[o + 4], wx0, wy0, scale, w, h, k)) n++;
         }
       }
     }
@@ -1909,11 +1926,12 @@ export class GLRenderer implements Renderer {
     if (l.drawn >= total) return;
     const ds = this.view.zoom * this.dpr;
     this.reserve(total - l.drawn);
+    const k = brushShape(l.brush).roundness;
     let n = 0;
     for (let i = l.drawn; i < total; i++) {
       const o = i * DAB_STRIDE;
       const d = l.dabs;
-      if (this.putDab(n, d[o], d[o + 1], d[o + 2], d[o + 3], d[o + 4], this.view.x, this.view.y, ds, w, h)) n++;
+      if (this.putDab(n, d[o], d[o + 1], d[o + 2], d[o + 3], d[o + 4], this.view.x, this.view.y, ds, w, h, k)) n++;
     }
     l.drawn = total;
     this.bindTarget(l.target);
