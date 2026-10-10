@@ -39,12 +39,25 @@
 
   // Position 0..1 on the track. Log scale maps it to min..max exponentially: fine steps at the
   // low end (size, flow, spacing). Values round to three significant digits, never finer than
-  // `step`; a linear slider rounds to `step`.
-  const toPos = (v: number) => (log ? Math.log(v / min) / Math.log(max / min) : (v - min) / (max - min));
+  // `step`; a linear slider rounds to `step`. A log slider from 0 (corner radius, rounding)
+  // keeps the first ZERO of the track for 0; the rest runs exponentially from `lo`.
+  const ZERO = 0.05;
+  const zeroed = $derived(log && min <= 0);
+  const lo = $derived(zeroed ? Math.min(Math.max(step, 0.5), max / 10) : min);
+  const logPos = (v: number) => Math.log(v / lo) / Math.log(max / lo);
+  const toPos = (v: number) => {
+    if (!log) return (v - min) / (max - min);
+    if (!zeroed) return logPos(v);
+    return v <= 0 ? 0 : v < lo ? ZERO / 2 : ZERO + (1 - ZERO) * logPos(v);
+  };
   function fromPos(p: number): number {
     p = Math.min(1, Math.max(0, p));
     if (!log) return Math.round((min + p * (max - min)) / step) * step;
-    const v = min * (max / min) ** p;
+    if (zeroed) {
+      if (p < ZERO / 2) return 0;
+      p = Math.max(0, (p - ZERO) / (1 - ZERO));
+    }
+    const v = lo * (max / lo) ** p;
     const q = Math.max(step, 10 ** (Math.floor(Math.log10(v)) - 2));
     return Math.round(v / q) * q;
   }

@@ -189,7 +189,7 @@
       <div class="corners">
         {#key `${first?.id}:${st.radiiLinked}`}
           {#if st.radiiLinked}
-            <Slider wide={stacked} label="Radius" value={st.radii[0]} min={0} max={500} step={1} width={70} title="Corner radius, in screen pixels" oninput={(v) => setRadius(null, v, true)} onchange={(v) => setRadius(null, v)} />
+            <Slider wide={stacked} label="Radius" value={st.radii[0]} min={0} max={500} step={0.1} log width={70} title="Corner radius, in screen pixels" oninput={(v) => setRadius(null, v, true)} onchange={(v) => setRadius(null, v)} />
           {:else}
             <span class="field">
               <span>Corners</span>
@@ -222,7 +222,7 @@
         <Slider wide={stacked} label="Inner" value={st.innerRatio} min={0.05} max={1} step={0.01} percent width={70} title="Inner radius, as a percent of the outer radius" oninput={(v) => setInner(v, true)} onchange={(v) => setInner(v)} />
       {/if}
       {#if kind === 'polygon' || kind === 'star' || (selShapes.length && has('polygon', 'star'))}
-        <Slider wide={stacked} label="Rounding" value={st.rounding} min={0} max={500} step={1} width={70} title="Corner rounding, in screen pixels" oninput={(v) => setRounding(v, true)} onchange={(v) => setRounding(v)} />
+        <Slider wide={stacked} label="Rounding" value={st.rounding} min={0} max={500} step={0.1} log width={70} title="Corner rounding, in screen pixels" oninput={(v) => setRounding(v, true)} onchange={(v) => setRounding(v)} />
       {/if}
     {/key}
     {#if kind === 'line' || (selShapes.length && has('line'))}
@@ -250,7 +250,7 @@
         class="icon wide"
         class:on={ed.keepSelection}
         aria-pressed={ed.keepSelection}
-        title="While on, clicks outside the box do not change the selection: only Esc or Deselect do"
+        title="While on, clicks outside the box neither select another shape nor deselect. Shift+click still adds or removes; Esc and Deselect still clear."
         onclick={() => (ed.keepSelection = !ed.keepSelection)}>Keep selection</button
       >
       <button class="icon wide" disabled={!selShapes.length} title="Deselect (Esc)" onclick={() => engine?.shapes.deselect()}>Deselect (Esc)</button>

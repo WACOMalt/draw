@@ -19,7 +19,7 @@
 
 import { newId } from '../../shared/ids';
 import { compose, effectivelyVisible, invert } from '../../shared/layers';
-import { byZ, clipPolygon, hitShape, outlinePolys, shapeBounds, type Box } from '../../shared/shapes';
+import { byZ, clipPolygon, cornerPoints, hitShape, outlinePolys, shapeBounds, type Box } from '../../shared/shapes';
 import { LIMITS, type Affine, type ClientMsg, type Layer, type Op, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from '../../shared/types';
 import { ed, showToast, type SelectOverlay } from '../state.svelte';
 import type { Doc } from './doc';
@@ -317,7 +317,7 @@ export class ShapeTool {
       if (Math.abs(x - px) <= r && Math.abs(y - py) <= r) return { kind: 'scale', hx, hy };
     }
     const single = box.single;
-    if (single?.kind === 'rect') {
+    if (single && hasRadiusDots(single)) {
       const dots = this.radiusDots(single);
       for (let i = 0; i < dots.length; i++) if (Math.hypot(x - dots[i][0], y - dots[i][1]) <= r) return { kind: 'radius', corner: i };
     }
@@ -326,10 +326,25 @@ export class ShapeTool {
     return null;
   }
 
-  /** Where the radius dots of a rectangle are on screen; none when it is too small to hold them. */
+  /**
+   * Where the radius dots of a rectangle, polygon or star are on screen; none when it is too
+   * small to hold them. A rectangle has one per corner. A polygon or star has one per outer
+   * corner, all for its one rounding radius: each sits on its corner's arc center, at least 14 px
+   * in from the corner so it can be grabbed at radius 0.
+   */
   private radiusDots(s: Shape): Pt[] {
     const k = this.pxPerUnit(s);
     if (s.w * k < 44 || s.h * k < 44) return [];
+    if (s.kind === 'polygon' || s.kind === 'star') {
+      const out: Pt[] = [];
+      for (let i = 0; i < outerCorners(s); i++) {
+        const c = polyCorner(s, i);
+        if (!c) continue;
+        const d = Math.min(Math.max((s.rounding ?? 0) / c.sinHalf, 14 / k), c.reach);
+        out.push(this.toScreen(...apply(s.m, c.v[0] + c.u[0] * d, c.v[1] + c.u[1] * d)));
+      }
+      return out;
+    }
     const r = s.radii ?? [0, 0, 0, 0];
     const at = (i: number, x: number, y: number, sx: number, sy: number) => {
       const d = Math.min(Math.max(r[i], 14 / k), Math.min(s.w, s.h) / 2);
@@ -363,16 +378,26 @@ export class ShapeTool {
       return this.beginEdit(e, x, y, zone.kind === 'move' ? 'move' : zone.kind, zone);
     }
     const hit = this.shapeAt(x, y, touch);
+    // Keep selection: a press outside the box neither swaps nor drops the selection, and starts
+    // no selection rectangle. Shift+click still adds or removes; Esc and Deselect still clear.
+    const locked = this.locked() && !e.shiftKey;
     if (hit) {
       if (e.shiftKey) {
         this.select(ed.selection.includes(hit.id) ? ed.selection.filter((id) => id !== hit.id) : [...ed.selection, hit.id]);
         return;
       }
+      if (locked) return;
       this.select([hit.id]);
       if (ed.canEdit) this.beginEdit(e, x, y, 'move', { kind: 'move' });
       return;
     }
+    if (locked) return;
     this.marquee = { pointerId: e.pointerId, touch, s0: [x, y], s1: [x, y], add: e.shiftKey, moved: false };
+  }
+
+  /** Keep selection is on and something is selected: clicks outside the box change nothing. */
+  private locked(): boolean {
+    return ed.keepSelection && ed.selection.length > 0;
   }
 
   move(e: PointerEvent, x: number, y: number): void {
@@ -407,7 +432,7 @@ export class ShapeTool {
           if (b.x1 >= x0 && b.x0 <= x1 && b.y1 >= y0 && b.y0 <= y1) hits.push(s.id);
         }
         this.select(mq.add ? [...new Set([...ed.selection, ...hits])] : hits);
-      } else if (!mq.add && !ed.keepSelection && e.type === 'pointerup') this.select([]);
+      } else if (!mq.add && !this.locked() && e.type === 'pointerup') this.select([]);
       this.scheduleOverlay();
     }
   }
@@ -446,7 +471,8 @@ export class ShapeTool {
       else if (zone.kind === 'radius' || zone.kind === 'endpoint') c.style.cursor = 'pointer';
       else c.style.cursor = this.resizeCursor(zone.hx, zone.hy);
     } else {
-      hover = this.shapeAt(x, y, false);
+      // With Keep selection on, a click would not select it: no outline, no label.
+      hover = this.locked() ? null : this.shapeAt(x, y, false);
       c.style.cursor = 'default';
     }
     if (hover?.id !== this.hover?.id || hover !== this.hover) {
@@ -706,6 +732,15 @@ export class ShapeTool {
         const inv = invert(s.m);
         if (!inv) return;
         const [qx, qy] = apply(inv, p[0], p[1]);
+        if (s.kind === 'polygon' || s.kind === 'star') {
+          // The pointer's distance along the corner's bisector is the arc center's; the radius
+          // follows from the corner angle. One radius for every corner, as in the options bar.
+          const c = polyCorner(s, g.corner);
+          if (!c) return;
+          const t = Math.max(0, Math.min((qx - c.v[0]) * c.u[0] + (qy - c.v[1]) * c.u[1], c.reach));
+          out.push({ ...s, rounding: Math.min(t * c.sinHalf, Math.min(s.w, s.h) / 2) });
+          break;
+        }
         const dx = [qx, s.w - qx, s.w - qx, qx][g.corner], dy = [qy, qy, s.h - qy, s.h - qy][g.corner];
         const r = Math.max(0, Math.min((dx + dy) / 2, Math.min(s.w, s.h) / 2));
         const radii = [...(s.radii ?? [0, 0, 0, 0])] as Shape['radii'] & number[];
@@ -923,7 +958,7 @@ export class ShapeTool {
         const c = box.corners.map(([wx, wy]) => this.toScreen(wx, wy));
         o.box = c;
         if (!(busy && this.edit?.kind === 'move')) o.handles = ShapeTool.HANDLES.map(([hx, hy]) => this.boxPoint(c, hx, hy));
-        if (box.single?.kind === 'rect' && !busy) o.dots = this.radiusDots(box.single);
+        if (box.single && hasRadiusDots(box.single) && !busy) o.dots = this.radiusDots(box.single);
       }
     }
     if (this.hover && !sel.some((s) => s.id === this.hover!.id) && !busy) {
@@ -963,6 +998,8 @@ export class ShapeTool {
         const r = s.radii ?? [0, 0, 0, 0];
         const k = this.pxPerUnit(s);
         text += r.every((v) => v === r[0]) ? ` · radius ${n(r[0] * k)}` : ` · radius ${r.map((v) => n(v * k)).join(' ')}`;
+      } else if (s.kind === 'polygon' || s.kind === 'star') {
+        text += ` · rounding ${n((s.rounding ?? 0) * this.pxPerUnit(s))}`;
       }
     }
     return { text, x: this.pointer[0] + 16, y: this.pointer[1] + 16 };
@@ -970,6 +1007,36 @@ export class ShapeTool {
 }
 
 // --- helpers ---------------------------------------------------------------------------------------
+
+/** Shapes with radius dots: rectangles (a radius per corner), polygons and stars (one rounding). */
+const hasRadiusDots = (s: Shape) => s.kind === 'rect' || s.kind === 'polygon' || s.kind === 'star';
+
+/** Outer corners: every corner of a polygon, the points of a star (its inner corners have no dot). */
+const outerCorners = (s: Shape) => (s.kind === 'star' ? (s.points ?? 5) : (s.sides ?? 6));
+
+/**
+ * Outer corner i of a polygon or star, in the shape's own units: the corner `v`, the unit
+ * bisector `u` into the shape, sin of half the corner angle (the arc center lies at
+ * rounding / sinHalf along `u`), and how far along `u` a dot may go (the center of the shape).
+ */
+function polyCorner(s: Shape, i: number): { v: Pt; u: Pt; sinHalf: number; reach: number } | null {
+  const p = cornerPoints(s);
+  const n = p.length / 2;
+  const at = s.kind === 'star' ? 2 * i : i;
+  const v: Pt = [p[2 * at], p[2 * at + 1]];
+  const j = (at + n - 1) % n, k = (at + 1) % n;
+  let ax = p[2 * j] - v[0], ay = p[2 * j + 1] - v[1], bx = p[2 * k] - v[0], by = p[2 * k + 1] - v[1];
+  const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+  if (!la || !lb) return null;
+  ax /= la;
+  ay /= la;
+  bx /= lb;
+  by /= lb;
+  const ux = ax + bx, uy = ay + by, lu = Math.hypot(ux, uy);
+  if (lu < 1e-9) return null;
+  const half = Math.acos(Math.max(-1, Math.min(1, ax * bx + ay * by))) / 2;
+  return { v, u: [ux / lu, uy / lu], sinHalf: Math.sin(half), reach: Math.hypot(s.w / 2 - v[0], s.h / 2 - v[1]) };
+}
 
 /** The props a shape op carries (no author, seq or deleted flag). */
 export function toInput(s: Shape): ShapeInput {

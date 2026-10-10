@@ -487,9 +487,9 @@ Toolbar order: brush, eraser, stroke eraser, the colors, eyedropper, Select, Sha
 
 - Hover: an outline shows the shape that a click would select, with a label "Click: select <name>".
 - A click on a shape selects it, and the active layer changes to its layer. Shift+click adds the shape to the selection or removes it. A press on a shape that is not selected and a drag move it at once.
-- With a selection, a press anywhere inside its box moves it, also over other shapes: the box wins. A handle scales. A press just outside a corner (26 px) rotates (Shift: 15° steps). A dot inside each corner of a rectangle changes the corner radius (all four when they are linked, Alt: one corner). A line has a handle at each end instead of a box. The cursor shows what a press does.
+- With a selection, a press anywhere inside its box moves it, also over other shapes: the box wins. A handle scales. A press just outside a corner (26 px) rotates (Shift: 15° steps). A dot inside each corner of a rectangle changes the corner radius (all four when they are linked, Alt: one corner). A polygon has a dot inside each corner and a star one inside each point; any of them changes the one rounding radius of all corners. Each dot sits on the center of its corner's arc, at least 14 px in from the corner; the label near the pointer shows the radius. Shapes under 44 px on screen show no dots. A line has a handle at each end instead of a box. The cursor shows what a press does.
 - A resize of one shape changes its frame: Shift keeps the proportions, Alt resizes from the center. With several shapes selected, the box is around all of them, and a resize scales their matrices.
-- A drag on empty canvas selects the shapes that its rectangle touches (Shift adds them). A click on empty canvas deselects, but not when "Keep selection" in the options bar is on (kept per device). Esc and the Deselect button always deselect.
+- A drag on empty canvas selects the shapes that its rectangle touches (Shift adds them). A click on empty canvas deselects. "Keep selection" in the options bar (kept per device) locks a selection: while it is on and something is selected, a press outside the box neither selects another shape nor deselects nor starts a selection rectangle, and the hover outline does not show. Shift+click still adds or removes a shape. Esc and the Deselect button always deselect. With nothing selected, clicks select as usual.
 - A press must move 3 px (7 px with a finger) before it changes a shape. Thus a click never moves a shape.
 - Delete or Backspace removes the selected shapes. The arrow keys move them by 1 screen pixel (Shift: 10).
 - A double-click (a double tap on a phone) or Enter is kept for point editing (phase 2). It shows a message and changes nothing.
@@ -497,6 +497,8 @@ Toolbar order: brush, eraser, stroke eraser, the colors, eyedropper, Select, Sha
 - On a paint layer or a group with paint, the Select tool shows the layer transform (section 9.0): the whole layer is the selection. While that transform has no change, a click on a shape closes it and selects the shape. A transform with changes stays until Apply or Cancel.
 
 **Options bar** (the phone shows the same options in the tool sheet, with the kinds as buttons):
+
+- The corner radius and the rounding sliders are logarithmic, like flow and spacing: fine steps at small radii. The first 5% of the track is 0; the rest runs from 0.5 to 500 screen pixels.
 
 - The Fill and Stroke swatches open a color picker with "None", the foreground and background colors, and the recent colors. Width (screen pixels), alignment (Inside, Center, Outside), the corner radius of a rectangle (one radius, or four when not linked), sides and rounding of a polygon, points, inner ratio and rounding of a star, and the caps of a line.
 - With shapes selected, the options show the first shape and change all the selected shapes where the setting fits their kind. A slider drag is one undo step. The values also become the style of the next shape.
