@@ -9,7 +9,8 @@
 // exact in a 256 px tile, with a few dozen points.
 
 import { compose, validAffine } from './layers';
-import { POINT_STRIDE, type Affine, type PathContour, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from './types';
+import { POINT_STRIDE, type Affine, type CompoundPart, type PathContour, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from './types';
+import { insideResult, joinPieces, outlinePieces, type BoolPart } from './boolean';
 
 /** Miter joins longer than this many half widths become bevels (as SVG's default of 4). */
 export const MITER_LIMIT = 4;
@@ -18,6 +19,11 @@ export type Seg =
   | { t: 'L'; x: number; y: number }
   /** A cubic Bezier from the current point, with the control points (x1, y1) and (x2, y2). */
   | { t: 'C'; x1: number; y1: number; x2: number; y2: number; x: number; y: number }
+  /**
+   * An x-spline segment from p1 to p2 (p: p0, p1, p2, p3 as 8 numbers; s1, s2: the smoothness
+   * of p1 and p2). It starts at the current point (xAt(t = 0)) and ends at (x, y) = xAt(1).
+   */
+  | { t: 'X'; p: number[]; s1: number; s2: number; x: number; y: number }
   /** An arc of the axis-aligned ellipse (cx, cy, rx, ry) from angle a0 to a1 (radians, either way). */
   | { t: 'A'; cx: number; cy: number; rx: number; ry: number; a0: number; a1: number };
 
@@ -33,7 +39,7 @@ export interface Contour {
 export type Box = [number, number, number, number];
 
 /** The geometry fields of a shape (what its outline depends on). */
-export type ShapeGeo = Pick<ShapeProps, 'w' | 'h' | 'radii' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'line' | 'path'> & { kind: ShapeKind };
+export type ShapeGeo = Pick<ShapeProps, 'w' | 'h' | 'radii' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'line' | 'path' | 'curve' | 'parts'> & { kind: ShapeKind };
 
 // --- outlines --------------------------------------------------------------------------------
 
@@ -177,8 +183,242 @@ export function shapeContours(s: ShapeGeo): Contour[] {
       return [{ x: x0, y: y0, closed: false, segs: [{ t: 'L', x: x1, y: y1 }] }];
     }
     case 'path':
-      return (s.path ?? []).filter((c) => c.pts.length >= POINT_STRIDE).map(pathContour);
+      return (s.path ?? []).filter((c) => c.pts.length >= POINT_STRIDE).map((c) => (s.curve === 'spline' ? splineContour(c) : pathContour(c)));
+    case 'compound':
+      // Every part's outline (the result's own outline: compoundOutline).
+      return (s.parts ?? []).flatMap((p) => {
+        const pp = partPath(p);
+        return pp.path.filter((c) => c.pts.length >= POINT_STRIDE).map((c) => (pp.curve === 'spline' ? splineContour(c) : pathContour(c)));
+      });
   }
+}
+
+// --- compound shapes -------------------------------------------------------------------------
+
+/** A path mapped by an affine (an x-spline maps exactly too: its weights sum to one). */
+function mapPath(path: PathContour[], m: Affine): PathContour[] {
+  return path.map((c) => {
+    const pts = c.pts.slice();
+    for (let i = 0; i < pts.length; i += POINT_STRIDE) {
+      for (let k = 0; k < 6; k += 2) {
+        const x = pts[i + k], y = pts[i + k + 1];
+        pts[i + k] = tx(m, x, y);
+        pts[i + k + 1] = ty(m, x, y);
+      }
+    }
+    return { closed: c.closed, pts };
+  });
+}
+
+/** A part of a compound as a path in the compound's local units (Bezier, or its own spline). */
+export function partPath(p: CompoundPart): { path: PathContour[]; curve: 'bezier' | 'spline' } {
+  const spline = p.kind === 'path' && p.curve === 'spline';
+  const local = p.kind === 'path' ? (p.path ?? []) : toPath({ ...p, kind: p.kind } as ShapeGeo);
+  return { path: mapPath(local, p.m), curve: spline ? 'spline' : 'bezier' };
+}
+
+/** The parts of a compound as boolean rings, flattened through A to `tol` (refined near `box`). */
+export function compoundRings(s: Pick<ShapeGeo, 'parts'>, A: Affine, tol: number, box: Box | null, reach = 0): BoolPart[] {
+  return (s.parts ?? []).map((p) => {
+    const pp = partPath(p);
+    const rings = pp.path
+      .filter((c) => c.pts.length >= 2 * POINT_STRIDE)
+      .map((c) => {
+        const f = flattenContour(pp.curve === 'spline' ? splineContour(c) : pathContour(c), A, tol, box, reach);
+        const r: number[] = [];
+        for (let i = 0; i < f.pts.length; i += 2) r.push(tx(A, f.pts[i], f.pts[i + 1]), ty(A, f.pts[i], f.pts[i + 1]));
+        return r;
+      });
+    return { op: p.op, rings };
+  });
+}
+
+/**
+ * The outline of a compound's result as one Bezier path (local units): what "flatten to one path"
+ * makes. The parts' own curves stay, cut where they cross; only the crossing points come from a
+ * fine flattening (within a millionth of the size).
+ */
+export function compoundToPath(s: Pick<ShapeGeo, 'parts'>): PathContour[] {
+  // Each part as Bezier contours; each contour flattened, every flat point knowing its curve and t.
+  type Src = { seg: number[]; t: number }; // seg: 8 numbers (a line has its handles at its ends)
+  const parts: BoolPart[] = [];
+  const meta: Src[][][] = [];
+  let size = 0;
+  for (const p of s.parts ?? []) {
+    const pp = partPath(p);
+    const bez = pp.curve === 'spline' ? toPath({ kind: 'path', w: 0, h: 0, path: pp.path, curve: 'spline' }) : pp.path;
+    const [x0, y0, x1, y1] = pathBounds(bez);
+    size = Math.max(size, x1 - x0, y1 - y0);
+    parts.push({ op: p.op, rings: [] });
+    meta.push([]);
+    for (const c of bez) {
+      if (c.pts.length < 2 * POINT_STRIDE) continue;
+      const n = c.pts.length / POINT_STRIDE;
+      const ring: number[] = [];
+      const src: Src[] = [];
+      const segs = c.closed ? n : n - 1;
+      for (let i = 0; i < segs; i++) {
+        const a = i * POINT_STRIDE, b = ((i + 1) % n) * POINT_STRIDE, q = c.pts;
+        const seg = [q[a], q[a + 1], q[a + 4], q[a + 5], q[b + 2], q[b + 3], q[b], q[b + 1]];
+        ring.push(seg[0], seg[1]);
+        src.push({ seg, t: 0 });
+        const straight = seg[2] === seg[0] && seg[3] === seg[1] && seg[4] === seg[6] && seg[5] === seg[7];
+        if (!straight) {
+          const N = 64;
+          for (let k = 1; k < N; k++) {
+            const [x, y] = cubicAt(seg, k / N);
+            ring.push(x, y);
+            src.push({ seg, t: k / N });
+          }
+        }
+      }
+      if (!c.closed) {
+        // An open contour fills as if closed: its closing line is part of the outline.
+        ring.push(c.pts[(n - 1) * POINT_STRIDE], c.pts[(n - 1) * POINT_STRIDE + 1]);
+        src.push({ seg: [], t: 0 });
+      }
+      parts[parts.length - 1].rings.push(ring);
+      meta[meta.length - 1].push(src);
+    }
+  }
+  const chains = joinPieces(outlinePieces(parts));
+  const out: PathContour[] = [];
+  for (const ch of chains) {
+    // Runs of pieces on one curve become one cut of that curve.
+    type Run = { seg: number[]; ta: number; tb: number; ax: number; ay: number; bx: number; by: number };
+    const runs: Run[] = [];
+    for (const pc of ch.pieces) {
+      const src = meta[pc.part][pc.ring];
+      const a = src[pc.edge], b = src[(pc.edge + 1) % src.length];
+      // The edge's curve and its t range (the next flat point may start the next curve: t = 1).
+      const seg = a.seg;
+      const tEnd = b.seg === seg ? b.t : 1;
+      const ta = a.t + (tEnd - a.t) * pc.t0, tb = a.t + (tEnd - a.t) * pc.t1;
+      const last = runs[runs.length - 1];
+      if (last && last.seg === seg && seg.length && Math.abs(last.tb - ta) < 1e-9) {
+        last.tb = tb;
+        last.bx = pc.bx;
+        last.by = pc.by;
+      } else runs.push({ seg, ta, tb, ax: pc.ax, ay: pc.ay, bx: pc.bx, by: pc.by });
+    }
+    if (ch.closed && runs.length > 1) {
+      // The loop may start in the middle of a run: join its last run to its first.
+      const f = runs[0], l = runs[runs.length - 1];
+      if (f.seg === l.seg && f.seg.length && Math.abs(l.tb - f.ta) < 1e-9) {
+        f.ta = l.ta;
+        f.ax = l.ax;
+        f.ay = l.ay;
+        runs.pop();
+      }
+    }
+    const pts: number[] = [];
+    const cubics = runs.map((r) => {
+      if (!r.seg.length) return [r.ax, r.ay, r.ax, r.ay, r.bx, r.by, r.bx, r.by];
+      const c = subCubic(r.seg, r.ta, r.tb);
+      // The cut points of the outline join the runs exactly.
+      const dx0 = r.ax - c[0], dy0 = r.ay - c[1], dx1 = r.bx - c[6], dy1 = r.by - c[7];
+      return [r.ax, r.ay, c[2] + dx0, c[3] + dy0, c[4] + dx1, c[5] + dy1, r.bx, r.by];
+    });
+    const n = cubics.length;
+    for (let i = 0; i < n; i++) {
+      const c = cubics[i], prev = cubics[(i - 1 + n) % n];
+      const hasPrev = ch.closed || i > 0;
+      const ix = hasPrev ? prev[4] : c[0], iy = hasPrev ? prev[5] : c[1];
+      const ax = c[0] - ix, ay = c[1] - iy, bx = c[2] - c[0], by = c[3] - c[1];
+      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      const smooth = la > 0 && lb > 0 && (ax * bx + ay * by) / (la * lb) > Math.cos(0.0018);
+      pts.push(c[0], c[1], ix, iy, c[2], c[3], smooth ? 1 : 0);
+    }
+    if (!ch.closed && n) {
+      const c = cubics[n - 1];
+      pts.push(c[6], c[7], c[4], c[5], c[6], c[7], 0);
+    }
+    if (pts.length >= 2 * POINT_STRIDE) out.push({ closed: ch.closed, pts });
+  }
+  return size > 0 ? out : [];
+}
+
+/** The part of a cubic from t = a to t = b (b < a: reversed). */
+function subCubic(c: number[], a: number, b: number): number[] {
+  if (b < a) {
+    const r = subCubic(c, b, a);
+    return [r[6], r[7], r[4], r[5], r[2], r[3], r[0], r[1]];
+  }
+  const right = a > 0 ? splitCubic(c, a)[1] : c;
+  return b < 1 ? splitCubic(right, (b - a) / (1 - a))[0] : right;
+}
+
+/** Whether a world point is in a compound's result (world units relative to the point). */
+function compoundInside(s: ShapeInput, x: number, y: number, tol: number): boolean {
+  const m = s.m;
+  const A: Affine = [m[0], m[1], m[2], m[3], m[4] - x, m[5] - y];
+  return insideResult(compoundRings(s, A, Math.max(tol / 4, 1e-300), [-tol * 4, -tol * 4, tol * 4, tol * 4]), 0, 0);
+}
+
+// --- x-splines ---------------------------------------------------------------------------------
+// General x-splines (Blanc and Schlick, "X-Splines: a spline model designed for the end-user",
+// SIGGRAPH 1995), as xfig draws them. A segment from p1 to p2 blends p0..p3 with weights that
+// depend on the smoothness s1 of p1 and s2 of p2. q = -s/2 makes s = -1 a Catmull-Rom curve.
+
+function xf(num: number, den: number): number {
+  const p = 2 * den * den;
+  const u = num / den;
+  return u * u * u * (10 - p + (2 * p - 15) * u + (6 - p) * u * u);
+}
+const xg = (u: number, q: number) => u * (q + u * (2 * q + u * (8 - 12 * q + u * (14 * q - 11 + u * (4 - 5 * q)))));
+const xh = (u: number, q: number) => u * (q + u * (2 * q + u * u * (-2 * q - u * q)));
+
+/** A point of an x-spline segment at t (0..1). */
+export function xAt(p: number[], s1: number, s2: number, t: number): [number, number] {
+  let a0: number, a1: number, a2: number, a3: number;
+  if (s1 < 0) {
+    a0 = xh(-t, -s1 / 2);
+    a2 = xg(t, -s1 / 2);
+  } else {
+    a0 = t < s1 ? xf(t - s1, -1 - s1) : 0;
+    a2 = xf(t + s1, 1 + s1);
+  }
+  if (s2 < 0) {
+    a1 = xg(1 - t, -s2 / 2);
+    a3 = xh(t - 1, -s2 / 2);
+  } else {
+    a1 = xf(t - 1 - s2, -1 - s2);
+    a3 = t > 1 - s2 ? xf(t - 1 + s2, 1 + s2) : 0;
+  }
+  const w = a0 + a1 + a2 + a3;
+  return [(a0 * p[0] + a1 * p[2] + a2 * p[4] + a3 * p[6]) / w, (a0 * p[1] + a1 * p[3] + a2 * p[5] + a3 * p[7]) / w];
+}
+
+/** The x-spline segments of a contour. An open contour starts and ends at its end points. */
+export function splineSegs(c: PathContour): Extract<Seg, { t: 'X' }>[] {
+  const S = POINT_STRIDE;
+  const n = c.pts.length / S;
+  const closed = c.closed && n > 2;
+  const P = (i: number) => {
+    const j = closed ? ((i % n) + n) % n : Math.max(0, Math.min(n - 1, i));
+    return [c.pts[j * S], c.pts[j * S + 1]];
+  };
+  // The ends of an open contour are sharp, so the curve starts and ends there.
+  const sm = (i: number) => {
+    const j = closed ? ((i % n) + n) % n : i;
+    if (!closed && (j <= 0 || j >= n - 1)) return 0;
+    return Math.max(-1, Math.min(1, c.pts[j * S + 6]));
+  };
+  const out: Extract<Seg, { t: 'X' }>[] = [];
+  const count = closed ? n : n - 1;
+  for (let i = 0; i < count; i++) {
+    const p = [...P(i - 1), ...P(i), ...P(i + 1), ...P(i + 2)];
+    const s1 = sm(i), s2 = sm(i + 1);
+    const [x, y] = xAt(p, s1, s2, 1);
+    out.push({ t: 'X', p, s1, s2, x, y });
+  }
+  return out;
+}
+
+function splineContour(c: PathContour): Contour {
+  const segs = splineSegs(c);
+  const [x, y] = segs.length ? xAt(segs[0].p, segs[0].s1, segs[0].s2, 0) : [c.pts[0], c.pts[1]];
+  return { x, y, closed: c.closed && c.pts.length / POINT_STRIDE > 2, segs };
 }
 
 /** The segment from point a to point b of a path contour: straight when both handles are at their anchors. */
@@ -322,6 +562,117 @@ function flattenCubic(p0: number[], A: Affine, scale: number, tol: number, box: 
   sub(p0, 0, true);
 }
 
+/**
+ * Points along an x-spline segment, after its start point: the rules of flattenCubic. Its
+ * polynomials have no simple bound, so every segment splits at least three times (8 pieces); a
+ * piece's distance from its chord is estimated from three inner points.
+ */
+function flattenSpline(seg: Extract<Seg, { t: 'X' }>, A: Affine, scale: number, tol: number, box: Box | null, reach: number, pts: number[], smooth: boolean[]): void {
+  const band = reach * scale;
+  const at = (t: number) => xAt(seg.p, seg.s1, seg.s2, t);
+  const sub = (t0: number, a: [number, number], t1: number, b: [number, number], depth: number, last: boolean) => {
+    const tm = (t0 + t1) / 2, m = at(tm);
+    if (depth >= 3) {
+      const q1 = at(t0 + (t1 - t0) / 4), q3 = at(t0 + ((t1 - t0) * 3) / 4);
+      const dev = 1.5 * Math.max(ptSeg(m[0], m[1], a[0], a[1], b[0], b[1]), ptSeg(q1[0], q1[1], a[0], a[1], b[0], b[1]), ptSeg(q3[0], q3[1], a[0], a[1], b[0], b[1])) * scale;
+      const ax = q1[0] - a[0], ay = q1[1] - a[1], bx = b[0] - q3[0], by = b[1] - q3[1];
+      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      const turn = la > 0 && lb > 0 ? Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb)))) : 0;
+      const err = dev + band * (1 - Math.cos(Math.min(turn, Math.PI) / 2));
+      let done = (err <= tol && turn < Math.PI / 2) || depth > 40;
+      if (!done && box && turn < Math.PI / 2) {
+        let hx0 = Infinity, hy0 = Infinity, hx1 = -Infinity, hy1 = -Infinity;
+        for (const q of [a, b, m, q1, q3]) {
+          const X = tx(A, q[0], q[1]), Y = ty(A, q[0], q[1]);
+          hx0 = Math.min(hx0, X);
+          hx1 = Math.max(hx1, X);
+          hy0 = Math.min(hy0, Y);
+          hy1 = Math.max(hy1, Y);
+        }
+        const g = dev + 2;
+        const dMin = Math.hypot(Math.max(0, box[0] - hx1 - g, hx0 - g - box[2]), Math.max(0, box[1] - hy1 - g, hy0 - g - box[3]));
+        let near = dMin <= err + 2;
+        if (!near && band > 0 && dMin <= band + err + 2) {
+          const AX = tx(A, a[0], a[1]), AY = ty(A, a[0], a[1]), BX = tx(A, b[0], b[1]), BY = ty(A, b[0], b[1]);
+          const dMax = Math.max(ptSeg(box[0], box[1], AX, AY, BX, BY), ptSeg(box[2], box[1], AX, AY, BX, BY), ptSeg(box[2], box[3], AX, AY, BX, BY), ptSeg(box[0], box[3], AX, AY, BX, BY));
+          near = dMax + dev >= band - err - 2;
+        }
+        done = !near;
+      }
+      if (done) {
+        pts.push(b[0], b[1]);
+        smooth.push(!last);
+        return;
+      }
+    }
+    sub(t0, a, tm, m, depth + 1, false);
+    sub(tm, m, t1, b, depth + 1, last);
+  };
+  sub(0, at(0), 1, [seg.x, seg.y], 0, true);
+}
+
+/**
+ * Cubics that follow an x-spline segment: the same ends and end directions, the handle lengths
+ * fitted by least squares to points between. A piece that strays more than 0.2% of the segment
+ * length splits in two.
+ */
+export function xToCubics(g: Extract<Seg, { t: 'X' }>): number[][] {
+  const at = (t: number) => xAt(g.p, g.s1, g.s2, t);
+  const a = at(0), b = at(1);
+  const len = Math.hypot(b[0] - a[0], b[1] - a[1]) + 1e-300;
+  const out: number[][] = [];
+  const fit = (t0: number, t1: number, depth: number) => {
+    const h = (t1 - t0) * 1e-4;
+    const p0 = at(t0), p3 = at(t1);
+    const d0 = at(t0 + h), d1 = at(t1 - h);
+    // Unit directions at the ends.
+    let ux = d0[0] - p0[0], uy = d0[1] - p0[1], vx = p3[0] - d1[0], vy = p3[1] - d1[1];
+    const lu = Math.hypot(ux, uy) || 1, lv = Math.hypot(vx, vy) || 1;
+    ux /= lu;
+    uy /= lu;
+    vx /= lv;
+    vy /= lv;
+    // B(t) = c0 p0 + c1 (p0 + al u) + c2 (p3 - be v) + c3 p3: linear in al, be.
+    let m11 = 0, m12 = 0, m22 = 0, r1 = 0, r2 = 0;
+    const N = 12;
+    const samples: [number, number, number][] = [];
+    for (let k = 1; k < N; k++) {
+      const t = k / N, u = 1 - t;
+      const c0 = u * u * u, c1 = 3 * u * u * t, c2 = 3 * u * t * t, c3 = t * t * t;
+      const q = at(t0 + (t1 - t0) * t);
+      samples.push([t, q[0], q[1]]);
+      const bx = (c0 + c1) * p0[0] + (c2 + c3) * p3[0], by = (c0 + c1) * p0[1] + (c2 + c3) * p3[1];
+      const ex = q[0] - bx, ey = q[1] - by;
+      const ax = c1 * ux, ay = c1 * uy, cx = -c2 * vx, cy = -c2 * vy;
+      m11 += ax * ax + ay * ay;
+      m12 += ax * cx + ay * cy;
+      m22 += cx * cx + cy * cy;
+      r1 += ax * ex + ay * ey;
+      r2 += cx * ex + cy * ey;
+    }
+    const det = m11 * m22 - m12 * m12;
+    const chord = Math.hypot(p3[0] - p0[0], p3[1] - p0[1]);
+    let al = chord / 3, be = chord / 3;
+    if (Math.abs(det) > 1e-300) {
+      al = (r1 * m22 - r2 * m12) / det;
+      be = (m11 * r2 - m12 * r1) / det;
+    }
+    const cub = [p0[0], p0[1], p0[0] + al * ux, p0[1] + al * uy, p3[0] - be * vx, p3[1] - be * vy, p3[0], p3[1]];
+    let err = 0;
+    for (const [t, qx, qy] of samples) {
+      const c = cubicAt(cub, t);
+      err = Math.max(err, Math.hypot(c[0] - qx, c[1] - qy));
+    }
+    if (err > len * 2e-3 && depth < 5) {
+      const tm = (t0 + t1) / 2;
+      fit(t0, tm, depth + 1);
+      fit(tm, t1, depth + 1);
+    } else out.push(cub);
+  };
+  fit(0, 1, 0);
+  return out;
+}
+
 /** A cubic Bezier (8 numbers) cut in two at t (de Casteljau): the exact same curve. */
 export function splitCubic(p: number[], t: number): [number[], number[]] {
   const [x0, y0, x1, y1, x2, y2, x3, y3] = p;
@@ -345,6 +696,10 @@ export function cubicAt(p: number[], t: number): [number, number] {
 /** Direction of a segment where it starts and where it ends (not normalized). */
 function tangents(seg: Seg, x: number, y: number): [number, number, number, number] {
   if (seg.t === 'L') return [seg.x - x, seg.y - y, seg.x - x, seg.y - y];
+  if (seg.t === 'X') {
+    const a = xAt(seg.p, seg.s1, seg.s2, 1e-4), b = xAt(seg.p, seg.s1, seg.s2, 1 - 1e-4);
+    return [a[0] - x, a[1] - y, seg.x - b[0], seg.y - b[1]];
+  }
   if (seg.t === 'C') {
     // A handle at its anchor gives no direction: the next control point does.
     const [sx, sy] = seg.x1 !== x || seg.y1 !== y ? [seg.x1 - x, seg.y1 - y] : seg.x2 !== x || seg.y2 !== y ? [seg.x2 - x, seg.y2 - y] : [seg.x - x, seg.y - y];
@@ -388,6 +743,10 @@ export function flattenContour(c: Contour, A: Affine, tol: number, box: Box | nu
       y = seg.y;
     } else if (seg.t === 'C') {
       flattenCubic([x, y, seg.x1, seg.y1, seg.x2, seg.y2, seg.x, seg.y], A, scale, tol, box, reach, pts, smooth);
+      x = seg.x;
+      y = seg.y;
+    } else if (seg.t === 'X') {
+      flattenSpline(seg, A, scale, tol, box, reach, pts, smooth);
       x = seg.x;
       y = seg.y;
     } else {
@@ -580,9 +939,16 @@ export interface Bounds {
 }
 
 /** Corners of the frame in the world (a line: its two end points). */
-export function shapeCorners(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line' | 'path'>): number[] {
+export function shapeCorners(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line' | 'path' | 'parts'>): number[] {
   const m = s.m;
-  const local = s.kind === 'line' && s.line ? s.line : [0, 0, s.w, 0, s.w, s.h, 0, s.h];
+  let local = s.kind === 'line' && s.line ? s.line : [0, 0, s.w, 0, s.w, s.h, 0, s.h];
+  if (s.kind === 'compound') {
+    // The frame corners of every part: the result lies within them.
+    local = [];
+    for (const p of s.parts ?? []) {
+      for (const [x, y] of [[0, 0], [p.w, 0], [p.w, p.h], [0, p.h]]) local.push(tx(p.m, x, y), ty(p.m, x, y));
+    }
+  }
   const out: number[] = [];
   for (let i = 0; i < local.length; i += 2) out.push(tx(m, local[i], local[i + 1]), ty(m, local[i], local[i + 1]));
   return out;
@@ -614,10 +980,11 @@ export function shapeBounds(s: ShapeInput): Bounds {
 }
 
 /** True when every frame corner is within ±max. */
-export function cornersWithin(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line' | 'path'>, max: number): boolean {
+export function cornersWithin(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line' | 'path' | 'parts'>, max: number): boolean {
   if (!shapeCorners(s).every((v) => Math.abs(v) <= max)) return false;
-  // A path: every anchor and handle too (they may lie outside the frame).
-  for (const c of s.kind === 'path' ? (s.path ?? []) : []) {
+  // A path: every anchor and handle too (they may lie outside the frame); a compound: its parts' too.
+  const paths = s.kind === 'path' ? (s.path ?? []) : s.kind === 'compound' ? (s.parts ?? []).flatMap((p) => mapPath(p.path ?? [], p.m)) : [];
+  for (const c of paths) {
     for (let i = 0; i < c.pts.length; i += POINT_STRIDE) {
       for (let k = 0; k < 6; k += 2) {
         const x = c.pts[i + k], y = c.pts[i + k + 1];
@@ -642,7 +1009,8 @@ const KIND_FIELDS: Record<ShapeKind, string[]> = {
   polygon: ['sides', 'rounding'],
   star: ['points', 'innerRatio', 'rounding'],
   line: ['line'],
-  path: ['path'],
+  path: ['path', 'curve'],
+  compound: ['parts'],
 };
 const ALL_KIND_FIELDS = new Set(Object.values(KIND_FIELDS).flat());
 
@@ -659,7 +1027,8 @@ export function stripForKind<T extends Pick<ShapeInput, 'kind'>>(s: T): T {
  * Arcs become cubic Beziers of at most 90° each (within 0.03% of the radius).
  */
 export function toPath(s: ShapeGeo): PathContour[] {
-  if (s.kind === 'path') return (s.path ?? []).map((c) => ({ closed: c.closed, pts: [...c.pts] }));
+  if (s.kind === 'compound') return compoundToPath(s);
+  if (s.kind === 'path' && s.curve !== 'spline') return (s.path ?? []).map((c) => ({ closed: c.closed, pts: [...c.pts] }));
   return shapeContours(s).map((c) => {
     // Anchors with handles: x, y, ix, iy, ox, oy (the type is set below).
     const p: number[][] = [[c.x, c.y, c.x, c.y, c.x, c.y]];
@@ -675,7 +1044,10 @@ export function toPath(s: ShapeGeo): PathContour[] {
     for (const g of c.segs) {
       if (g.t === 'L') to(x, y, g.x, g.y, g.x, g.y);
       else if (g.t === 'C') to(g.x1, g.y1, g.x2, g.y2, g.x, g.y);
-      else {
+      else if (g.t === 'X') {
+        // An x-spline segment becomes one cubic or more, fitted within 0.2% of its length.
+        for (const q of xToCubics(g)) to(q[2], q[3], q[4], q[5], q[6], q[7]);
+      } else {
         const n = Math.max(1, Math.ceil(Math.abs(g.a1 - g.a0) / (Math.PI / 2) - 1e-9));
         const da = (g.a1 - g.a0) / n;
         const k = (4 / 3) * Math.tan(da / 4);
@@ -697,7 +1069,10 @@ export function toPath(s: ShapeGeo): PathContour[] {
     }
     const pts: number[] = [];
     for (const q of p) {
-      const smooth = !(q[2] === q[0] && q[3] === q[1]) && !(q[4] === q[0] && q[5] === q[1]) && sameDir(q[0] - q[2], q[1] - q[3], q[4] - q[0], q[5] - q[1]);
+      // Smooth: both handles, on one line (within 0.1°: a fitted spline is not exact).
+      const ax = q[0] - q[2], ay = q[1] - q[3], bx = q[4] - q[0], by = q[5] - q[1];
+      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      const smooth = la > 0 && lb > 0 && (ax * bx + ay * by) / (la * lb) > Math.cos(0.0018);
       pts.push(q[0], q[1], q[2], q[3], q[4], q[5], smooth ? 1 : 0);
     }
     return { closed: c.closed, pts };
@@ -705,7 +1080,33 @@ export function toPath(s: ShapeGeo): PathContour[] {
 }
 
 /** The box of the curves of path contours (local units): anchors and the extremes of each curve. */
-export function pathBounds(path: PathContour[]): [number, number, number, number] {
+export function pathBounds(path: PathContour[], curve?: ShapeProps['curve']): [number, number, number, number] {
+  if (curve === 'spline') {
+    // An x-spline: the box of its points, flattened finely for its size.
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const c of path) {
+      for (let i = 0; i < c.pts.length; i += POINT_STRIDE) {
+        x0 = Math.min(x0, c.pts[i]);
+        x1 = Math.max(x1, c.pts[i]);
+        y0 = Math.min(y0, c.pts[i + 1]);
+        y1 = Math.max(y1, c.pts[i + 1]);
+      }
+    }
+    if (!(x0 <= x1)) return [0, 0, 0, 0];
+    const tol = Math.max(x1 - x0, y1 - y0, 1e-300) * 1e-6;
+    x0 = y0 = Infinity;
+    x1 = y1 = -Infinity;
+    for (const c of path) {
+      const f = flattenContour(splineContour(c), [1, 0, 0, 1, 0, 0], tol);
+      for (let i = 0; i < f.pts.length; i += 2) {
+        x0 = Math.min(x0, f.pts[i]);
+        x1 = Math.max(x1, f.pts[i]);
+        y0 = Math.min(y0, f.pts[i + 1]);
+        y1 = Math.max(y1, f.pts[i + 1]);
+      }
+    }
+    return [x0, y0, x1, y1];
+  }
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   const add = (x: number, y: number) => {
     if (x < x0) x0 = x;
@@ -743,9 +1144,9 @@ export function pathBounds(path: PathContour[]): [number, number, number, number
 }
 
 /** A path shape with its frame fitted to its curves again: the origin moves into `m`. */
-export function fitPathFrame<T extends Pick<ShapeInput, 'm' | 'w' | 'h' | 'path'>>(s: T): T {
+export function fitPathFrame<T extends Pick<ShapeInput, 'm' | 'w' | 'h' | 'path' | 'curve'>>(s: T): T {
   const path = s.path ?? [];
-  const [x0, y0, x1, y1] = pathBounds(path);
+  const [x0, y0, x1, y1] = pathBounds(path, s.curve);
   const moved = path.map((c) => {
     const pts = c.pts.slice();
     for (let i = 0; i < pts.length; i += POINT_STRIDE) {
@@ -799,6 +1200,18 @@ export function outlinePolys(s: ShapeGeo, A: Affine, tol: number, box: Box | nul
 export function hitShape(s: ShapeInput, x: number, y: number, tol: number): boolean {
   const b = shapeBounds(s);
   if (x < b.x0 - tol || x > b.x1 + tol || y < b.y0 - tol || y > b.y1 + tol) return false;
+  if (s.kind === 'compound') {
+    // In the result, or near its outline (a point around differs), or on its stroke band.
+    const sc = maxScale(s.m);
+    const r = (s.stroke && s.strokeWidth > 0 ? s.strokeWidth * sc * (s.align === 'center' ? 0.5 : s.align === 'outside' ? 1 : 0) : 0) + tol;
+    const c = compoundInside(s, x, y, r);
+    if (c && (s.fill || !s.stroke)) return true;
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      if (compoundInside(s, x + Math.cos(a) * r, y + Math.sin(a) * r, r) !== c) return true;
+    }
+    return false;
+  }
   const m = s.m;
   // World relative to the point: the numbers stay small near it at any zoom.
   const A: Affine = [m[0], m[1], m[2], m[3], m[4] - x, m[5] - y];

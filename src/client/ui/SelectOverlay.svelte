@@ -16,6 +16,7 @@
 
 {#if o}
   <svg class="overlay" aria-hidden="true">
+    {#each o.parts as d}<path class="part" {d} />{/each}
     {#each o.outlines as d}<path class="sel" {d} />{/each}
     {#if o.hover}{#each o.hover.outline as d}<path class="hover" {d} />{/each}{/if}
     {#if o.box}
@@ -38,6 +39,15 @@
         <rect class="anchor" class:on={a.sel} x={a.x - (coarse ? 8 : 4)} y={a.y - (coarse ? 8 : 4)} width={coarse ? 16 : 8} height={coarse ? 16 : 8} />
       {/if}
     {/each}
+    {#each o.rings as g, i (i)}
+      <!-- The smoothness ring: the arc from the top shows how soft (blue, clockwise) or how round
+           through the point (orange, counterclockwise) it is; the knob sets it. -->
+      <circle class="ring" cx={g.x} cy={g.y} r={g.r} />
+      {#if g.s !== 0}
+        <path class="arc" class:soft={g.s > 0} d="M{g.x} {g.y - g.r}A{g.r} {g.r} 0 0 {g.s > 0 ? 1 : 0} {g.kx} {g.ky}" />
+      {/if}
+      <circle class="ringknob" class:soft={g.s > 0} class:through={g.s < 0} cx={g.kx} cy={g.ky} r={coarse ? 9 : 5} />
+    {/each}
     {#if o.marquee}
       <rect class="marquee" x={o.marquee[0]} y={o.marquee[1]} width={o.marquee[2]} height={o.marquee[3]} />
     {/if}
@@ -46,11 +56,23 @@
     <div class="label" style:transform="translate({o.tip.x}px, {o.tip.y}px)">{o.tip.text}</div>
   {/if}
   {#if o.bar && engine}
-    <div class="bar" role="toolbar" aria-label={o.bar.kind === 'pen' ? 'Pen' : 'Points'}>
-      {#if o.bar.kind === 'points'}
+    <div class="bar" role="toolbar" aria-label={o.bar.kind === 'pen' ? 'Pen' : o.bar.kind === 'parts' ? 'Parts' : 'Points'}>
+      {#if o.bar.kind === 'parts'}
+        <span class="info">Parts of {o.bar.label} · {o.bar.selected ? `${o.bar.selected} selected · double-click for its points` : 'click one to select it'}</span>
+        <button disabled={!o.bar.selected} title="Delete the selected parts (Delete)" onclick={() => engine.shapes.remove()}>Delete</button>
+        <button class="primary" title="Back to the whole shape (Esc)" onclick={() => engine.shapes.exitParts()}>Done</button>
+      {:else if o.bar.kind === 'points'}
         <span class="info">{o.bar.selected ? `${o.bar.selected} of ${o.bar.points} points` : `${o.bar.points} points · click one to select it`}</span>
-        <button disabled={!o.bar.selected} title="Corner: the handles move on their own" onclick={() => engine.shapes.setPointType(CORNER)}>Corner</button>
-        <button disabled={!o.bar.selected} title="Smooth: the handles stay on one line" onclick={() => engine.shapes.setPointType(SMOOTH)}>Smooth</button>
+        {#if o.bar.curve === 'spline'}
+          <button disabled={!o.bar.selected} title="Corner: a sharp point" onclick={() => engine.shapes.setPointSmoothness(0)}>Corner</button>
+          <button disabled={!o.bar.selected} title="Through: the curve goes through the point, round" onclick={() => engine.shapes.setPointSmoothness(-1)}>Through</button>
+          <button disabled={!o.bar.selected} title="Soft: the curve bends toward the point" onclick={() => engine.shapes.setPointSmoothness(1)}>Soft</button>
+          <button title="Make it a Bezier path: points with handles" onclick={() => engine.shapes.setCurve('bezier')}>To Bezier</button>
+        {:else}
+          <button disabled={!o.bar.selected} title="Corner: the handles move on their own" onclick={() => engine.shapes.setPointType(CORNER)}>Corner</button>
+          <button disabled={!o.bar.selected} title="Smooth: the handles stay on one line" onclick={() => engine.shapes.setPointType(SMOOTH)}>Smooth</button>
+          <button title="Make it a spline: smooth curves through or near the points, without handles" onclick={() => engine.shapes.setCurve('spline')}>To spline</button>
+        {/if}
         <button disabled={!o.bar.selected} title="Delete the points (Delete)" onclick={() => engine.shapes.deletePoints()}>Delete</button>
         <button class="primary" title="Back to the whole shape (Enter or Esc)" onclick={() => engine.shapes.exitPoints()}>Done</button>
       {:else}
@@ -89,6 +111,13 @@
     fill: none;
     stroke: var(--accent);
     stroke-width: 1;
+  }
+  .part {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+    opacity: 0.8;
   }
   .hover {
     fill: none;
@@ -133,12 +162,38 @@
   .anchor.on {
     fill: var(--accent);
   }
+  .ring {
+    fill: none;
+    stroke: rgba(0, 0, 0, 0.25);
+    stroke-width: 3;
+  }
+  .arc {
+    fill: none;
+    stroke: #f08a24;
+    stroke-width: 3;
+    stroke-linecap: round;
+  }
+  .arc.soft {
+    stroke: var(--accent);
+  }
+  .ringknob {
+    fill: #fff;
+    stroke: #9a9a9a;
+    stroke-width: 1.5;
+  }
+  .ringknob.soft {
+    stroke: var(--accent);
+  }
+  .ringknob.through {
+    stroke: #f08a24;
+  }
   .bar {
     position: absolute;
     left: 50%;
     bottom: 12px;
     z-index: 6;
     transform: translateX(-50%);
+    width: max-content;
     display: flex;
     align-items: center;
     gap: 6px;

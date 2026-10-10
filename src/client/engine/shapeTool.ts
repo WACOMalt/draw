@@ -19,12 +19,15 @@
 
 import { newId } from '../../shared/ids';
 import { compose, effectivelyVisible, invert } from '../../shared/layers';
-import { byZ, clipPolygon, cornerPoints, fitPathFrame, hitShape, outlinePolys, shapeBounds, stripForKind, toPath, type Box } from '../../shared/shapes';
+import { byZ, clipPolygon, compoundToPath, cornerPoints, fitPathFrame, hitShape, outlinePolys, shapeBounds, stripForKind, toPath, type Box } from '../../shared/shapes';
+import { OP_NAME, fitCompoundFrame, partOf, partShape, splitPartId, withPart } from '../../shared/compound';
 import {
   LIMITS,
   POINT_STRIDE,
   type Affine,
   type ClientMsg,
+  type CompoundOp,
+  type CompoundPart,
   type Layer,
   type Op,
   type PathContour,
@@ -36,7 +39,13 @@ import {
 } from '../../shared/types';
 import {
   CORNER,
+  SMOOTH,
   SYMMETRIC,
+  bezierToSpline,
+  clonePath,
+  setSmoothness,
+  smoothOf,
+  toggleSplinePoint,
   allKeys,
   count,
   getPt,
@@ -55,7 +64,8 @@ import { ed, showToast, type SelectOverlay } from '../state.svelte';
 import type { Doc } from './doc';
 import type { Renderer } from './renderer';
 
-export const SHAPE_LABEL: Record<ShapeKind, string> = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', star: 'Star', line: 'Line', path: 'Path' };
+export const SHAPE_LABEL: Record<ShapeKind, string> = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', star: 'Star', line: 'Line', path: 'Path', compound: 'Compound' };
+const partLabel = (k: ShapeKind) => SHAPE_LABEL[k];
 
 /** What the shape tools need from the engine. */
 export interface ShapeHost {
@@ -75,7 +85,7 @@ export interface ShapeHost {
 type Pt = [number, number];
 
 /** The props a gesture or an edit may change, compared to make the ops. */
-const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
+const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'curve', 'parts', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
 
 const LIVE_MS = 40;
 /** Movement (CSS px) before a press counts as a drag: smaller jitters change nothing. */
@@ -131,7 +141,7 @@ interface Create {
 interface PointDrag {
   pointerId: number;
   touch: boolean;
-  kind: 'handle' | 'anchor' | 'marquee';
+  kind: 'handle' | 'anchor' | 'marquee' | 'ring';
   s0: Pt;
   s1: Pt;
   p0: Pt;
@@ -147,6 +157,7 @@ interface PointDrag {
 /** The Pen's path in progress: points in world units relative to `o` (the first point). */
 interface PenPath {
   id: string;
+  curve: 'bezier' | 'spline';
   layerId: string;
   createdLayer: string | null;
   z: number;
@@ -172,6 +183,8 @@ export class ShapeTool {
   private pdrag: PointDrag | null = null;
   private pen: PenPath | null = null;
   private penDrag: { pointerId: number; s0: Pt; idx: number; moved: boolean; closing: boolean } | null = null;
+  /** The point whose ring knob is dragged (point editing of a spline). */
+  private ringKey: PKey | null = null;
   /** The shapes before an options bar drag started (editSelected). */
   private editOrig: Map<string, Shape> | null = null;
   private hover: Shape | null = null;
@@ -182,6 +195,8 @@ export class ShapeTool {
   private lastClick = { t: 0, x: 0, y: 0 };
   /** Shapes as the user sees them, cached until the document or the drafts change. */
   private viewCache: Map<string, Shape> | null = null;
+  /** Touch screen: bigger targets (the smoothness ring). */
+  private coarse = matchMedia('(pointer: coarse)').matches;
   /** Peers' drafts: when each last arrived (stale ones are dropped). */
   private remote = new Map<string, number>();
 
@@ -199,7 +214,28 @@ export class ShapeTool {
 
   /** A shape as it shows now: a draft, else the view. */
   current(id: string): Shape | undefined {
+    const pid = splitPartId(id);
+    if (pid) {
+      // A part of a compound: a shape of its own, made from the compound as it shows now.
+      const c = this.drafts.get(pid[0]) ?? this.view().get(pid[0]);
+      return c && !c.deleted ? partShape(c, pid[1], partLabel) : undefined;
+    }
     return this.drafts.get(id) ?? this.view().get(id);
+  }
+
+  /** Shapes with the parts put back into their compounds (the compounds as the view has them). */
+  private toReal(list: Shape[]): Shape[] {
+    const out = new Map<string, Shape>();
+    for (const s of list) {
+      const pid = splitPartId(s.id);
+      if (!pid) {
+        out.set(s.id, s);
+        continue;
+      }
+      const c = out.get(pid[0]) ?? this.view().get(pid[0]);
+      if (c && !c.deleted) out.set(c.id, withPart(c, pid[1], s));
+    }
+    return [...out.values()];
   }
 
   /** The selected shapes as they show now. */
@@ -218,9 +254,14 @@ export class ShapeTool {
     const v = this.view();
     const byId = new Map(ed.layers.map((l) => [l.id, l]));
     ed.shapes = [...v.values()].filter((s) => !s.deleted && byId.has(s.layerId)).sort(byZ);
+    if (ed.partsOf) {
+      const c = v.get(ed.partsOf);
+      if (!c || c.deleted || c.kind !== 'compound' || !byId.has(c.layerId)) ed.partsOf = null;
+    }
     const keep = ed.selection.filter((id) => {
-      const s = v.get(id);
-      return s && !s.deleted && byId.has(s.layerId);
+      const pid = splitPartId(id);
+      const s = v.get(pid ? pid[0] : id);
+      return s && !s.deleted && byId.has(s.layerId) && (!pid || (pid[0] === ed.partsOf && pid[1] < (s.parts?.length ?? 0)));
     });
     if (keep.length !== ed.selection.length) ed.selection = keep;
     if (ed.pointEdit && !keep.includes(ed.pointEdit.id)) ed.pointEdit = null;
@@ -236,7 +277,7 @@ export class ShapeTool {
   }
 
   private setDrafts(list: Shape[]): void {
-    this.drafts = new Map(list.map((s) => [s.id, s]));
+    this.drafts = new Map(this.toReal(list).map((s) => [s.id, s]));
     this.pushDrafts();
     this.sendLive();
     this.scheduleOverlay();
@@ -310,6 +351,14 @@ export class ShapeTool {
   shapeAt(x: number, y: number, touch: boolean): Shape | null {
     const [wx, wy] = this.toWorld(x, y);
     const tol = (touch ? 10 : 4) / this.zoom;
+    const c = ed.partsOf ? this.current(ed.partsOf) : undefined;
+    if (c?.kind === 'compound' && !c.deleted) {
+      // Parts mode: the topmost part under the point, by its own area (filled or not).
+      for (let i = (c.parts?.length ?? 0) - 1; i >= 0; i--) {
+        const p = partShape(c, i, partLabel)!;
+        if (hitShape({ ...p, fill: p.fill ?? '#000000' }, wx, wy, tol)) return p;
+      }
+    }
     const by = new Map<string, Shape[]>();
     for (const s of this.view().values()) {
       if (s.deleted) continue;
@@ -433,15 +482,22 @@ export class ShapeTool {
     // Double-click (a double tap) on a shape: its points.
     const zone = this.zoneAt(x, y, touch);
     if (dbl && (zone || this.shapeAt(x, y, touch))) {
+      // A compound: its parts first. A part, or any other shape: its points.
       const target = zone && ed.selection.length === 1 ? ed.selection[0] : this.shapeAt(x, y, touch)?.id;
-      if (target) this.enterPoints(target);
+      if (target && this.current(target)?.kind === 'compound') this.enterParts(target, [x, y]);
+      else if (target) this.enterPoints(target);
       return;
     }
     if (zone) {
       if (!ed.canEdit) return showToast('View only: you can look around but not change shapes');
       return this.beginEdit(e, x, y, zone.kind === 'move' ? 'move' : zone.kind, zone);
     }
-    const hit = this.shapeAt(x, y, touch);
+    let hit = this.shapeAt(x, y, touch);
+    if (ed.partsOf && !zone && splitPartId(hit?.id ?? '')?.[0] !== ed.partsOf) {
+      // Parts mode ends at a press outside the parts.
+      this.exitParts();
+      hit = this.shapeAt(x, y, touch);
+    }
     // Keep selection: a press outside the box neither swaps nor drops the selection, and starts
     // no selection rectangle. Shift+click still adds or removes; Esc and Deselect still clear.
     const locked = this.locked() && !e.shiftKey;
@@ -606,6 +662,10 @@ export class ShapeTool {
       this.cancel();
       return true;
     }
+    if (ed.partsOf) {
+      this.exitParts();
+      return true;
+    }
     if (!ed.selection.length) return false;
     this.select([]);
     return true;
@@ -747,8 +807,7 @@ export class ShapeTool {
     this.select([s.id]);
   }
 
-  private nextShapeName(kind: ShapeKind): string {
-    const prefix = SHAPE_LABEL[kind];
+  private nextShapeName(kind: ShapeKind, prefix = SHAPE_LABEL[kind]): string {
     let n = 1;
     const re = new RegExp(`^${prefix} (\\d+)$`);
     for (const s of this.view().values()) {
@@ -912,6 +971,11 @@ export class ShapeTool {
         return { closed: c.closed, pts };
       });
     }
+    if (s.kind === 'compound' && s.parts) {
+      // The parts stretch with the frame.
+      const kx = s.w > 0 ? (x1 - x0) / s.w : 1, ky = s.h > 0 ? (y1 - y0) / s.h : 1;
+      out.parts = s.parts.map((p) => ({ ...p, m: compose([kx, 0, 0, ky, 0, 0], p.m) }));
+    }
     return out;
   }
 
@@ -948,6 +1012,15 @@ export class ShapeTool {
 
   /** Sends one update per changed shape and one undo step for all; ends the drafts. */
   private commit(orig: Map<string, Shape>, next: Shape[]): void {
+    // A changed part changes its compound: compare the compounds.
+    const before = new Map<string, Shape>();
+    for (const [id, s] of orig) {
+      const pid = splitPartId(id);
+      const c = pid ? this.view().get(pid[0]) : s;
+      if (c) before.set(c.id, c);
+    }
+    orig = before;
+    next = this.toReal(next);
     const undo: Op[] = [], redo: Op[] = [];
     for (const n of next) {
       const o = orig.get(n.id);
@@ -1000,16 +1073,202 @@ export class ShapeTool {
   /** Removes shapes (the selection by default). Undo brings them back. */
   remove(ids = ed.selection): void {
     if (!ed.canEdit || !ids.length) return;
-    const live = ids.filter((id) => {
-      const s = this.current(id);
-      return s && !s.deleted;
+    const live: string[] = [];
+    const cut = new Map<string, Set<number>>();
+    for (const id of ids) {
+      const pid = splitPartId(id);
+      if (pid) {
+        let set = cut.get(pid[0]);
+        if (!set) cut.set(pid[0], (set = new Set()));
+        set.add(pid[1]);
+      } else if (this.current(id) && !this.current(id)!.deleted) live.push(id);
+    }
+    // Parts: out of their compound (a compound without parts goes).
+    const undo: Op[] = [], redo: Op[] = [];
+    for (const [cid, set] of cut) {
+      const c = this.view().get(cid);
+      if (!c || c.deleted || !c.parts || live.includes(cid)) continue;
+      const parts = c.parts.filter((_, i) => !set.has(i));
+      if (!parts.length) {
+        live.push(cid);
+        continue;
+      }
+      const n = fitCompoundFrame({ ...c, parts });
+      redo.push({ type: 'shape.update', id: cid, props: { parts: n.parts, w: n.w, h: n.h, m: n.m } });
+      undo.push({ type: 'shape.update', id: cid, props: { parts: c.parts, w: c.w, h: c.h, m: c.m } });
+    }
+    for (const id of live) {
+      redo.push({ type: 'shape.remove', id });
+      undo.push({ type: 'shape.restore', id });
+    }
+    if (!redo.length) return;
+    for (const op of redo) this.host.sendOp(op);
+    this.host.pushUndo({ undo, redo });
+    ed.selection = ed.selection.filter((id) => !live.includes(id) && !cut.has(splitPartId(id)?.[0] ?? ''));
+    if (ed.partsOf && live.includes(ed.partsOf)) ed.partsOf = null;
+    this.scheduleOverlay();
+  }
+
+  // --- compound shapes ------------------------------------------------------------------------------
+  //
+  // Combine makes one compound shape of the selected shapes: the bottom one gives the style, the
+  // others combine with it by the op. The parts stay live: a double-click shows them (parts mode),
+  // and each one moves, scales and edits its points as a shape of its own. Release makes them
+  // shapes again; Flatten makes the result one path.
+
+  /** Why the selection cannot be combined, or null. */
+  combineProblem(): string | null {
+    const sel = this.selected();
+    if (sel.length < 2) return 'Select two or more shapes';
+    if (sel.some((s) => splitPartId(s.id))) return 'Select whole shapes';
+    if (sel.some((s) => s.kind === 'line')) return 'Lines cannot be combined: they have no area';
+    if (new Set(sel.map((s) => s.layerId)).size > 1) return 'Select shapes on one layer';
+    if (sel.length > LIMITS.maxParts) return `At most ${LIMITS.maxParts} shapes`;
+    return null;
+  }
+
+  /** Combines the selected shapes into one compound shape, by `op`. One undo step. */
+  combine(op: CompoundOp): void {
+    if (!ed.canEdit || this.busy()) return;
+    const why = this.combineProblem();
+    if (why) return showToast(why);
+    const list = [...this.selected()].sort(byZ);
+    let x0 = Infinity, y0 = Infinity;
+    for (const s of list) {
+      const b = shapeBounds(s);
+      x0 = Math.min(x0, b.x0);
+      y0 = Math.min(y0, b.y0);
+    }
+    const T: Affine = [1, 0, 0, 1, -x0, -y0];
+    const base = list[0];
+    const c = fitCompoundFrame<Shape>({
+      id: newId(),
+      layerId: base.layerId,
+      kind: 'compound',
+      name: this.nextShapeName('compound', OP_NAME[op]),
+      z: list[list.length - 1].z,
+      w: 0,
+      h: 0,
+      m: [1, 0, 0, 1, x0, y0],
+      parts: list.map((s) => partOf(s, op, T)),
+      fill: base.fill,
+      stroke: base.stroke,
+      strokeWidth: base.strokeWidth * Math.sqrt(Math.abs(base.m[0] * base.m[3] - base.m[1] * base.m[2])),
+      align: base.align,
+      cap: base.cap,
+      join: base.join,
+      author: '',
+      seq: 0,
     });
-    for (const id of live) this.host.sendOp({ type: 'shape.remove', id });
+    this.host.sendOp({ type: 'shape.add', shape: toInput(c) });
+    for (const s of list) this.host.sendOp({ type: 'shape.remove', id: s.id });
     this.host.pushUndo({
-      undo: live.map((id) => ({ type: 'shape.restore', id }) as Op),
-      redo: live.map((id) => ({ type: 'shape.remove', id }) as Op),
+      undo: [{ type: 'shape.remove', id: c.id }, ...list.map((s) => ({ type: 'shape.restore', id: s.id }) as Op)],
+      redo: [{ type: 'shape.restore', id: c.id }, ...list.map((s) => ({ type: 'shape.remove', id: s.id }) as Op)],
     });
-    ed.selection = ed.selection.filter((id) => !live.includes(id));
+    this.select([c.id]);
+  }
+
+  /** The selected compound shapes (whole). */
+  private selectedCompounds(): Shape[] {
+    return this.selected().filter((s) => s.kind === 'compound' && !splitPartId(s.id));
+  }
+
+  /** Makes the parts of the selected compounds shapes again, with the compound's style. One undo step. */
+  release(): void {
+    if (!ed.canEdit || this.busy()) return;
+    const list = this.selectedCompounds();
+    if (!list.length) return;
+    this.exitParts(false);
+    const undo: Op[] = [], redo: Op[] = [];
+    const made: string[] = [];
+    for (const c of list) {
+      const n = c.parts!.length;
+      c.parts!.forEach((_, i) => {
+        const p = partShape(c, i, partLabel)!;
+        const s: Shape = stripForKind({ ...p, id: newId(), z: c.z + i / n });
+        this.host.sendOp({ type: 'shape.add', shape: toInput(s) });
+        made.push(s.id);
+        undo.push({ type: 'shape.remove', id: s.id });
+        redo.push({ type: 'shape.restore', id: s.id });
+      });
+      this.host.sendOp({ type: 'shape.remove', id: c.id });
+      undo.push({ type: 'shape.restore', id: c.id });
+      redo.push({ type: 'shape.remove', id: c.id });
+    }
+    this.host.pushUndo({ undo, redo });
+    this.select(made);
+  }
+
+  /** Makes the selected compounds one path each: the result's outline. One undo step. */
+  flatten(): void {
+    if (!ed.canEdit || this.busy()) return;
+    const list = this.selectedCompounds();
+    if (!list.length) return;
+    const next: Shape[] = [];
+    for (const c of list) {
+      const path = compoundToPath(c);
+      if (!path.length) {
+        showToast(`${c.name || 'The compound'} is empty: nothing to flatten`);
+        continue;
+      }
+      if (path.reduce((n, p) => n + p.pts.length / POINT_STRIDE, 0) > LIMITS.maxPathPoints) {
+        showToast(`${c.name || 'The compound'} has too many points to flatten`);
+        continue;
+      }
+      next.push(stripForKind(fitPathFrame({ ...c, kind: 'path', path })));
+    }
+    this.exitParts(false);
+    this.commit(new Map(list.map((c) => [c.id, c])), next);
+  }
+
+  /** Sets the op of every part of the selected compounds. */
+  setCompoundOp(op: CompoundOp): void {
+    this.editSelected((s) => (s.kind === 'compound' && !splitPartId(s.id) ? { parts: s.parts!.map((p) => ({ ...p, op })) } : null), false);
+  }
+
+  /** Sets the op of the selected parts. */
+  setPartOp(op: CompoundOp): void {
+    if (!ed.canEdit || this.busy()) return;
+    const by = new Map<string, Set<number>>();
+    for (const id of ed.selection) {
+      const pid = splitPartId(id);
+      if (!pid) continue;
+      let set = by.get(pid[0]);
+      if (!set) by.set(pid[0], (set = new Set()));
+      set.add(pid[1]);
+    }
+    const orig = new Map<string, Shape>(), next: Shape[] = [];
+    for (const [cid, set] of by) {
+      const c = this.view().get(cid);
+      if (!c?.parts) continue;
+      orig.set(cid, c);
+      next.push({ ...c, parts: c.parts.map((p, i): CompoundPart => (set.has(i) ? { ...p, op } : p)) });
+    }
+    this.commit(orig, next);
+  }
+
+  /** Parts mode: the parts of a compound can be selected and changed. `at`: select the part there. */
+  enterParts(id: string, at?: Pt): void {
+    const c = this.current(id);
+    if (!c || c.deleted || c.kind !== 'compound') return;
+    if (!ed.canEdit) return showToast('View only: you can look around but not change shapes');
+    this.exitPoints();
+    ed.partsOf = id;
+    const hit = at ? this.shapeAt(at[0], at[1], false) : null;
+    this.select(hit && splitPartId(hit.id)?.[0] === id ? [hit.id] : []);
+    this.hover = null;
+  }
+
+  /** Back from parts mode to the whole compound (`select`: select it). */
+  exitParts(select = true): void {
+    const id = ed.partsOf;
+    if (!id) return;
+    this.exitPoints();
+    ed.partsOf = null;
+    const c = this.current(id);
+    if (select) this.select(c && !c.deleted ? [id] : []);
+    else ed.selection = ed.selection.filter((s) => !splitPartId(s));
     this.scheduleOverlay();
   }
 
@@ -1032,7 +1291,7 @@ export class ShapeTool {
     const pe = ed.pointEdit;
     const s = pe ? this.current(pe.id) : undefined;
     if (!pe || !s || s.deleted) return null;
-    return { s, path: toPath(s) };
+    return { s, path: editPath(s) };
   }
 
   /** Local units of a shape to screen pixels. */
@@ -1069,15 +1328,27 @@ export class ShapeTool {
   }
 
   /** What is under a screen point in point editing: a handle of a selected point, a point, or a segment. */
-  private pointHit(x: number, y: number, touch: boolean): { kind: 'handle'; key: PKey; which: 'in' | 'out' } | { kind: 'anchor'; key: PKey } | { kind: 'segment'; c: number; seg: number; t: number } | null {
+  private pointHit(
+    x: number,
+    y: number,
+    touch: boolean,
+  ): { kind: 'handle'; key: PKey; which: 'in' | 'out' } | { kind: 'ring'; key: PKey } | { kind: 'anchor'; key: PKey } | { kind: 'segment'; c: number; seg: number; t: number } | null {
     const ps = this.pointShape();
     if (!ps) return null;
     const r = touch ? 16 : 6;
     const sc = this.localToScreen(ps.s);
+    const spline = ps.s.kind === 'path' && ps.s.curve === 'spline';
     for (const ks of ed.pointEdit!.points) {
       const k = parseKey(ks);
       if (!ps.path[k.c] || k.i >= count(ps.path[k.c])) continue;
       const v = getPt(ps.path, k);
+      if (spline) {
+        // The smoothness ring's knob.
+        const [ax, ay] = sc(v.x, v.y);
+        const [kx, ky] = ringKnob(ax, ay, smoothOf(ps.path, k), this.coarse);
+        if (Math.hypot(x - kx, y - ky) <= r) return { kind: 'ring', key: k };
+        continue;
+      }
       for (const which of ['out', 'in'] as const) {
         const [hx, hy] = which === 'in' ? [v.ix, v.iy] : [v.ox, v.oy];
         if (hx === v.x && hy === v.y) continue;
@@ -1090,7 +1361,7 @@ export class ShapeTool {
       const [sx, sy] = sc(v.x, v.y);
       if (Math.hypot(x - sx, y - sy) <= r) return { kind: 'anchor', key: k };
     }
-    const near = nearestOnPath(ps.path, sc, x, y);
+    const near = nearestOnPath(ps.path, sc, x, y, curveOf(ps.s));
     if (near && near.d <= r) return { kind: 'segment', c: near.c, seg: near.seg, t: near.t };
     return null;
   }
@@ -1102,13 +1373,14 @@ export class ShapeTool {
     const hit = this.pointHit(x, y, touch);
     const pe = ed.pointEdit!;
     if (dbl && hit?.kind === 'anchor') {
-      // Double-click a point: corner ↔ smooth.
-      this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, toggleSmooth(ps.path, hit.key))]);
+      // Double-click a point: corner ↔ smooth (a spline point: corner ↔ through).
+      const next = curveOf(ps.s) === 'spline' ? toggleSplinePoint(ps.path, hit.key) : toggleSmooth(ps.path, hit.key);
+      this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, next)]);
       return;
     }
     if (dbl && hit?.kind === 'segment') {
       // Double-click a segment: a new point there.
-      const { path, key } = insertPoint(ps.path, hit.c, hit.seg, hit.t);
+      const { path, key } = insertPoint(ps.path, hit.c, hit.seg, hit.t, curveOf(ps.s));
       this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, path)]);
       this.setPoints([keyOf(key)]);
       return;
@@ -1116,6 +1388,12 @@ export class ShapeTool {
     const base = { pointerId: e.pointerId, touch, s0: [x, y] as Pt, p0: this.toWorld(x, y), shape: ps.s, path: ps.path, moved: false };
     if (hit?.kind === 'handle') {
       this.pdrag = { ...base, kind: 'handle', keys: [hit.key], which: hit.which, s1: [x, y], add: false };
+      return;
+    }
+    if (hit?.kind === 'ring') {
+      // The ring's knob sets the smoothness of every selected point.
+      this.pdrag = { ...base, kind: 'ring', keys: pe.points.map(parseKey), which: 'out', s1: [x, y], add: false };
+      this.ringKey = hit.key;
       return;
     }
     if (hit?.kind === 'anchor') {
@@ -1148,6 +1426,16 @@ export class ShapeTool {
       }
       const a = apply(inv, ...g.p0), b = apply(inv, ...p);
       this.setDrafts([this.withPath(g.shape, moveAnchors(g.path, g.keys, b[0] - a[0], b[1] - a[1]))]);
+      return;
+    }
+    if (g.kind === 'ring') {
+      // The knob's angle from the top: clockwise is soft, counterclockwise goes through.
+      const v = getPt(g.path, this.ringKey!);
+      const [ax, ay] = this.localToScreen(g.shape)(v.x, v.y);
+      let sm = Math.max(-1, Math.min(1, Math.atan2(x - ax, -(y - ay)) / Math.PI));
+      if (shift) sm = Math.round(sm * 4) / 4;
+      if (Math.abs(sm) < 0.04) sm = 0; // a corner is easy to hit
+      this.setDrafts([this.withPath(g.shape, setSmoothness(g.path, g.keys, sm))]);
       return;
     }
     const k = g.keys[0];
@@ -1197,13 +1485,39 @@ export class ShapeTool {
     this.clearDrafts();
   }
 
-  /** The type of the selected points (the options bar and the point bar): corner, smooth or symmetric. */
+  /**
+   * The type of the selected points (the point bar): corner, smooth or symmetric. On a spline:
+   * CORNER is a sharp point (0), SMOOTH goes through it round (-1).
+   */
   setPointType(t: number): void {
     const ps = this.pointShape();
     if (!ps || !ed.canEdit) return;
     const keys = ed.pointEdit!.points.map(parseKey);
     if (!keys.length) return showToast('Select points first');
-    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, setType(ps.path, keys, t))]);
+    const next = curveOf(ps.s) === 'spline' ? setSmoothness(ps.path, keys, t === CORNER ? 0 : -1) : setType(ps.path, keys, t);
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, next)]);
+  }
+
+  /** The smoothness of the selected spline points (the point bar: Soft is 1). */
+  setPointSmoothness(v: number): void {
+    const ps = this.pointShape();
+    if (!ps || !ed.canEdit || curveOf(ps.s) !== 'spline') return;
+    const keys = ed.pointEdit!.points.map(parseKey);
+    if (!keys.length) return showToast('Select points first');
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, setSmoothness(ps.path, keys, v))]);
+  }
+
+  /**
+   * The curve of a path (point editing, or one selected shape): Bezier points become spline
+   * points through the same anchors; a spline becomes Bezier curves that follow it closely.
+   */
+  setCurve(curve: 'bezier' | 'spline'): void {
+    const id = ed.pointEdit?.id ?? (ed.selection.length === 1 ? ed.selection[0] : null);
+    const s = id ? this.current(id) : null;
+    if (!s || !ed.canEdit || curveOf(s) === curve) return;
+    const path = curve === 'spline' ? bezierToSpline(toPath(s)) : toPath(s);
+    this.commit(new Map([[s.id, s]]), [stripForKind(fitPathFrame({ ...s, kind: 'path', path, curve }))]);
+    if (ed.pointEdit) this.setPoints([]);
   }
 
   /** Removes the selected points; a shape left without a segment goes. */
@@ -1257,7 +1571,7 @@ export class ShapeTool {
         return;
       }
       const lx = p[0] - pen.o[0], ly = p[1] - pen.o[1];
-      pen.c.pts.push(lx, ly, lx, ly, lx, ly, CORNER);
+      pen.c.pts.push(lx, ly, lx, ly, lx, ly, pen.curve === 'spline' ? ed.penStyle.smooth : CORNER);
       this.penDrag = { pointerId: e.pointerId, s0: [x, y], idx: n, moved: false, closing: false };
       this.penDraft();
       return;
@@ -1265,7 +1579,7 @@ export class ShapeTool {
     // Not drawing: a click on the selected shape's outline or points edits it.
     const sel = this.selected();
     if (sel.length === 1) {
-      const s = sel[0], path = toPath(s);
+      const s = sel[0], path = editPath(s);
       const sc = this.localToScreen(s);
       for (const k of allKeys(path)) {
         const v = getPt(path, k);
@@ -1277,9 +1591,9 @@ export class ShapeTool {
           return;
         }
       }
-      const near = nearestOnPath(path, sc, x, y);
+      const near = nearestOnPath(path, sc, x, y, curveOf(s));
       if (near && near.d <= r) {
-        const { path: next, key } = insertPoint(path, near.c, near.seg, near.t);
+        const { path: next, key } = insertPoint(path, near.c, near.seg, near.t, curveOf(s));
         this.commit(new Map([[s.id, s]]), [this.withPath(s, next)]);
         ed.pointEdit = { id: s.id, points: [keyOf(key)] };
         this.scheduleOverlay();
@@ -1291,7 +1605,8 @@ export class ShapeTool {
     if (!target) return;
     let z = 0;
     for (const s of this.view().values()) if (s.layerId === target.layerId && !s.deleted) z = Math.max(z, s.z);
-    this.pen = { id: newId(), layerId: target.layerId, createdLayer: target.created, z: z + 1, o: p, c: { closed: false, pts: [0, 0, 0, 0, 0, 0, CORNER] } };
+    const curve = ed.penStyle.curve === 'spline' ? 'spline' : 'bezier';
+    this.pen = { id: newId(), layerId: target.layerId, createdLayer: target.created, z: z + 1, o: p, curve, c: { closed: false, pts: [0, 0, 0, 0, 0, 0, curve === 'spline' ? ed.penStyle.smooth : CORNER] } };
     ed.penDrawing = true;
     ed.selection = [];
     ed.pointEdit = null;
@@ -1307,6 +1622,12 @@ export class ShapeTool {
     const p = this.toWorld(x, y);
     const lx = p[0] - pen.o[0], ly = p[1] - pen.o[1];
     const o = d.idx * POINT_STRIDE, a = pen.c.pts;
+    if (pen.curve === 'spline') {
+      // A spline point has no handles: the drag moves it (not the first one, when closing).
+      if (!d.closing) a.splice(o, 6, lx, ly, lx, ly, lx, ly);
+      this.penDraft();
+      return;
+    }
     const px = a[o], py = a[o + 1];
     if (d.closing) {
       // Closing: the drag shapes the curve into the first point (its incoming handle).
@@ -1357,6 +1678,7 @@ export class ShapeTool {
         align: st.align,
         cap: st.cap,
         join: 'round',
+        ...(pen.curve === 'spline' ? { curve: 'spline' as const } : {}),
         author: '',
         seq: Infinity,
       },
@@ -1431,7 +1753,10 @@ export class ShapeTool {
     if (e.key === 'Escape') return this.escape();
     if (!ed.selection.length) return false;
     if (e.key === 'Delete' || e.key === 'Backspace') this.remove();
-    else if (e.key === 'Enter' && ed.selection.length === 1 && ed.tool === 'select') this.enterPoints(ed.selection[0]);
+    else if (e.key === 'Enter' && ed.selection.length === 1 && ed.tool === 'select') {
+      if (this.current(ed.selection[0])?.kind === 'compound') this.enterParts(ed.selection[0]);
+      else this.enterPoints(ed.selection[0]);
+    }
     else if (a) this.nudge(a[0] * k, a[1] * k);
     else return false;
     return true;
@@ -1468,6 +1793,7 @@ export class ShapeTool {
     // Another tool: a path in progress ends, point editing ends.
     if (this.pen && tool !== 'pen') this.finishPen();
     if (ed.pointEdit && tool !== 'select') this.exitPoints();
+    if (ed.partsOf && tool !== 'select') this.exitParts();
     if ((tool !== 'select' && tool !== 'shape' && tool !== 'pen') || ed.transform) {
       if (ed.overlay) ed.overlay = null;
       return;
@@ -1483,10 +1809,18 @@ export class ShapeTool {
       readout: null,
       anchors: [],
       knobs: [],
+      rings: [],
       rubber: null,
       tip: null,
       bar: null,
+      parts: [],
     };
+    // Parts mode: every part's outline (dashed), and a bar to go back.
+    const pc = ed.partsOf ? this.current(ed.partsOf) : undefined;
+    if (pc?.kind === 'compound' && tool === 'select') {
+      for (let i = 0; i < (pc.parts?.length ?? 0); i++) o.parts.push(...this.outline(partShape(pc, i, partLabel)!));
+      if (!ed.pointEdit) o.bar = { kind: 'parts', points: pc.parts!.length, selected: ed.selection.length, curve: 'bezier', label: pc.name || 'Compound' };
+    }
     if (tool === 'pen' && this.pen) return void (ed.overlay = this.penOverlay(o));
     if (ed.pointEdit) return void (ed.overlay = this.pointOverlay(o));
     const sel = this.selected();
@@ -1517,7 +1851,7 @@ export class ShapeTool {
   }
 
   /** Anchors and handles of a path on screen; `sel` are selected points (their handles show). */
-  private pathMarks(o: SelectOverlay, path: PathContour[], sc: (x: number, y: number) => Pt, sel: Set<string>, handlesOf: Set<string>): void {
+  private pathMarks(o: SelectOverlay, path: PathContour[], sc: (x: number, y: number) => Pt, sel: Set<string>, handlesOf: Set<string>, spline = false): void {
     const { w, h } = this.host.comp.size;
     const on = ([x, y]: Pt) => x > -60 && y > -60 && x < w + 60 && y < h + 60;
     for (const k of allKeys(path)) {
@@ -1532,6 +1866,10 @@ export class ShapeTool {
         }
       }
       if (on(a)) o.anchors.push({ x: a[0], y: a[1], smooth: v.t !== CORNER, sel: sel.has(ks) });
+      if (spline && sel.has(ks) && on(a)) {
+        const [kx, ky] = ringKnob(a[0], a[1], v.t, this.coarse);
+        o.rings.push({ x: a[0], y: a[1], s: v.t, kx, ky, r: ringRadius(this.coarse) });
+      }
     }
   }
 
@@ -1539,13 +1877,13 @@ export class ShapeTool {
     const ps = this.pointShape();
     if (!ps) return o;
     const shown = this.drafts.get(ps.s.id) ?? ps.s;
-    const path = toPath(shown);
+    const path = editPath(shown);
     o.outlines = this.outline(shown);
     const sel = new Set(ed.pointEdit!.points);
-    this.pathMarks(o, path, this.localToScreen(shown), sel, sel);
+    this.pathMarks(o, path, this.localToScreen(shown), sel, sel, curveOf(shown) === 'spline');
     const g = this.pdrag;
     if (g?.kind === 'marquee' && g.moved) o.marquee = [Math.min(g.s0[0], g.s1[0]), Math.min(g.s0[1], g.s1[1]), Math.abs(g.s1[0] - g.s0[0]), Math.abs(g.s1[1] - g.s0[1])];
-    o.bar = { kind: 'points', points: allKeys(path).length, selected: sel.size };
+    o.bar = { kind: 'points', points: allKeys(path).length, selected: sel.size, curve: curveOf(shown) ?? 'bezier' };
     return o;
   }
 
@@ -1557,7 +1895,7 @@ export class ShapeTool {
     if (s) o.outlines = this.outline(s);
     const last = new Set([keyOf({ c: 0, i: n - 1 })]);
     if (this.penDrag?.closing) last.add('0:0');
-    this.pathMarks(o, [pen.c], sc, last, last);
+    this.pathMarks(o, [pen.c], sc, pen.curve === 'spline' ? new Set() : last, last, pen.curve === 'spline');
     // The next segment, from the last point to the pointer (it bends with the last out handle).
     if (this.pointer && !this.penDrag && !pen.c.closed) {
       const v = getPt([pen.c], { c: 0, i: n - 1 });
@@ -1568,7 +1906,7 @@ export class ShapeTool {
       const [fx, fy] = sc(pen.c.pts[0], pen.c.pts[1]);
       if (n >= 2 && Math.hypot(px - fx, py - fy) <= 10) o.tip = { text: 'Click the first point to close the shape', x: fx + 16, y: fy + 18 };
     }
-    o.bar = { kind: 'pen', points: n, selected: 0 };
+    o.bar = { kind: 'pen', points: n, selected: 0, curve: pen.curve };
     return o;
   }
 
@@ -1576,7 +1914,8 @@ export class ShapeTool {
   private readout(): SelectOverlay['readout'] {
     const kind = this.create ? 'create' : this.edit?.moved ? this.edit.kind : null;
     if (!kind || !this.pointer || kind === 'move') return null;
-    const list = [...this.drafts.values()];
+    // The shapes the gesture changes (a part shows its own numbers, not its compound's).
+    const list = this.edit ? [...this.edit.orig.keys()].map((id) => this.current(id)).filter((s): s is Shape => !!s) : [...this.drafts.values()];
     if (!list.length) return null;
     const s = list[0];
     const n = (v: number) => (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10);
@@ -1606,6 +1945,23 @@ export class ShapeTool {
 }
 
 // --- helpers ---------------------------------------------------------------------------------------
+
+/** The curve of a shape's path (non-path shapes become Bezier paths). */
+const curveOf = (s: Shape) => (s.kind === 'path' ? s.curve : undefined);
+
+/** The path that point editing changes: a path's own points, or any other shape as a Bezier path. */
+function editPath(s: Shape): PathContour[] {
+  return s.kind === 'path' ? clonePath(s.path ?? []) : toPath(s);
+}
+
+/** Radius of the smoothness ring around a selected spline point (CSS px). */
+export const ringRadius = (touch: boolean) => (touch ? 30 : 20);
+
+/** Where the ring's knob is: at the top for a corner, clockwise up to the bottom for soft (1), counterclockwise for through (-1). */
+export function ringKnob(x: number, y: number, smooth: number, touch: boolean): Pt {
+  const a = smooth * Math.PI, r = ringRadius(touch);
+  return [x + r * Math.sin(a), y - r * Math.cos(a)];
+}
 
 /** Shapes with radius dots: rectangles (a radius per corner), polygons and stars (one rounding). */
 const hasRadiusDots = (s: Shape) => s.kind === 'rect' || s.kind === 'polygon' || s.kind === 'star';

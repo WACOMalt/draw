@@ -156,7 +156,7 @@ export type LayerKind = (typeof LAYER_KINDS)[number];
 // --- vector shapes ---------------------------------------------------------------------------
 
 /** Never remove a kind after a release: old documents would break. Add new ones. */
-export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'path'] as const;
+export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'path', 'compound'] as const;
 export type ShapeKind = (typeof SHAPE_KINDS)[number];
 export const STROKE_ALIGNS = ['center', 'inside', 'outside'] as const;
 export type StrokeAlign = (typeof STROKE_ALIGNS)[number];
@@ -177,6 +177,33 @@ export interface PathContour {
   pts: number[];
 }
 export const POINT_STRIDE = 7;
+/**
+ * How a part of a compound shape combines with the result of the parts below it. The first
+ * part's op does not count: the result starts as that part.
+ */
+export const COMPOUND_OPS = ['unite', 'subtract', 'intersect', 'exclude'] as const;
+export type CompoundOp = (typeof COMPOUND_OPS)[number];
+
+/**
+ * A part of a compound shape: the geometry of a shape (a rectangle, an ellipse, a polygon, a star
+ * or a path, with its live settings) in the compound's local units, without a style: the compound
+ * draws the result with its own fill and stroke.
+ */
+export type CompoundPart = Pick<
+  ShapeProps,
+  'w' | 'h' | 'm' | 'radii' | 'radiiLinked' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'path' | 'curve'
+> & { kind: Exclude<ShapeKind, 'line' | 'compound'>; op: CompoundOp; name?: string };
+
+/**
+ * The curve of a path, one for all its points. bezier: each point has two handles. spline: an
+ * x-spline (Blanc and Schlick, 1995) through or near its points, without handles: the 7th number
+ * of a point is its smoothness, -1 to 1. Negative: the curve goes through the point, round at -1.
+ * 0: a sharp corner at the point. Positive: the curve bends toward the point without touching it
+ * (soft), most at 1. The handle numbers of a spline point repeat its anchor.
+ */
+export const CURVE_TYPES = ['bezier', 'spline'] as const;
+export type CurveType = (typeof CURVE_TYPES)[number];
+
 /**
  * corner: the two handles move on their own. smooth: the handles stay on one line (each keeps
  * its length). symmetric: the handles stay on one line with the same length.
@@ -199,6 +226,8 @@ export type PointType = (typeof POINT_TYPES)[number];
  * - line: `line`, the start and end points (x0, y0, x1, y1) in the frame.
  * - path: `path`, Bezier contours (PathContour). Point editing turns any other kind into a
  *   path. The frame is the box of the curve.
+ * - compound: `parts`, shapes combined live (unite, subtract, intersect, exclude), in the
+ *   compound's local units. The frame is the box of the parts.
  * The polygon and the star fill the frame: their points are scaled to its width and height.
  */
 export interface ShapeProps {
@@ -216,6 +245,10 @@ export interface ShapeProps {
   rounding?: number;
   line?: [number, number, number, number];
   path?: PathContour[];
+  /** The curve of a path (absent: bezier). */
+  curve?: CurveType;
+  /** The parts of a compound shape, bottom to top. */
+  parts?: CompoundPart[];
   /** #rrggbb, or null: no fill. Lines have no fill. */
   fill: string | null;
   /** #rrggbb, or null: no stroke. */
@@ -247,7 +280,7 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -418,6 +451,8 @@ export const LIMITS = {
   /** Points of all contours of one path, and its contours. */
   maxPathPoints: 5000,
   maxContours: 100,
+  /** Parts of one compound shape. */
+  maxParts: 64,
 } as const;
 
 /** Unambiguous alphabet for session codes: no 0/O, 1/I/L. */

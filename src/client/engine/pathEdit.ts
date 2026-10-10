@@ -1,8 +1,8 @@
 // Edits of path points (point editing and the Pen tool, shapeTool.ts). Pure functions: each
 // returns new contours and leaves its input alone. Coordinates are local units of the shape.
 
-import { cubicAt, splitCubic } from '../../shared/shapes';
-import { POINT_STRIDE as S, type PathContour } from '../../shared/types';
+import { cubicAt, splineSegs, splitCubic, xAt } from '../../shared/shapes';
+import { POINT_STRIDE as S, type CurveType, type PathContour } from '../../shared/types';
 
 export const CORNER = 0;
 export const SMOOTH = 1;
@@ -161,8 +161,29 @@ export function segCubic(c: PathContour, i: number): number[] {
 /** Segments of a contour: one per point, minus one when it is open. */
 export const segCount = (c: PathContour) => (c.closed ? count(c) : Math.max(0, count(c) - 1));
 
-/** Adds a point on segment `seg` at t, without changing the curve. */
-export function insertPoint(path: PathContour[], c: number, seg: number, t: number): { path: PathContour[]; key: PKey } {
+/** A point on segment `seg` of a contour at t, for either curve. */
+export function segAt(con: PathContour, curve: CurveType | undefined, seg: number, t: number): [number, number] {
+  if (curve === 'spline') {
+    const g = splineSegs(con)[seg];
+    return xAt(g.p, g.s1, g.s2, t);
+  }
+  return cubicAt(segCubic(con, seg), t);
+}
+
+/** Spline segments of a contour (a closed spline needs three points). */
+const splineSegCount = (c: PathContour) => (c.closed && count(c) > 2 ? count(c) : Math.max(0, count(c) - 1));
+
+/**
+ * Adds a point on segment `seg` at t. A Bezier curve keeps its shape; a spline gets a point there
+ * that the curve goes through (smoothness -1), which moves the curve a little.
+ */
+export function insertPoint(path: PathContour[], c: number, seg: number, t: number, curve?: CurveType): { path: PathContour[]; key: PKey } {
+  if (curve === 'spline') {
+    const p = clonePath(path);
+    const [x, y] = segAt(p[c], curve, seg, t);
+    p[c].pts.splice((seg + 1) * S, 0, x, y, x, y, x, y, -1);
+    return { path: p, key: { c, i: seg + 1 } };
+  }
   const p = clonePath(path);
   const con = p[c], n = count(con), j = (seg + 1) % n;
   const cub = segCubic(con, seg);
@@ -199,6 +220,41 @@ export function removePoints(path: PathContour[], keys: PKey[]): PathContour[] {
   return out;
 }
 
+// --- splines -----------------------------------------------------------------------------------
+
+/** The smoothness of a spline point (the 7th number). */
+export const smoothOf = (p: PathContour[], k: PKey) => p[k.c].pts[k.i * S + 6];
+
+/** Sets the smoothness of spline points (-1 through, 0 corner, 1 soft). */
+export function setSmoothness(path: PathContour[], keys: PKey[], v: number): PathContour[] {
+  const p = clonePath(path);
+  const s = Math.max(-1, Math.min(1, v));
+  for (const k of keys) p[k.c].pts[k.i * S + 6] = s;
+  return p;
+}
+
+/** Double-click on a spline point: a corner goes through round (-1); any other becomes a corner. */
+export function toggleSplinePoint(path: PathContour[], k: PKey): PathContour[] {
+  return setSmoothness(path, [k], smoothOf(path, k) === 0 ? -1 : 0);
+}
+
+/**
+ * Bezier points as spline points: the anchors stay; a corner without handles stays a corner (0),
+ * any other point goes through round (-1).
+ */
+export function bezierToSpline(path: PathContour[]): PathContour[] {
+  return path.map((c) => {
+    const pts = c.pts.slice();
+    for (let i = 0; i < pts.length; i += S) {
+      const smooth = pts[i + 6] !== CORNER || pts[i + 2] !== pts[i] || pts[i + 3] !== pts[i + 1] || pts[i + 4] !== pts[i] || pts[i + 5] !== pts[i + 1];
+      pts[i + 2] = pts[i + 4] = pts[i];
+      pts[i + 3] = pts[i + 5] = pts[i + 1];
+      pts[i + 6] = smooth ? -1 : 0;
+    }
+    return { closed: c.closed, pts };
+  });
+}
+
 /** Every point key of a path. */
 export function allKeys(path: PathContour[]): PKey[] {
   const out: PKey[] = [];
@@ -212,13 +268,15 @@ export function allKeys(path: PathContour[]): PKey[] {
  * The point of the path nearest to a screen point (`toScreen` maps local units to screen
  * pixels): its segment, its t and the distance in pixels. Null when there is no segment.
  */
-export function nearestOnPath(path: PathContour[], toScreen: (x: number, y: number) => [number, number], x: number, y: number): { c: number; seg: number; t: number; d: number } | null {
+export function nearestOnPath(path: PathContour[], toScreen: (x: number, y: number) => [number, number], x: number, y: number, curve?: CurveType): { c: number; seg: number; t: number; d: number } | null {
   let best: { c: number; seg: number; t: number; d: number } | null = null;
   path.forEach((con, c) => {
-    for (let seg = 0; seg < segCount(con); seg++) {
-      const cub = segCubic(con, seg);
+    const n = curve === 'spline' ? splineSegCount(con) : segCount(con);
+    const xs = curve === 'spline' ? splineSegs(con) : null;
+    for (let seg = 0; seg < n; seg++) {
+      const cub = xs ? null : segCubic(con, seg);
       const dist = (t: number) => {
-        const [lx, ly] = cubicAt(cub, t);
+        const [lx, ly] = xs ? xAt(xs[seg].p, xs[seg].s1, xs[seg].s2, t) : cubicAt(cub!, t);
         const [sx, sy] = toScreen(lx, ly);
         return Math.hypot(sx - x, sy - y);
       };
