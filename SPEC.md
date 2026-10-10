@@ -548,7 +548,7 @@ Toolbar order: brush, eraser, stroke eraser, the colors, eyedropper, Select, Pen
 - Enter, Esc or Done ends an open path. Backspace, Ctrl+Z or "Undo point" takes back the last point. Another tool also ends the path. A path needs two points, or it goes.
 - The path is a draft until it ends, so other people see it grow. Then one `shape.add` goes out (one undo step), on the active shape layer or a new one above the active layer.
 - With one shape selected and no path in progress, a click on its outline adds a point and a click on its point removes it.
-- "New points: Bezier | Spline" in the options bar sets the curve type of the next path. In spline mode, a click adds a point with the smoothness of the Smoothness slider (-100% to 100%, -1 to 1), and a drag places the point. The curve shows through or near the points at once.
+- "New points: Bezier | Spline" in the options bar sets the curve type of the next path. It shows whenever the Pen is the active tool, also with a shape selected. In spline mode, a click adds a point with the smoothness of the Smoothness slider (-100% to 100%, -1 to 1), and a drag places the point. The curve shows through or near the points at once.
 
 **Compound shapes.** A compound shape combines shapes live (section 4.1).
 

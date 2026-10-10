@@ -387,8 +387,9 @@
         </select>
       </label>
     {/if}
-    {#if ed.tool === 'pen' && !selShapes.length}
-      <div class="toggles" role="radiogroup" aria-label="New points">
+    {#if ed.tool === 'pen'}
+      <!-- Always shown with the Pen: it sets the curve of the next path (a path keeps the curve it started with). -->
+      <div class="toggles" role="radiogroup" aria-label="New points" title="The curve of the next path you draw">
         <span class="lbl2">New points</span>
         <button class="icon wide" class:on={ed.penStyle.curve !== 'spline'} role="radio" aria-checked={ed.penStyle.curve !== 'spline'} title="Bezier: click for corners, drag for curves with handles" onclick={() => (ed.penStyle.curve = 'bezier')}>Bezier</button>
         <button class="icon wide" class:on={ed.penStyle.curve === 'spline'} role="radio" aria-checked={ed.penStyle.curve === 'spline'} title="Spline: a smooth curve through or near the points, without handles" onclick={() => (ed.penStyle.curve = 'spline')}>Spline</button>
