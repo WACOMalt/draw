@@ -2,7 +2,7 @@
 // half-float (RGBA16F) buffers when the device supports it, else RGBA8. Blend modes run in a
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
-import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, strokeSeed } from '../../../shared/brush';
+import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, lowFlow, strokeSeed } from '../../../shared/brush';
 import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Shape, type Stroke } from '../../../shared/types';
 import { byZ } from '../../../shared/shapes';
 import { compose, effectivelyVisible, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
@@ -1147,6 +1147,17 @@ export class GLRenderer implements Renderer {
   }
 
   /**
+   * The stroke builds up in the stroke buffer (strokeT) first, as a stroke in progress does: below
+   * full opacity, and with low-flow dabs in 8-bit buffers (see lowFlow). Else its dabs go straight
+   * onto the tile. In 8-bit buffers, low-flow dabs straight on paint stopped at a lighter floor
+   * than the stroke in progress showed, and the stroke got lighter when the pen lifted. `dot`: the
+   * stroke draws as one dot here (stageStroke), which cannot build up.
+   */
+  private viaBuffer(b: Brush, dot: boolean): boolean {
+    return b.opacity < 1 || (!dot && this.precision === 8 && lowFlow(b));
+  }
+
+  /**
    * Strokes with the same key draw the same way apart from color and hardness, so a run of them
    * shares one draw call. Null: the stroke needs a call of its own (below full opacity it goes
    * through a stroke buffer; grain has a per-stroke origin).
@@ -1154,9 +1165,10 @@ export class GLRenderer implements Renderer {
   private batchKey(rec: StrokeRec, scale: number): string | null {
     if (rec.stroke.vector) return null;
     const b = rec.stroke.brush;
-    if (b.opacity < 1 || (b.grain && (b.grainStrength ?? 0.5))) return null;
+    const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2;
+    if (this.viaBuffer(b, dot) || (b.grain && (b.grainStrength ?? 0.5))) return null;
     const erase = b.tool === 'erase' ? 'e' : 'p';
-    if ((rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2) return `${erase}|round|1`;
+    if (dot) return `${erase}|round|1`;
     const s = brushShape(b);
     return `${erase}|${s.tip}|${s.roundness}`;
   }
@@ -1206,21 +1218,31 @@ export class GLRenderer implements Renderer {
     let work = 2000 + fill; // the draw call and the dabs
     const erase = b.tool === 'erase';
     const grain = dot ? null : this.grainFor(b, rec.stroke.pts[0], rec.stroke.pts[1], wx0, wy0, scale);
-    if (b.opacity >= 1) {
+    if (!this.viaBuffer(b, dot)) {
       // Source-over and destination-out are associative: at full opacity the dabs can go
       // straight onto the tile with the same result as a separate stroke buffer.
       this.bindTarget(target);
       this.blendFor(erase);
       this.drawDabs(n, brush, w, h, grain, true);
     } else {
+      // Only the box of the stroke on the tile: zoomed out, one tile holds hundreds of strokes.
+      const x0 = Math.max(0, Math.floor((rec.x0 - wx0) * scale) - 1), y0 = Math.max(0, Math.floor((rec.y0 - wy0) * scale) - 1);
+      const x1 = Math.min(w, Math.ceil((rec.x1 - wx0) * scale) + 1), y1 = Math.min(h, Math.ceil((rec.y1 - wy0) * scale) + 1);
+      const bw = x1 - x0, bh = y1 - y0;
+      if (bw <= 0 || bh <= 0) return work;
+      const gl = this.gl;
       this.bindTarget(this.strokeT);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(x0, y0, bw, bh);
       this.clear();
+      gl.disable(gl.SCISSOR_TEST);
       this.blendFor(false);
       this.drawDabs(n, brush, w, h, grain, true);
       this.bindTarget(target);
       this.blendFor(erase);
-      this.copy(this.strokeT.tex, target, [0, 0, w, h], b.opacity);
-      work += 3 * w * h; // clear, copy
+      const sw = this.strokeT.w, sh = this.strokeT.h;
+      this.copy(this.strokeT.tex, target, [x0, y0, bw, bh], b.opacity, [x0 / sw, y0 / sh, x1 / sw, y1 / sh]);
+      work += 3 * bw * bh; // clear, copy
     }
     return work;
   }
