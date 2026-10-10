@@ -1,7 +1,7 @@
 // Which newer document features a canvas uses. The server lists them in `welcome`; a client
 // that does not know one of them asks for an update instead of drawing the canvas wrong.
 
-import type { Brush, DocFeature, Layer, Stroke } from './types';
+import type { Brush, DocFeature, Layer, Shape, Stroke } from './types';
 
 /** True when the brush draws differently from the plain round brush of older clients. */
 export function brushHasDynamics(b: Brush): boolean {
@@ -16,7 +16,7 @@ export function brushHasDynamics(b: Brush): boolean {
   );
 }
 
-export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>): DocFeature[] {
+export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, shapes: Iterable<Shape> = []): DocFeature[] {
   const f = new Set<DocFeature>();
   for (const l of layers) {
     if (l.deleted) continue;
@@ -30,7 +30,13 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>):
     if (s.deleted) continue;
     if (s.mask) f.add('mask');
     if (brushHasDynamics(s.brush)) f.add('tips');
-    if (f.has('mask') && f.has('tips')) break; // nothing more to learn from strokes
+    if (s.vector) f.add('vectors');
+    if (f.has('mask') && f.has('tips') && f.has('vectors')) break; // nothing more to learn from strokes
+  }
+  for (const s of shapes) {
+    if (s.deleted || s.kind !== 'path') continue;
+    f.add('paths');
+    break;
   }
   return [...f];
 }

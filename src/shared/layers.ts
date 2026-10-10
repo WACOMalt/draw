@@ -149,7 +149,7 @@ export const applyPoint = (m: Affine, x: number, y: number): [number, number] =>
  * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). Null: a point would go
  * past `maxCoord` or the size out of range.
  */
-export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush'> | null {
+export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector'> | null {
   const pts = s.pts.slice();
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1];
@@ -169,6 +169,12 @@ export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRang
       const deg = (Math.atan2(m[1], m[0]) * 180) / Math.PI;
       brush.angle = ((((brush.angle ?? 0) + deg) % 360) + 360) % 360;
     }
+  }
+  if (s.vector) {
+    // A vector stroke: its shape's matrix follows (its frame corners, in pts, are checked above).
+    const vm = compose(m, s.vector.m);
+    if (!validAffine(vm)) return null;
+    return { pts, brush, vector: { ...s.vector, m: vm } };
   }
   return { pts, brush };
 }

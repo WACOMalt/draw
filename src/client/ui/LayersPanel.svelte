@@ -417,6 +417,17 @@
       <Icon name="clip" />
     </button>
     <button class="icon" title="Duplicate (Ctrl+J)" disabled={!active} onclick={() => active && engine?.duplicate(active.id)}><Icon name="copy" /></button>
+    {#if active?.kind === 'shape'}
+      <button
+        class="icon"
+        title="Convert to a paint layer: the shapes become paint (exact at any zoom) that the brush and the erasers work on. Undo turns it back."
+        aria-label="Convert to a paint layer"
+        disabled={!ed.canEdit}
+        onclick={() => active && engine?.convertLayerToPaint(active.id)}
+      >
+        <Icon name="brush" />
+      </button>
+    {/if}
     {#if sheet}
       <button class="icon" title="Transform: move, scale, rotate" disabled={!active || active.kind === 'adjust'} onclick={() => engine?.startTransform()}>
         <Icon name="transform" />

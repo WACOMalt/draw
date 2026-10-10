@@ -7,6 +7,7 @@ import { DabPainter, StampCache } from './stamp';
 import { StrokeIndex, strokeDabs, strokeKey, type StrokeRec as Rec } from './strokeIndex';
 import { ShapeIndex, shapeTouches, type ShapeRec } from './shapeIndex';
 import { drawShapes } from './shapeRaster';
+import { vectorShape } from '../../shared/flatten';
 import { TILE, tileKey, tileWorld, type FromWorker, type TileView, type ToWorker } from './tiles';
 
 interface TileRef {
@@ -75,6 +76,11 @@ function renderShapeTile(t: TileRef): ImageBitmap | null {
 }
 
 function drawStroke(ctx: OffscreenCanvasRenderingContext2D, rec: Rec, wx0: number, wy0: number, wx1: number, wy1: number, scale: number): void {
+  if (rec.stroke.vector) {
+    // A shape made paint: its exact outline, in the stroke order.
+    drawShapes(ctx, [vectorShape(rec.stroke)], wx0, wy0, scale, TILE, TILE);
+    return;
+  }
   const painter = new DabPainter(ctx, stamps, rec.stroke.brush, wx0, wy0, scale);
   const w = (rec.x1 - rec.x0) * scale;
   const h = (rec.y1 - rec.y0) * scale;

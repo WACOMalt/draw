@@ -2,7 +2,8 @@
 // server has not echoed yet. The UI shows confirmed state with pending layer ops on top.
 
 import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shared/layers';
-import { shapeBounds, transformShapeMatrix } from '../../shared/shapes';
+import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
+import { planFromPaint, planToPaint, vectorShape } from '../../shared/flatten';
 import { LIMITS, type AppliedOp, type Layer, type Op, type Shape, type Stroke } from '../../shared/types';
 
 export interface PendingOp {
@@ -47,8 +48,10 @@ export { sortLayers } from '../../shared/layers';
 export interface StrokeChanges {
   /** Strokes that changed in place (same id: the renderer drops and adds them). */
   changed: Stroke[];
-  /** New strokes (copies). */
+  /** New strokes (copies, vector strokes). */
   added: Stroke[];
+  /** Strokes that are gone. */
+  removed?: string[];
   /** Shapes that are new or changed (the renderer replaces them by id). */
   shapes: Shape[];
   /** Shapes that are gone (removed). */
@@ -64,6 +67,8 @@ export interface Bounds {
 }
 
 export function strokeBounds(s: Stroke): Bounds {
+  // A vector stroke covers what its shape draws.
+  if (s.vector) return shapeBounds(vectorShape(s));
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   const p = s.pts;
   for (let i = 0; i < p.length; i += 3) {
@@ -120,7 +125,7 @@ export class Doc {
   }
 
   /** Applies a server op to the confirmed state. Returns what changed in the strokes, if anything. */
-  apply(seq: number, op: AppliedOp): StrokeChanges | null {
+  apply(seq: number, op: AppliedOp, by = ''): StrokeChanges | null {
     this.seq = seq;
     switch (op.type) {
       case 'layer.transform': {
@@ -174,6 +179,37 @@ export class Doc {
         this.putShape(next);
         this.version++;
         return { changed: [], added: [], shapes: next.deleted ? [] : [next], shapesGone: [] };
+      }
+      case 'shapes.toPaint': {
+        const plan = planToPaint(this.layers, this.strokes, this.shapes, op, seq, by);
+        if ('error' in plan) return null; // the server accepted it: the documents differ
+        const added = plan.strokes;
+        for (const st of added) {
+          this.strokes.set(st.id, st);
+          this.bounds.set(st.id, strokeBounds(st));
+        }
+        for (const id of plan.shapes) this.putShape({ ...this.shapes.get(id)!, deleted: true });
+        if (plan.kind) this.layers.set(op.layerId, { ...this.layers.get(op.layerId)!, kind: plan.kind });
+        this.version++;
+        return { changed: [], added, shapes: [], shapesGone: plan.shapes };
+      }
+      case 'shapes.fromPaint': {
+        const plan = planFromPaint(this.layers, this.strokes, this.shapes, op);
+        if ('error' in plan) return null;
+        for (const id of plan.strokes) {
+          this.strokes.delete(id);
+          this.bounds.delete(id);
+        }
+        const back: Shape[] = [];
+        for (const id of plan.shapes) {
+          const sh: Shape = { ...this.shapes.get(id)! };
+          delete sh.deleted;
+          this.putShape(sh);
+          back.push(sh);
+        }
+        if (plan.kind) this.layers.set(op.layerId, { ...this.layers.get(op.layerId)!, kind: plan.kind });
+        this.version++;
+        return { changed: [], added: [], removed: plan.strokes, shapes: back, shapesGone: [] };
       }
       case 'shape.remove': {
         const old = this.shapes.get(op.id);
@@ -245,7 +281,7 @@ export class Doc {
   }
 }
 
-/** A shape with some props changed (the client sends only props that fit the shape's kind). */
+/** A shape with some props changed. Settings of other kinds go, as on the server. */
 export function applyShapeProps(s: Shape, props: Partial<Shape>): Shape {
-  return { ...s, ...props };
+  return stripForKind({ ...s, ...props });
 }

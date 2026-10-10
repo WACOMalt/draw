@@ -12,10 +12,10 @@ export const BDRAW_EXT = 'bdraw';
 export const BDRAW_MIME = 'application/x-bdraw';
 /**
  * 2: layers may have adjust, clip and mask; strokes may have mask and brush dynamics.
- * 3: shape layers and `shapes`. A file without shapes is still written as 2, so servers from
- * before shapes accept it.
+ * 3: shape layers and `shapes`. 4: paths (kind 'path') and vector strokes (`vector`). A file is
+ * written with the lowest version that holds it, so older servers accept what they can read.
  */
-export const BDRAW_VERSION = 3;
+export const BDRAW_VERSION = 4;
 
 export interface BdrawFile {
   format: 'bdraw';
@@ -50,15 +50,16 @@ export function makeBdraw(
   const live = [...layers].filter((l) => !l.deleted).sort((a, b) => a.order - b.order);
   const ids = new Set(live.map((l) => l.id));
   const liveShapes = [...shapes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.z - b.z);
+  const liveStrokes = [...strokes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.seq - b.seq);
   return {
     format: 'bdraw',
-    version: liveShapes.length || live.some((l) => l.kind === 'shape') ? BDRAW_VERSION : 2,
+    version: liveShapes.some((s) => s.kind === 'path') || liveStrokes.some((s) => s.vector) ? 4 : liveShapes.length || live.some((l) => l.kind === 'shape') ? 3 : 2,
     app,
     savedAt: new Date().toISOString(),
     ...(preview ? { preview } : {}),
     ...(source ? { source } : {}),
     layers: live,
-    strokes: [...strokes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.seq - b.seq),
+    strokes: liveStrokes,
     ...(liveShapes.length ? { shapes: liveShapes } : {}),
   };
 }

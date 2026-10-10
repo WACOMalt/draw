@@ -2,6 +2,7 @@
   import { BRUSH_TIPS, GRAINS, LIMITS, SHAPE_KINDS, type BrushTip, type GrainId, type LineCap, type Shape, type ShapeProps, type StrokeAlign } from '../../shared/types';
   import type { Engine } from '../engine/engine';
   import { SHAPE_LABEL } from '../engine/shapeTool';
+  import { centerOnly } from '../../shared/shapes';
   import { ed, type ShapeStyle, type Tool } from '../state.svelte';
   import Icon from './Icon.svelte';
   import PresetsPanel from './PresetsPanel.svelte';
@@ -17,6 +18,7 @@
     strokeEraser: 'Stroke eraser',
     eyedropper: 'Eyedropper',
     select: 'Select',
+    pen: 'Pen',
     shape: 'Shapes',
     hand: 'Hand',
     zoom: 'Zoom',
@@ -47,9 +49,9 @@
   const first = $derived(selShapes[0] ?? null);
   /** Screen pixels per local unit of a shape. */
   const kOf = (s: Shape) => Math.sqrt(Math.abs(s.m[0] * s.m[3] - s.m[1] * s.m[2])) * ed.view.zoom;
-  const kind = $derived(first?.kind ?? ed.shapeKind);
+  const kind = $derived(first?.kind ?? (ed.tool === 'pen' ? 'path' : ed.shapeKind));
   const st = $derived.by((): ShapeStyle => {
-    if (!first) return ed.shapeStyle;
+    if (!first) return ed.tool === 'pen' ? { ...ed.shapeStyle, ...ed.penStyle } : ed.shapeStyle;
     const k = kOf(first);
     const r = first.radii ?? [0, 0, 0, 0];
     return {
@@ -66,8 +68,11 @@
       rounding: (first.rounding ?? 0) * k,
     };
   });
-  const showStyle = $derived(ed.tool === 'shape' || selShapes.length > 0);
-  const kinds = $derived(new Set(selShapes.length ? selShapes.map((s) => s.kind) : [ed.shapeKind]));
+  const showStyle = $derived(ed.tool === 'shape' || ed.tool === 'pen' || selShapes.length > 0);
+  const kinds = $derived(new Set(selShapes.length ? selShapes.map((s) => s.kind) : [kind]));
+  // Alignment is for closed outlines; caps are for open ones (lines, open paths, the Pen).
+  const alignable = $derived(selShapes.length ? selShapes.some((s) => !centerOnly(s)) : kind !== 'line' && kind !== 'path');
+  const capped = $derived(selShapes.length ? selShapes.some((s) => centerOnly(s)) : kind === 'line' || kind === 'path');
   const has = (...k: Shape['kind'][]) => k.some((x) => kinds.has(x));
   const round = (v: number) => (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10);
 
@@ -76,14 +81,17 @@
    * null: not for this kind), and in the style for the next shape. `live`: a drag in progress.
    */
   function setShape(style: Partial<ShapeStyle>, fn: (s: Shape, k: number) => Partial<ShapeProps> | null, live = false) {
-    Object.assign(ed.shapeStyle, style);
+    // The Pen keeps a style of its own (its paths start without a fill).
+    if (ed.tool === 'pen') {
+      for (const k of ['fill', 'stroke', 'strokeWidth', 'align', 'cap'] as const) if (k in style) (ed.penStyle as Record<string, unknown>)[k] = style[k];
+    } else Object.assign(ed.shapeStyle, style);
     if (selShapes.length) engine?.shapes.editSelected((s) => fn(s, kOf(s)), live);
   }
   const setFill = (v: string | null, live = false) => setShape({ fill: v }, (s) => (s.kind === 'line' ? null : { fill: v }), live);
   const setStroke = (v: string | null, live = false) => setShape({ stroke: v }, () => ({ stroke: v }), live);
   const setWidth = (px: number, live = false) =>
     setShape({ strokeWidth: px }, (s, k) => ({ strokeWidth: px / k, ...(s.stroke ? {} : { stroke: ed.shapeStyle.stroke ?? ed.fg }) }), live);
-  const setAlign = (a: StrokeAlign) => setShape({ align: a }, (s) => (s.kind === 'line' ? null : { align: a }));
+  const setAlign = (a: StrokeAlign) => setShape({ align: a }, (s) => (centerOnly(s) ? null : { align: a }));
   const setCap = (c: LineCap) => setShape({ cap: c }, () => ({ cap: c }));
   function setRadius(i: number | null, px: number, live = false) {
     const radii = [...st.radii] as ShapeStyle['radii'];
@@ -108,6 +116,15 @@
   const ALIGNS: [StrokeAlign, string][] = [['inside', 'Inside'], ['center', 'Center'], ['outside', 'Outside']];
   const CAPS: [LineCap, string][] = [['butt', 'Butt'], ['round', 'Round'], ['square', 'Square']];
   const activeLayer = $derived(ed.layers.find((l) => l.id === ed.activeLayerId) ?? null);
+
+  /** The element's text as its tooltip: the hints are cut to one line. */
+  function fullTitle(node: HTMLElement) {
+    const set = () => (node.title = node.textContent?.trim() ?? '');
+    set();
+    const mo = new MutationObserver(set);
+    mo.observe(node, { childList: true, characterData: true, subtree: true });
+    return { destroy: () => mo.disconnect() };
+  }
 
   /** True when any dynamics setting is not at its default: the button shows it is on. */
   const dynamicsOn = $derived(
@@ -162,15 +179,18 @@
   {#if ed.tool === 'shape' && !stacked}
     <span class="kindname"><Icon name={ed.shapeKind} />{SHAPE_LABEL[ed.shapeKind]}</span>
   {/if}
+  {#if ed.pointEdit && !stacked}
+    <span class="kindname">Points</span>
+  {/if}
   {#if selShapes.length && !stacked}
     <!-- With a selection, the options below change it (also with the Shapes tool). -->
     <span class="selname" title="The options change the selected shapes">
-      {ed.tool === 'shape' ? 'Editing: ' : ''}{selShapes.length === 1 ? selShapes[0].name || SHAPE_LABEL[selShapes[0].kind] : `${selShapes.length} shapes`}
+      {ed.tool === 'shape' || ed.tool === 'pen' ? 'Editing: ' : ''}{selShapes.length === 1 ? selShapes[0].name || SHAPE_LABEL[selShapes[0].kind] : `${selShapes.length} shapes`}
     </span>
   {/if}
   {#if showStyle}
     <div class="colorsrow">
-      {#if has('rect', 'ellipse', 'polygon', 'star')}
+      {#if has('rect', 'ellipse', 'polygon', 'star', 'path')}
         <span class="field"><span>Fill</span><ShapeColor big={stacked} label="Fill" value={st.fill} oninput={(v) => setFill(v, true)} onchange={(v) => setFill(v)} /></span>
       {/if}
       <span class="field"><span>Stroke</span><ShapeColor big={stacked} label="Stroke" value={st.stroke} oninput={(v) => setStroke(v, true)} onchange={(v) => setStroke(v)} /></span>
@@ -178,7 +198,7 @@
     {#key `${first?.id}:${ed.selection.length}`}
       <Slider wide={stacked} label="Width" value={st.strokeWidth} min={0.5} max={LIMITS.maxBrushPx} step={0.1} log width={80} title="Stroke width, in screen pixels at the current zoom" oninput={(v) => setWidth(v, true)} onchange={(v) => setWidth(v)} />
     {/key}
-    {#if has('rect', 'ellipse', 'polygon', 'star')}
+    {#if alignable}
       <div class="toggles" role="radiogroup" aria-label="Stroke alignment">
         {#each ALIGNS as [a, label]}
           <button class="icon wide" class:on={st.align === a} role="radio" aria-checked={st.align === a} title="The stroke lies {a === 'center' ? 'on the center of' : `${a}`} the outline" onclick={() => setAlign(a)}>{label}</button>
@@ -225,7 +245,7 @@
         <Slider wide={stacked} label="Rounding" value={st.rounding} min={0} max={500} step={0.1} log width={70} title="Corner rounding, in screen pixels" oninput={(v) => setRounding(v, true)} onchange={(v) => setRounding(v)} />
       {/if}
     {/key}
-    {#if kind === 'line' || (selShapes.length && has('line'))}
+    {#if capped}
       <div class="toggles" role="radiogroup" aria-label="Line caps">
         {#each CAPS as [c, label]}
           <button class="icon wide" class:on={st.cap === c} role="radio" aria-checked={st.cap === c} title="{label} line ends" onclick={() => setCap(c)}>{label}</button>
@@ -233,16 +253,26 @@
       </div>
     {/if}
   {/if}
-  {#if ed.tool === 'shape'}
-    <span class="hint">{kind === 'line' ? 'Shift: 45° steps · Alt: from the center' : 'Shift: square · Alt: from the center'} · Click: a 100 px shape</span>
+  {#if ed.tool === 'pen'}
+    <span class="hint" use:fullTitle>
+      {ed.penDrawing
+        ? 'Click: a corner · Drag: a curve point · Alt+drag: break the handles · Click the first point: close · Enter: finish · Backspace: last point'
+        : selShapes.length === 1
+          ? 'Click its outline: add a point · Click a point: remove it · Click elsewhere: a new path'
+          : 'Click: a corner point · Drag: a curve point with handles'}
+    </span>
+  {:else if ed.pointEdit}
+    <span class="hint" use:fullTitle>Drag points and handles · Alt+drag a handle: break it · Double-click a point: corner or smooth · Double-click the outline: add a point · Delete: remove · Enter or Esc: done</span>
+  {:else if ed.tool === 'shape'}
+    <span class="hint" use:fullTitle>{kind === 'line' ? 'Shift: 45° steps · Alt: from the center' : 'Shift: square · Alt: from the center'} · Click: a 100 px shape</span>
   {:else if ed.transform}
-    <span class="hint">The whole layer is the selection: drag inside to move, handles to scale, the round handle to rotate. Click a shape to select it.</span>
+    <span class="hint" use:fullTitle>The whole layer is the selection: drag inside to move, handles to scale, the round handle to rotate. Click a shape to select it.</span>
   {:else if selShapes.length}
-    <span class="hint">Drag inside: move · Handles: scale · Just outside a corner: rotate · Double-click: points</span>
+    <span class="hint" use:fullTitle>Drag inside: move · Handles: scale · Just outside a corner: rotate · Double-click: points</span>
   {:else if activeLayer && activeLayer.kind !== 'shape' && activeLayer.kind !== 'adjust'}
-    <span class="hint">Click a shape to select it. On a paint layer or a group with paint, Select moves, scales and rotates the whole layer.</span>
+    <span class="hint" use:fullTitle>Click a shape to select it. On a paint layer or a group with paint, Select moves, scales and rotates the whole layer.</span>
   {:else}
-    <span class="hint">Click a shape to select it · Shift+click: add or remove · Drag on empty canvas: select by rectangle</span>
+    <span class="hint" use:fullTitle>Click a shape to select it · Shift+click: add or remove · Drag on empty canvas: select by rectangle</span>
   {/if}
   {#if ed.tool === 'select'}
     <div class="toggles end">
@@ -252,6 +282,12 @@
         aria-pressed={ed.keepSelection}
         title="While on, clicks outside the box neither select another shape nor deselect. Shift+click still adds or removes; Esc and Deselect still clear."
         onclick={() => (ed.keepSelection = !ed.keepSelection)}>Keep selection</button
+      >
+      <button
+        class="icon wide"
+        disabled={!selShapes.length || !ed.canEdit}
+        title="The selected shapes become paint on a new paint layer above: the brush and the erasers work on them. Undo turns them back."
+        onclick={() => engine?.convertShapesToPaint()}>To paint layer</button
       >
       <button class="icon wide" disabled={!selShapes.length} title="Deselect (Esc)" onclick={() => engine?.shapes.deselect()}>Deselect (Esc)</button>
     </div>
@@ -331,11 +367,11 @@
         Active layer
       </button>
     </div>
-    <span class="hint">Removes every stroke whose path the circle touches. Undo brings them back.</span>
-  {:else if ed.tool === 'select' || ed.tool === 'shape'}
+    <span class="hint" use:fullTitle>Removes every stroke whose path the circle touches. Undo brings them back.</span>
+  {:else if ed.tool === 'select' || ed.tool === 'shape' || ed.tool === 'pen'}
     {@render shapeOpts()}
   {:else if ed.tool === 'eyedropper'}
-    <span class="hint">Click the canvas to pick a color from all layers. Hold Alt with the brush for a quick pick.</span>
+    <span class="hint" use:fullTitle>Click the canvas to pick a color from all layers. Hold Alt with the brush for a quick pick.</span>
   {:else if ed.tool === 'zoom'}
     <div class="toggles">
       <button class="icon wide" title="Zoom out (Ctrl+−)" onclick={() => engine?.zoomBy(0.5)}>−</button>
@@ -343,9 +379,9 @@
       <button class="icon wide" title="Actual size (Ctrl+1)" onclick={() => engine?.resetView()}>100%</button>
       <button class="icon wide" title="Fit everything (Ctrl+0)" onclick={() => engine?.fitAll()}>Fit all</button>
     </div>
-    <span class="hint">Click to zoom in. Alt+click or right-click to zoom out. Drag right or left to zoom smoothly.</span>
+    <span class="hint" use:fullTitle>Click to zoom in. Alt+click or right-click to zoom out. Drag right or left to zoom smoothly.</span>
   {:else}
-    <span class="hint">Drag to pan. Hold Space with any tool to pan. Scroll to zoom.</span>
+    <span class="hint" use:fullTitle>Drag to pan. Hold Space with any tool to pan. Scroll to zoom.</span>
   {/if}
 </div>
 
@@ -405,8 +441,18 @@
     border-color: var(--accent-dim);
     background: #24394c;
   }
+  /* One line: a hint that wrapped would add a row and move the canvas (also mid-gesture, when
+     the hint changes). The full text shows on hover. */
   .hint {
     color: var(--text-dim);
+    flex: 1 1 0;
+    min-width: 120px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .stacked .hint {
+    white-space: normal;
   }
   .kindname {
     display: inline-flex;

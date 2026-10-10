@@ -20,11 +20,16 @@ import {
   type LayerMask,
   type LayerProps,
   type Op,
+  type PathContour,
   type ShapeInput,
   type ShapeProps,
+  type ShapeUpdate,
+  type StrokeVector,
+  POINT_STRIDE,
+  POINT_TYPES,
 } from './types';
 import { validAffine } from './layers';
-import { cornersWithin } from './shapes';
+import { cornersWithin, stripForKind } from './shapes';
 
 export class ValidationError extends Error {}
 
@@ -205,8 +210,17 @@ export function validateOp(v: unknown): Op {
           brush: validateBrush(s.brush),
           pts: validatePoints(s.pts),
           ...(s.mask !== undefined ? { mask: id(s.mask, 'mask') } : {}),
+          // A vector stroke (from a .bdraw file; live clients make them with shapes.toPaint).
+          ...(s.vector !== undefined && s.mask === undefined ? { vector: validateVector(s.vector) } : {}),
         },
       };
+    }
+    case 'shapes.toPaint':
+    case 'shapes.fromPaint': {
+      if (!Array.isArray(o.ids) || o.ids.length < 1 || o.ids.length > LIMITS.maxShapes) fail('bad ids');
+      const ids = o.ids.map((x) => id(x, 'ids'));
+      if (new Set(ids).size !== ids.length) fail('duplicate ids');
+      return { type: o.type, key: id(o.key, 'key'), ids, layerId: id(o.layerId, 'layerId') };
     }
     case 'stroke.remove':
     case 'stroke.restore':
@@ -259,10 +273,34 @@ function tuple4(v: unknown, f: (x: unknown, what: string) => number, what: strin
 
 const colorOrNull = (v: unknown) => (v === null ? null : validateColor(v));
 
+/** Path contours: at most LIMITS.maxContours, LIMITS.maxPathPoints points in all, coordinates in range. */
+function pathContours(v: unknown): PathContour[] {
+  if (!Array.isArray(v) || v.length < 1 || v.length > LIMITS.maxContours) fail('bad path');
+  let total = 0;
+  return v.map((c) => {
+    const o = obj(c, 'path contour');
+    const pts = o.pts;
+    if (!Array.isArray(pts) || pts.length < POINT_STRIDE || pts.length % POINT_STRIDE !== 0) fail('bad path points');
+    total += pts.length / POINT_STRIDE;
+    if (total > LIMITS.maxPathPoints) fail('too many path points');
+    const out = new Array<number>(pts.length);
+    for (let i = 0; i < pts.length; i++) {
+      if (i % POINT_STRIDE === POINT_STRIDE - 1) {
+        const t = pts[i];
+        if (typeof t !== 'number' || !Number.isInteger(t) || t < 0 || t >= POINT_TYPES.length) fail('bad point type');
+        out[i] = t;
+      } else out[i] = coord(pts[i], 'path point');
+    }
+    return { closed: bool(o.closed, 'path closed'), pts: out };
+  });
+}
+
 /** Shape props, range checks only. `partial`: only the props present, at least one. */
-function shapeProps(v: unknown, partial: boolean): Partial<ShapeProps> {
+function shapeProps(v: unknown, partial: boolean): ShapeUpdate {
   const p = obj(v, 'props');
-  const out: Partial<ShapeProps> = {};
+  const out: ShapeUpdate = {};
+  // An update may change the kind (point editing makes a path; undo turns it back).
+  if (partial && p.kind !== undefined) out.kind = oneOf(p.kind, SHAPE_KINDS, 'kind');
   const want = (k: keyof ShapeProps) => p[k] !== undefined || !partial;
   if (want('name')) out.name = str(p.name, LIMITS.maxShapeName, 'name');
   if (want('z')) out.z = num(p.z, -1e12, 1e12, 'z');
@@ -291,6 +329,7 @@ function shapeProps(v: unknown, partial: boolean): Partial<ShapeProps> {
   if (p.innerRatio !== undefined) out.innerRatio = num(p.innerRatio, 0.01, 1, 'innerRatio');
   if (p.rounding !== undefined) out.rounding = len(p.rounding, 'rounding');
   if (p.line !== undefined) out.line = tuple4(p.line, coord, 'line');
+  if (p.path !== undefined) out.path = pathContours(p.path);
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -303,7 +342,7 @@ function shapeProps(v: unknown, partial: boolean): Partial<ShapeProps> {
 export function validateShapeInput(v: unknown): ShapeInput {
   const s = obj(v, 'shape');
   const kind = oneOf(s.kind, SHAPE_KINDS, 'shape.kind');
-  const p = shapeProps(s, false) as ShapeProps;
+  const p = shapeProps(s, false) as ShapeProps & ShapeUpdate;
   const out: ShapeInput = {
     id: id(s.id),
     layerId: id(s.layerId, 'layerId'),
@@ -316,7 +355,7 @@ export function validateShapeInput(v: unknown): ShapeInput {
     fill: kind === 'line' ? null : p.fill,
     stroke: p.stroke,
     strokeWidth: p.strokeWidth,
-    align: kind === 'line' ? 'center' : p.align,
+    align: kind === 'line' ? 'center' : (p.align as ShapeProps['align']),
     cap: p.cap,
     join: p.join,
   };
@@ -332,9 +371,16 @@ export function validateShapeInput(v: unknown): ShapeInput {
     out.points = need('points');
     out.innerRatio = need('innerRatio');
   } else if (kind === 'line') out.line = need('line');
+  else if (kind === 'path') out.path = need('path');
   if ((kind === 'polygon' || kind === 'star') && p.rounding !== undefined) out.rounding = p.rounding;
   if (!cornersWithin(out, LIMITS.maxCoord)) fail('shape out of range');
-  return out;
+  return stripForKind(out);
+}
+
+/** The shape kept on a vector stroke: a valid shape without id, layer, name and order. */
+export function validateVector(v: unknown): StrokeVector {
+  const { id: _i, layerId: _l, name: _n, z: _z, ...rest } = validateShapeInput({ ...obj(v, 'vector'), id: 'vector0000', layerId: 'vector0000', name: '', z: 0 });
+  return rest;
 }
 
 export { id as validateId, num as validateNumber, str as validateString };

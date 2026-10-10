@@ -8,10 +8,14 @@ import type { Marker } from './engine/navigator';
 /**
  * strokeEraser: removes whole strokes whose path the circle touches. zoom: the magnifier (click
  * zooms in, Alt+click or right-click zooms out, a sideways drag zooms smoothly). See engine.ts.
- * select: selects, moves, scales and rotates shapes; on a paint layer or a group, it transforms
- * the layer. shape: draws a new shape of `ed.shapeKind`. See shapeTool.ts.
+ * select: selects, moves, scales and rotates shapes (a double-click edits their points); on a
+ * paint layer or a group, it transforms the layer. shape: draws a new shape of `ed.shapeKind`.
+ * pen: draws a path point by point. See shapeTool.ts.
  */
-export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'select' | 'shape' | 'hand' | 'zoom';
+export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'select' | 'pen' | 'shape' | 'hand' | 'zoom';
+
+/** The style of new Pen paths (lengths in screen pixels, as ShapeStyle). */
+export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'strokeWidth' | 'align' | 'cap'>;
 
 /**
  * Settings for new shapes (the options bar edits the selected shapes instead, when there are
@@ -50,6 +54,16 @@ export interface SelectOverlay {
   marquee: [number, number, number, number] | null;
   /** Live numbers while drawing or changing a shape. */
   readout: { text: string; x: number; y: number } | null;
+  /** Point editing and the Pen: the anchors (square: corner, round: smooth) and the handles. */
+  anchors: { x: number; y: number; smooth: boolean; sel: boolean }[];
+  /** A handle knob at (x, y) and its anchor at (ax, ay). */
+  knobs: { x: number; y: number; ax: number; ay: number }[];
+  /** The Pen: the next segment, from the last point to the pointer (SVG path data). */
+  rubber: string | null;
+  /** A hint near the pointer, as "Click the first point to close the shape". */
+  tip: { text: string; x: number; y: number } | null;
+  /** The floating bar of point editing or of the Pen. */
+  bar: { kind: 'points' | 'pen'; points: number; selected: number } | null;
 }
 export type { BrushSettings } from '../shared/types';
 import type { BrushSettings } from '../shared/types';
@@ -126,6 +140,7 @@ const prefs = load('draw.prefs', {
   swatches: [] as string[],
   shapeKind: 'rect' as ShapeKind,
   shapeStyle: {} as Partial<ShapeStyle>,
+  penStyle: { fill: null, stroke: '#1d3557', strokeWidth: 3, align: 'center', cap: 'round' } as PenStyle,
   /** Clicks on empty canvas keep the selection (only Esc and Deselect clear it). */
   keepSelection: false,
 });
@@ -149,7 +164,12 @@ class EditorState {
   color = $state(prefs.color);
   shapeKind = $state<ShapeKind>(prefs.shapeKind);
   shapeStyle = $state<ShapeStyle>({ ...SHAPE_STYLE, ...prefs.shapeStyle });
+  penStyle = $state<PenStyle>({ ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);
+  /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
+  pointEdit = $state<{ id: string; points: string[] } | null>(null);
+  /** The Pen is drawing a path (Enter or Done ends it). */
+  penDrawing = $state(false);
   /** Selected shapes (ids). */
   selection = $state<string[]>([]);
   /** Live shapes as the user sees them (pending changes included), for the panels. */
@@ -222,6 +242,7 @@ class EditorState {
       swatches: $state.snapshot(this.swatches),
       shapeKind: this.shapeKind,
       shapeStyle: $state.snapshot(this.shapeStyle),
+      penStyle: $state.snapshot(this.penStyle),
       keepSelection: this.keepSelection,
     });
   }

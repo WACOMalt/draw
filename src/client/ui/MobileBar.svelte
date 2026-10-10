@@ -12,13 +12,14 @@
     { id: 'strokeEraser', icon: 'strokeEraser', label: 'Stroke eraser' },
     { id: 'eyedropper', icon: 'eyedropper', label: 'Eyedropper' },
     { id: 'select', icon: 'select', label: 'Select' },
+    { id: 'pen', icon: 'pen', label: 'Pen' },
     { id: 'shape', icon: 'rect', label: 'Shapes' },
     { id: 'hand', icon: 'hand', label: 'Hand' },
   ];
 
   function tool(t: Tool) {
     // Tapping the active tool again opens its settings (Shapes: the kind and the style).
-    if (ed.tool === t && (t === 'brush' || t === 'eraser' || t === 'strokeEraser' || t === 'shape' || t === 'select')) sheet = sheet === 'brush' ? null : 'brush';
+    if (ed.tool === t && (t === 'brush' || t === 'eraser' || t === 'strokeEraser' || t === 'shape' || t === 'select' || t === 'pen')) sheet = sheet === 'brush' ? null : 'brush';
     else ed.tool = t;
     engine?.updateCursor();
   }

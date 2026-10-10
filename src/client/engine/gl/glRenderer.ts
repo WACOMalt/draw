@@ -15,6 +15,7 @@ import { createPrograms, type Program, type Programs } from './programs';
 import { perfProfile, type PerfProfile } from '../perf';
 import { ShapeIndex, shapeRec, shapeTouches, type ShapeRec } from '../shapeIndex';
 import { drawShapes } from '../shapeRaster';
+import { vectorShape } from '../../../shared/flatten';
 
 /** Two screen buffers: `a` holds the composite so far, `b` receives the next blend pass. */
 interface Pair {
@@ -550,7 +551,15 @@ export class GLRenderer implements Renderer {
     this.layers = layers;
     this.tree = layerTree(layers);
     this.byId = new Map(layers.map((l) => [l.id, l]));
-    this.shapeLayers = new Set(layers.filter((l) => l.kind === 'shape').map((l) => l.id));
+    const next = new Set(layers.filter((l) => l.kind === 'shape').map((l) => l.id));
+    // A layer that became paint (or shapes again) draws its tiles the other way now.
+    for (const t of this.tiles.values()) {
+      if (next.has(t.layer) === this.shapeLayers.has(t.layer)) continue;
+      if (t.job) this.dropJob(t);
+      t.stale = true;
+      t.append = [];
+    }
+    this.shapeLayers = next;
     for (const [id, l] of this.luts) {
       if (!layers.some((x) => x.id === id && x.kind === 'adjust')) {
         this.gl.deleteTexture(l.tex);
@@ -1111,6 +1120,7 @@ export class GLRenderer implements Renderer {
    * through a stroke buffer; grain has a per-stroke origin).
    */
   private batchKey(rec: StrokeRec, scale: number): string | null {
+    if (rec.stroke.vector) return null;
     const b = rec.stroke.brush;
     if (b.opacity < 1 || (b.grain && (b.grainStrength ?? 0.5))) return null;
     const erase = b.tool === 'erase' ? 'e' : 'p';
@@ -1156,6 +1166,7 @@ export class GLRenderer implements Renderer {
 
   /** Draws one stroke into a tile target, in a call of its own. Returns the work spent. */
   private drawStroke(target: Target, rec: StrokeRec, wx0: number, wy0: number, scale: number): number {
+    if (rec.stroke.vector) return this.drawVectorStroke(target, rec, wx0, wy0, scale);
     const b = rec.stroke.brush;
     const w = target.w, h = target.h;
     const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
@@ -1180,6 +1191,24 @@ export class GLRenderer implements Renderer {
       work += 3 * w * h; // clear, copy
     }
     return work;
+  }
+
+  /**
+   * A vector stroke (a shape made paint) onto a tile target: drawn as the shape on the shape
+   * canvas, then over the tile's pixels, in its stroke order.
+   */
+  private drawVectorStroke(target: Target, rec: StrokeRec, wx0: number, wy0: number, scale: number): number {
+    const w = target.w, h = target.h;
+    const c = (this.shapeCanvas ??= new OffscreenCanvas(TILE, TILE));
+    const ctx = c.getContext('2d')!;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, c.width, c.height);
+    drawShapes(ctx, [vectorShape(rec.stroke)], wx0, wy0, scale, w, h);
+    this.uploadCanvas(this.shapeTex, c);
+    this.bindTarget(target);
+    this.blendFor(false);
+    this.copy(this.shapeTex, target, [0, 0, w, h]);
+    return 2000 + 3 * w * h;
   }
 
   /** Stops a render in progress and returns its target to the pool. */

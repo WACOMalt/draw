@@ -25,6 +25,7 @@ import {
   validateString,
 } from '../shared/validate';
 import { transformShapeMatrix } from '../shared/shapes';
+import { planFromPaint, planToPaint } from '../shared/flatten';
 import { docFeatures } from '../shared/features';
 import { depthOf, duplicateOf, effectivelyDeleted, subtreeHeight, subtreeIds, transformStroke } from '../shared/layers';
 import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
@@ -230,7 +231,7 @@ export class Session {
         const l = this.layers.get(op.id);
         if (!l || effectivelyDeleted(this.layers, l)) throw new OpError('no such layer');
         const ids = subtreeIds(this.layers.values(), l.id);
-        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush'>][] = [];
+        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'vector'>][] = [];
         for (const st of this.strokes.values()) {
           if (!ids.has(st.layerId)) continue;
           const t = transformStroke(st, op.m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
@@ -293,6 +294,23 @@ export class Session {
         if (this.liveShapes() >= LIMITS.maxShapes) throw new OpError('too many shapes');
         delete sh.deleted;
         return { type: 'shape.restore', id: op.id, shape: sh };
+      }
+      case 'shapes.toPaint': {
+        const plan = planToPaint(this.layers, this.strokes, this.shapes, op, seq, by);
+        if ('error' in plan) throw new OpError(plan.error);
+        for (const st of plan.strokes) this.strokes.set(st.id, st);
+        for (const id of plan.shapes) this.shapes.get(id)!.deleted = true;
+        if (plan.kind) this.layers.get(op.layerId)!.kind = plan.kind;
+        return op;
+      }
+      case 'shapes.fromPaint': {
+        const plan = planFromPaint(this.layers, this.strokes, this.shapes, op);
+        if ('error' in plan) throw new OpError(plan.error);
+        if (this.liveShapes() + plan.shapes.length > LIMITS.maxShapes) throw new OpError('too many shapes');
+        for (const id of plan.strokes) this.strokes.get(id)!.deleted = true;
+        for (const id of plan.shapes) delete this.shapes.get(id)!.deleted;
+        if (plan.kind) this.layers.get(op.layerId)!.kind = plan.kind;
+        return op;
       }
       case 'layer.remove': {
         const l = this.layers.get(op.id);
@@ -528,7 +546,7 @@ export class Session {
         role: client.role,
         canvas: this.info(client),
         grant: access.grant,
-        features: docFeatures(this.layers.values(), this.strokes.values()),
+        features: docFeatures(this.layers.values(), this.strokes.values(), this.shapes.values()),
         previewSeq: this.store.previewInfo(this.code)?.seq ?? null,
       });
       if (!client.embed) this.broadcast({ t: 'peer.join', peer: client.peer }, client);

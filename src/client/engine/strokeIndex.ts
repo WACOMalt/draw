@@ -3,6 +3,8 @@
 
 import { computeDabs, strokeSeed, type DabList } from '../../shared/brush';
 import type { Stroke } from '../../shared/types';
+import { vectorShape } from '../../shared/flatten';
+import { shapeBounds } from '../../shared/shapes';
 
 /** Index and tile key of a stroke: its layer, or `layer#maskId` for a stroke on a layer mask. */
 export function strokeKey(s: Pick<Stroke, 'layerId' | 'mask'>): string {
@@ -37,6 +39,11 @@ export class StrokeIndex {
   }
 
   static makeRec(stroke: Stroke): StrokeRec {
+    if (stroke.vector) {
+      // A vector stroke: what its shape draws.
+      const b = shapeBounds(vectorShape(stroke));
+      return { stroke, x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, dabs: null };
+    }
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     const p = stroke.pts;
     for (let i = 0; i < p.length; i += 3) {

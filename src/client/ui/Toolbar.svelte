@@ -8,7 +8,7 @@
 
   let { engine }: { engine: Engine | null } = $props();
 
-  // Top: painting tools, the colors, the eyedropper, Select and Shapes. Bottom: navigation.
+  // Top: painting tools, the colors, the eyedropper, Select, Pen and Shapes. Bottom: navigation.
   type T = { id: Tool; icon: string; label: string; key: string };
   const PAINT: T[] = [
     { id: 'brush', icon: 'brush', label: 'Brush', key: 'B' },
@@ -16,7 +16,8 @@
     { id: 'strokeEraser', icon: 'strokeEraser', label: 'Stroke eraser: removes whole strokes', key: 'Shift+E' },
   ];
   const PICK: T = { id: 'eyedropper', icon: 'eyedropper', label: 'Eyedropper', key: 'I' };
-  const SELECT: T = { id: 'select', icon: 'select', label: 'Select: shapes, or the whole layer on a paint layer', key: 'V' };
+  const SELECT: T = { id: 'select', icon: 'select', label: 'Select: shapes (double-click: their points), or the whole layer on a paint layer', key: 'V' };
+  const PEN: T = { id: 'pen', icon: 'pen', label: 'Pen: click for corners, drag for curves', key: 'P' };
   const VIEW: T[] = [
     { id: 'hand', icon: 'hand', label: 'Hand', key: 'H' },
     { id: 'zoom', icon: 'zoom', label: 'Zoom: click zooms in, Alt+click or right-click zooms out, drag sideways', key: 'Z' },
@@ -69,6 +70,7 @@
   {@render tool(PICK)}
   <span class="sep"></span>
   {@render tool(SELECT)}
+  {@render tool(PEN)}
   <span class="shapewrap" use:dismiss={{ open: !!flyout, close: () => (flyout = null) }}>
     <button
       bind:this={shapeBtn}

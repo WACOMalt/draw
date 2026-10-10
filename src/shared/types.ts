@@ -139,7 +139,16 @@ export interface Stroke {
   deleted?: boolean;
   /** Set on a mask stroke: the id of the layer mask it paints (Layer.mask.id). */
   mask?: string;
+  /**
+   * A vector stroke: a shape made paint (shapes.toPaint). It draws as that shape, exact at any
+   * zoom, in the stroke order of its layer: the eraser and the brush work over it. `pts` are its
+   * frame corners (for bounds, transforms and the stroke eraser); `brush` gives its main color.
+   */
+  vector?: StrokeVector;
 }
+
+/** The geometry and style of a shape, kept on a vector stroke. */
+export type StrokeVector = Omit<ShapeInput, 'id' | 'layerId' | 'name' | 'z'>;
 
 export const LAYER_KINDS = ['paint', 'adjust', 'group', 'shape'] as const;
 export type LayerKind = (typeof LAYER_KINDS)[number];
@@ -147,7 +156,7 @@ export type LayerKind = (typeof LAYER_KINDS)[number];
 // --- vector shapes ---------------------------------------------------------------------------
 
 /** Never remove a kind after a release: old documents would break. Add new ones. */
-export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line'] as const;
+export const SHAPE_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'path'] as const;
 export type ShapeKind = (typeof SHAPE_KINDS)[number];
 export const STROKE_ALIGNS = ['center', 'inside', 'outside'] as const;
 export type StrokeAlign = (typeof STROKE_ALIGNS)[number];
@@ -155,6 +164,25 @@ export const LINE_CAPS = ['butt', 'round', 'square'] as const;
 export type LineCap = (typeof LINE_CAPS)[number];
 export const LINE_JOINS = ['miter', 'round', 'bevel'] as const;
 export type LineJoin = (typeof LINE_JOINS)[number];
+
+/**
+ * One contour of a path: its points, POINT_STRIDE numbers each, in local units: the anchor
+ * (x, y), the handle toward the previous point (ix, iy), the handle toward the next point
+ * (ox, oy), and the point type (PointType). A handle at its anchor is no handle: a segment
+ * whose two handles are at their anchors is straight. A closed contour joins its last point
+ * to its first.
+ */
+export interface PathContour {
+  closed: boolean;
+  pts: number[];
+}
+export const POINT_STRIDE = 7;
+/**
+ * corner: the two handles move on their own. smooth: the handles stay on one line (each keeps
+ * its length). symmetric: the handles stay on one line with the same length.
+ */
+export const POINT_TYPES = ['corner', 'smooth', 'symmetric'] as const;
+export type PointType = (typeof POINT_TYPES)[number];
 
 /**
  * What a shape op may set. Geometry: a frame of w × h local units, (0, 0) to (w, h), that the
@@ -169,6 +197,8 @@ export type LineJoin = (typeof LINE_JOINS)[number];
  *   fraction of the outer one. Both: `rounding`, a corner radius (each corner gets at most what
  *   fits).
  * - line: `line`, the start and end points (x0, y0, x1, y1) in the frame.
+ * - path: `path`, Bezier contours (PathContour). Point editing turns any other kind into a
+ *   path. The frame is the box of the curve.
  * The polygon and the star fill the frame: their points are scaled to its width and height.
  */
 export interface ShapeProps {
@@ -185,16 +215,20 @@ export interface ShapeProps {
   innerRatio?: number;
   rounding?: number;
   line?: [number, number, number, number];
+  path?: PathContour[];
   /** #rrggbb, or null: no fill. Lines have no fill. */
   fill: string | null;
   /** #rrggbb, or null: no stroke. */
   stroke: string | null;
   strokeWidth: number;
-  /** Lines always stroke on the center. */
+  /** Lines and paths with an open contour always stroke on the center. */
   align: StrokeAlign;
   cap: LineCap;
   join: LineJoin;
 }
+
+/** What shape.update may change: props, and the kind (to and from a path). */
+export type ShapeUpdate = Partial<ShapeProps> & { kind?: ShapeKind };
 
 /** A shape as a client sends it in shape.add and shape.live. */
 export type ShapeInput = ShapeProps & { id: string; layerId: string; kind: ShapeKind };
@@ -213,7 +247,7 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -232,8 +266,11 @@ export type Op =
   | { type: 'layer.transform'; id: string; m: Affine }
   /** Adds a shape to a shape layer. */
   | { type: 'shape.add'; shape: ShapeInput }
-  /** Changes some props of a shape. The result must still be a valid shape of its kind. */
-  | { type: 'shape.update'; id: string; props: Partial<ShapeProps> }
+  /**
+   * Changes some props of a shape, or its kind (with the settings the new kind needs). The
+   * result must be a valid shape of its kind; settings of other kinds are dropped.
+   */
+  | { type: 'shape.update'; id: string; props: ShapeUpdate }
   | { type: 'shape.remove'; id: string }
   | { type: 'shape.restore'; id: string }
   /**
@@ -241,7 +278,15 @@ export type Op =
    * `newId`; copies of its layers, strokes and shapes get ids derived from `newId` and the original id
    * (derivedId), so every client makes the same copy. The copy goes into `parent` at `order`.
    */
-  | { type: 'layer.duplicate'; id: string; newId: string; name: string; order: number; parent: string | null };
+  | { type: 'layer.duplicate'; id: string; newId: string; name: string; order: number; parent: string | null }
+  /**
+   * Makes shapes paint: each shape `ids` (live) becomes a vector stroke on the layer `layerId`
+   * (id derivedId(key, shape id), in shape order) and is removed. A paint layer takes them; their
+   * own shape layer takes them when they are all its shapes, and then becomes a paint layer.
+   */
+  | { type: 'shapes.toPaint'; key: string; ids: string[]; layerId: string }
+  /** The undo of shapes.toPaint (same key, ids, layerId): the strokes go, the shapes come back. */
+  | { type: 'shapes.fromPaint'; key: string; ids: string[]; layerId: string };
 
 /** An op as the server broadcasts it: restore ops carry the full object so late joiners can apply them. */
 export type AppliedOp =
@@ -370,6 +415,9 @@ export const LIMITS = {
   /** Polygon sides and star points. */
   minCorners: 3,
   maxCorners: 64,
+  /** Points of all contours of one path, and its contours. */
+  maxPathPoints: 5000,
+  maxContours: 100,
 } as const;
 
 /** Unambiguous alphabet for session codes: no 0/O, 1/I/L. */

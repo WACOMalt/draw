@@ -8,7 +8,7 @@
 // the outline and the stroke are built here as polygons in double precision, cut to the target,
 // and Canvas only fills small numbers.
 
-import { MITER_LIMIT, clipPolygon, flattenContour, maxScale, shapeContours, strokePolygons, type Box, type Contour } from '../../shared/shapes';
+import { MITER_LIMIT, centerOnly, clipPolygon, flattenContour, maxScale, shapeContours, strokePolygons, type Box, type Contour } from '../../shared/shapes';
 import { invert } from '../../shared/layers';
 import type { Affine, Shape } from '../../shared/types';
 
@@ -35,12 +35,14 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
   if (!fill && !stroke) return;
   const m = s.m;
   const A: Affine = [m[0] * sc, m[1] * sc, m[2] * sc, m[3] * sc, (m[4] - ox) * sc, (m[5] - oy) * sc];
-  const align = s.kind === 'line' ? 'center' : s.align;
+  const align = centerOnly(s) ? 'center' : s.align;
   // Inside and outside strokes draw twice the width on the center line, then cut away half.
   const band = stroke ? (align === 'center' ? s.strokeWidth : 2 * s.strokeWidth) : 0;
   // How far the stroke reaches past the outline (miter tips and square caps reach further).
   const reach = (band / 2) * (s.kind !== 'line' && s.join === 'miter' ? MITER_LIMIT : Math.SQRT2);
+  // Every point Canvas gets: the frame (a line: its ends; a path: its anchors and handles too).
   const local = s.kind === 'line' && s.line ? s.line : [0, 0, s.w, 0, s.w, s.h, 0, s.h];
+  if (s.kind === 'path') for (const c of s.path ?? []) for (let i = 0; i < c.pts.length; i += 7) local.push(...c.pts.slice(i, i + 6));
   let safe = reach * maxScale(A) < SAFE;
   for (let i = 0; safe && i < local.length; i += 2) {
     const x = A[0] * local[i] + A[2] * local[i + 1] + A[4];
@@ -95,6 +97,7 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
       outline.moveTo(c.x, c.y);
       for (const g of c.segs) {
         if (g.t === 'L') outline.lineTo(g.x, g.y);
+        else if (g.t === 'C') outline.bezierCurveTo(g.x1, g.y1, g.x2, g.y2, g.x, g.y);
         else outline.ellipse(g.cx, g.cy, Math.abs(g.rx), Math.abs(g.ry), 0, g.a0, g.a1, g.a1 < g.a0);
       }
       if (c.closed) outline.closePath();
@@ -126,7 +129,8 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
     };
     for (const c of cs) {
       const f = flattenContour(c, A, TOL, box, band / 2);
-      if (f.closed) {
+      // A path fills an open contour as if it were closed (as SVG does).
+      if (f.closed || s.kind === 'path') {
         const p: number[] = [];
         for (let i = 0; i < f.pts.length; i += 2) {
           p.push(A[0] * f.pts[i] + A[2] * f.pts[i + 1] + A[4], A[1] * f.pts[i] + A[3] * f.pts[i + 1] + A[5]);

@@ -88,6 +88,8 @@
       ed.selection = [];
       ed.shapes = [];
       ed.overlay = null;
+      ed.pointEdit = null;
+      ed.penDrawing = false;
     };
   });
 
@@ -99,7 +101,7 @@
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.keepSelection]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.penStyle, ed.keepSelection]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
@@ -139,7 +141,7 @@
       <canvas bind:this={canvas}></canvas>
       <canvas class="paths" bind:this={pathsCanvas}></canvas>
       <div class="brush-cursor" bind:this={brushCursor}></div>
-      <SelectOverlay />
+      <SelectOverlay {engine} />
       {#each ed.markers as m (m.key)}
         <button
           class="marker {m.kind}"
