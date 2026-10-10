@@ -2,7 +2,7 @@
 // Rasterizes committed strokes, and the shapes of shape layers, into 256×256 layer tiles. Holds
 // vector data only, no tile pixels.
 
-import { DAB_CHUNK, DAB_STRIDE } from '../../shared/brush';
+import { DAB_CHUNK, DAB_STRIDE, lowFlow } from '../../shared/brush';
 import { DabPainter, StampCache } from './stamp';
 import { StrokeIndex, strokeDabs, strokeKey, type StrokeRec as Rec } from './strokeIndex';
 import { ShapeIndex, shapeTouches, type ShapeRec } from './shapeIndex';
@@ -121,19 +121,26 @@ function renderTile(t: TileRef): ImageBitmap | null {
     any = true;
     const b = rec.stroke.brush;
     const mode = b.tool === 'erase' ? 'destination-out' : 'source-over';
-    if (b.opacity >= 1) {
+    const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2; // see drawStroke
+    if (b.opacity >= 1 && (dot || !lowFlow(b))) {
       // Source-over and destination-out are associative: at full opacity the dabs can go
-      // straight onto the tile with the same result as a separate stroke buffer.
+      // straight onto the tile with the same result as a separate stroke buffer. Not low-flow
+      // dabs: in 8 bits they stop at a lighter floor on paint than in the empty buffer that the
+      // stroke in progress uses (see lowFlow).
       tileCtx.globalCompositeOperation = mode;
       drawStroke(tileCtx, rec, wx0, wy0, wx1, wy1, scale);
     } else {
+      // Only the box of the stroke on the tile: zoomed out, one tile holds hundreds of strokes.
+      const x0 = Math.max(0, Math.floor((rec.x0 - wx0) * scale) - 1), y0 = Math.max(0, Math.floor((rec.y0 - wy0) * scale) - 1);
+      const x1 = Math.min(TILE, Math.ceil((rec.x1 - wx0) * scale) + 1), y1 = Math.min(TILE, Math.ceil((rec.y1 - wy0) * scale) + 1);
+      if (x1 <= x0 || y1 <= y0) continue;
       strokeCtx.globalCompositeOperation = 'source-over';
       strokeCtx.globalAlpha = 1;
-      strokeCtx.clearRect(0, 0, TILE, TILE);
+      strokeCtx.clearRect(x0, y0, x1 - x0, y1 - y0);
       drawStroke(strokeCtx, rec, wx0, wy0, wx1, wy1, scale);
       tileCtx.globalCompositeOperation = mode;
       tileCtx.globalAlpha = b.opacity;
-      tileCtx.drawImage(strokeCanvas, 0, 0);
+      tileCtx.drawImage(strokeCanvas, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
     }
     tileCtx.globalAlpha = 1;
   }

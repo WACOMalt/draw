@@ -29,6 +29,16 @@ export function dabAlpha(brush: Brush, p: number): number {
   return brush.pressureFlow ? brush.flow * Math.max(MIN_PRESSURE, p) : brush.flow;
 }
 
+/**
+ * True when a dab of this brush can have an alpha below 1/2 (low flow, pressure flow, opacity
+ * jitter). In an 8-bit buffer, such a dab stops changing a pixel once the change rounds to zero.
+ * Straight onto existing paint, this stops the color at a fixed floor (19/255 at about 3% flow).
+ * In an empty stroke buffer, as the stroke in progress draws, only the alpha stops near 1.
+ */
+export function lowFlow(brush: Brush): boolean {
+  return brush.flow < 0.5 || brush.pressureFlow || (brush.opacityJitter ?? 0) > 0;
+}
+
 /** Decimal places that keep about 0.1 device pixel of precision at this device scale
  *  (device px per world unit). Negative means rounding to tens, hundreds, ... */
 export function pointDecimals(deviceScale: number): number {
