@@ -5,6 +5,7 @@
   // The canvas part draws only: the engine handles the pointer (shapeTool.ts makes ed.overlay).
   import type { Engine } from '../engine/engine';
   import { CORNER, SMOOTH } from '../engine/pathEdit';
+  import { RING_SPAN } from '../engine/shapeTool';
   import { ed } from '../state.svelte';
 
   let { engine }: { engine: Engine | null } = $props();
@@ -42,7 +43,8 @@
     {#each o.rings as g, i (i)}
       <!-- The smoothness ring: the arc from the top shows how soft (blue, clockwise) or how round
            through the point (orange, counterclockwise) it is; the knob sets it. -->
-      <circle class="ring" cx={g.x} cy={g.y} r={g.r} />
+      <!-- The track, open at the bottom: the knob cannot cross from soft to through there. -->
+      <path class="ring" d="M{g.x - g.r * Math.sin(RING_SPAN)} {g.y - g.r * Math.cos(RING_SPAN)}A{g.r} {g.r} 0 1 1 {g.x + g.r * Math.sin(RING_SPAN)} {g.y - g.r * Math.cos(RING_SPAN)}" />
       {#if g.s !== 0}
         <path class="arc" class:soft={g.s > 0} d="M{g.x} {g.y - g.r}A{g.r} {g.r} 0 0 {g.s > 0 ? 1 : 0} {g.kx} {g.ky}" />
       {/if}
@@ -166,6 +168,7 @@
     fill: none;
     stroke: rgba(0, 0, 0, 0.25);
     stroke-width: 3;
+    stroke-linecap: round;
   }
   .arc {
     fill: none;
