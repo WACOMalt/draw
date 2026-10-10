@@ -474,7 +474,7 @@
   {:else if ed.transform}
     <span class="hint" use:fullTitle>The whole layer is the selection: drag inside to move, handles to scale, the round handle to rotate. Click a shape to select it.</span>
   {:else if selShapes.length}
-    <span class="hint" use:fullTitle>Drag inside: move · Handles: scale · Just outside a corner: rotate · Double-click: {selShapes.length === 1 && selShapes[0].kind === 'compound' ? 'parts' : 'points'}</span>
+    <span class="hint" use:fullTitle>Drag inside: move · Alt+drag: copy · Handles: scale · Just outside a corner: rotate · Double-click: {selShapes.length === 1 && selShapes[0].kind === 'compound' ? 'parts' : 'points'}</span>
   {:else if activeLayer && activeLayer.kind !== 'shape' && activeLayer.kind !== 'adjust'}
     <span class="hint" use:fullTitle>Click a shape to select it. On a paint layer or a group with paint, Select moves, scales and rotates the whole layer.</span>
   {:else}
@@ -488,6 +488,12 @@
         aria-pressed={ed.keepSelection}
         title="While on, clicks outside the box neither select another shape nor deselect. Shift+click still adds or removes; Esc and Deselect still clear."
         onclick={() => (ed.keepSelection = !ed.keepSelection)}>Keep selection</button
+      >
+      <button
+        class="icon wide"
+        disabled={!selShapes.length || !ed.canEdit || !!ed.partsOf}
+        title="Copies of the selected shapes, a little down and right, on top of them (Ctrl+D). Alt+drag a selection to drag a copy away."
+        onclick={() => engine?.shapes.duplicate()}>Duplicate</button
       >
       <button
         class="icon wide"
