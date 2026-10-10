@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { SHAPE_KINDS, type ShapeKind } from '../../shared/types';
+  import { CUSTOM_SHAPES, type CustomShape } from '../../shared/types';
   import type { Engine } from '../engine/engine';
-  import { SHAPE_LABEL } from '../engine/shapeTool';
-  import { ed, type Tool } from '../state.svelte';
+  import { CUSTOM_LABEL, SHAPE_LABEL } from '../engine/shapeTool';
+  import { ed, type DrawKind, type Tool } from '../state.svelte';
   import Icon from './Icon.svelte';
+  import PresetIcon from './PresetIcon.svelte';
   import { dismiss } from '../dismiss';
 
   let { engine }: { engine: Engine | null } = $props();
@@ -34,15 +35,34 @@
 
   function openFlyout() {
     const r = shapeBtn.getBoundingClientRect();
-    flyout = { x: r.right + 6, y: Math.min(r.top, window.innerHeight - 200) };
+    flyout = { x: r.right + 6, y: Math.max(4, Math.min(r.top, window.innerHeight - 330)) };
   }
 
-  function pickKind(k: ShapeKind) {
+  /** The kinds in the menu. "Arrow" is a line with an arrowhead at its end. */
+  const KINDS: { id: string; kind: DrawKind; label: string; icon: string }[] = [
+    { id: 'rect', kind: 'rect', label: 'Rectangle', icon: 'rect' },
+    { id: 'ellipse', kind: 'ellipse', label: 'Ellipse', icon: 'ellipse' },
+    { id: 'polygon', kind: 'polygon', label: 'Polygon', icon: 'polygon' },
+    { id: 'star', kind: 'star', label: 'Star', icon: 'star' },
+    { id: 'line', kind: 'line', label: 'Line', icon: 'line' },
+    { id: 'arrow', kind: 'line', label: 'Arrow', icon: 'arrowline' },
+  ];
+  const arrowed = $derived(ed.shapeStyle.arrows[0] !== 'none' || ed.shapeStyle.arrows[1] !== 'none');
+  const isOn = (id: string) => (ed.shapeKind === 'line' ? id === (arrowed ? 'arrow' : 'line') : id === ed.shapeKind);
+
+  function pickKind(k: DrawKind, id: string = k) {
     ed.shapeKind = k;
+    if (id === 'line') ed.shapeStyle.arrows = ['none', 'none'];
+    if (id === 'arrow' && !arrowed) ed.shapeStyle.arrows = ['none', 'arrow'];
     flyout = null;
     // The options bar then shows the settings of the new kind, not of a selected shape.
     engine?.shapes.deselect();
     select('shape');
+  }
+
+  function pickPreset(p: CustomShape) {
+    ed.shapeStyle.preset = p;
+    pickKind('custom');
   }
 
   // A long press on the Shapes button opens the menu too (pens and fingers have no right click).
@@ -76,7 +96,7 @@
       bind:this={shapeBtn}
       class="icon tool more"
       class:on={ed.tool === 'shape'}
-      title="Shapes: {SHAPE_LABEL[ed.shapeKind]} (U; Shift+U: next shape). Click again, or right-click, for the other shapes."
+      title="Shapes: {ed.shapeKind === 'custom' ? CUSTOM_LABEL[ed.shapeStyle.preset] : SHAPE_LABEL[ed.shapeKind]} (U; Shift+U: next shape). Click again, or right-click, for the other shapes."
       aria-label="Shapes"
       aria-haspopup="menu"
       aria-expanded={!!flyout}
@@ -102,15 +122,28 @@
       onpointerup={() => window.clearTimeout(pressTimer)}
       onpointerleave={() => window.clearTimeout(pressTimer)}
     >
-      <Icon name={ed.shapeKind} />
+      {#if ed.shapeKind === 'custom'}<PresetIcon preset={ed.shapeStyle.preset} />{:else}<Icon name={ed.shapeKind === 'line' && arrowed ? 'arrowline' : ed.shapeKind} />{/if}
     </button>
     {#if flyout}
       <div class="flyout" role="menu" style:left="{flyout.x}px" style:top="{flyout.y}px" data-over-canvas>
-        {#each SHAPE_KINDS as k}
-          <button role="menuitem" class:on={ed.shapeKind === k} onclick={() => pickKind(k)}>
-            <Icon name={k} /><span>{SHAPE_LABEL[k]}</span><kbd>U</kbd>
+        {#each KINDS as k}
+          <button role="menuitem" class:on={isOn(k.id)} onclick={() => pickKind(k.kind, k.id)}>
+            <Icon name={k.icon} /><span>{k.label}</span><kbd>U</kbd>
           </button>
         {/each}
+        <div class="sub">Custom shapes</div>
+        <div class="grid">
+          {#each CUSTOM_SHAPES as p}
+            <button
+              role="menuitem"
+              class="cell"
+              class:on={ed.shapeKind === 'custom' && ed.shapeStyle.preset === p}
+              title={CUSTOM_LABEL[p]}
+              aria-label={CUSTOM_LABEL[p]}
+              onclick={() => pickPreset(p)}><PresetIcon preset={p} size={18} /></button
+            >
+          {/each}
+        </div>
       </div>
     {/if}
   </span>
@@ -193,6 +226,24 @@
   }
   .flyout span {
     flex: 1;
+  }
+  .flyout .sub {
+    padding: 8px 10px 4px;
+    color: var(--text-faint);
+    font-size: 11px;
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+  }
+  .flyout .grid {
+    display: grid;
+    grid-template-columns: repeat(6, 30px);
+    gap: 2px;
+    padding: 0 6px 4px;
+  }
+  .flyout .grid .cell {
+    width: 30px;
+    padding: 0;
+    justify-content: center;
   }
   .flyout kbd {
     font: inherit;

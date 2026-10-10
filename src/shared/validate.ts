@@ -13,6 +13,8 @@ import {
   STROKE_ALIGNS,
   CURVE_TYPES,
   COMPOUND_OPS,
+  ARROW_KINDS,
+  CUSTOM_SHAPES,
   type CompoundPart,
   type Adjust,
   type Affine,
@@ -320,11 +322,17 @@ function compoundParts(v: unknown): CompoundPart[] {
     });
     for (const c of shape.path ?? []) points += c.pts.length / POINT_STRIDE;
     if (points > LIMITS.maxPathPoints) fail('too many path points');
-    const { id: _i, layerId: _l, name: _n, z: _z, fill: _f, stroke: _s, strokeWidth: _w, align: _a, cap: _c, join: _j, ...geo } = shape;
+    const { id: _i, layerId: _l, name: _n, z: _z, fill: _f, stroke: _s, strokeWidth: _w, align: _a, cap: _c, join: _j, dash: _d, arrows: _r, ...geo } = shape;
     const part = { ...geo, op } as CompoundPart;
     if (o.name !== undefined) part.name = str(o.name, LIMITS.maxShapeName, 'part name');
     return part;
   });
+}
+
+/** A dash pattern: up to LIMITS.maxDash lengths in stroke widths. Empty, or all zero: solid. */
+function dashPattern(v: unknown): number[] {
+  if (!Array.isArray(v) || v.length > LIMITS.maxDash) fail('bad dash');
+  return v.map((x) => num(x, 0, LIMITS.maxDashLength, 'dash'));
 }
 
 /** Shape props, range checks only. `partial`: only the props present, at least one. */
@@ -364,6 +372,19 @@ function shapeProps(v: unknown, partial: boolean): ShapeUpdate {
   if (p.path !== undefined) out.path = pathContours(p.path);
   if (p.curve !== undefined) out.curve = oneOf(p.curve, CURVE_TYPES, 'curve');
   if (p.parts !== undefined) out.parts = compoundParts(p.parts);
+  if (p.arc !== undefined) {
+    if (!Array.isArray(p.arc) || p.arc.length !== 2) fail('bad arc');
+    out.arc = [num(p.arc[0], -360, 360, 'arc'), num(p.arc[1], -360, 360, 'arc')];
+  }
+  if (p.hole !== undefined) out.hole = num(p.hole, 0, 0.99, 'hole');
+  if (p.preset !== undefined) out.preset = oneOf(p.preset, CUSTOM_SHAPES, 'preset');
+  // Style for any kind. "Off" values (an empty dash, no arrows) are allowed, so an update can
+  // turn them off; validateShapeInput then leaves them out.
+  if (p.dash !== undefined) out.dash = dashPattern(p.dash);
+  if (p.arrows !== undefined) {
+    if (!Array.isArray(p.arrows) || p.arrows.length !== 2) fail('bad arrows');
+    out.arrows = [oneOf(p.arrows[0], ARROW_KINDS, 'arrows'), oneOf(p.arrows[1], ARROW_KINDS, 'arrows')];
+  }
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -406,6 +427,12 @@ export function validateShapeInput(v: unknown): ShapeInput {
     out.innerRatio = need('innerRatio');
   } else if (kind === 'line') out.line = need('line');
   else if (kind === 'compound') out.parts = need('parts');
+  else if (kind === 'custom') out.preset = need('preset');
+  else if (kind === 'ellipse') {
+    // A whole turn (or none) is the whole ellipse; no hole is no hole.
+    if (p.arc && ((((p.arc[1] - p.arc[0]) % 360) + 360) % 360) !== 0) out.arc = p.arc;
+    if (p.hole) out.hole = p.hole;
+  }
   else if (kind === 'path') {
     out.path = need('path');
     if (p.curve === 'spline') out.curve = 'spline';
@@ -418,6 +445,8 @@ export function validateShapeInput(v: unknown): ShapeInput {
     }
   }
   if ((kind === 'polygon' || kind === 'star') && p.rounding !== undefined) out.rounding = p.rounding;
+  if (p.dash?.some((d) => d > 0)) out.dash = p.dash;
+  if (p.arrows && (p.arrows[0] !== 'none' || p.arrows[1] !== 'none')) out.arrows = p.arrows;
   if (!cornersWithin(out, LIMITS.maxCoord)) fail('shape out of range');
   return stripForKind(out);
 }

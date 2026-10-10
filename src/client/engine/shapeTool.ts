@@ -28,6 +28,7 @@ import {
   type ClientMsg,
   type CompoundOp,
   type CompoundPart,
+  type CustomShape,
   type Layer,
   type Op,
   type PathContour,
@@ -64,7 +65,23 @@ import { ed, showToast, type SelectOverlay } from '../state.svelte';
 import type { Doc } from './doc';
 import type { Renderer } from './renderer';
 
-export const SHAPE_LABEL: Record<ShapeKind, string> = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', star: 'Star', line: 'Line', path: 'Path', compound: 'Compound' };
+export const SHAPE_LABEL: Record<ShapeKind, string> = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', star: 'Star', line: 'Line', path: 'Path', compound: 'Compound', custom: 'Custom shape' };
+export const CUSTOM_LABEL: Record<CustomShape, string> = {
+  heart: 'Heart',
+  bubble: 'Speech bubble',
+  arrow: 'Block arrow',
+  cloud: 'Cloud',
+  check: 'Check',
+  bolt: 'Lightning',
+  moon: 'Moon',
+  drop: 'Drop',
+  plus: 'Plus',
+  banner: 'Banner',
+  burst: 'Burst',
+  frame: 'Frame',
+};
+/** A shape's kind as people call it (a custom shape: its outline). */
+export const shapeLabel = (s: Pick<Shape, 'kind' | 'preset'>) => (s.kind === 'custom' && s.preset ? CUSTOM_LABEL[s.preset] : SHAPE_LABEL[s.kind]);
 const partLabel = (k: ShapeKind) => SHAPE_LABEL[k];
 
 /** What the shape tools need from the engine. */
@@ -85,7 +102,7 @@ export interface ShapeHost {
 type Pt = [number, number];
 
 /** The props a gesture or an edit may change, compared to make the ops. */
-const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'curve', 'parts', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
+const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'curve', 'parts', 'arc', 'hole', 'preset', 'dash', 'arrows', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
 
 const LIVE_MS = 40;
 /** Movement (CSS px) before a press counts as a drag: smaller jitters change nothing. */
@@ -762,7 +779,12 @@ export class ShapeTool {
       base.rounding = px(st.rounding);
     } else if (kind === 'line') {
       base.line = [p[0] - x0, p[1] - y0, q[0] - x0, q[1] - y0];
-    }
+      if (st.arrows[0] !== 'none' || st.arrows[1] !== 'none') base.arrows = [...st.arrows];
+    } else if (kind === 'ellipse') {
+      if (st.arc[0] !== st.arc[1]) base.arc = [...st.arc];
+      if (st.hole > 0) base.hole = st.hole;
+    } else if (kind === 'custom') base.preset = st.preset;
+    if (st.dash.some((d) => d > 0)) base.dash = [...st.dash];
     return base;
   }
 
@@ -796,7 +818,7 @@ export class ShapeTool {
       s.w = Math.max(s.w, min);
       s.h = Math.max(s.h, min);
     }
-    s.name = this.nextShapeName(s.kind);
+    s.name = this.nextShapeName(s.kind, shapeLabel(s));
     this.clearDrafts();
     const op: Op = { type: 'shape.add', shape: toInput(s) };
     this.host.sendOp(op);
@@ -1679,6 +1701,8 @@ export class ShapeTool {
         cap: st.cap,
         join: 'round',
         ...(pen.curve === 'spline' ? { curve: 'spline' as const } : {}),
+        ...(st.dash?.some((d) => d > 0) ? { dash: [...st.dash] } : {}),
+        ...(st.arrows && (st.arrows[0] !== 'none' || st.arrows[1] !== 'none') ? { arrows: [...st.arrows] as Shape['arrows'] } : {}),
         author: '',
         seq: Infinity,
       },
@@ -1841,7 +1865,7 @@ export class ShapeTool {
     if (this.hover && !sel.some((s) => s.id === this.hover!.id) && !busy) {
       const s = this.current(this.hover.id);
       if (s && !s.deleted && this.pointer) {
-        o.hover = { outline: this.outline(s), label: s.name || SHAPE_LABEL[s.kind], x: this.pointer[0], y: this.pointer[1] };
+        o.hover = { outline: this.outline(s), label: s.name || shapeLabel(s), x: this.pointer[0], y: this.pointer[1] };
       }
     }
     const mq = this.marquee;

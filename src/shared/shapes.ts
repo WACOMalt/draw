@@ -9,7 +9,7 @@
 // exact in a 256 px tile, with a few dozen points.
 
 import { compose, validAffine } from './layers';
-import { POINT_STRIDE, type Affine, type CompoundPart, type PathContour, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from './types';
+import { POINT_STRIDE, type Affine, type CompoundPart, type CustomShape, type PathContour, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from './types';
 import { insideResult, joinPieces, outlinePieces, type BoolPart } from './boolean';
 
 /** Miter joins longer than this many half widths become bevels (as SVG's default of 4). */
@@ -22,8 +22,9 @@ export type Seg =
   /**
    * An x-spline segment from p1 to p2 (p: p0, p1, p2, p3 as 8 numbers; s1, s2: the smoothness
    * of p1 and p2). It starts at the current point (xAt(t = 0)) and ends at (x, y) = xAt(1).
+   * `t0`, `t1`: only that part of it (a dash; absent: 0 and 1).
    */
-  | { t: 'X'; p: number[]; s1: number; s2: number; x: number; y: number }
+  | { t: 'X'; p: number[]; s1: number; s2: number; x: number; y: number; t0?: number; t1?: number }
   /** An arc of the axis-aligned ellipse (cx, cy, rx, ry) from angle a0 to a1 (radians, either way). */
   | { t: 'A'; cx: number; cy: number; rx: number; ry: number; a0: number; a1: number };
 
@@ -39,7 +40,7 @@ export interface Contour {
 export type Box = [number, number, number, number];
 
 /** The geometry fields of a shape (what its outline depends on). */
-export type ShapeGeo = Pick<ShapeProps, 'w' | 'h' | 'radii' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'line' | 'path' | 'curve' | 'parts'> & { kind: ShapeKind };
+export type ShapeGeo = Pick<ShapeProps, 'w' | 'h' | 'radii' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'line' | 'path' | 'curve' | 'parts' | 'arc' | 'hole' | 'preset'> & { kind: ShapeKind };
 
 // --- outlines --------------------------------------------------------------------------------
 
@@ -174,7 +175,11 @@ export function shapeContours(s: ShapeGeo): Contour[] {
       return [{ x: tl, y: 0, closed: true, segs }];
     }
     case 'ellipse':
-      return [{ x: w, y: h / 2, closed: true, segs: [{ t: 'A', cx: w / 2, cy: h / 2, rx: w / 2, ry: h / 2, a0: 0, a1: 2 * Math.PI }] }];
+      return ellipseContours(w, h, s.arc, s.hole);
+    case 'custom': {
+      const k: Affine = [w / 100, 0, 0, h / 100, 0, 0];
+      return mapPath(CUSTOM_PATHS[s.preset ?? 'heart'] ?? [], k).map(pathContour);
+    }
     case 'polygon':
     case 'star':
       return [roundedPolygon(cornerPoints(s), s.rounding ?? 0)];
@@ -192,6 +197,117 @@ export function shapeContours(s: ShapeGeo): Contour[] {
       });
   }
 }
+
+/**
+ * The start and end of a pie slice in radians (end > start, less than one turn more), or null
+ * for the whole ellipse. Angles are degrees on the circle before the frame stretches it: 0 is
+ * right, 90 is down (clockwise on screen).
+ */
+export function arcRange(arc: [number, number] | undefined): [number, number] | null {
+  if (!arc) return null;
+  const sweep = (((arc[1] - arc[0]) % 360) + 360) % 360;
+  if (sweep === 0) return null;
+  const a0 = (arc[0] * Math.PI) / 180;
+  return [a0, a0 + (sweep * Math.PI) / 180];
+}
+
+/** An ellipse, a ring (with a hole), a pie slice, or a slice of a ring. */
+function ellipseContours(w: number, h: number, arc: [number, number] | undefined, hole: number | undefined): Contour[] {
+  const cx = w / 2, cy = h / 2, rx = w / 2, ry = h / 2;
+  const k = Math.max(0, Math.min(0.99, hole ?? 0));
+  const range = arcRange(arc);
+  if (!range) {
+    const out: Contour[] = [{ x: w, y: cy, closed: true, segs: [{ t: 'A', cx, cy, rx, ry, a0: 0, a1: 2 * Math.PI }] }];
+    // The hole turns the other way: the nonzero fill leaves it empty.
+    if (k > 0) out.push({ x: cx + rx * k, y: cy, closed: true, segs: [{ t: 'A', cx, cy, rx: rx * k, ry: ry * k, a0: 2 * Math.PI, a1: 0 }] });
+    return out;
+  }
+  const [a0, a1] = range;
+  const segs: Seg[] = [{ t: 'A', cx, cy, rx, ry, a0, a1 }];
+  if (k > 0) {
+    segs.push({ t: 'L', x: cx + rx * k * Math.cos(a1), y: cy + ry * k * Math.sin(a1) });
+    segs.push({ t: 'A', cx, cy, rx: rx * k, ry: ry * k, a0: a1, a1: a0 });
+  } else segs.push({ t: 'L', x: cx, y: cy });
+  return [{ x: cx + rx * Math.cos(a0), y: cy + ry * Math.sin(a0), closed: true, segs }];
+}
+
+// --- custom shapes ----------------------------------------------------------------------------
+
+/**
+ * Path contours from SVG path data with absolute M, L, H, V, C and Z commands. A point is a
+ * corner, or smooth where its two handles are on one line.
+ */
+function svgPath(d: string): PathContour[] {
+  const tok = d.match(/[MLHVCZ]|-?[\d.]+/g) ?? [];
+  const out: PathContour[] = [];
+  let pts: number[][] = [];
+  let i = 0, cmd = '';
+  const num = () => +tok[i++];
+  const end = (closed: boolean) => {
+    if (!pts.length) return;
+    const first = pts[0], last = pts[pts.length - 1];
+    if (closed && pts.length > 1 && last[0] === first[0] && last[1] === first[1]) {
+      first[2] = last[2];
+      first[3] = last[3];
+      pts.pop();
+    }
+    const flat: number[] = [];
+    for (const q of pts) {
+      const ax = q[0] - q[2], ay = q[1] - q[3], bx = q[4] - q[0], by = q[5] - q[1];
+      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      flat.push(q[0], q[1], q[2], q[3], q[4], q[5], la > 0 && lb > 0 && (ax * bx + ay * by) / (la * lb) > Math.cos(0.02) ? 1 : 0);
+    }
+    out.push({ closed, pts: flat });
+    pts = [];
+  };
+  const to = (x: number, y: number) => pts.push([x, y, x, y, x, y]);
+  while (i < tok.length) {
+    if (/[A-Z]/.test(tok[i])) cmd = tok[i++];
+    const cur = pts[pts.length - 1];
+    if (cmd === 'M') {
+      end(false);
+      to(num(), num());
+      cmd = 'L';
+    } else if (cmd === 'L') to(num(), num());
+    else if (cmd === 'H') to(num(), cur[1]);
+    else if (cmd === 'V') to(cur[0], num());
+    else if (cmd === 'C') {
+      const [x1, y1, x2, y2, x, y] = [num(), num(), num(), num(), num(), num()];
+      cur[4] = x1;
+      cur[5] = y1;
+      pts.push([x, y, x2, y2, x, y]);
+    } else if (cmd === 'Z') end(true);
+  }
+  end(false);
+  return out;
+}
+
+/** A starburst: `n` points, the inner radius a fraction of the outer one. */
+function burst(n: number, inner: number): string {
+  let d = '';
+  for (let k = 0; k < 2 * n; k++) {
+    const a = -Math.PI / 2 + (Math.PI * k) / n, r = k % 2 ? 48 * inner : 48;
+    d += `${k ? 'L' : 'M'}${(50 + r * Math.cos(a)).toFixed(3)} ${(50 + r * Math.sin(a)).toFixed(3)} `;
+  }
+  return d + 'Z';
+}
+
+/** The outlines of the custom shapes, in a 100 × 100 box (the frame stretches them). */
+export const CUSTOM_PATHS: Record<CustomShape, PathContour[]> = {
+  heart: svgPath('M50 92 C26 74 2 56 2 32 C2 16 14 5 28 5 C38 5 46 11 50 19 C54 11 62 5 72 5 C86 5 98 16 98 32 C98 56 74 74 50 92 Z'),
+  bubble: svgPath('M16 6 H84 C92 6 98 12 98 20 V60 C98 68 92 74 84 74 H46 L22 95 L28 74 H16 C8 74 2 68 2 60 V20 C2 12 8 6 16 6 Z'),
+  arrow: svgPath('M2 34 H56 V10 L98 50 L56 90 V66 H2 Z'),
+  cloud: svgPath('M24 82 C11 82 2 72 2 60 C2 48 11 39 23 39 C24 25 35 15 49 15 C60 15 69 21 74 31 C88 31 98 42 98 56 C98 70 87 82 73 82 Z'),
+  check: svgPath('M4 54 L18 40 L38 60 L82 14 L96 28 L38 88 Z'),
+  bolt: svgPath('M60 2 L14 58 H46 L36 98 L86 38 H54 Z'),
+  moon: svgPath('M66 4 C40 6 16 26 16 54 C16 80 37 98 62 98 C76 98 88 92 96 82 C70 86 44 68 44 40 C44 24 52 11 66 4 Z'),
+  drop: svgPath('M50 2 C50 2 14 46 14 64 C14 84 30 98 50 98 C70 98 86 84 86 64 C86 46 50 2 50 2 Z'),
+  plus: svgPath('M36 2 H64 V36 H98 V64 H64 V98 H36 V64 H2 V36 H36 Z'),
+  banner: svgPath('M2 20 H98 L84 50 L98 80 H2 L16 50 Z'),
+  burst: svgPath(burst(16, 0.8)),
+  // The hole turns the other way: the nonzero fill leaves it empty.
+  frame: svgPath('M2 2 H98 V98 H2 Z M20 20 V80 H80 V20 Z'),
+};
 
 // --- compound shapes -------------------------------------------------------------------------
 
@@ -339,7 +455,7 @@ export function compoundToPath(s: Pick<ShapeGeo, 'parts'>): PathContour[] {
 }
 
 /** The part of a cubic from t = a to t = b (b < a: reversed). */
-function subCubic(c: number[], a: number, b: number): number[] {
+export function subCubic(c: number[], a: number, b: number): number[] {
   if (b < a) {
     const r = subCubic(c, b, a);
     return [r[6], r[7], r[4], r[5], r[2], r[3], r[0], r[1]];
@@ -367,6 +483,12 @@ function xf(num: number, den: number): number {
 }
 const xg = (u: number, q: number) => u * (q + u * (2 * q + u * (8 - 12 * q + u * (14 * q - 11 + u * (4 - 5 * q)))));
 const xh = (u: number, q: number) => u * (q + u * (2 * q + u * u * (-2 * q - u * q)));
+
+/** A point of an x-spline segment (or of its part from t0 to t1) at t, 0 to 1. */
+export function xSegAt(g: Extract<Seg, { t: 'X' }>, t: number): [number, number] {
+  const t0 = g.t0 ?? 0, t1 = g.t1 ?? 1;
+  return xAt(g.p, g.s1, g.s2, t0 + (t1 - t0) * t);
+}
 
 /** A point of an x-spline segment at t (0..1). */
 export function xAt(p: number[], s1: number, s2: number, t: number): [number, number] {
@@ -569,7 +691,7 @@ function flattenCubic(p0: number[], A: Affine, scale: number, tol: number, box: 
  */
 function flattenSpline(seg: Extract<Seg, { t: 'X' }>, A: Affine, scale: number, tol: number, box: Box | null, reach: number, pts: number[], smooth: boolean[]): void {
   const band = reach * scale;
-  const at = (t: number) => xAt(seg.p, seg.s1, seg.s2, t);
+  const at = (t: number) => xSegAt(seg, t);
   const sub = (t0: number, a: [number, number], t1: number, b: [number, number], depth: number, last: boolean) => {
     const tm = (t0 + t1) / 2, m = at(tm);
     if (depth >= 3) {
@@ -617,7 +739,7 @@ function flattenSpline(seg: Extract<Seg, { t: 'X' }>, A: Affine, scale: number, 
  * length splits in two.
  */
 export function xToCubics(g: Extract<Seg, { t: 'X' }>): number[][] {
-  const at = (t: number) => xAt(g.p, g.s1, g.s2, t);
+  const at = (t: number) => xSegAt(g, t);
   const a = at(0), b = at(1);
   const len = Math.hypot(b[0] - a[0], b[1] - a[1]) + 1e-300;
   const out: number[][] = [];
@@ -694,10 +816,10 @@ export function cubicAt(p: number[], t: number): [number, number] {
 }
 
 /** Direction of a segment where it starts and where it ends (not normalized). */
-function tangents(seg: Seg, x: number, y: number): [number, number, number, number] {
+export function tangents(seg: Seg, x: number, y: number): [number, number, number, number] {
   if (seg.t === 'L') return [seg.x - x, seg.y - y, seg.x - x, seg.y - y];
   if (seg.t === 'X') {
-    const a = xAt(seg.p, seg.s1, seg.s2, 1e-4), b = xAt(seg.p, seg.s1, seg.s2, 1 - 1e-4);
+    const a = xSegAt(seg, 1e-4), b = xSegAt(seg, 1 - 1e-4);
     return [a[0] - x, a[1] - y, seg.x - b[0], seg.y - b[1]];
   }
   if (seg.t === 'C') {
@@ -955,13 +1077,16 @@ export function shapeCorners(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'lin
 }
 
 /** The band of stroke outside the outline, in local units (0: none). */
-export function strokeReach(s: Pick<ShapeProps, 'stroke' | 'strokeWidth' | 'align' | 'cap' | 'join' | 'path'> & { kind: ShapeKind }): number {
+export function strokeReach(s: Pick<ShapeProps, 'stroke' | 'strokeWidth' | 'align' | 'cap' | 'join' | 'path' | 'arrows' | 'dash'> & { kind: ShapeKind }): number {
   if (!s.stroke || !(s.strokeWidth > 0)) return 0;
   const open = centerOnly(s);
   const band = open || s.align === 'center' ? s.strokeWidth / 2 : s.align === 'outside' ? s.strokeWidth : 0;
   const miter = s.kind !== 'line' && s.join === 'miter' ? MITER_LIMIT : 1;
-  const cap = open && s.cap === 'square' ? Math.SQRT2 : 1;
-  return band * Math.max(miter, cap);
+  // Square caps reach out at the ends of an open contour, and at the ends of every dash.
+  const cap = (open || s.dash?.some((d) => d > 0)) && s.cap === 'square' ? Math.SQRT2 : 1;
+  // Arrowheads reach up to 3 stroke widths from the end point (strokeStyle.ts HEAD_REACH).
+  const heads = open && s.arrows?.some((a) => a !== 'none') ? 3 * s.strokeWidth : 0;
+  return Math.max(band * Math.max(miter, cap), heads);
 }
 
 /** World bounding box of what a shape draws (the stroke included). */
@@ -1005,12 +1130,13 @@ export function centerOnly(s: Pick<ShapeInput, 'kind' | 'path'>): boolean {
 /** The fields each kind uses besides the common ones. Others are dropped (stripForKind). */
 const KIND_FIELDS: Record<ShapeKind, string[]> = {
   rect: ['radii', 'radiiLinked'],
-  ellipse: [],
+  ellipse: ['arc', 'hole'],
   polygon: ['sides', 'rounding'],
   star: ['points', 'innerRatio', 'rounding'],
   line: ['line'],
   path: ['path', 'curve'],
   compound: ['parts'],
+  custom: ['preset'],
 };
 const ALL_KIND_FIELDS = new Set(Object.values(KIND_FIELDS).flat());
 

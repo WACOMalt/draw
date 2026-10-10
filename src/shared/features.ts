@@ -16,6 +16,16 @@ export function brushHasDynamics(b: Brush): boolean {
   );
 }
 
+/** Features of a shape's geometry and style (also of a part, or of a vector stroke). */
+function shapeFeatures(s: Partial<Pick<Shape, 'kind' | 'arc' | 'hole' | 'dash' | 'arrows' | 'curve'>>, f: Set<DocFeature>): void {
+  if (s.kind === 'path') f.add('paths');
+  if (s.curve === 'spline') f.add('splines');
+  if (s.kind === 'custom') f.add('custom');
+  if (s.arc || s.hole) f.add('arcs');
+  if (s.dash?.some((d) => d > 0)) f.add('dashes');
+  if (s.arrows?.some((a) => a !== 'none')) f.add('arrows');
+}
+
 export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, shapes: Iterable<Shape> = []): DocFeature[] {
   const f = new Set<DocFeature>();
   for (const l of layers) {
@@ -30,22 +40,15 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, 
     if (s.deleted) continue;
     if (s.mask) f.add('mask');
     if (brushHasDynamics(s.brush)) f.add('tips');
-    if (s.vector) f.add('vectors');
-    if (s.vector?.curve === 'spline') f.add('splines');
-    if (s.vector?.kind === 'compound') f.add('compounds');
+    if (!s.vector) continue;
+    f.add('vectors');
+    for (const g of [s.vector, ...(s.vector.parts ?? [])]) shapeFeatures(g, f);
+    if (s.vector.kind === 'compound') f.add('compounds');
   }
   for (const s of shapes) {
     if (s.deleted) continue;
-    if (s.kind === 'compound') {
-      f.add('compounds');
-      for (const p of s.parts ?? []) {
-        if (p.kind === 'path') f.add('paths');
-        if (p.curve === 'spline') f.add('splines');
-      }
-    }
-    if (s.kind !== 'path') continue;
-    f.add('paths');
-    if (s.curve === 'spline') f.add('splines');
+    if (s.kind === 'compound') f.add('compounds');
+    for (const g of [s, ...(s.parts ?? [])]) shapeFeatures(g, f);
   }
   return [...f];
 }
