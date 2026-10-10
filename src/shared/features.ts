@@ -30,7 +30,8 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, 
     if (s.deleted) continue;
     if (s.mask) f.add('mask');
     if (brushHasDynamics(s.brush)) f.add('tips');
-    if (f.has('mask') && f.has('tips')) break; // nothing more to learn from strokes
+    if (s.vector) f.add('vectors');
+    if (f.has('mask') && f.has('tips') && f.has('vectors')) break; // nothing more to learn from strokes
   }
   for (const s of shapes) {
     if (s.deleted || s.kind !== 'path') continue;

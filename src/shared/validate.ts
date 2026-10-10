@@ -24,6 +24,7 @@ import {
   type ShapeInput,
   type ShapeProps,
   type ShapeUpdate,
+  type StrokeVector,
   POINT_STRIDE,
   POINT_TYPES,
 } from './types';
@@ -209,8 +210,17 @@ export function validateOp(v: unknown): Op {
           brush: validateBrush(s.brush),
           pts: validatePoints(s.pts),
           ...(s.mask !== undefined ? { mask: id(s.mask, 'mask') } : {}),
+          // A vector stroke (from a .bdraw file; live clients make them with shapes.toPaint).
+          ...(s.vector !== undefined && s.mask === undefined ? { vector: validateVector(s.vector) } : {}),
         },
       };
+    }
+    case 'shapes.toPaint':
+    case 'shapes.fromPaint': {
+      if (!Array.isArray(o.ids) || o.ids.length < 1 || o.ids.length > LIMITS.maxShapes) fail('bad ids');
+      const ids = o.ids.map((x) => id(x, 'ids'));
+      if (new Set(ids).size !== ids.length) fail('duplicate ids');
+      return { type: o.type, key: id(o.key, 'key'), ids, layerId: id(o.layerId, 'layerId') };
     }
     case 'stroke.remove':
     case 'stroke.restore':
@@ -365,6 +375,12 @@ export function validateShapeInput(v: unknown): ShapeInput {
   if ((kind === 'polygon' || kind === 'star') && p.rounding !== undefined) out.rounding = p.rounding;
   if (!cornersWithin(out, LIMITS.maxCoord)) fail('shape out of range');
   return stripForKind(out);
+}
+
+/** The shape kept on a vector stroke: a valid shape without id, layer, name and order. */
+export function validateVector(v: unknown): StrokeVector {
+  const { id: _i, layerId: _l, name: _n, z: _z, ...rest } = validateShapeInput({ ...obj(v, 'vector'), id: 'vector0000', layerId: 'vector0000', name: '', z: 0 });
+  return rest;
 }
 
 export { id as validateId, num as validateNumber, str as validateString };

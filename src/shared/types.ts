@@ -139,7 +139,16 @@ export interface Stroke {
   deleted?: boolean;
   /** Set on a mask stroke: the id of the layer mask it paints (Layer.mask.id). */
   mask?: string;
+  /**
+   * A vector stroke: a shape made paint (shapes.toPaint). It draws as that shape, exact at any
+   * zoom, in the stroke order of its layer: the eraser and the brush work over it. `pts` are its
+   * frame corners (for bounds, transforms and the stroke eraser); `brush` gives its main color.
+   */
+  vector?: StrokeVector;
 }
+
+/** The geometry and style of a shape, kept on a vector stroke. */
+export type StrokeVector = Omit<ShapeInput, 'id' | 'layerId' | 'name' | 'z'>;
 
 export const LAYER_KINDS = ['paint', 'adjust', 'group', 'shape'] as const;
 export type LayerKind = (typeof LAYER_KINDS)[number];
@@ -238,7 +247,7 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -269,7 +278,15 @@ export type Op =
    * `newId`; copies of its layers, strokes and shapes get ids derived from `newId` and the original id
    * (derivedId), so every client makes the same copy. The copy goes into `parent` at `order`.
    */
-  | { type: 'layer.duplicate'; id: string; newId: string; name: string; order: number; parent: string | null };
+  | { type: 'layer.duplicate'; id: string; newId: string; name: string; order: number; parent: string | null }
+  /**
+   * Makes shapes paint: each shape `ids` (live) becomes a vector stroke on the layer `layerId`
+   * (id derivedId(key, shape id), in shape order) and is removed. A paint layer takes them; their
+   * own shape layer takes them when they are all its shapes, and then becomes a paint layer.
+   */
+  | { type: 'shapes.toPaint'; key: string; ids: string[]; layerId: string }
+  /** The undo of shapes.toPaint (same key, ids, layerId): the strokes go, the shapes come back. */
+  | { type: 'shapes.fromPaint'; key: string; ids: string[]; layerId: string };
 
 /** An op as the server broadcasts it: restore ops carry the full object so late joiners can apply them. */
 export type AppliedOp =

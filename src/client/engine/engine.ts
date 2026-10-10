@@ -1460,6 +1460,48 @@ export class Engine {
     ed.activeLayerId = kids.at(-1)?.id ?? ed.activeLayerId;
   }
 
+  // --- shapes made paint ------------------------------------------------------------------------
+  //
+  // Shapes become vector strokes (shared/flatten.ts): exact at any zoom, and paint like any other
+  // stroke, so the brush and the erasers work over them. One op, one undo step.
+
+  /** A shape layer becomes a paint layer in place: mask, clipping, opacity and its place stay. */
+  convertLayerToPaint(id: string): void {
+    if (!ed.canEdit) return;
+    const l = this.doc.layer(id);
+    if (!l || l.kind !== 'shape') return;
+    const ids = [...this.doc.shapes.values()].filter((s) => !s.deleted && s.layerId === id).map((s) => s.id);
+    if (!ids.length) return showToast('The layer has no shapes yet');
+    this.shapes.cancel();
+    const op: Op = { type: 'shapes.toPaint', key: newId(), ids, layerId: id };
+    this.sendOp(op);
+    this.pushUndo({ undo: [{ ...op, type: 'shapes.fromPaint' }], redo: [op] });
+    ed.selection = [];
+    showToast(`${ids.length} shape${ids.length === 1 ? '' : 's'} became paint`);
+  }
+
+  /** The selected shapes become paint on a new paint layer above their (topmost) layer. */
+  convertShapesToPaint(ids = ed.selection): void {
+    if (!ed.canEdit || !ids.length) return;
+    const list = ids.map((id) => this.doc.shapes.get(id)).filter((s) => s && !s.deleted);
+    if (list.length !== ids.length) return showToast('Wait a moment: the shapes are still being saved');
+    const order = ed.layers.map((l) => l.id);
+    const top = ed.layers.find((l) => l.id === list.map((s) => s!.layerId).sort((a, b) => order.indexOf(b) - order.indexOf(a))[0]);
+    if (!top) return;
+    this.shapes.cancel();
+    const lid = newId();
+    const add: Op = {
+      type: 'layer.add',
+      layer: { id: lid, name: `${top.name} paint`.slice(0, LIMITS.maxLayerName), order: this.orderAbove(top), ...(top.parent ? { parent: top.parent } : {}), blend: 'normal', opacity: 1, visible: true },
+    };
+    const op: Op = { type: 'shapes.toPaint', key: newId(), ids: [...ids], layerId: lid };
+    this.sendOp(add);
+    this.sendOp(op);
+    this.pushUndo({ undo: [{ ...op, type: 'shapes.fromPaint' }, { type: 'layer.remove', id: lid }], redo: [{ type: 'layer.restore', id: lid }, op] });
+    ed.selection = [];
+    ed.activeLayerId = lid;
+  }
+
   /** Copies a layer, or a group with everything in it, right above it. One op: see layer.duplicate. */
   duplicate(id: string): void {
     if (!ed.canEdit) return;
@@ -1800,7 +1842,7 @@ export class Engine {
         this.previewSeq = Math.max(this.previewSeq ?? -1, m.seq);
         break;
       case 'op': {
-        const changes = this.doc.apply(m.seq, m.op);
+        const changes = this.doc.apply(m.seq, m.op, m.by);
         if (m.by === ed.clientId) this.doc.dropPending(m.opId);
         const op = m.op;
         if (changes) {
@@ -1810,6 +1852,7 @@ export class Engine {
             this.comp.addStroke(st, m.seq);
           }
           for (const st of changes.added) this.comp.addStroke(st, m.seq);
+          for (const id of changes.removed ?? []) this.comp.removeStroke(id, m.seq);
           for (const sh of changes.shapes) this.comp.putShape(sh, m.seq);
           for (const id of changes.shapesGone) this.comp.removeShape(id, m.seq);
           this.comp.advanceSeq(m.seq);

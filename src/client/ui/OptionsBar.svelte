@@ -283,6 +283,12 @@
         title="While on, clicks outside the box neither select another shape nor deselect. Shift+click still adds or removes; Esc and Deselect still clear."
         onclick={() => (ed.keepSelection = !ed.keepSelection)}>Keep selection</button
       >
+      <button
+        class="icon wide"
+        disabled={!selShapes.length || !ed.canEdit}
+        title="The selected shapes become paint on a new paint layer above: the brush and the erasers work on them. Undo turns them back."
+        onclick={() => engine?.convertShapesToPaint()}>To paint layer</button
+      >
       <button class="icon wide" disabled={!selShapes.length} title="Deselect (Esc)" onclick={() => engine?.shapes.deselect()}>Deselect (Esc)</button>
     </div>
   {/if}
