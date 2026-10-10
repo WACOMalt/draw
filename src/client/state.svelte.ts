@@ -193,6 +193,8 @@ class EditorState {
   shapeStyle = $state<ShapeStyle>({ ...SHAPE_STYLE, ...prefs.shapeStyle });
   penStyle = $state<PenStyle>({ ...PEN_STYLE, ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);
+  /** Height of the floating options bar over the canvas (CSS px from the canvas top; 0: none). */
+  optsHeight = $state(0);
   /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
   pointEdit = $state<{ id: string; points: string[] } | null>(null);
   /** Parts mode: the compound shape whose parts can be selected (their ids: "<compound id>~<index>"). */

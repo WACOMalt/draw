@@ -47,7 +47,8 @@
   }
   .banner {
     position: absolute;
-    top: 10px;
+    /* Below the floating options bar (Editor.svelte sets --opts-h). */
+    top: calc(var(--opts-h, 0px) + 10px);
     left: 50%;
     transform: translateX(-50%);
     z-index: 5;
