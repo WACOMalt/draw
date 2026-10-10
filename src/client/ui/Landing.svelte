@@ -126,9 +126,7 @@
     {/if}
   </div>
   <p class="version">
-    <span title={upd.appVersion && upd.appVersion !== __APP_VERSION__ ? 'The page comes from the server; the app updates from GitHub' : undefined}>
-      v{__APP_VERSION__}{#if upd.appVersion && upd.appVersion !== __APP_VERSION__}&nbsp;(server) · app v{upd.appVersion}{/if}
-    </span>
+    v{__APP_VERSION__}
     {#if CAN_UPDATE}
       · <button class="check" disabled={upd.checking} onclick={() => checkForUpdates(true)}>{upd.checking ? 'Checking…' : 'Check for updates'}</button>
     {/if}

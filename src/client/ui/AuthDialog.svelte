@@ -1,6 +1,6 @@
 <script lang="ts">
   import { announceAuth, api, errorText } from '../api';
-  import { IS_TAURI } from '../config';
+  import { BUNDLED } from '../config';
   import { desktopToken } from '../identity';
   import { ed, showToast, type User } from '../state.svelte';
   import Modal from './Modal.svelte';
@@ -42,7 +42,7 @@
     error = '';
     try {
       if (ed.auth === 'login') {
-        const r = await api<{ user: User; token?: string }>('POST', '/api/auth/login', { email, password, client: IS_TAURI ? 'desktop' : undefined });
+        const r = await api<{ user: User; token?: string }>('POST', '/api/auth/login', { email, password, client: BUNDLED ? 'desktop' : undefined });
         if (r.ok) return signedIn(r.data.user, r.data.token);
         unverified = r.data.error === 'unverified';
         error = errorText(r.data.error);
@@ -52,7 +52,7 @@
           password,
           name,
           captcha,
-          client: IS_TAURI ? 'desktop' : undefined,
+          client: BUNDLED ? 'desktop' : undefined,
         });
         captchaRound++; // a challenge works once
         if (!r.ok) return void (error = errorText(r.data.error));
@@ -70,7 +70,7 @@
         const r = await api<{ user: User }>('POST', '/api/auth/reset', { token: ed.resetToken, password });
         if (!r.ok) return void (error = errorText(r.data.error));
         // The reset sets a cookie for the web app. The desktop app logs in again for its token.
-        if (IS_TAURI) {
+        if (BUNDLED) {
           showToast('Password changed. Log in with the new password.');
           return view('login');
         }
@@ -90,7 +90,7 @@
 <Modal title={titles[ed.auth ?? 'login']} onClose={close}>
   {#if ed.auth === 'sent'}
     <p>We sent a link to <b>{ed.authEmail}</b>. Open it to continue.</p>
-    <p class="muted">It can take a minute. Check the spam folder too.{IS_TAURI ? ' After you confirm in the browser, log in here.' : ''}</p>
+    <p class="muted">It can take a minute. Check the spam folder too.{BUNDLED ? ' After you confirm in the browser, log in here.' : ''}</p>
     <div class="actions">
       <button class="primary" onclick={() => view('login')}>Back to log in</button>
       <button onclick={resend}>Send again</button>

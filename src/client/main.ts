@@ -2,7 +2,7 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import Embed from './ui/Embed.svelte';
 import './app.css';
-import { API_BASE, IS_TAURI } from './config';
+import { BUNDLED } from './config';
 import { parseKey } from '../shared/types';
 import { parseFrame } from './embed';
 
@@ -24,7 +24,7 @@ if (embedKey) {
 
 // The service worker makes the app installable (Chrome, Edge, Firefox for Android).
 // Only in production builds: in dev it would cache Vite's modules.
-if (import.meta.env.PROD && !IS_TAURI && !API_BASE && !embedKey && 'serviceWorker' in navigator) {
+if (import.meta.env.PROD && !BUNDLED && !embedKey && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch((e) => console.warn('service worker', e));
   });

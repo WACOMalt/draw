@@ -1,5 +1,6 @@
 // Where the server lives. Empty = the origin that served the page (web and PWA).
-// The Tauri build sets VITE_SERVER_ORIGIN (see .env.tauri), because its page comes from the app.
+// The app build (`vite build --mode tauri`, for the Tauri apps and the Linux Electron app) sets
+// VITE_SERVER_ORIGIN (see .env.tauri), because its page comes with the app.
 
 const env = (import.meta.env.VITE_SERVER_ORIGIN as string | undefined)?.replace(/\/+$/, '') ?? '';
 
@@ -11,7 +12,13 @@ export const PUBLIC_ORIGIN = env || location.origin;
 
 export const IS_TAURI = '__TAURI_INTERNALS__' in window;
 
-/** The Linux desktop app: the hosted site in Electron (electron/preload.cjs). */
+/**
+ * The page comes with the app (every desktop and mobile app), not from the server: the server is
+ * another origin, so it signs in with a bearer token instead of a cookie.
+ */
+export const BUNDLED = API_BASE !== '';
+
+/** The Linux desktop app: Electron, with the page bundled (electron/main.cjs, preload.cjs). */
 export interface DrawDesktop {
   kind: 'electron';
   onOpenFile(callback: (name: string, bytes: Uint8Array) => void): void;

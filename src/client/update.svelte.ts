@@ -65,11 +65,6 @@ export const upd = $state({
   auto: true,
   /** A version the person chose to skip: not offered again until a newer one. */
   skip: '',
-  /**
-   * The installed app's version, after a check. The Linux app loads its page from the server,
-   * so the page's version (__APP_VERSION__) is the server's and may be older.
-   */
-  appVersion: '',
 });
 
 const STORE = 'draw.update';
@@ -159,10 +154,8 @@ export async function checkForUpdates(manual = false): Promise<void> {
   lastCheck = Date.now();
   try {
     const { current, update: u } = ANDROID ? await androidCheck() : await desktopCheck();
-    upd.appVersion = current;
     if (!u) {
-      const site = current !== __APP_VERSION__ ? ` The page comes from the server, which runs v${__APP_VERSION__}.` : '';
-      if (manual) showToast(`The Draw app is up to date (v${current}).${site}`);
+      if (manual) showToast(`Draw is up to date (v${current})`);
       return;
     }
     if (!manual && u.version === upd.skip) return;

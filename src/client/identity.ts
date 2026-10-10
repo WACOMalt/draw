@@ -3,7 +3,7 @@
 // - the desktop app keeps its bearer session token here (the web app uses an httpOnly cookie)
 // - join-password grants and share-link tokens per canvas
 
-import { IS_TAURI } from './config';
+import { BUNDLED } from './config';
 
 function get(key: string): string | null {
   try {
@@ -34,8 +34,8 @@ export function anonSecret(): string {
 }
 
 export const desktopToken = {
-  get: (): string | null => (IS_TAURI ? get('draw.token') : null),
-  set: (t: string | null) => IS_TAURI && set('draw.token', t),
+  get: (): string | null => (BUNDLED ? get('draw.token') : null),
+  set: (t: string | null) => BUNDLED && set('draw.token', t),
 };
 
 export const grants = {
