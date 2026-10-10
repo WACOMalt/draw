@@ -781,6 +781,91 @@ try {
     check(imp.status === 201 && imp.data.skipped === 0 && iw.shapes[0]?.kind === 'path' && iw.strokes[0]?.vector?.kind === 'rect', 'paths: a .bdraw with a path and a vector stroke imports');
   }
 
+  // --- spline paths and compound shapes ---------------------------------------------------------
+  {
+    const cb = new Browser();
+    await account(cb, 'compound@example.com', 'Compound Tester');
+    const cc = (await cb.api('POST', '/api/sessions', { name: 'compound-test' })).data.key;
+    const o = await cb.join(cc);
+    await first(o);
+    let opn = 900;
+    const tryOp = async (op) => {
+      const n = opn++;
+      o.send({ t: 'op', opId: `c${n}xxxxx`, op });
+      return o.next((m) => (m.t === 'reject' || m.t === 'op') && m.opId === `c${n}xxxxx`, 2000);
+    };
+    const style = { fill: '#2a9d8f', stroke: '#1d3557', strokeWidth: 4, align: 'center', cap: 'round', join: 'round' };
+    // A spline point repeats its anchor as its handles; the 7th number is its smoothness.
+    const sp = (x, y, s) => [x, y, x, y, x, y, s];
+    const spline = (id, pts, extra = {}) => ({ id, layerId: 'cmpLAYER01', kind: 'path', curve: 'spline', name: 'Path 1', z: 1, w: 100, h: 100, m: [1, 0, 0, 1, 0, 0], path: [{ closed: true, pts }], ...style, ...extra });
+    await tryOp({ type: 'layer.add', layer: { id: 'cmpLAYER01', kind: 'shape', name: 'Shapes', order: 2, blend: 'normal', opacity: 1, visible: true } });
+    let r = await tryOp({ type: 'shape.add', shape: spline('splSHAPE01', [...sp(0, 0, -1), ...sp(100, 0, 0), ...sp(100, 100, 0.5), ...sp(0, 100, 1)]) });
+    check(r?.t === 'op' && r.op.shape.curve === 'spline', 'splines: add a spline path (smoothness from -1 to 1)');
+    r = await tryOp({ type: 'shape.add', shape: spline('splBAD0001', [...sp(0, 0, 1.5), ...sp(100, 0, 0), ...sp(0, 100, 0)]) });
+    check(r?.t === 'reject', 'splines: a smoothness above 1 is refused');
+    r = await tryOp({ type: 'shape.add', shape: spline('splBAD0002', [...sp(0, 0, 0.5), ...sp(100, 0, 0), ...sp(0, 100, 0)], { curve: undefined }) });
+    check(r?.t === 'reject', 'splines: a Bezier point type must be a whole number');
+    r = await tryOp({ type: 'shape.add', shape: spline('splBAD0003', [...sp(0, 0, 0), ...sp(100, 0, 0), ...sp(0, 100, 0)], { curve: 'xspline' }) });
+    check(r?.t === 'reject', 'splines: an unknown curve is refused');
+    let w2 = await first(await cb.join(cc));
+    check(w2.features.includes('splines') && w2.features.includes('paths'), 'splines: welcome lists the splines feature');
+
+    // A compound: parts with an op each, in the compound's local units.
+    const part = (kind, op, x, y, extra = {}) => ({ kind, op, w: 100, h: 100, m: [1, 0, 0, 1, x, y], ...extra });
+    const compound = (id, parts, extra = {}) => ({ id, layerId: 'cmpLAYER01', kind: 'compound', name: 'Union 1', z: 2, w: 150, h: 150, m: [1, 0, 0, 1, 200, 0], parts, ...style, ...extra });
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpSHAPE01', [part('rect', 'unite', 0, 0, { radii: [0, 0, 0, 0] }), part('ellipse', 'subtract', 50, 50), part('path', 'unite', 0, 50, { path: [{ closed: true, pts: [...sp(0, 0, -1), ...sp(50, 0, -1), ...sp(0, 50, -1)] }], curve: 'spline' })]) });
+    check(r?.t === 'op' && r.op.shape.parts.length === 3 && r.op.shape.parts[1].op === 'subtract', 'compounds: add a compound shape');
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpBAD0001', []) });
+    check(r?.t === 'reject', 'compounds: a compound needs parts');
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpBAD0002', [part('rect', 'unite', 0, 0), part('line', 'unite', 0, 0, { line: [0, 0, 10, 10] })]) });
+    check(r?.t === 'reject', 'compounds: a line cannot be a part');
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpBAD0003', [part('rect', 'unite', 0, 0), part('ellipse', 'blend', 0, 0)]) });
+    check(r?.t === 'reject', 'compounds: an unknown op is refused');
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpBAD0004', [part('rect', 'unite', 0, 0), part('compound', 'unite', 0, 0, { parts: [part('rect', 'unite', 0, 0)] })]) });
+    check(r?.t === 'reject', 'compounds: a compound cannot be a part');
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpBAD0005', Array.from({ length: 65 }, (_, i) => part('ellipse', 'unite', i, 0))) });
+    check(r?.t === 'reject', 'compounds: at most 64 parts');
+    r = await tryOp({ type: 'shape.add', shape: compound('cmpBAD0006', [part('polygon', 'unite', 0, 0)]) });
+    check(r?.t === 'reject', 'compounds: each part must be valid for its kind');
+
+    // Change an op; flatten to one path; undo the flatten.
+    const before = (await first(await cb.join(cc))).shapes.find((x) => x.id === 'cmpSHAPE01');
+    r = await tryOp({ type: 'shape.update', id: 'cmpSHAPE01', props: { parts: before.parts.map((p, i) => (i === 1 ? { ...p, op: 'intersect' } : p)) } });
+    w2 = await first(await cb.join(cc));
+    check(r?.t === 'op' && w2.shapes.find((x) => x.id === 'cmpSHAPE01').parts[1].op === 'intersect', 'compounds: change the op of a part');
+    check(w2.features.includes('compounds'), 'compounds: welcome lists the compounds feature');
+    const flat = { closed: true, pts: [0, 0, 0, 0, 0, 0, 0, 100, 0, 100, 0, 100, 0, 0, 0, 0, 100, 0, 100, 0, 0, 0, 100, 0, 100, 0, 100, 0] };
+    r = await tryOp({ type: 'shape.update', id: 'cmpSHAPE01', props: { kind: 'path', path: [flat], w: 100, h: 100 } });
+    w2 = await first(await cb.join(cc));
+    let sh = w2.shapes.find((x) => x.id === 'cmpSHAPE01');
+    check(r?.t === 'op' && sh.kind === 'path' && !sh.parts && !w2.features.includes('compounds'), 'compounds: flatten makes it one path (the parts go)');
+    r = await tryOp({ type: 'shape.update', id: 'cmpSHAPE01', props: { kind: 'compound', parts: before.parts, w: before.w, h: before.h } });
+    w2 = await first(await cb.join(cc));
+    sh = w2.shapes.find((x) => x.id === 'cmpSHAPE01');
+    check(r?.t === 'op' && sh.kind === 'compound' && sh.parts.length === 3 && !sh.path, 'compounds: undo of a flatten brings the parts back');
+
+    // A compound made paint keeps its parts in the vector.
+    await tryOp({ type: 'layer.add', layer: { id: 'cmpPAINT01', kind: 'paint', name: 'Paint', order: 3, blend: 'normal', opacity: 1, visible: true } });
+    r = await tryOp({ type: 'shapes.toPaint', key: 'cmpKEY0001', ids: ['cmpSHAPE01'], layerId: 'cmpPAINT01' });
+    w2 = await first(await cb.join(cc));
+    const vec = w2.strokes.find((x) => x.vector?.kind === 'compound');
+    check(r?.t === 'op' && vec?.vector.parts.length === 3 && w2.features.includes('compounds'), 'compounds: a compound made paint keeps its parts');
+
+    // A .bdraw (version 6) with a compound shape and a compound vector.
+    const file = {
+      format: 'bdraw', version: 6, app: 'test', savedAt: '',
+      layers: [
+        { id: 'impCMPL001', name: 'Shapes', order: 1, blend: 'normal', opacity: 1, visible: true, deleted: false, kind: 'shape' },
+        { id: 'impCMPP001', name: 'Paint', order: 2, blend: 'normal', opacity: 1, visible: true, deleted: false },
+      ],
+      strokes: [{ ...vec, id: 'impCMPV001', layerId: 'impCMPP001' }],
+      shapes: [compound('impCMP0001', before.parts, { layerId: 'impCMPL001' })],
+    };
+    const imp = await cb.upload(Buffer.from(JSON.stringify(file)), {});
+    const iw = await first(await new Browser().join(imp.data.key));
+    check(imp.status === 201 && imp.data.skipped === 0 && iw.shapes[0]?.parts?.length === 3 && iw.strokes[0]?.vector?.kind === 'compound', 'compounds: a .bdraw with compounds imports');
+  }
+
   // --- admins manage every owned canvas like its owner ------------------------------------------
   const adm = (await funky.api('POST', '/api/sessions', { name: 'admin-test' })).data.key;
   await funky.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'none' });
