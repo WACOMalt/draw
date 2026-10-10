@@ -1999,9 +1999,15 @@ export class Engine {
         const a = this.activeLayer();
         if (a && e.shiftKey) this.ungroup(a.id);
         else if (a) this.groupLayer(a.id);
+      } else if (key === 'd' && ed.selection.length) {
+        // Ctrl+D: duplicate the selected shapes (the browser's bookmark shortcut otherwise).
+        e.preventDefault();
+        this.shapes.duplicate();
       } else if (key === 'j') {
         e.preventDefault();
-        if (ed.activeLayerId) this.duplicate(ed.activeLayerId);
+        // With shapes selected, Ctrl+J copies them; else the active layer.
+        if (ed.selection.length) this.shapes.duplicate();
+        else if (ed.activeLayerId) this.duplicate(ed.activeLayerId);
       } else if (key === '=' || key === '+') {
         e.preventDefault();
         this.zoomBy(1.25);

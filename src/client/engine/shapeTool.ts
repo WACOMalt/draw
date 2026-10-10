@@ -139,6 +139,8 @@ interface Edit {
   end: 0 | 1;
   /** Several shapes: their world box (x0, y0, x1, y1). */
   box: Box | null;
+  /** Alt+drag: `orig` are copies (new ids) that the drag places; the originals stay. */
+  dup: string[] | null;
 }
 
 interface Create {
@@ -844,7 +846,9 @@ export class ShapeTool {
   private beginEdit(e: PointerEvent, x: number, y: number, kind: Edit['kind'], zone: Zone): void {
     const sel = this.selected();
     if (!sel.length) return;
-    const orig = new Map(sel.map((s) => [s.id, s]));
+    // Alt+drag to move: drags copies away, the originals stay (whole shapes only, not parts).
+    const dup = kind === 'move' && e.altKey && sel.every((s) => !splitPartId(s.id));
+    const orig = new Map((dup ? this.copiesOf(sel, 0, 0) : sel).map((s) => [s.id, s]));
     const box = this.boxOf(sel);
     let bb: Box | null = null;
     if (box && !box.single) {
@@ -864,6 +868,7 @@ export class ShapeTool {
       corner: zone.kind === 'radius' ? zone.corner : 0,
       end: zone.kind === 'endpoint' ? zone.end : 0,
       box: bb,
+      dup: dup ? sel.map((s) => s.id) : null,
     };
     this.hover = null;
   }
@@ -871,6 +876,8 @@ export class ShapeTool {
   private moveEdit(x: number, y: number, shift: boolean, alt: boolean): void {
     const g = this.edit!;
     if (!g.moved && Math.hypot(x - g.s0[0], y - g.s0[1]) <= (g.touch ? DRAG_PX_TOUCH : DRAG_PX)) return;
+    // Alt+drag: the copies are the selection from now on (the drafts below make them show).
+    if (!g.moved && g.dup) ed.selection = [...g.orig.keys()];
     g.moved = true;
     const p = this.toWorld(x, y);
     const out: Shape[] = [];
@@ -1027,9 +1034,71 @@ export class ShapeTool {
     this.edit = null;
     if (cancel || !g.moved) {
       this.clearDrafts();
+      if (g.dup) this.select(g.dup);
       return;
     }
+    if (g.dup) {
+      const copies = [...this.drafts.values()];
+      this.clearDrafts();
+      return this.addCopies(copies);
+    }
     this.commit(g.orig, [...this.drafts.values()]);
+  }
+
+  /**
+   * Copies of shapes with new ids, `dx`, `dy` world units away. Each goes right above its
+   * original in its layer (between it and the next shape up). Not sent yet.
+   */
+  private copiesOf(list: Shape[], dx: number, dy: number): Shape[] {
+    const zs = new Map<string, number[]>();
+    for (const s of this.view().values()) {
+      if (s.deleted) continue;
+      let l = zs.get(s.layerId);
+      if (!l) zs.set(s.layerId, (l = []));
+      l.push(s.z);
+    }
+    // An automatic name ("Rectangle 2") gets the next free number; a name someone chose stays.
+    const next = new Map<string, number>();
+    const nameOf = (s: Shape) => {
+      const m = /^(.*) (\d+)$/.exec(s.name);
+      if (!m || m[1] !== shapeLabel(s)) return s.name;
+      const n = next.get(m[1]) ?? +this.nextShapeName(s.kind, m[1]).split(' ').pop()!;
+      next.set(m[1], n + 1);
+      return `${m[1]} ${n}`;
+    };
+    return [...list].sort(byZ).map((s) => {
+      const l = zs.get(s.layerId) ?? [];
+      let above = Infinity;
+      for (const z of l) if (z > s.z && z < above) above = z;
+      const z = above === Infinity ? s.z + 1 : (s.z + above) / 2;
+      l.push(z); // the next copy goes above this one
+      const { author: _a, seq: _s, deleted: _d, ...rest } = s;
+      return { ...rest, id: newId(), name: nameOf(s), z, m: [s.m[0], s.m[1], s.m[2], s.m[3], s.m[4] + dx, s.m[5] + dy] as Affine, author: '', seq: Infinity };
+    });
+  }
+
+  /** Adds shapes (one undo step) and selects them. */
+  private addCopies(copies: Shape[]): void {
+    if (!copies.length) return;
+    let live = 0;
+    for (const s of this.view().values()) if (!s.deleted) live++;
+    if (live + copies.length > LIMITS.maxShapes) return void showToast('Too many shapes on this canvas');
+    for (const c of copies) this.host.sendOp({ type: 'shape.add', shape: toInput(c) });
+    this.host.pushUndo({
+      undo: copies.map((c) => ({ type: 'shape.remove', id: c.id }) as Op),
+      redo: copies.map((c) => ({ type: 'shape.restore', id: c.id }) as Op),
+    });
+    this.select(copies.map((c) => c.id));
+  }
+
+  /** Duplicates the selected shapes (Ctrl+D): copies 10 screen pixels down and right, selected. */
+  duplicate(): void {
+    if (!ed.canEdit) return showToast('View only: you can look around but not change shapes');
+    if (this.busy()) return;
+    const list = this.selected().filter((s) => !splitPartId(s.id));
+    if (!list.length) return showToast(ed.selection.length ? 'Select whole shapes to duplicate them (not parts)' : 'Select shapes to duplicate them');
+    const d = 10 / this.zoom;
+    this.addCopies(this.copiesOf(list, d, d));
   }
 
   /** Sends one update per changed shape and one undo step for all; ends the drafts. */
