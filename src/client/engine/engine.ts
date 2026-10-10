@@ -597,7 +597,7 @@ export class Engine {
             ? this.altDown
               ? 'zoom-out'
               : 'zoom-in'
-            : tool === 'shape'
+            : tool === 'shape' || tool === 'pen'
               ? 'crosshair'
               : tool === 'select'
                 ? 'default'
@@ -671,7 +671,7 @@ export class Engine {
       return;
     }
     if (tool === 'strokeEraser' && !eraserEnd) return this.beginSweep(e, x, y);
-    if ((tool === 'select' || tool === 'shape') && !eraserEnd) return this.shapes.down(e, x, y);
+    if ((tool === 'select' || tool === 'shape' || tool === 'pen') && !eraserEnd) return this.shapes.down(e, x, y);
     this.beginStroke(e, x, y, eraserEnd);
   }
 
@@ -700,7 +700,7 @@ export class Engine {
       this.pointer = e.pointerType === 'touch' ? null : { x, y };
       const t = this.effectiveTool();
       if (t === 'strokeEraser') this.hoverAt(x, y);
-      if ((t === 'select' || t === 'shape') && e.pointerType !== 'touch') this.shapes.hoverAt(x, y);
+      if ((t === 'select' || t === 'shape' || t === 'pen') && e.pointerType !== 'touch') this.shapes.hoverAt(x, y);
       const [wx, wy] = this.comp.toWorld(x, y);
       ed.cursor = { x: wx, y: wy };
       this.updateBrushCursor();
@@ -1163,6 +1163,8 @@ export class Engine {
   undo(): void {
     if (!ed.canEdit) return;
     if (this.stroke || this.shapes.busy()) return;
+    // While the Pen draws, undo takes back its last point.
+    if (ed.penDrawing) return this.shapes.penUndoPoint();
     if (ed.transform) return this.cancelTransform();
     const e = this.undoStack.pop();
     if (!e) return;
@@ -1969,26 +1971,10 @@ export class Engine {
       }
       return;
     }
-    // Shapes: delete, deselect, nudge. Enter (like a double-click) is kept for point editing.
-    if ((ed.tool === 'select' || ed.tool === 'shape') && !ed.transform) {
-      if (e.key === 'Escape' && !e.defaultPrevented && this.shapes.escape()) return e.preventDefault();
-      if (ed.selection.length) {
-        if (e.key === 'Delete' || e.key === 'Backspace') {
-          e.preventDefault();
-          return this.shapes.remove();
-        }
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          return showToast('Point editing comes in a later version');
-        }
-        const arrows: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-        const a = arrows[e.key];
-        if (a) {
-          e.preventDefault();
-          const k = e.shiftKey ? 10 : 1;
-          return this.shapes.nudge(a[0] * k, a[1] * k);
-        }
-      }
+    // Shapes, points and the Pen: delete, deselect, nudge, Enter, Esc (shapeTool.ts key). An Esc
+    // that closed a popup is not for them.
+    if ((ed.tool === 'select' || ed.tool === 'shape' || ed.tool === 'pen') && !ed.transform && !(e.key === 'Escape' && e.defaultPrevented)) {
+      if (this.shapes.key(e)) return e.preventDefault();
     }
     const b = ed.activeBrush;
     switch (e.code) {
@@ -2007,7 +1993,7 @@ export class Engine {
       else b.opacity = v;
       return;
     }
-    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', v: 'select', u: 'shape', h: 'hand', z: 'zoom' };
+    const tools: Record<string, Tool> = { b: 'brush', e: e.shiftKey ? 'strokeEraser' : 'eraser', i: 'eyedropper', v: 'select', p: 'pen', u: 'shape', h: 'hand', z: 'zoom' };
     if (key === 'u' && e.shiftKey) {
       // Shift+U: the next kind of shape.
       ed.shapeKind = SHAPE_KINDS[(SHAPE_KINDS.indexOf(ed.shapeKind) + 1) % SHAPE_KINDS.length];

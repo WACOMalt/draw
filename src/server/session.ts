@@ -528,7 +528,7 @@ export class Session {
         role: client.role,
         canvas: this.info(client),
         grant: access.grant,
-        features: docFeatures(this.layers.values(), this.strokes.values()),
+        features: docFeatures(this.layers.values(), this.strokes.values(), this.shapes.values()),
         previewSeq: this.store.previewInfo(this.code)?.seq ?? null,
       });
       if (!client.embed) this.broadcast({ t: 'peer.join', peer: client.peer }, client);

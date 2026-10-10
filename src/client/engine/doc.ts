@@ -2,7 +2,7 @@
 // server has not echoed yet. The UI shows confirmed state with pending layer ops on top.
 
 import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shared/layers';
-import { shapeBounds, transformShapeMatrix } from '../../shared/shapes';
+import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
 import { LIMITS, type AppliedOp, type Layer, type Op, type Shape, type Stroke } from '../../shared/types';
 
 export interface PendingOp {
@@ -245,7 +245,7 @@ export class Doc {
   }
 }
 
-/** A shape with some props changed (the client sends only props that fit the shape's kind). */
+/** A shape with some props changed. Settings of other kinds go, as on the server. */
 export function applyShapeProps(s: Shape, props: Partial<Shape>): Shape {
-  return { ...s, ...props };
+  return stripForKind({ ...s, ...props });
 }

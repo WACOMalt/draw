@@ -9,13 +9,15 @@
 // exact in a 256 px tile, with a few dozen points.
 
 import { compose, validAffine } from './layers';
-import type { Affine, Shape, ShapeInput, ShapeKind, ShapeProps } from './types';
+import { POINT_STRIDE, type Affine, type PathContour, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from './types';
 
 /** Miter joins longer than this many half widths become bevels (as SVG's default of 4). */
 export const MITER_LIMIT = 4;
 
 export type Seg =
   | { t: 'L'; x: number; y: number }
+  /** A cubic Bezier from the current point, with the control points (x1, y1) and (x2, y2). */
+  | { t: 'C'; x1: number; y1: number; x2: number; y2: number; x: number; y: number }
   /** An arc of the axis-aligned ellipse (cx, cy, rx, ry) from angle a0 to a1 (radians, either way). */
   | { t: 'A'; cx: number; cy: number; rx: number; ry: number; a0: number; a1: number };
 
@@ -31,7 +33,7 @@ export interface Contour {
 export type Box = [number, number, number, number];
 
 /** The geometry fields of a shape (what its outline depends on). */
-export type ShapeGeo = Pick<ShapeProps, 'w' | 'h' | 'radii' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'line'> & { kind: ShapeKind };
+export type ShapeGeo = Pick<ShapeProps, 'w' | 'h' | 'radii' | 'sides' | 'points' | 'innerRatio' | 'rounding' | 'line' | 'path'> & { kind: ShapeKind };
 
 // --- outlines --------------------------------------------------------------------------------
 
@@ -174,7 +176,26 @@ export function shapeContours(s: ShapeGeo): Contour[] {
       const [x0, y0, x1, y1] = s.line ?? [0, 0, w, h];
       return [{ x: x0, y: y0, closed: false, segs: [{ t: 'L', x: x1, y: y1 }] }];
     }
+    case 'path':
+      return (s.path ?? []).filter((c) => c.pts.length >= POINT_STRIDE).map(pathContour);
   }
+}
+
+/** The segment from point a to point b of a path contour: straight when both handles are at their anchors. */
+function pathSeg(p: number[], a: number, b: number): Seg {
+  const S = POINT_STRIDE;
+  const [x0, y0, ox, oy] = [p[a * S], p[a * S + 1], p[a * S + 4], p[a * S + 5]];
+  const [x1, y1, ix, iy] = [p[b * S], p[b * S + 1], p[b * S + 2], p[b * S + 3]];
+  if (ox === x0 && oy === y0 && ix === x1 && iy === y1) return { t: 'L', x: x1, y: y1 };
+  return { t: 'C', x1: ox, y1: oy, x2: ix, y2: iy, x: x1, y: y1 };
+}
+
+function pathContour(c: PathContour): Contour {
+  const n = c.pts.length / POINT_STRIDE;
+  const segs: Seg[] = [];
+  for (let i = 0; i + 1 < n; i++) segs.push(pathSeg(c.pts, i, i + 1));
+  if (c.closed && n > 1) segs.push(pathSeg(c.pts, n - 1, 0));
+  return { x: c.pts[0], y: c.pts[1], closed: c.closed && n > 1, segs };
 }
 
 // --- flattening ------------------------------------------------------------------------------
@@ -250,9 +271,86 @@ function flattenArc(seg: Extract<Seg, { t: 'A' }>, A: Affine, scale: number, tol
   sub(seg.a0, seg.a1, 0, true);
 }
 
+/**
+ * Points along a cubic Bezier (p: the four control points, local units), after its start point:
+ * the same refinement rules as flattenArc. A piece lies inside the box of its control points; its
+ * distance from the chord is at most that of its two inner control points.
+ */
+function flattenCubic(p0: number[], A: Affine, scale: number, tol: number, box: Box | null, reach: number, pts: number[], smooth: boolean[]): void {
+  const band = reach * scale;
+  const sub = (p: number[], depth: number, last: boolean) => {
+    const [x0, y0, x1, y1, x2, y2, x3, y3] = p;
+    const dev = Math.max(ptSeg(x1, y1, x0, y0, x3, y3), ptSeg(x2, y2, x0, y0, x3, y3)) * scale;
+    // The band beside the curve strays further where the piece turns.
+    let turn = 0;
+    if (reach > 0) {
+      const ax = x1 - x0 || x2 - x0, ay = y1 - y0 || y2 - y0;
+      const bx = x3 - x2 || x3 - x1, by = y3 - y2 || y3 - y1;
+      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      if (la > 0 && lb > 0) turn = Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb))));
+    }
+    const err = dev + band * (1 - Math.cos(Math.min(turn, Math.PI) / 2));
+    let done = (err <= tol && turn < Math.PI / 2) || depth > 40;
+    if (!done && box && turn < Math.PI / 2) {
+      let hx0 = Infinity, hy0 = Infinity, hx1 = -Infinity, hy1 = -Infinity;
+      for (let i = 0; i < 8; i += 2) {
+        const X = tx(A, p[i], p[i + 1]), Y = ty(A, p[i], p[i + 1]);
+        hx0 = Math.min(hx0, X);
+        hx1 = Math.max(hx1, X);
+        hy0 = Math.min(hy0, Y);
+        hy1 = Math.max(hy1, Y);
+      }
+      const dMin = Math.hypot(Math.max(0, box[0] - hx1, hx0 - box[2]), Math.max(0, box[1] - hy1, hy0 - box[3]));
+      const m = err + 2;
+      let near = dMin <= m;
+      if (!near && band > 0 && dMin <= band + m) {
+        const ax = tx(A, x0, y0), ay = ty(A, x0, y0), bx = tx(A, x3, y3), by = ty(A, x3, y3);
+        const dMax = Math.max(ptSeg(box[0], box[1], ax, ay, bx, by), ptSeg(box[2], box[1], ax, ay, bx, by), ptSeg(box[2], box[3], ax, ay, bx, by), ptSeg(box[0], box[3], ax, ay, bx, by));
+        near = dMax + dev >= band - m;
+      }
+      done = !near;
+    }
+    if (done) {
+      pts.push(x3, y3);
+      smooth.push(!last);
+      return;
+    }
+    const [l, r] = splitCubic(p, 0.5);
+    sub(l, depth + 1, false);
+    sub(r, depth + 1, last);
+  };
+  sub(p0, 0, true);
+}
+
+/** A cubic Bezier (8 numbers) cut in two at t (de Casteljau): the exact same curve. */
+export function splitCubic(p: number[], t: number): [number[], number[]] {
+  const [x0, y0, x1, y1, x2, y2, x3, y3] = p;
+  const l = (a: number, b: number) => a + (b - a) * t;
+  const ax = l(x0, x1), ay = l(y0, y1), bx = l(x1, x2), by = l(y1, y2), cx = l(x2, x3), cy = l(y2, y3);
+  const dx = l(ax, bx), dy = l(ay, by), ex = l(bx, cx), ey = l(by, cy);
+  const fx = l(dx, ex), fy = l(dy, ey);
+  return [
+    [x0, y0, ax, ay, dx, dy, fx, fy],
+    [fx, fy, ex, ey, cx, cy, x3, y3],
+  ];
+}
+
+/** A point on a cubic Bezier. */
+export function cubicAt(p: number[], t: number): [number, number] {
+  const u = 1 - t;
+  const a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [a * p[0] + b * p[2] + c * p[4] + d * p[6], a * p[1] + b * p[3] + c * p[5] + d * p[7]];
+}
+
 /** Direction of a segment where it starts and where it ends (not normalized). */
 function tangents(seg: Seg, x: number, y: number): [number, number, number, number] {
   if (seg.t === 'L') return [seg.x - x, seg.y - y, seg.x - x, seg.y - y];
+  if (seg.t === 'C') {
+    // A handle at its anchor gives no direction: the next control point does.
+    const [sx, sy] = seg.x1 !== x || seg.y1 !== y ? [seg.x1 - x, seg.y1 - y] : seg.x2 !== x || seg.y2 !== y ? [seg.x2 - x, seg.y2 - y] : [seg.x - x, seg.y - y];
+    const [ex, ey] = seg.x2 !== seg.x || seg.y2 !== seg.y ? [seg.x - seg.x2, seg.y - seg.y2] : seg.x1 !== seg.x || seg.y1 !== seg.y ? [seg.x - seg.x1, seg.y - seg.y1] : [seg.x - x, seg.y - y];
+    return [sx, sy, ex, ey];
+  }
   const s = seg.a1 >= seg.a0 ? 1 : -1;
   return [-seg.rx * Math.sin(seg.a0) * s, seg.ry * Math.cos(seg.a0) * s, -seg.rx * Math.sin(seg.a1) * s, seg.ry * Math.cos(seg.a1) * s];
 }
@@ -286,6 +384,10 @@ export function flattenContour(c: Contour, A: Affine, tol: number, box: Box | nu
     if (seg.t === 'L') {
       pts.push(seg.x, seg.y);
       smooth.push(false);
+      x = seg.x;
+      y = seg.y;
+    } else if (seg.t === 'C') {
+      flattenCubic([x, y, seg.x1, seg.y1, seg.x2, seg.y2, seg.x, seg.y], A, scale, tol, box, reach, pts, smooth);
       x = seg.x;
       y = seg.y;
     } else {
@@ -478,7 +580,7 @@ export interface Bounds {
 }
 
 /** Corners of the frame in the world (a line: its two end points). */
-export function shapeCorners(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line'>): number[] {
+export function shapeCorners(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line' | 'path'>): number[] {
   const m = s.m;
   const local = s.kind === 'line' && s.line ? s.line : [0, 0, s.w, 0, s.w, s.h, 0, s.h];
   const out: number[] = [];
@@ -487,11 +589,12 @@ export function shapeCorners(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'lin
 }
 
 /** The band of stroke outside the outline, in local units (0: none). */
-export function strokeReach(s: Pick<ShapeProps, 'stroke' | 'strokeWidth' | 'align' | 'cap' | 'join'> & { kind: ShapeKind }): number {
+export function strokeReach(s: Pick<ShapeProps, 'stroke' | 'strokeWidth' | 'align' | 'cap' | 'join' | 'path'> & { kind: ShapeKind }): number {
   if (!s.stroke || !(s.strokeWidth > 0)) return 0;
-  const band = s.kind === 'line' || s.align === 'center' ? s.strokeWidth / 2 : s.align === 'outside' ? s.strokeWidth : 0;
+  const open = centerOnly(s);
+  const band = open || s.align === 'center' ? s.strokeWidth / 2 : s.align === 'outside' ? s.strokeWidth : 0;
   const miter = s.kind !== 'line' && s.join === 'miter' ? MITER_LIMIT : 1;
-  const cap = s.kind === 'line' && s.cap === 'square' ? Math.SQRT2 : 1;
+  const cap = open && s.cap === 'square' ? Math.SQRT2 : 1;
   return band * Math.max(miter, cap);
 }
 
@@ -511,8 +614,149 @@ export function shapeBounds(s: ShapeInput): Bounds {
 }
 
 /** True when every frame corner is within ±max. */
-export function cornersWithin(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line'>, max: number): boolean {
-  return shapeCorners(s).every((v) => Math.abs(v) <= max);
+export function cornersWithin(s: Pick<ShapeInput, 'kind' | 'w' | 'h' | 'm' | 'line' | 'path'>, max: number): boolean {
+  if (!shapeCorners(s).every((v) => Math.abs(v) <= max)) return false;
+  // A path: every anchor and handle too (they may lie outside the frame).
+  for (const c of s.kind === 'path' ? (s.path ?? []) : []) {
+    for (let i = 0; i < c.pts.length; i += POINT_STRIDE) {
+      for (let k = 0; k < 6; k += 2) {
+        const x = c.pts[i + k], y = c.pts[i + k + 1];
+        if (!(Math.abs(tx(s.m, x, y)) <= max && Math.abs(ty(s.m, x, y)) <= max)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+// --- paths -----------------------------------------------------------------------------------
+
+/** True when the shape strokes on the center only: a line, or a path with an open contour. */
+export function centerOnly(s: Pick<ShapeInput, 'kind' | 'path'>): boolean {
+  return s.kind === 'line' || (s.kind === 'path' && (s.path ?? []).some((c) => !c.closed));
+}
+
+/** The fields each kind uses besides the common ones. Others are dropped (stripForKind). */
+const KIND_FIELDS: Record<ShapeKind, string[]> = {
+  rect: ['radii', 'radiiLinked'],
+  ellipse: [],
+  polygon: ['sides', 'rounding'],
+  star: ['points', 'innerRatio', 'rounding'],
+  line: ['line'],
+  path: ['path'],
+};
+const ALL_KIND_FIELDS = new Set(Object.values(KIND_FIELDS).flat());
+
+/** A copy without the settings of other kinds (after a kind change). */
+export function stripForKind<T extends Pick<ShapeInput, 'kind'>>(s: T): T {
+  const keep = new Set(KIND_FIELDS[s.kind]);
+  const out = { ...s } as Record<string, unknown>;
+  for (const k of ALL_KIND_FIELDS) if (!keep.has(k)) delete out[k];
+  return out as T;
+}
+
+/**
+ * The outline of any shape as path contours (local units): what point editing starts from.
+ * Arcs become cubic Beziers of at most 90° each (within 0.03% of the radius).
+ */
+export function toPath(s: ShapeGeo): PathContour[] {
+  if (s.kind === 'path') return (s.path ?? []).map((c) => ({ closed: c.closed, pts: [...c.pts] }));
+  return shapeContours(s).map((c) => {
+    // Anchors with handles: x, y, ix, iy, ox, oy (the type is set below).
+    const p: number[][] = [[c.x, c.y, c.x, c.y, c.x, c.y]];
+    let x = c.x, y = c.y;
+    const to = (x1: number, y1: number, x2: number, y2: number, nx: number, ny: number) => {
+      const last = p[p.length - 1];
+      last[4] = x1;
+      last[5] = y1;
+      p.push([nx, ny, x2, y2, nx, ny]);
+      x = nx;
+      y = ny;
+    };
+    for (const g of c.segs) {
+      if (g.t === 'L') to(x, y, g.x, g.y, g.x, g.y);
+      else if (g.t === 'C') to(g.x1, g.y1, g.x2, g.y2, g.x, g.y);
+      else {
+        const n = Math.max(1, Math.ceil(Math.abs(g.a1 - g.a0) / (Math.PI / 2) - 1e-9));
+        const da = (g.a1 - g.a0) / n;
+        const k = (4 / 3) * Math.tan(da / 4);
+        for (let i = 0; i < n; i++) {
+          const a = g.a0 + da * i, b = a + da;
+          const ex = g.cx + g.rx * Math.cos(b), ey = g.cy + g.ry * Math.sin(b);
+          to(x - k * g.rx * Math.sin(a), y + k * g.ry * Math.cos(a), ex + k * g.rx * Math.sin(b), ey - k * g.ry * Math.cos(b), ex, ey);
+        }
+      }
+    }
+    // A closed contour ends where it starts: the last point is the first one.
+    if (c.closed && p.length > 1) {
+      const last = p[p.length - 1], first = p[0];
+      if (Math.abs(last[0] - first[0]) <= 1e-9 * (Math.abs(first[0]) + 1) && Math.abs(last[1] - first[1]) <= 1e-9 * (Math.abs(first[1]) + 1)) {
+        first[2] = last[2];
+        first[3] = last[3];
+        p.pop();
+      }
+    }
+    const pts: number[] = [];
+    for (const q of p) {
+      const smooth = !(q[2] === q[0] && q[3] === q[1]) && !(q[4] === q[0] && q[5] === q[1]) && sameDir(q[0] - q[2], q[1] - q[3], q[4] - q[0], q[5] - q[1]);
+      pts.push(q[0], q[1], q[2], q[3], q[4], q[5], smooth ? 1 : 0);
+    }
+    return { closed: c.closed, pts };
+  });
+}
+
+/** The box of the curves of path contours (local units): anchors and the extremes of each curve. */
+export function pathBounds(path: PathContour[]): [number, number, number, number] {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const add = (x: number, y: number) => {
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+  };
+  for (const c of path) {
+    const con = pathContour(c);
+    let x = con.x, y = con.y;
+    add(x, y);
+    for (const g of con.segs) {
+      if (g.t === 'C') {
+        const p = [x, y, g.x1, g.y1, g.x2, g.y2, g.x, g.y];
+        // Where the derivative is zero, on each axis.
+        for (const axis of [0, 1]) {
+          const [a, b, c2, d] = [p[axis], p[axis + 2], p[axis + 4], p[axis + 6]];
+          const qa = -a + 3 * b - 3 * c2 + d, qb = 2 * (a - 2 * b + c2), qc = b - a;
+          const roots: number[] = [];
+          if (Math.abs(qa) < 1e-12 * (Math.abs(a) + Math.abs(d) + 1)) {
+            if (qb !== 0) roots.push(-qc / qb);
+          } else {
+            const disc = qb * qb - 4 * qa * qc;
+            if (disc >= 0) roots.push((-qb + Math.sqrt(disc)) / (2 * qa), (-qb - Math.sqrt(disc)) / (2 * qa));
+          }
+          for (const t of roots) if (t > 0 && t < 1) add(...cubicAt(p, t));
+        }
+      }
+      if (g.t !== 'A') add(g.x, g.y);
+      x = (g as { x: number }).x;
+      y = (g as { y: number }).y;
+    }
+  }
+  return x0 <= x1 ? [x0, y0, x1, y1] : [0, 0, 0, 0];
+}
+
+/** A path shape with its frame fitted to its curves again: the origin moves into `m`. */
+export function fitPathFrame<T extends Pick<ShapeInput, 'm' | 'w' | 'h' | 'path'>>(s: T): T {
+  const path = s.path ?? [];
+  const [x0, y0, x1, y1] = pathBounds(path);
+  const moved = path.map((c) => {
+    const pts = c.pts.slice();
+    for (let i = 0; i < pts.length; i += POINT_STRIDE) {
+      for (let k = 0; k < 6; k += 2) {
+        pts[i + k] -= x0;
+        pts[i + k + 1] -= y0;
+      }
+    }
+    return { closed: c.closed, pts };
+  });
+  return { ...s, path: moved, w: x1 - x0, h: y1 - y0, m: compose(s.m, [1, 0, 0, 1, x0, y0]) };
 }
 
 /** The shape's matrix after a layer transform, or null when it would go out of range. */
@@ -560,17 +804,19 @@ export function hitShape(s: ShapeInput, x: number, y: number, tol: number): bool
   const A: Affine = [m[0], m[1], m[2], m[3], m[4] - x, m[5] - y];
   const sc = maxScale(m);
   const half = s.stroke && s.strokeWidth > 0 ? s.strokeWidth * sc : 0;
-  const reach = s.kind === 'line' || s.align === 'center' ? half / 2 : s.align === 'outside' ? half : 0;
+  const reach = centerOnly(s) || s.align === 'center' ? half / 2 : s.align === 'outside' ? half : 0;
   const r = reach + tol;
   const polys = outlinePolys(s, A, Math.max(tol / 4, 1e-300), [-r * 2, -r * 2, r * 2, r * 2]);
   let wind = 0;
   let dist = Infinity;
   for (const { pts, closed } of polys) {
     const n = pts.length;
-    for (let i = 0; i + (closed ? 0 : 2) < n; i += 2) {
+    // A path fills an open contour as if it were closed (as SVG does).
+    const fills = closed || s.kind === 'path';
+    for (let i = 0; i < n; i += 2) {
       const ax = pts[i], ay = pts[i + 1], bx = pts[(i + 2) % n], by = pts[(i + 3) % n];
-      dist = Math.min(dist, segDist(ax, ay, bx, by));
-      if (closed) {
+      if (closed || i + 2 < n) dist = Math.min(dist, segDist(ax, ay, bx, by));
+      if (fills) {
         // Winding number around the origin.
         if (ay <= 0) {
           if (by > 0 && ax * by - bx * ay > 0) wind++;

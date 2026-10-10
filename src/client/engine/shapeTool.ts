@@ -19,13 +19,43 @@
 
 import { newId } from '../../shared/ids';
 import { compose, effectivelyVisible, invert } from '../../shared/layers';
-import { byZ, clipPolygon, cornerPoints, hitShape, outlinePolys, shapeBounds, type Box } from '../../shared/shapes';
-import { LIMITS, type Affine, type ClientMsg, type Layer, type Op, type Shape, type ShapeInput, type ShapeKind, type ShapeProps } from '../../shared/types';
+import { byZ, clipPolygon, cornerPoints, fitPathFrame, hitShape, outlinePolys, shapeBounds, stripForKind, toPath, type Box } from '../../shared/shapes';
+import {
+  LIMITS,
+  POINT_STRIDE,
+  type Affine,
+  type ClientMsg,
+  type Layer,
+  type Op,
+  type PathContour,
+  type Shape,
+  type ShapeInput,
+  type ShapeKind,
+  type ShapeProps,
+  type ShapeUpdate,
+} from '../../shared/types';
+import {
+  CORNER,
+  SYMMETRIC,
+  allKeys,
+  count,
+  getPt,
+  insertPoint,
+  keyOf,
+  moveAnchors,
+  nearestOnPath,
+  parseKey,
+  removePoints,
+  setHandle,
+  setType,
+  toggleSmooth,
+  type PKey,
+} from './pathEdit';
 import { ed, showToast, type SelectOverlay } from '../state.svelte';
 import type { Doc } from './doc';
 import type { Renderer } from './renderer';
 
-export const SHAPE_LABEL: Record<ShapeKind, string> = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', star: 'Star', line: 'Line' };
+export const SHAPE_LABEL: Record<ShapeKind, string> = { rect: 'Rectangle', ellipse: 'Ellipse', polygon: 'Polygon', star: 'Star', line: 'Line', path: 'Path' };
 
 /** What the shape tools need from the engine. */
 export interface ShapeHost {
@@ -45,7 +75,7 @@ export interface ShapeHost {
 type Pt = [number, number];
 
 /** The props a gesture or an edit may change, compared to make the ops. */
-const PROP_KEYS: (keyof ShapeProps)[] = ['name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
+const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
 
 const LIVE_MS = 40;
 /** Movement (CSS px) before a press counts as a drag: smaller jitters change nothing. */
@@ -97,6 +127,33 @@ interface Create {
   moved: boolean;
 }
 
+/** A press in point editing: on a handle, on points, or a selection rectangle. */
+interface PointDrag {
+  pointerId: number;
+  touch: boolean;
+  kind: 'handle' | 'anchor' | 'marquee';
+  s0: Pt;
+  s1: Pt;
+  p0: Pt;
+  /** The shape and its path at the press. */
+  shape: Shape;
+  path: PathContour[];
+  keys: PKey[];
+  which: 'in' | 'out';
+  add: boolean;
+  moved: boolean;
+}
+
+/** The Pen's path in progress: points in world units relative to `o` (the first point). */
+interface PenPath {
+  id: string;
+  layerId: string;
+  createdLayer: string | null;
+  z: number;
+  o: Pt;
+  c: PathContour;
+}
+
 interface Marquee {
   pointerId: number;
   touch: boolean;
@@ -112,6 +169,9 @@ export class ShapeTool {
   private edit: Edit | null = null;
   private create: Create | null = null;
   private marquee: Marquee | null = null;
+  private pdrag: PointDrag | null = null;
+  private pen: PenPath | null = null;
+  private penDrag: { pointerId: number; s0: Pt; idx: number; moved: boolean; closing: boolean } | null = null;
   /** The shapes before an options bar drag started (editSelected). */
   private editOrig: Map<string, Shape> | null = null;
   private hover: Shape | null = null;
@@ -163,6 +223,7 @@ export class ShapeTool {
       return s && !s.deleted && byId.has(s.layerId);
     });
     if (keep.length !== ed.selection.length) ed.selection = keep;
+    if (ed.pointEdit && !keep.includes(ed.pointEdit.id)) ed.pointEdit = null;
     this.pushDrafts();
     this.scheduleOverlay();
   }
@@ -357,20 +418,23 @@ export class ShapeTool {
 
   /** True while a press of this tool is in progress. */
   busy(pointerId?: number): boolean {
-    const g = this.edit ?? this.create ?? this.marquee;
+    const g = this.edit ?? this.create ?? this.marquee ?? this.pdrag ?? this.penDrag;
     return !!g && (pointerId === undefined || g.pointerId === pointerId);
   }
 
   down(e: PointerEvent, x: number, y: number): void {
     const touch = e.pointerType === 'touch';
+    if (ed.tool === 'pen') return this.penDown(e, x, y);
     if (ed.tool === 'shape') return this.beginCreate(e, x, y, touch);
-    // Double-click: kept for point editing (phase 2).
     const now = performance.now();
-    const dbl = now - this.lastClick.t < DOUBLE_MS && Math.hypot(x - this.lastClick.x, y - this.lastClick.y) < 8;
+    const dbl = now - this.lastClick.t < DOUBLE_MS && Math.hypot(x - this.lastClick.x, y - this.lastClick.y) < (touch ? 16 : 8);
     this.lastClick = { t: dbl ? 0 : now, x, y };
+    if (ed.pointEdit) return this.pointDown(e, x, y, dbl);
+    // Double-click (a double tap) on a shape: its points.
     const zone = this.zoneAt(x, y, touch);
     if (dbl && (zone || this.shapeAt(x, y, touch))) {
-      showToast('Point editing comes in a later version');
+      const target = zone && ed.selection.length === 1 ? ed.selection[0] : this.shapeAt(x, y, touch)?.id;
+      if (target) this.enterPoints(target);
       return;
     }
     if (zone) {
@@ -403,6 +467,8 @@ export class ShapeTool {
   move(e: PointerEvent, x: number, y: number): void {
     this.pointer = [x, y];
     const shift = e.shiftKey, alt = e.altKey;
+    if (this.penDrag?.pointerId === e.pointerId) return this.penMove(x, y, alt);
+    if (this.pdrag?.pointerId === e.pointerId) return this.pointMove(x, y, shift, alt);
     if (this.create?.pointerId === e.pointerId) return this.moveCreate(x, y, shift, alt);
     if (this.edit?.pointerId === e.pointerId) return this.moveEdit(x, y, shift, alt);
     const mq = this.marquee;
@@ -416,6 +482,8 @@ export class ShapeTool {
   }
 
   up(e: PointerEvent): void {
+    if (this.penDrag?.pointerId === e.pointerId) return this.penUp();
+    if (this.pdrag?.pointerId === e.pointerId) return this.pointUp(e);
     if (this.create?.pointerId === e.pointerId) return this.endCreate(e.type === 'pointercancel');
     if (this.edit?.pointerId === e.pointerId) return this.endEdit(e.type === 'pointercancel');
     const mq = this.marquee;
@@ -441,6 +509,12 @@ export class ShapeTool {
   cancel(): void {
     if (this.create) this.endCreate(true);
     if (this.edit) this.endEdit(true);
+    this.cancelPointDrag();
+    if (this.penDrag) {
+      // A pinch while placing a point: that point goes, the path stays.
+      this.penDrag = null;
+      this.penUndoPoint();
+    }
     if (this.marquee) {
       this.marquee = null;
       this.scheduleOverlay();
@@ -461,6 +535,18 @@ export class ShapeTool {
     const c = this.host.canvas;
     if (ed.tool === 'shape') {
       c.style.cursor = 'crosshair';
+      return;
+    }
+    if (ed.tool === 'pen') {
+      c.style.cursor = 'crosshair';
+      this.scheduleOverlay(); // the rubber band follows the pointer
+      return;
+    }
+    if (ed.pointEdit) {
+      const h = this.pointHit(x, y, false);
+      c.style.cursor = h?.kind === 'handle' || h?.kind === 'anchor' ? 'move' : h?.kind === 'segment' ? 'copy' : 'default';
+      if (this.hover) this.hover = null;
+      this.scheduleOverlay();
       return;
     }
     const zone = this.zoneAt(x, y, false);
@@ -529,27 +615,36 @@ export class ShapeTool {
 
   private beginCreate(e: PointerEvent, x: number, y: number, touch: boolean): void {
     if (!ed.canEdit) return showToast('View only: you can look around but not draw');
-    const active = this.host.activeLayer();
-    let layerId: string;
-    let createdLayer: string | null = null;
-    const byId = new Map(ed.layers.map((l) => [l.id, l]));
-    if (active?.kind === 'shape' && effectivelyVisible(byId, active)) layerId = active.id;
-    else {
-      // A new shape layer above the active layer. The press makes it now, so the drag already
-      // shows on it (and to other people).
-      if (ed.layers.length >= LIMITS.maxLayers) return showToast('Too many layers');
-      layerId = createdLayer = newId();
-      this.host.sendOp({
-        type: 'layer.add',
-        layer: { id: layerId, kind: 'shape', name: this.host.nextName('Shapes'), ...this.host.newLayerPlace(), blend: 'normal', opacity: 1, visible: true },
-      });
-      this.host.setActiveLayer(layerId);
-    }
+    const target = this.shapeLayerFor();
+    if (!target) return;
+    const { layerId, created: createdLayer } = target;
     let z = 0;
     for (const s of this.view().values()) if (s.layerId === layerId && !s.deleted) z = Math.max(z, s.z);
     this.create = { pointerId: e.pointerId, touch, p0: this.toWorld(x, y), s0: [x, y], id: newId(), layerId, createdLayer, z: z + 1, moved: false };
     ed.selection = [];
     this.hover = null;
+  }
+
+  /**
+   * The layer for a new shape: the active layer when it is a visible shape layer, else a new
+   * shape layer above it. The press makes it at once, so the drag already shows on it (and to
+   * other people). Null: no room for a layer.
+   */
+  private shapeLayerFor(): { layerId: string; created: string | null } | null {
+    const active = this.host.activeLayer();
+    const byId = new Map(ed.layers.map((l) => [l.id, l]));
+    if (active?.kind === 'shape' && effectivelyVisible(byId, active)) return { layerId: active.id, created: null };
+    if (ed.layers.length >= LIMITS.maxLayers) {
+      showToast('Too many layers');
+      return null;
+    }
+    const id = newId();
+    this.host.sendOp({
+      type: 'layer.add',
+      layer: { id, kind: 'shape', name: this.host.nextName('Shapes'), ...this.host.newLayerPlace(), blend: 'normal', opacity: 1, visible: true },
+    });
+    this.host.setActiveLayer(id);
+    return { layerId: id, created: id };
   }
 
   /** A new shape from the press point `a` to `b` (world). */
@@ -804,7 +899,20 @@ export class ShapeTool {
       [x0, x1] = fit(hx, x0, x1, s.w);
       [y0, y1] = fit(hy, y0, y1, s.h);
     }
-    return { ...s, w: x1 - x0, h: y1 - y0, m: compose(s.m, [1, 0, 0, 1, x0, y0]) };
+    const out = { ...s, w: x1 - x0, h: y1 - y0, m: compose(s.m, [1, 0, 0, 1, x0, y0]) };
+    if (s.kind === 'path' && s.path) {
+      // The path stretches with its frame.
+      const kx = s.w > 0 ? (x1 - x0) / s.w : 1, ky = s.h > 0 ? (y1 - y0) / s.h : 1;
+      out.path = s.path.map((c) => {
+        const pts = c.pts.slice();
+        for (let i = 0; i < pts.length; i++) {
+          const f = i % POINT_STRIDE;
+          if (f < 6) pts[i] *= f % 2 ? ky : kx;
+        }
+        return { closed: c.closed, pts };
+      });
+    }
+    return out;
   }
 
   /** Several shapes (or a line), scaled by a handle of their world box: the matrices change. */
@@ -844,7 +952,7 @@ export class ShapeTool {
     for (const n of next) {
       const o = orig.get(n.id);
       if (!o) continue;
-      const props: Partial<ShapeProps> = {}, old: Partial<ShapeProps> = {};
+      const props: ShapeUpdate = {}, old: ShapeUpdate = {};
       for (const k of PROP_KEYS) {
         if (JSON.stringify(n[k]) === JSON.stringify(o[k])) continue;
         (props as Record<string, unknown>)[k] = n[k];
@@ -913,6 +1021,422 @@ export class ShapeTool {
     this.commit(new Map(sel.map((s) => [s.id, s])), sel.map((s) => ({ ...s, m: [s.m[0], s.m[1], s.m[2], s.m[3], s.m[4] + dx * d, s.m[5] + dy * d] as Affine })));
   }
 
+  // --- point editing ----------------------------------------------------------------------------
+  //
+  // A double-click on a shape (or Enter) shows its points. A shape that is not a path becomes one
+  // at the first change (one op: kind, path, frame; undo turns it back). The path edits in the
+  // local units of the shape as it was at the press; the frame then fits the curve again.
+
+  /** The shape in point editing, as it shows now, and its path. */
+  private pointShape(): { s: Shape; path: PathContour[] } | null {
+    const pe = ed.pointEdit;
+    const s = pe ? this.current(pe.id) : undefined;
+    if (!pe || !s || s.deleted) return null;
+    return { s, path: toPath(s) };
+  }
+
+  /** Local units of a shape to screen pixels. */
+  private localToScreen(s: Shape): (x: number, y: number) => Pt {
+    return (x, y) => this.toScreen(...apply(s.m, x, y));
+  }
+
+  enterPoints(id: string): void {
+    const s = this.current(id);
+    if (!s || s.deleted) return;
+    if (!ed.canEdit) return showToast('View only: you can look around but not change shapes');
+    if (ed.selection.length !== 1 || ed.selection[0] !== id) this.select([id]);
+    ed.pointEdit = { id, points: [] };
+    this.hover = null;
+    this.scheduleOverlay();
+  }
+
+  /** Back from point editing to the whole shape. */
+  exitPoints(): void {
+    if (!ed.pointEdit) return;
+    this.cancelPointDrag();
+    ed.pointEdit = null;
+    this.scheduleOverlay();
+  }
+
+  private setPoints(keys: string[]): void {
+    if (ed.pointEdit) ed.pointEdit = { ...ed.pointEdit, points: keys };
+    this.scheduleOverlay();
+  }
+
+  /** The path shape for a new path (local units of `s`): the frame fits the curve. */
+  private withPath(s: Shape, path: PathContour[]): Shape {
+    return stripForKind(fitPathFrame({ ...s, kind: 'path', path }));
+  }
+
+  /** What is under a screen point in point editing: a handle of a selected point, a point, or a segment. */
+  private pointHit(x: number, y: number, touch: boolean): { kind: 'handle'; key: PKey; which: 'in' | 'out' } | { kind: 'anchor'; key: PKey } | { kind: 'segment'; c: number; seg: number; t: number } | null {
+    const ps = this.pointShape();
+    if (!ps) return null;
+    const r = touch ? 16 : 6;
+    const sc = this.localToScreen(ps.s);
+    for (const ks of ed.pointEdit!.points) {
+      const k = parseKey(ks);
+      if (!ps.path[k.c] || k.i >= count(ps.path[k.c])) continue;
+      const v = getPt(ps.path, k);
+      for (const which of ['out', 'in'] as const) {
+        const [hx, hy] = which === 'in' ? [v.ix, v.iy] : [v.ox, v.oy];
+        if (hx === v.x && hy === v.y) continue;
+        const [sx, sy] = sc(hx, hy);
+        if (Math.hypot(x - sx, y - sy) <= r) return { kind: 'handle', key: k, which };
+      }
+    }
+    for (const k of allKeys(ps.path)) {
+      const v = getPt(ps.path, k);
+      const [sx, sy] = sc(v.x, v.y);
+      if (Math.hypot(x - sx, y - sy) <= r) return { kind: 'anchor', key: k };
+    }
+    const near = nearestOnPath(ps.path, sc, x, y);
+    if (near && near.d <= r) return { kind: 'segment', c: near.c, seg: near.seg, t: near.t };
+    return null;
+  }
+
+  private pointDown(e: PointerEvent, x: number, y: number, dbl: boolean): void {
+    const ps = this.pointShape();
+    if (!ps) return this.exitPoints();
+    const touch = e.pointerType === 'touch';
+    const hit = this.pointHit(x, y, touch);
+    const pe = ed.pointEdit!;
+    if (dbl && hit?.kind === 'anchor') {
+      // Double-click a point: corner ↔ smooth.
+      this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, toggleSmooth(ps.path, hit.key))]);
+      return;
+    }
+    if (dbl && hit?.kind === 'segment') {
+      // Double-click a segment: a new point there.
+      const { path, key } = insertPoint(ps.path, hit.c, hit.seg, hit.t);
+      this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, path)]);
+      this.setPoints([keyOf(key)]);
+      return;
+    }
+    const base = { pointerId: e.pointerId, touch, s0: [x, y] as Pt, p0: this.toWorld(x, y), shape: ps.s, path: ps.path, moved: false };
+    if (hit?.kind === 'handle') {
+      this.pdrag = { ...base, kind: 'handle', keys: [hit.key], which: hit.which, s1: [x, y], add: false };
+      return;
+    }
+    if (hit?.kind === 'anchor') {
+      const ks = keyOf(hit.key);
+      let sel = pe.points;
+      if (e.shiftKey) sel = sel.includes(ks) ? sel.filter((k) => k !== ks) : [...sel, ks];
+      else if (!sel.includes(ks)) sel = [ks];
+      this.setPoints(sel);
+      if (sel.includes(ks)) this.pdrag = { ...base, kind: 'anchor', keys: sel.map(parseKey), which: 'out', s1: [x, y], add: false };
+      return;
+    }
+    // Elsewhere: a drag selects points by rectangle; a click outside the shape goes back to it.
+    this.pdrag = { ...base, kind: 'marquee', keys: [], which: 'out', s1: [x, y], add: e.shiftKey };
+  }
+
+  private pointMove(x: number, y: number, shift: boolean, alt: boolean): void {
+    const g = this.pdrag!;
+    if (!g.moved && Math.hypot(x - g.s0[0], y - g.s0[1]) <= (g.touch ? DRAG_PX_TOUCH : DRAG_PX)) return;
+    g.moved = true;
+    g.s1 = [x, y];
+    if (g.kind === 'marquee') return this.scheduleOverlay();
+    const inv = invert(g.shape.m);
+    if (!inv) return;
+    let p = this.toWorld(x, y);
+    if (g.kind === 'anchor') {
+      if (shift) {
+        // Along one axis (on screen).
+        if (Math.abs(p[0] - g.p0[0]) > Math.abs(p[1] - g.p0[1])) p = [p[0], g.p0[1]];
+        else p = [g.p0[0], p[1]];
+      }
+      const a = apply(inv, ...g.p0), b = apply(inv, ...p);
+      this.setDrafts([this.withPath(g.shape, moveAnchors(g.path, g.keys, b[0] - a[0], b[1] - a[1]))]);
+      return;
+    }
+    const k = g.keys[0];
+    const v = getPt(g.path, k);
+    let q = apply(inv, ...p);
+    if (shift) {
+      // 45° steps around the anchor, on screen.
+      const [ax, ay] = apply(g.shape.m, v.x, v.y);
+      const len = Math.hypot(p[0] - ax, p[1] - ay);
+      const ang = Math.round(Math.atan2(p[1] - ay, p[0] - ax) / (Math.PI / 4)) * (Math.PI / 4);
+      q = apply(inv, ax + Math.cos(ang) * len, ay + Math.sin(ang) * len);
+    }
+    this.setDrafts([this.withPath(g.shape, setHandle(g.path, k, g.which, q[0], q[1], alt))]);
+  }
+
+  private pointUp(e: PointerEvent): void {
+    const g = this.pdrag!;
+    this.pdrag = null;
+    if (e.type === 'pointercancel') return void this.clearDrafts();
+    if (g.kind === 'marquee') {
+      if (g.moved) {
+        const x0 = Math.min(g.s0[0], g.s1[0]), x1 = Math.max(g.s0[0], g.s1[0]), y0 = Math.min(g.s0[1], g.s1[1]), y1 = Math.max(g.s0[1], g.s1[1]);
+        const sc = this.localToScreen(g.shape);
+        const inside = allKeys(g.path).filter((k) => {
+          const v = getPt(g.path, k);
+          const [sx, sy] = sc(v.x, v.y);
+          return sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1;
+        });
+        const keys = inside.map(keyOf);
+        this.setPoints(g.add ? [...new Set([...ed.pointEdit!.points, ...keys])] : keys);
+      } else if (!g.add) {
+        // A click on the shape clears the points; outside it, back to the whole shape.
+        const [wx, wy] = this.toWorld(...g.s0);
+        if (hitShape(g.shape, wx, wy, (g.touch ? 10 : 4) / this.zoom)) this.setPoints([]);
+        else this.exitPoints();
+      }
+      this.scheduleOverlay();
+      return;
+    }
+    if (!g.moved) return;
+    this.commit(new Map([[g.shape.id, g.shape]]), [...this.drafts.values()]);
+  }
+
+  private cancelPointDrag(): void {
+    if (!this.pdrag) return;
+    this.pdrag = null;
+    this.clearDrafts();
+  }
+
+  /** The type of the selected points (the options bar and the point bar): corner, smooth or symmetric. */
+  setPointType(t: number): void {
+    const ps = this.pointShape();
+    if (!ps || !ed.canEdit) return;
+    const keys = ed.pointEdit!.points.map(parseKey);
+    if (!keys.length) return showToast('Select points first');
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, setType(ps.path, keys, t))]);
+  }
+
+  /** Removes the selected points; a shape left without a segment goes. */
+  deletePoints(): void {
+    const ps = this.pointShape();
+    if (!ps || !ed.canEdit) return;
+    const keys = ed.pointEdit!.points.map(parseKey);
+    if (!keys.length) return;
+    const path = removePoints(ps.path, keys);
+    if (!path.length) {
+      this.exitPoints();
+      this.remove([ps.s.id]);
+      return;
+    }
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, path)]);
+    this.setPoints([]);
+  }
+
+  /** Arrow keys in point editing: the selected points move one screen pixel (Shift: ten). */
+  private nudgePoints(dx: number, dy: number): void {
+    const ps = this.pointShape();
+    if (!ps || !ed.canEdit || this.busy()) return;
+    const keys = ed.pointEdit!.points.map(parseKey);
+    const inv = invert(ps.s.m);
+    if (!keys.length || !inv) return;
+    const d = 1 / this.zoom;
+    const a = apply(inv, 0, 0), b = apply(inv, dx * d, dy * d);
+    this.commit(new Map([[ps.s.id, ps.s]]), [this.withPath(ps.s, moveAnchors(ps.path, keys, b[0] - a[0], b[1] - a[1]))]);
+  }
+
+  // --- the Pen ----------------------------------------------------------------------------------
+  //
+  // Click: a corner point. Drag: a point with handles (Alt: only the outgoing one). Click the first
+  // point: the path closes and ends. Enter, Esc or Done: the open path ends. Backspace: the last
+  // point goes. With a path selected and the Pen not drawing, a click on its outline adds a point,
+  // and a click on a point removes it. The path is a draft until it ends: then one shape.add.
+
+  private penDown(e: PointerEvent, x: number, y: number): void {
+    const touch = e.pointerType === 'touch';
+    if (!ed.canEdit) return showToast('View only: you can look around but not draw');
+    const r = touch ? 16 : 7;
+    const p = this.toWorld(x, y);
+    const pen = this.pen;
+    if (pen) {
+      const n = count(pen.c);
+      const [fx, fy] = this.toScreen(pen.o[0] + pen.c.pts[0], pen.o[1] + pen.c.pts[1]);
+      if (n >= 2 && Math.hypot(x - fx, y - fy) <= r) {
+        pen.c.closed = true;
+        this.penDrag = { pointerId: e.pointerId, s0: [x, y], idx: 0, moved: false, closing: true };
+        this.penDraft();
+        return;
+      }
+      const lx = p[0] - pen.o[0], ly = p[1] - pen.o[1];
+      pen.c.pts.push(lx, ly, lx, ly, lx, ly, CORNER);
+      this.penDrag = { pointerId: e.pointerId, s0: [x, y], idx: n, moved: false, closing: false };
+      this.penDraft();
+      return;
+    }
+    // Not drawing: a click on the selected shape's outline or points edits it.
+    const sel = this.selected();
+    if (sel.length === 1) {
+      const s = sel[0], path = toPath(s);
+      const sc = this.localToScreen(s);
+      for (const k of allKeys(path)) {
+        const v = getPt(path, k);
+        const [sx, sy] = sc(v.x, v.y);
+        if (Math.hypot(x - sx, y - sy) <= r) {
+          const left = removePoints(path, [k]);
+          if (!left.length) this.remove([s.id]);
+          else this.commit(new Map([[s.id, s]]), [this.withPath(s, left)]);
+          return;
+        }
+      }
+      const near = nearestOnPath(path, sc, x, y);
+      if (near && near.d <= r) {
+        const { path: next, key } = insertPoint(path, near.c, near.seg, near.t);
+        this.commit(new Map([[s.id, s]]), [this.withPath(s, next)]);
+        ed.pointEdit = { id: s.id, points: [keyOf(key)] };
+        this.scheduleOverlay();
+        return;
+      }
+    }
+    // A new path, on the active shape layer or a new one above the active layer.
+    const target = this.shapeLayerFor();
+    if (!target) return;
+    let z = 0;
+    for (const s of this.view().values()) if (s.layerId === target.layerId && !s.deleted) z = Math.max(z, s.z);
+    this.pen = { id: newId(), layerId: target.layerId, createdLayer: target.created, z: z + 1, o: p, c: { closed: false, pts: [0, 0, 0, 0, 0, 0, CORNER] } };
+    ed.penDrawing = true;
+    ed.selection = [];
+    ed.pointEdit = null;
+    this.penDrag = { pointerId: e.pointerId, s0: [x, y], idx: 0, moved: false, closing: false };
+    this.penDraft();
+  }
+
+  private penMove(x: number, y: number, alt: boolean): void {
+    const d = this.penDrag!, pen = this.pen!;
+    if (!d.moved && Math.hypot(x - d.s0[0], y - d.s0[1]) <= DRAG_PX) return;
+    d.moved = true;
+    // The drag pulls the outgoing handle; the incoming one mirrors it (Alt: it stays).
+    const p = this.toWorld(x, y);
+    const lx = p[0] - pen.o[0], ly = p[1] - pen.o[1];
+    const o = d.idx * POINT_STRIDE, a = pen.c.pts;
+    const px = a[o], py = a[o + 1];
+    if (d.closing) {
+      // Closing: the drag shapes the curve into the first point (its incoming handle).
+      a[o + 2] = px - (lx - px);
+      a[o + 3] = py - (ly - py);
+      if (!alt) {
+        a[o + 4] = lx;
+        a[o + 5] = ly;
+      }
+      a[o + 6] = alt ? CORNER : SYMMETRIC;
+    } else {
+      a[o + 4] = lx;
+      a[o + 5] = ly;
+      if (!alt) {
+        a[o + 2] = px - (lx - px);
+        a[o + 3] = py - (ly - py);
+      }
+      a[o + 6] = alt ? CORNER : SYMMETRIC;
+    }
+    this.penDraft();
+  }
+
+  private penUp(): void {
+    const d = this.penDrag;
+    this.penDrag = null;
+    if (d?.closing) this.finishPen();
+  }
+
+  /** The path in progress as a shape (a draft until it ends). */
+  private penShape(): Shape | null {
+    const pen = this.pen;
+    if (!pen) return null;
+    const st = ed.penStyle;
+    const z = this.zoom;
+    return this.withPath(
+      {
+        id: pen.id,
+        layerId: pen.layerId,
+        kind: 'path',
+        name: '',
+        z: pen.z,
+        w: 0,
+        h: 0,
+        m: [1, 0, 0, 1, pen.o[0], pen.o[1]],
+        fill: st.fill,
+        stroke: st.stroke ?? (st.fill ? null : ed.fg),
+        strokeWidth: Math.max(0.5, st.strokeWidth) / z,
+        align: st.align,
+        cap: st.cap,
+        join: 'round',
+        author: '',
+        seq: Infinity,
+      },
+      [{ closed: pen.c.closed, pts: pen.c.pts.slice() }],
+    );
+  }
+
+  private penDraft(): void {
+    const s = this.penShape();
+    if (s) this.setDrafts([s]);
+  }
+
+  /** Ends the path: a shape of at least two points is added (one undo step). */
+  finishPen(): void {
+    const pen = this.pen;
+    if (!pen) return;
+    this.penDrag = null;
+    const s = this.penShape()!;
+    this.pen = null;
+    ed.penDrawing = false;
+    this.clearDrafts();
+    if (count(pen.c) < 2) {
+      if (pen.createdLayer) this.host.sendOp({ type: 'layer.remove', id: pen.createdLayer });
+      return;
+    }
+    s.name = this.nextShapeName('path');
+    this.host.sendOp({ type: 'shape.add', shape: toInput(s) });
+    this.host.pushUndo({
+      undo: [{ type: 'shape.remove', id: s.id }, ...(pen.createdLayer ? [{ type: 'layer.remove', id: pen.createdLayer } as Op] : [])],
+      redo: [...(pen.createdLayer ? [{ type: 'layer.restore', id: pen.createdLayer } as Op] : []), { type: 'shape.restore', id: s.id }],
+    });
+    this.select([s.id]);
+  }
+
+  /** Backspace while drawing: the last point goes (the first one ends the path). */
+  penUndoPoint(): void {
+    const pen = this.pen;
+    if (!pen) return;
+    if (pen.c.closed) pen.c.closed = false;
+    else pen.c.pts.length -= POINT_STRIDE;
+    if (!pen.c.pts.length) return this.finishPen();
+    this.penDraft();
+  }
+
+  /** The Pen bar's Close button: the path closes and ends. */
+  penClose(): void {
+    if (!this.pen || count(this.pen.c) < 2) return;
+    this.pen.c.closed = true;
+    this.finishPen();
+  }
+
+  /** Keys of the shape tools. Returns true when the key was used. */
+  key(e: KeyboardEvent): boolean {
+    if (this.pen) {
+      if (e.key === 'Enter' || e.key === 'Escape') this.finishPen();
+      else if (e.key === 'Backspace' || e.key === 'Delete') this.penUndoPoint();
+      else return false;
+      return true;
+    }
+    const arrows: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    const a = arrows[e.key];
+    const k = e.shiftKey ? 10 : 1;
+    if (ed.pointEdit) {
+      if (e.key === 'Escape' || e.key === 'Enter') {
+        if (this.busy()) this.cancel();
+        else this.exitPoints();
+      } else if (e.key === 'Delete' || e.key === 'Backspace') this.deletePoints();
+      else if (a) this.nudgePoints(a[0] * k, a[1] * k);
+      else return false;
+      return true;
+    }
+    if (e.key === 'Escape') return this.escape();
+    if (!ed.selection.length) return false;
+    if (e.key === 'Delete' || e.key === 'Backspace') this.remove();
+    else if (e.key === 'Enter' && ed.selection.length === 1 && ed.tool === 'select') this.enterPoints(ed.selection[0]);
+    else if (a) this.nudge(a[0] * k, a[1] * k);
+    else return false;
+    return true;
+  }
+
   // --- overlay -----------------------------------------------------------------------------------
 
   scheduleOverlay(): void {
@@ -941,11 +1465,30 @@ export class ShapeTool {
 
   private updateOverlay(): void {
     const tool = ed.tool;
-    if ((tool !== 'select' && tool !== 'shape') || ed.transform) {
+    // Another tool: a path in progress ends, point editing ends.
+    if (this.pen && tool !== 'pen') this.finishPen();
+    if (ed.pointEdit && tool !== 'select') this.exitPoints();
+    if ((tool !== 'select' && tool !== 'shape' && tool !== 'pen') || ed.transform) {
       if (ed.overlay) ed.overlay = null;
       return;
     }
-    const o: SelectOverlay = { hover: null, outlines: [], box: null, handles: [], dots: [], ends: [], marquee: null, readout: null };
+    const o: SelectOverlay = {
+      hover: null,
+      outlines: [],
+      box: null,
+      handles: [],
+      dots: [],
+      ends: [],
+      marquee: null,
+      readout: null,
+      anchors: [],
+      knobs: [],
+      rubber: null,
+      tip: null,
+      bar: null,
+    };
+    if (tool === 'pen' && this.pen) return void (ed.overlay = this.penOverlay(o));
+    if (ed.pointEdit) return void (ed.overlay = this.pointOverlay(o));
     const sel = this.selected();
     for (const s of sel) o.outlines.push(...this.outline(s));
     const busy = !!this.edit?.moved || !!this.create;
@@ -971,6 +1514,62 @@ export class ShapeTool {
     if (mq?.moved) o.marquee = [Math.min(mq.s0[0], mq.s1[0]), Math.min(mq.s0[1], mq.s1[1]), Math.abs(mq.s1[0] - mq.s0[0]), Math.abs(mq.s1[1] - mq.s0[1])];
     o.readout = this.readout();
     ed.overlay = o;
+  }
+
+  /** Anchors and handles of a path on screen; `sel` are selected points (their handles show). */
+  private pathMarks(o: SelectOverlay, path: PathContour[], sc: (x: number, y: number) => Pt, sel: Set<string>, handlesOf: Set<string>): void {
+    const { w, h } = this.host.comp.size;
+    const on = ([x, y]: Pt) => x > -60 && y > -60 && x < w + 60 && y < h + 60;
+    for (const k of allKeys(path)) {
+      const v = getPt(path, k);
+      const a = sc(v.x, v.y);
+      const ks = keyOf(k);
+      if (handlesOf.has(ks)) {
+        for (const [hx, hy] of [[v.ix, v.iy], [v.ox, v.oy]]) {
+          if (hx === v.x && hy === v.y) continue;
+          const kn = sc(hx, hy);
+          if (on(kn) || on(a)) o.knobs.push({ x: kn[0], y: kn[1], ax: a[0], ay: a[1] });
+        }
+      }
+      if (on(a)) o.anchors.push({ x: a[0], y: a[1], smooth: v.t !== CORNER, sel: sel.has(ks) });
+    }
+  }
+
+  private pointOverlay(o: SelectOverlay): SelectOverlay {
+    const ps = this.pointShape();
+    if (!ps) return o;
+    const shown = this.drafts.get(ps.s.id) ?? ps.s;
+    const path = toPath(shown);
+    o.outlines = this.outline(shown);
+    const sel = new Set(ed.pointEdit!.points);
+    this.pathMarks(o, path, this.localToScreen(shown), sel, sel);
+    const g = this.pdrag;
+    if (g?.kind === 'marquee' && g.moved) o.marquee = [Math.min(g.s0[0], g.s1[0]), Math.min(g.s0[1], g.s1[1]), Math.abs(g.s1[0] - g.s0[0]), Math.abs(g.s1[1] - g.s0[1])];
+    o.bar = { kind: 'points', points: allKeys(path).length, selected: sel.size };
+    return o;
+  }
+
+  private penOverlay(o: SelectOverlay): SelectOverlay {
+    const pen = this.pen!;
+    const s = this.drafts.get(pen.id);
+    const n = count(pen.c);
+    const sc = (x: number, y: number) => this.toScreen(pen.o[0] + x, pen.o[1] + y);
+    if (s) o.outlines = this.outline(s);
+    const last = new Set([keyOf({ c: 0, i: n - 1 })]);
+    if (this.penDrag?.closing) last.add('0:0');
+    this.pathMarks(o, [pen.c], sc, last, last);
+    // The next segment, from the last point to the pointer (it bends with the last out handle).
+    if (this.pointer && !this.penDrag && !pen.c.closed) {
+      const v = getPt([pen.c], { c: 0, i: n - 1 });
+      const [ax, ay] = sc(v.x, v.y), [bx, by] = sc(v.ox, v.oy);
+      const [px, py] = this.pointer;
+      const f = (x: number) => Math.round(x * 10) / 10;
+      o.rubber = `M${f(ax)} ${f(ay)}C${f(bx)} ${f(by)} ${f(px)} ${f(py)} ${f(px)} ${f(py)}`;
+      const [fx, fy] = sc(pen.c.pts[0], pen.c.pts[1]);
+      if (n >= 2 && Math.hypot(px - fx, py - fy) <= 10) o.tip = { text: 'Click the first point to close the shape', x: fx + 16, y: fy + 18 };
+    }
+    o.bar = { kind: 'pen', points: n, selected: 0 };
+    return o;
   }
 
   /** Live numbers while drawing or changing: size, radius, angle (screen pixels, degrees). */
