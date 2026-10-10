@@ -31,7 +31,6 @@
     <button class="icon" class:on={ed.tool === t.id} aria-label={t.label} onclick={() => tool(t.id)}><Icon name={t.id === 'shape' ? ed.shapeKind : t.icon} /></button>
   {/each}
   <span class="sep"></span>
-  <button class="icon" class:on={sheet === 'brush'} aria-label="Tool settings" onclick={() => toggle('brush')}><Icon name="sliders" /></button>
   <button class="icon color" class:on={sheet === 'color'} aria-label="Color" onclick={() => toggle('color')}>
     <span style:background={ed.fg}></span>
   </button>
