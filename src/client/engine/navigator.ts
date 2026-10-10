@@ -82,7 +82,7 @@ function* content(doc: Doc, visibleLayers: Set<string>): Generator<Bounds> {
   }
 }
 
-export function computeMarkers(doc: Doc, visibleLayers: Set<string>, view: ViewState, w: number, h: number): Marker[] {
+export function computeMarkers(doc: Doc, visibleLayers: Set<string>, view: ViewState, w: number, h: number, top = 0): Marker[] {
   const z = view.zoom;
   const tiny: Tiny[] = [];
   const sectors = Array.from({ length: 8 }, () => ({ n: 0, nearest: Infinity, items: [] as Bounds[], dists: [] as number[] }));
@@ -139,6 +139,8 @@ export function computeMarkers(doc: Doc, visibleLayers: Set<string>, view: ViewS
       if (y >= h - EDGE_INSET - 1) x = w - CONTROLS_W - 16;
       else y = h - CONTROLS_H - 16;
     }
+    // Below the floating options bar (`top`: its height).
+    y = Math.max(y, top + EDGE_INSET);
     markers.push({ key: `e${i}`, kind: 'edge', x, y, angle, count: sec.n, target: t });
   });
   return markers;

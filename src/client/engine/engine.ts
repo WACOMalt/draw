@@ -496,7 +496,7 @@ export class Engine {
         return;
       }
       const { w, h } = this.comp.size;
-      ed.markers = computeMarkers(this.doc, this.visibleLayerIds(), this.comp.view, w, h);
+      ed.markers = computeMarkers(this.doc, this.visibleLayerIds(), this.comp.view, w, h, ed.optsHeight);
       this.markersCost = performance.now() - t0;
     };
     const interval = Math.max(MARKERS_MS, this.markersCost * 10);

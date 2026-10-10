@@ -133,11 +133,9 @@
 {:else}
   <div class="editor" class:narrow>
     <TopBar {engine} {code} {narrow} {onLeave} />
-    {#if !narrow}
-      <OptionsBar {engine} />
-      <Toolbar {engine} />
-    {/if}
-    <div class="stage">
+    {#if !narrow}<Toolbar {engine} />{/if}
+    <div class="stage" style:--opts-h="{ed.optsHeight}px">
+      {#if !narrow}<OptionsBar {engine} />{/if}
       <canvas bind:this={canvas}></canvas>
       <canvas class="paths" bind:this={pathsCanvas}></canvas>
       <div class="brush-cursor" bind:this={brushCursor}></div>
@@ -213,12 +211,12 @@
     height: 100%;
     height: 100dvh;
     display: grid;
-    /* The options bar wraps to more rows in a narrow window (minmax: one row of 38px). */
-    grid-template-rows: 36px minmax(38px, auto) minmax(0, 1fr) 24px;
+    /* The options bar floats over the stage (OptionsBar.svelte): when it wraps to more rows,
+       nothing moves. */
+    grid-template-rows: 36px minmax(0, 1fr) 24px;
     grid-template-columns: 44px minmax(0, 1fr) 264px;
     grid-template-areas:
       'top top top'
-      'opts opts opts'
       'tools stage panels'
       'status status status';
   }
@@ -427,7 +425,7 @@
     pointer-events: none;
   }
   .conn {
-    top: 12px;
+    top: calc(var(--opts-h, 0px) + 12px);
     color: #ffd43b;
   }
   .missing {

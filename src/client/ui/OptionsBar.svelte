@@ -13,6 +13,22 @@
   import { dismiss } from '../dismiss';
 
   let { stacked = false, engine = null }: { stacked?: boolean; engine?: Engine | null } = $props();
+
+  /**
+   * The bar floats over the top of the canvas, so the canvas never moves when it wraps to more
+   * rows. Its height goes to ed.optsHeight: overlays at the top of the canvas move below it.
+   */
+  function floating(node: HTMLElement) {
+    if (stacked) return;
+    const ro = new ResizeObserver(() => (ed.optsHeight = node.offsetHeight + node.offsetTop));
+    ro.observe(node);
+    return {
+      destroy: () => {
+        ro.disconnect();
+        ed.optsHeight = 0;
+      },
+    };
+  }
   const painting = $derived(ed.tool === 'brush' || ed.tool === 'eraser');
   const TOOL_LABEL: Record<Tool, string> = {
     brush: 'Brush',
@@ -371,8 +387,9 @@
         </select>
       </label>
     {/if}
-    {#if ed.tool === 'pen' && !selShapes.length}
-      <div class="toggles" role="radiogroup" aria-label="New points">
+    {#if ed.tool === 'pen'}
+      <!-- Always shown with the Pen: it sets the curve of the next path (a path keeps the curve it started with). -->
+      <div class="toggles" role="radiogroup" aria-label="New points" title="The curve of the next path you draw">
         <span class="lbl2">New points</span>
         <button class="icon wide" class:on={ed.penStyle.curve !== 'spline'} role="radio" aria-checked={ed.penStyle.curve !== 'spline'} title="Bezier: click for corners, drag for curves with handles" onclick={() => (ed.penStyle.curve = 'bezier')}>Bezier</button>
         <button class="icon wide" class:on={ed.penStyle.curve === 'spline'} role="radio" aria-checked={ed.penStyle.curve === 'spline'} title="Spline: a smooth curve through or near the points, without handles" onclick={() => (ed.penStyle.curve = 'spline')}>Spline</button>
@@ -483,7 +500,7 @@
   {/if}
 {/snippet}
 
-<div class="opts" class:stacked>
+<div class="opts" class:stacked use:floating data-over-canvas={stacked ? undefined : true}>
   <span class="tool">{TOOL_LABEL[ed.tool]}</span>
   {#if painting}
     {#if !stacked}
@@ -576,20 +593,32 @@
 
 <style>
   .opts {
-    grid-area: opts;
+    /* Floats over the top of the canvas, between the toolbar and the panels (Editor.svelte). */
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    right: 6px;
+    z-index: 20;
     display: flex;
     flex-wrap: wrap; /* never cut off controls: a narrow window gets a second row */
     align-items: center;
     gap: 4px 16px;
+    min-height: 38px;
     padding: 4px 12px;
     background: var(--bg-2);
-    border-bottom: 1px solid var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   }
   .tool {
     font-weight: 600;
     min-width: 66px;
   }
   .stacked {
+    position: static;
+    min-height: 0;
+    border-radius: 0;
+    box-shadow: none;
     flex-wrap: nowrap;
     flex-direction: column;
     align-items: stretch;

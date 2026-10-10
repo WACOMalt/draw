@@ -331,7 +331,7 @@ At load, the server replays the op log to build the document. Limits: 4 MB per m
 The layout is close to Photoshop, but simpler, with a dark theme.
 
 - Top bar: app name, session code with a copy-link button, peer avatars, connection state
-- Options bar: the settings of the current tool (size, opacity, flow, hardness, spacing, pressure, build-up). In a narrow window, the bar wraps to a second row. It never cuts off a control.
+- Options bar: the settings of the current tool (size, opacity, flow, hardness, spacing, pressure, build-up). It floats over the top of the canvas, between the left toolbar and the right panel. When the bar changes height (another tool, a narrow window), the canvas, the toolbar and the panels do not move. In a narrow window, the bar wraps to more rows. It never cuts off a control. The overlays at the top of the canvas (the temporary-canvas banner, the connection message, the edge markers) stay below the bar. A wheel over the bar zooms the canvas.
 - Left toolbar, top to bottom: brush (B), eraser (E), stroke eraser (Shift+E), foreground and background colors, eyedropper (I), Transform (Ctrl+T or V; it opens and closes the transform box of the active layer); at the bottom: hand (H) and zoom (Z). Zoom tool: a click zooms in 2× at the point (a short animation), Alt+click or right-click zooms out 2×, a sideways drag zooms smoothly about the press point (right: in); the cursor shows zoom-in or zoom-out. Its options bar has zoom out, zoom in, 100% and Fit all. Two fingers still pinch-zoom with any tool
 - Right panels: Color, Layers
 - Status bar: zoom, cursor position in world units, stroke count
@@ -548,7 +548,7 @@ Toolbar order: brush, eraser, stroke eraser, the colors, eyedropper, Select, Pen
 - Enter, Esc or Done ends an open path. Backspace, Ctrl+Z or "Undo point" takes back the last point. Another tool also ends the path. A path needs two points, or it goes.
 - The path is a draft until it ends, so other people see it grow. Then one `shape.add` goes out (one undo step), on the active shape layer or a new one above the active layer.
 - With one shape selected and no path in progress, a click on its outline adds a point and a click on its point removes it.
-- "New points: Bezier | Spline" in the options bar sets the curve type of the next path. In spline mode, a click adds a point with the smoothness of the Smoothness slider (-100% to 100%, -1 to 1), and a drag places the point. The curve shows through or near the points at once.
+- "New points: Bezier | Spline" in the options bar sets the curve type of the next path. It shows whenever the Pen is the active tool, also with a shape selected. In spline mode, a click adds a point with the smoothness of the Smoothness slider (-100% to 100%, -1 to 1), and a drag places the point. The curve shows through or near the points at once.
 
 **Compound shapes.** A compound shape combines shapes live (section 4.1).
 
