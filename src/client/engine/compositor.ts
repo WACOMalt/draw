@@ -482,6 +482,12 @@ export class Canvas2DRenderer implements Renderer {
     if (!this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
 
+  renderNow(): void {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.dirty = true;
+    this.render();
+  }
+
   private render(): void {
     this.raf = 0;
     if (this.dirty) {
