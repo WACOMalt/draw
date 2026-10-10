@@ -204,6 +204,9 @@ export class ShapeTool {
   private penDrag: { pointerId: number; s0: Pt; idx: number; moved: boolean; closing: boolean } | null = null;
   /** The point whose ring knob is dragged (point editing of a spline). */
   private ringKey: PKey | null = null;
+  /** The ring's drag: the knob's value, and the pointer's angle at the last move. */
+  private ringValue = 0;
+  private ringAngle = 0;
   /** The shapes before an options bar drag started (editSelected). */
   private editOrig: Map<string, Shape> | null = null;
   private hover: Shape | null = null;
@@ -1485,6 +1488,10 @@ export class ShapeTool {
       // The ring's knob sets the smoothness of every selected point.
       this.pdrag = { ...base, kind: 'ring', keys: pe.points.map(parseKey), which: 'out', s1: [x, y], add: false };
       this.ringKey = hit.key;
+      this.ringValue = smoothOf(ps.path, hit.key);
+      const v = getPt(ps.path, hit.key);
+      const [ax, ay] = this.localToScreen(ps.s)(v.x, v.y);
+      this.ringAngle = Math.atan2(x - ax, -(y - ay));
       return;
     }
     if (hit?.kind === 'anchor') {
@@ -1520,10 +1527,22 @@ export class ShapeTool {
       return;
     }
     if (g.kind === 'ring') {
-      // The knob's angle from the top: clockwise is soft, counterclockwise goes through.
+      // The knob's angle from the top: clockwise is soft, counterclockwise goes through. The ends
+      // stop at a gap at the bottom, as on a balance knob. The knob follows the pointer only while
+      // the pointer stays with it: a pointer that slips past an end (across the gap) leaves the
+      // knob there, and takes it again when it comes back to it. Thus soft and through never
+      // swap at the bottom; to change sides, the knob goes back over the top (a corner).
       const v = getPt(g.path, this.ringKey!);
       const [ax, ay] = this.localToScreen(g.shape)(v.x, v.y);
-      let sm = Math.max(-1, Math.min(1, Math.atan2(x - ax, -(y - ay)) / Math.PI));
+      const a = Math.atan2(x - ax, -(y - ay));
+      let step = a - this.ringAngle;
+      if (step > Math.PI) step -= 2 * Math.PI;
+      if (step < -Math.PI) step += 2 * Math.PI;
+      this.ringAngle = a;
+      const to = Math.max(-RING_SPAN, Math.min(RING_SPAN, a));
+      const knob = this.ringValue * RING_SPAN;
+      let sm = Math.abs(to - knob) <= Math.abs(step) + 0.35 ? to / RING_SPAN : this.ringValue;
+      this.ringValue = sm;
       if (shift) sm = Math.round(sm * 4) / 4;
       if (Math.abs(sm) < 0.04) sm = 0; // a corner is easy to hit
       this.setDrafts([this.withPath(g.shape, setSmoothness(g.path, g.keys, sm))]);
@@ -2050,9 +2069,12 @@ function editPath(s: Shape): PathContour[] {
 /** Radius of the smoothness ring around a selected spline point (CSS px). */
 export const ringRadius = (touch: boolean) => (touch ? 30 : 20);
 
-/** Where the ring's knob is: at the top for a corner, clockwise up to the bottom for soft (1), counterclockwise for through (-1). */
+/** The ring's ends, each side of the top (radians): a 30° gap at the bottom keeps soft and through apart. */
+export const RING_SPAN = Math.PI * (11 / 12);
+
+/** Where the ring's knob is: at the top for a corner, clockwise to the gap for soft (1), counterclockwise for through (-1). */
 export function ringKnob(x: number, y: number, smooth: number, touch: boolean): Pt {
-  const a = smooth * Math.PI, r = ringRadius(touch);
+  const a = smooth * RING_SPAN, r = ringRadius(touch);
   return [x + r * Math.sin(a), y - r * Math.cos(a)];
 }
 
