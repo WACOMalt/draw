@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
-// Rasterizes committed strokes into 256×256 layer tiles. Holds vector data only, no tile pixels.
+// Rasterizes committed strokes, and the shapes of shape layers, into 256×256 layer tiles. Holds
+// vector data only, no tile pixels.
 
 import { DAB_CHUNK, DAB_STRIDE } from '../../shared/brush';
 import { DabPainter, StampCache } from './stamp';

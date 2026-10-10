@@ -142,7 +142,18 @@
   {#if ed.tool === 'shape' && stacked}
     <div class="kinds" role="radiogroup" aria-label="Shape">
       {#each SHAPE_KINDS as k}
-        <button class="icon chip" class:on={ed.shapeKind === k} role="radio" aria-checked={ed.shapeKind === k} title={SHAPE_LABEL[k]} aria-label={SHAPE_LABEL[k]} onclick={() => (ed.shapeKind = k)}>
+        <button
+          class="icon chip"
+          class:on={ed.shapeKind === k}
+          role="radio"
+          aria-checked={ed.shapeKind === k}
+          title={SHAPE_LABEL[k]}
+          aria-label={SHAPE_LABEL[k]}
+          onclick={() => {
+            ed.shapeKind = k;
+            engine?.shapes.deselect();
+          }}
+        >
           <Icon name={k} />
         </button>
       {/each}
@@ -150,8 +161,12 @@
   {/if}
   {#if ed.tool === 'shape' && !stacked}
     <span class="kindname"><Icon name={ed.shapeKind} />{SHAPE_LABEL[ed.shapeKind]}</span>
-  {:else if ed.tool === 'select' && selShapes.length}
-    <span class="selname">{selShapes.length === 1 ? selShapes[0].name || SHAPE_LABEL[selShapes[0].kind] : `${selShapes.length} shapes`}</span>
+  {/if}
+  {#if selShapes.length && !stacked}
+    <!-- With a selection, the options below change it (also with the Shapes tool). -->
+    <span class="selname" title="The options change the selected shapes">
+      {ed.tool === 'shape' ? 'Editing: ' : ''}{selShapes.length === 1 ? selShapes[0].name || SHAPE_LABEL[selShapes[0].kind] : `${selShapes.length} shapes`}
+    </span>
   {/if}
   {#if showStyle}
     <div class="colorsrow">

@@ -1162,7 +1162,7 @@ export class Engine {
 
   undo(): void {
     if (!ed.canEdit) return;
-    if (this.stroke) return;
+    if (this.stroke || this.shapes.busy()) return;
     if (ed.transform) return this.cancelTransform();
     const e = this.undoStack.pop();
     if (!e) return;
@@ -1173,7 +1173,7 @@ export class Engine {
 
   redo(): void {
     if (!ed.canEdit) return;
-    if (this.stroke) return;
+    if (this.stroke || this.shapes.busy()) return;
     const e = this.redoStack.pop();
     if (!e) return;
     e.redo.forEach((op) => this.sendOp(op));
@@ -2011,6 +2011,7 @@ export class Engine {
     if (key === 'u' && e.shiftKey) {
       // Shift+U: the next kind of shape.
       ed.shapeKind = SHAPE_KINDS[(SHAPE_KINDS.indexOf(ed.shapeKind) + 1) % SHAPE_KINDS.length];
+      this.shapes.deselect();
       ed.tool = 'shape';
       this.updateCursor();
     } else if (tools[key]) {

@@ -96,6 +96,20 @@ export function save(key: string, value: unknown): void {
 }
 
 const { tool: _t, color: _c, ...brushDefaults } = DEFAULT_BRUSH;
+
+const SHAPE_STYLE: ShapeStyle = {
+  fill: '#7c3aed',
+  stroke: null,
+  strokeWidth: 4,
+  align: 'inside',
+  cap: 'round',
+  radii: [0, 0, 0, 0],
+  radiiLinked: true,
+  sides: 6,
+  points: 5,
+  innerRatio: 0.45,
+  rounding: 0,
+};
 const prefs = load('draw.prefs', {
   name: `${pick(ADJ)} ${pick(NOUN)}`,
   color: pick(PEER_COLORS),
@@ -111,19 +125,7 @@ const prefs = load('draw.prefs', {
   bg: '#ffffff',
   swatches: [] as string[],
   shapeKind: 'rect' as ShapeKind,
-  shapeStyle: {
-    fill: '#7c3aed',
-    stroke: null,
-    strokeWidth: 4,
-    align: 'inside',
-    cap: 'round',
-    radii: [0, 0, 0, 0],
-    radiiLinked: true,
-    sides: 6,
-    points: 5,
-    innerRatio: 0.45,
-    rounding: 0,
-  } as ShapeStyle,
+  shapeStyle: {} as Partial<ShapeStyle>,
   /** Clicks on empty canvas keep the selection (only Esc and Deselect clear it). */
   keepSelection: false,
 });
@@ -146,7 +148,7 @@ class EditorState {
   name = $state(prefs.name);
   color = $state(prefs.color);
   shapeKind = $state<ShapeKind>(prefs.shapeKind);
-  shapeStyle = $state<ShapeStyle>({ ...prefs.shapeStyle });
+  shapeStyle = $state<ShapeStyle>({ ...SHAPE_STYLE, ...prefs.shapeStyle });
   keepSelection = $state(prefs.keepSelection);
   /** Selected shapes (ids). */
   selection = $state<string[]>([]);

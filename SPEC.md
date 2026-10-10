@@ -56,9 +56,16 @@ A document is a set of layers and a set of strokes. The server gives each accept
 
 ```ts
 Layer  { id, name, order: number, blend: BlendMode | 'pass', opacity: 0..1, visible, deleted,
-         kind?: 'paint' | 'adjust' | 'group', parent?: groupId | null,
+         kind?: 'paint' | 'adjust' | 'group' | 'shape', parent?: groupId | null,
          adjust?: Adjust, clip?: boolean, mask?: { id, enabled } | null }
 Stroke { id, layerId, seq, author, brush: Brush, pts: number[], deleted, mask?: maskId }
+Shape  { id, layerId, kind: 'rect' | 'ellipse' | 'polygon' | 'star' | 'line', seq, author, deleted?,
+         name, z: number, w, h, m: Affine,
+         radii?: [tl, tr, br, bl], radiiLinked?, sides?, points?, innerRatio?, rounding?,
+         line?: [x0, y0, x1, y1],
+         fill: '#rrggbb' | null, stroke: '#rrggbb' | null, strokeWidth,
+         align: 'center' | 'inside' | 'outside', cap: 'butt' | 'round' | 'square',
+         join: 'miter' | 'round' | 'bevel' }
 Brush  { tool: 'paint' | 'erase', color: '#rrggbb', size, opacity, flow,
          hardness, spacing, pressureSize, pressureFlow, buildup,
          tip?, angle?, roundness?, followDirection?, sizeJitter?, angleJitter?,
@@ -70,6 +77,7 @@ All fields with `?` are optional. Older documents have none of them and stay val
 - **Adjustment layer** (`kind: 'adjust'`): it has no paint. It changes the composite of everything below it. `Adjust` is levels, curves (2 to 16 points), hue/saturation, or brightness/contrast. The server refuses a plain stroke on an adjustment layer. A mask stroke is permitted.
 - **Clipping mask** (`clip: true`): the layer shows only where the nearest layer below it that is not clipped (the base) has alpha. The base and its clipped layers are a clipping group.
 - **Group** (`kind: 'group'`), as in Photoshop: a folder of layers. A layer's `parent` names its group (absent or null: the top level), and `order` sorts the layers of one parent. Groups nest up to 8 levels (`LIMITS.maxGroupDepth`; layers may sit inside the 8th). A group has no paint. Its blend is "pass through" (`'pass'`, the default, for groups only): its layers blend with what is below the group, as if they were not grouped, and with opacity under 100% the result is mixed with the backdrop by the opacity. Any other blend makes the group isolated: its layers composite on their own (adjustment layers inside change only the group), then the result blends as one layer. Hiding a group hides its layers. Deleting a group deletes its layers with it (they count as deleted while the group is), and restoring it brings them back unchanged. Clipping works among the layers of one group; a group can be a clipping base. The server checks that the parent is a live group, that a group never goes into itself, and the depth. Rules: `src/shared/layers.ts`.
+- **Shape layer** (`kind: 'shape'`): a layer that holds many vector shapes (section 4.1). Each shape has its own fill and stroke, as in Illustrator. Opacity, blend, mask, clipping, groups, visibility, transform and duplicate work as on a paint layer. The server refuses a plain stroke on a shape layer. A mask stroke is permitted.
 - **Layer mask** (`mask`): strokes with `mask: <mask id>` on the layer. They paint grey on an implied white mask: black hides the layer, white shows it, and the eraser goes back to white. A new mask gets a new id. Thus the strokes of a deleted mask stay out of a later mask, and undo of the delete brings them back. `enabled: false` turns the mask off and keeps it.
 
 - `pts` is a flat array of `x, y, pressure` triples in world units. One world unit is one CSS pixel at 100% zoom.
@@ -80,6 +88,24 @@ All fields with `?` are optional. Older documents have none of them and stay val
 - A stroke keeps the `seq` of its creation. If a user restores a stroke, it goes back to its original position in the z-order.
 - **Transform** (`layer.transform`, with an affine matrix `m = [a, b, c, d, e, f]`): changes the points of every stroke of a layer, or of a group and everything in it (masks too, and deleted strokes, so undoing a delete puts them back in the new place). The brush size scales by √|det m| (the average scale), and a fixed tip angle turns with the rotation. Strokes stay vectors, so a transformed layer stays sharp at any scale. A non-uniform scale or a skew keeps the tip shape. The server refuses a matrix that is not invertible, and a transform that would move a point past `maxCoord`. Undo is the inverse matrix.
 - **Duplicate** (`layer.duplicate`, with the source `id`, a `newId`, the name, the order and the parent): copies a layer, or a group with everything in it, in one op. The copies' ids come from `derivedId(newId, original id)` (three FNV-1a hashes, base 62), so the server and every client make the same copy. Copied strokes keep their `seq` and author. Undo deletes the copy.
+
+### 4.1 Shapes
+
+A shape is a record in the document, as a stroke is. Rules: `src/shared/shapes.ts` (outline, bounds, hit test) and `src/shared/validate.ts` (`validateShapeInput`).
+
+- **Geometry:** a frame from (0, 0) to (`w`, `h`) in local units, and an affine matrix `m` that maps local units to world units. A move, a rotation and a layer transform change `m` only. Thus they stay exact. A resize with a handle of the Select tool changes the frame, and `m` keeps its rotation.
+- **Live settings:** the settings stay editable. Phase 2 (point editing) will change a shape into a path.
+  - `rect`: `radii`, four corner radii (top left, top right, bottom right, bottom left). `radiiLinked` tells the editor to change all four together. When two radii are too large for a side, all four become smaller by the same factor, as in CSS.
+  - `ellipse`: no settings.
+  - `polygon`: `sides`, 3 to 64. `star`: `points`, 3 to 64, and `innerRatio`, the inner radius as a fraction of the outer radius (0.01 to 1). The points of a polygon or a star are scaled to fill the frame.
+  - `polygon` and `star`: `rounding`, a corner radius. Each corner gets at most the radius that fits half of its shorter edge.
+  - `line`: `line`, the start and the end point in local units. The frame is the box of the two points.
+- **Lengths:** the radii, `rounding` and `strokeWidth` are local units. Thus a layer transform scales them with the shape, and a skew skews the stroke too. The editor shows them in screen pixels at the current zoom, as the brush size.
+- **Style:** `fill` and `stroke` are a color or null (none). A line has no fill. `align` puts the stroke on the center of the outline, inside it, or outside it. A line always has a center stroke. `cap` is for the ends of a line. `join` is for corners (the editor uses miter, with a miter limit of 4).
+- **Order:** `z` is a fractional index among the shapes of a layer, as `order` is among layers.
+- **Ops:** `shape.add` (the whole shape), `shape.update` (some props), `shape.remove` and `shape.restore` (a tombstone, as for strokes). The server merges an update with the shape and checks the result as a whole shape of its kind. Settings of another kind are dropped. The server refuses a frame corner past `maxCoord`, and more than 20000 live shapes on a canvas (`LIMITS.maxShapes`).
+- **Layer ops:** `layer.transform` multiplies the matrix of each shape of the layers (also deleted shapes) by the transform. `layer.duplicate` copies the shapes, with ids from `derivedId`.
+- **Feature flag:** a document with a shape layer lists `shapes` in `welcome.features`. A client from before shapes then asks for an update. It does not draw the shape layer as an empty paint layer.
 
 ## 5. Brush model
 
@@ -175,7 +201,15 @@ A worker holds a copy of all confirmed strokes and renders tiles with OffscreenC
 
 The fallback draws tips, rotation, roundness, and jitter, but not grain. It applies layer masks and adjustment layers on the CPU (`getImageData`), with the same formulas as the shaders. A clipped layer uses `source-atop`, so its blend mode is not applied (Canvas 2D has no blend mode with atop).
 
-### 6.4 Strokes in progress and the handoff
+### 6.4 Shapes
+
+- A shape layer has tiles, as a paint layer has. To render a tile, the renderer draws the shapes that touch it, bottom to top, with Canvas 2D paths on an OffscreenCanvas of 256 × 256 pixels. The WebGL2 renderer then copies the canvas into the tile texture. The tile worker of the Canvas 2D renderer does the same in the worker (`src/client/engine/shapeRaster.ts`).
+- Deep zoom: the renderer builds the matrix from local units to tile pixels in double precision, and subtracts the tile origin first, as `putDab` does. If the whole shape is less than 32768 pixels from the tile, Canvas draws the path through that matrix. Else the renderer makes the outline and the stroke as polygons in double precision, and cuts them to the tile. An arc becomes short chords only near the tile, where an edge of the outline or of the stroke band can cross it. Thus a shape stays sharp at 10^11×, with a few dozen points for each tile.
+- Stroke alignment: an inside stroke draws twice the width, clipped to the outline. An outside stroke draws twice the width under the fill. Without a fill, an outside stroke is clipped to everything outside the outline.
+- Edits: while a shape changes (a drag, a slider), the change is a draft. A layer with drafts draws straight to the screen each frame, from all its shapes, in place of its tiles. When the drafts end, this continues until the tiles of the layer in view are current. Thus a drag shows at once, and the layer does not flash back.
+- Far zoom-out is not optimized yet: each tile draws every shape that touches it.
+
+### 6.5 Strokes in progress and the handoff
 
 - The local stroke draws at once. The input uses `getCoalescedEvents()` for full pen rate.
 - Remote strokes in progress arrive as `live` messages every 40 ms. Each one draws into its own buffer.
@@ -183,7 +217,7 @@ The fallback draws tips, rotation, roundness, and jitter, but not grain. It appl
 
 ## 7. Sync protocol
 
-Document features: `welcome.features` lists the newer features the document uses (`adjust`, `clip`, `mask`, `tips`, from `src/shared/features.ts`). A client that does not know a feature shows "This canvas uses features from a newer Draw" and does not draw the canvas silently wrong. A `live` message for a stroke on a mask carries `mask`.
+Document features: `welcome.features` lists the newer features the document uses (`adjust`, `clip`, `mask`, `tips`, `groups`, `shapes`, from `src/shared/features.ts`). A client that does not know a feature shows "This canvas uses features from a newer Draw" and does not draw the canvas silently wrong. A `live` message for a stroke on a mask carries `mask`.
 
 Transport: JSON over WebSocket at `/ws?code=XXXX-XXXX`, with permessage-deflate.
 
@@ -196,11 +230,12 @@ Transport: JSON over WebSocket at `/ws?code=XXXX-XXXX`, with permessage-deflate.
 | C→S | `op` | yes | One document op (table below) |
 | S→C | `op` | — | The op with its `seq` and author, to all clients |
 | C→S→C | `live` | no | Points of a stroke in progress |
+| C→S→C | `shape.live` | no | Shapes as a person changes them (at most every 40 ms). An empty list ends the drafts. |
 | C→S→C | `cursor` | no | Cursor position and active layer (max 20/s) |
 | S→C | `peer.join`, `peer.leave` | — | Presence |
 | S→C | `error` | — | Rejected op, with a reason code |
 
-Ops: `stroke.add`, `stroke.remove`, `stroke.restore`, `layer.add`, `layer.update` (any of name, blend, opacity, visible, order), `layer.remove`, `layer.restore`.
+Ops: `stroke.add`, `stroke.remove`, `stroke.restore`, `layer.add`, `layer.update` (any of name, blend, opacity, visible, order), `layer.remove`, `layer.restore`, `layer.transform`, `layer.duplicate`, `shape.add`, `shape.update`, `shape.remove`, `shape.restore`.
 
 Consistency:
 
@@ -209,7 +244,7 @@ Consistency:
 - Concurrent `layer.update` writes use last-writer-wins by `seq`, one property at a time.
 - Strokes do not conflict. Each stroke is its own object.
 
-Undo and redo are local to each user. Each user has a stack of their own actions. Undo sends the inverse op: `stroke.remove` for a stroke, `layer.update` with the old values for a property change, `layer.restore` for a layer delete.
+Undo and redo are local to each user. Each user has a stack of their own actions. Undo sends the inverse op: `stroke.remove` for a stroke, `layer.update` with the old values for a property change, `layer.restore` for a layer delete, `shape.update` with the old values for a shape change, `shape.remove` for a new shape (and `layer.remove` for the shape layer that it made).
 
 ## 8. Server
 
@@ -332,7 +367,8 @@ A tool (Shift+E; after the eraser in the toolbars) that removes whole strokes, a
 ### 9.0 Layers panel, groups and transform
 
 - The panel is a tree, top layer first: a group's row (folder icon, an arrow to open or close it; closed groups are kept per device), then its layers, indented. Every row has a grip: drag it (mouse, pen or finger) onto the upper or lower part of a row to go above or below it, or onto the middle of a group to go into it, at its top. The up and down buttons move a layer among the layers of its group.
-- Buttons: new layer, new adjustment layer, group (puts the active layer in a new group; on a group: ungroup), mask, clip, duplicate, up, down, delete. Transform is in the left toolbar; the phone's layers sheet keeps a Transform button (phones have no left toolbar). Shortcuts: Ctrl+G groups, Ctrl+Shift+G ungroups, Ctrl+J duplicates, Ctrl+T or V transforms (browsers keep Ctrl+T for a new tab; V works there).
+- Buttons: new layer, new adjustment layer, group (puts the active layer in a new group; on a group: ungroup), mask, clip, duplicate, up, down, delete. The Select tool (V) transforms a paint layer or a group (section 9.8). The phone's layers sheet keeps a Transform button. Shortcuts: Ctrl+G groups, Ctrl+Shift+G ungroups, Ctrl+J duplicates, Ctrl+T transforms (browsers keep Ctrl+T for a new tab; the Select tool works there).
+- A shape layer row opens and closes, as a group row. Open, it shows its shapes, top first: the kind icon, the name (double-click renames), a chip with the fill and stroke colors, and a delete button. A click on a shape row selects the shape (Shift+click adds or removes it) and changes to the Select tool.
 - New layers go above the active layer in its group, or at the top of the active group. A group cannot be painted on: the brush says so.
 - Transform: a box around what the layer or group draws, with 8 handles and a rotate handle. Drag inside to move. A corner scales and keeps the shape (Shift: free; Alt: from the center). An edge stretches one way. The rotate handle turns (Shift: 15° steps). A toolbar shows the size and the angle, and has flip horizontal, flip vertical, reset, cancel and apply. Enter applies, Esc cancels, arrow keys nudge (Shift: 10 px). While the box is open the canvas only pans, and the wheel still zooms over the box.
 - Preview: while the handles move, the renderer draws a copy of what the layer showed on screen through the transform (one GPU pass), so dragging stays smooth even for a large group. Parts that were off screen are missing until the transform is applied. After Apply, the preview stays until the layer's tiles show the transformed strokes, so the layer does not flash back.
@@ -358,14 +394,14 @@ For WebKitGTK and WKWebView, the desktop app reads the pen in the native layer (
 
 ### 9.2 Files (.bdraw)
 
-- Content: the document as the server sends it in `welcome` (`layers`: Layer[], `strokes`: Stroke[]), plus a header: `format: "bdraw"`, `version: 2` (version 2 can hold adjustment layers, clipping, masks, and brush dynamics; the server reads versions 1 and 2), the app version, the save time, and the source canvas (information only). Deleted layers and erased strokes are not in the file. Type: `src/shared/bdraw.ts`.
+- Content: the document as the server sends it in `welcome` (`layers`: Layer[], `strokes`: Stroke[], `shapes`: Shape[]), plus a header: `format: "bdraw"`, `version`, the app version, the save time, and the source canvas (information only). Version 2 can hold adjustment layers, clipping, masks, and brush dynamics. Version 3 adds shape layers and `shapes`. A file without shapes is still written as version 2, so a server from before shapes accepts it. The server reads versions 1 to 3. Deleted layers, erased strokes and removed shapes are not in the file. Type: `src/shared/bdraw.ts`.
 - Encoding: gzip-compressed JSON. Plain JSON is also valid. A browser without `CompressionStream` writes plain JSON.
 - Preview: `preview` is a PNG data URL of everything on the visible layers (4% margin), fitted into 512 × 512 px, rendered by the off-screen renderer (§9.4). It comes right after `savedAt`, so a reader finds it near the start of the file. It is information only, and the server ignores it. Without WebGL2 the file has no preview.
 - Thumbnails (Linux): the Linux app installs `draw-thumbnailer.sh` in `~/.local/share/xyz.bsums.draw/` and `~/.local/share/thumbnailers/xyz.bsums.draw.thumbnailer` (freedesktop thumbnailer spec) when it starts, for every package type. The entry runs `sh draw-thumbnailer.sh %i %o %s APP`, where APP is the AppImage file or the app binary. The script decompresses at most the first 8 MB and writes the `preview` PNG (fast). A file without a preview (saved before Draw 0.2.24) goes to `APP --thumbnail IN OUT SIZE`: the app loads `thumb/thumb.html` (built from `thumb.html` and `src/client/thumb.ts` by `npm run build:thumb`) in a hidden window with a temporary profile, renders everything on the visible layers with the off-screen renderer (§9.4), writes the PNG and exits, in 1 to 2 s. No single-instance lock, so several can run next to the open app. The file manager scales the result. The script needs only POSIX `sh`, `gzip`, `head`, `tr`, `grep`, `sed` and `base64`.
 - KDE Dolphin (KIO 6, 2024 and later) lists the thumbnailer as "Draw canvas" (the MIME type comment) under Settings, Interface, Previews. Dolphin uses only the previews ticked there, so tick it once.
 - Save: the save button or `Ctrl+S` writes the confirmed state of the client. A viewer can save too, because a viewer can see the full canvas.
 - Open: the open button, `Ctrl+O`, a file dropped on the window, the file manager (desktop app), or the installed PWA (Chromium `file_handlers`). The app always opens the file as a new online canvas with the same create form as the landing page. It never changes the canvas that the file came from.
-- Server: `POST /api/import`. The body is the raw file (at most 32 MB, at most 256 MB after gunzip). The create options are URI-encoded JSON in the `X-Draw-Options` header. A cross-site page cannot send this header without a CORS preflight. The server reads and checks the whole file before it makes the canvas. Then it replays each layer and each stroke (in `seq` order) as `layer.add` and `stroke.add` ops, through the same checks as live ops. It skips entries that fail and returns the number it skipped. Strokes keep their IDs and their author.
+- Server: `POST /api/import`. The body is the raw file (at most 32 MB, at most 256 MB after gunzip). The create options are URI-encoded JSON in the `X-Draw-Options` header. A cross-site page cannot send this header without a CORS preflight. The server reads and checks the whole file before it makes the canvas. Then it replays each layer, each stroke (in `seq` order) and each shape as `layer.add`, `stroke.add` and `shape.add` ops, through the same checks as live ops. It skips entries that fail and returns the number it skipped. Strokes and shapes keep their IDs and their author.
 - Desktop app: the installers register `.bdraw` (`application/x-bdraw`). The `.deb` and `.rpm` packages install a shared-mime-info file in `/usr/share/mime/packages`. The AppImage contains the same file (AppImageLauncher installs it). Gear Lever does not install MIME types, so an AppImage writes the file to `~/.local/share/mime/packages` when it starts (only if it is missing or different) and runs `update-mime-database`. The desktop file has `Exec=draw %F`, so file managers send the paths. The app gets the path as an argument (Windows, Linux) or as `RunEvent::Opened` (macOS). It reads the file with a command that reads only the files the system opened the app with.
 
 Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all content, `Ctrl+1` goes to 100%, and `M` shows or hides the markers. `[` and `]` change the size. `Shift+[` and `Shift+]` change the hardness. Keys 1–0 set the opacity. `X` swaps the colors. Hold `Space` to pan. Hold `Alt` for the eyedropper. `Ctrl+Z` and `Ctrl+Shift+Z` undo and redo. The mouse wheel zooms at the cursor. `Ctrl`+wheel and trackpad pinches zoom the canvas over the panels and popups too, never the page. A plain wheel over a popover that floats on the canvas zooms the canvas when the popover cannot scroll. `Ctrl+=`, `Ctrl+-`, `Ctrl+0` and `Ctrl+1` work while a number field or a list has the keyboard.
@@ -435,6 +471,40 @@ The Android app and the Linux AppImage update themselves from the latest GitHub 
 - The web app and the Windows and macOS apps show nothing.
 - Keep the asset names above and the `--latest` publish in `.github/workflows/release.yml`, or the apps stop finding updates. Apps before v0.2.35 have no updater: update those by hand one time.
 
+### 9.8 Shapes and the Select tool
+
+Toolbar order: brush, eraser, stroke eraser, the colors, eyedropper, Select, Shapes. Hand and Zoom are at the bottom. The phone bar has Select and Shapes after the eyedropper.
+
+**Shapes tool (U).** Shift+U changes to the next kind. A click on the Shapes button when it is active, a right-click, or a long press opens a menu of the kinds: rectangle, ellipse, polygon, star, line.
+
+- A drag draws a shape from the start point to the pointer. Shift makes a square, a circle, or a line in 45° steps. Alt draws from the center. A label near the pointer shows the size in screen pixels (and the radius of a rectangle).
+- A click without a drag makes a shape of 100 screen pixels, centered at the click (a line starts at the click).
+- The new shape goes into the active layer when it is a visible shape layer. Else the press makes a new shape layer above the active layer. Undo removes the shape, and the new layer with it.
+- After the drag, the new shape is selected. The tool stays the Shapes tool.
+
+**Select tool (V)** on shapes. The rules prevent a change of the selection by accident:
+
+- Hover: an outline shows the shape that a click would select, with a label "Click: select <name>".
+- A click on a shape selects it, and the active layer changes to its layer. Shift+click adds the shape to the selection or removes it. A press on a shape that is not selected and a drag move it at once.
+- With a selection, a press anywhere inside its box moves it, also over other shapes: the box wins. A handle scales. A press just outside a corner (26 px) rotates (Shift: 15° steps). A dot inside each corner of a rectangle changes the corner radius (all four when they are linked, Alt: one corner). A line has a handle at each end instead of a box. The cursor shows what a press does.
+- A resize of one shape changes its frame: Shift keeps the proportions, Alt resizes from the center. With several shapes selected, the box is around all of them, and a resize scales their matrices.
+- A drag on empty canvas selects the shapes that its rectangle touches (Shift adds them). A click on empty canvas deselects, but not when "Keep selection" in the options bar is on (kept per device). Esc and the Deselect button always deselect.
+- A press must move 3 px (7 px with a finger) before it changes a shape. Thus a click never moves a shape.
+- Delete or Backspace removes the selected shapes. The arrow keys move them by 1 screen pixel (Shift: 10).
+- A double-click (a double tap on a phone) or Enter is kept for point editing (phase 2). It shows a message and changes nothing.
+- One drag is one undo step for all the shapes that it changed.
+- On a paint layer or a group with paint, the Select tool shows the layer transform (section 9.0): the whole layer is the selection. While that transform has no change, a click on a shape closes it and selects the shape. A transform with changes stays until Apply or Cancel.
+
+**Options bar** (the phone shows the same options in the tool sheet, with the kinds as buttons):
+
+- The Fill and Stroke swatches open a color picker with "None", the foreground and background colors, and the recent colors. Width (screen pixels), alignment (Inside, Center, Outside), the corner radius of a rectangle (one radius, or four when not linked), sides and rounding of a polygon, points, inner ratio and rounding of a star, and the caps of a line.
+- With shapes selected, the options show the first shape and change all the selected shapes where the setting fits their kind. A slider drag is one undo step. The values also become the style of the next shape.
+- The bar shows the gestures as text: "Drag inside: move · Handles: scale · Just outside a corner: rotate · Double-click: points".
+
+**Multiplayer.** During a drag, the client sends the changed shapes in `shape.live` at most every 40 ms. Other people see the drafts at once. At the end of the drag, one `shape.update` op for each shape goes out, then an empty `shape.live`. A client drops the drafts of a person who leaves, or who sends nothing for 10 s.
+
+**Painting on a shape layer.** The brush, the eraser and the stroke eraser (on the active layer only) do not paint on a shape layer. A message tells the person to select a paint layer, or to add one.
+
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).
@@ -482,7 +552,8 @@ Desktop app on Windows and macOS (Tauri v2, `src-tauri/`; the Linux parts of `sr
 - Code signing for the Windows and macOS installers
 - A spatial index for the markers, for documents with more than about 100 000 strokes
 - Coordinate rebasing, for zoom without the float64 limit (about 15 orders of magnitude around the work area)
-- Selection, transform, fill, and text tools
+- Shapes, phase 2: point editing (a double-click or Enter on a shape) and a Pen tool. Phase 3: one curve type for each path (Bezier, or x-spline with a smoothness for each point), live compound shapes (unite, subtract, intersect, exclude) and "flatten to one path". Later: custom shapes, arrowheads, dashes, ellipse arcs and holes, and faster shape tiles at far zoom-out
+- Pixel selection, fill, and text tools
 - Export of a region at a chosen resolution, and PSD export
 
 ## 12. Risks

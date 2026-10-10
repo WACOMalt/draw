@@ -39,6 +39,8 @@
   function pickKind(k: ShapeKind) {
     ed.shapeKind = k;
     flyout = null;
+    // The options bar then shows the settings of the new kind, not of a selected shape.
+    engine?.shapes.deselect();
     select('shape');
   }
 

@@ -388,14 +388,20 @@ export class GLRenderer implements Renderer {
     return tex;
   }
 
-  /** Copies a canvas into a texture. Canvas rows go top first, as image space wants. */
+  /**
+   * Copies a canvas into a texture (and clears the canvas). Canvas rows go top first, as image
+   * space wants. The copy goes through an ImageBitmap: several tiles draw on the same canvas in
+   * one frame, and a direct upload of the canvas could get the pixels of a later tile.
+   */
   private uploadCanvas(tex: WebGLTexture, c: OffscreenCanvas): void {
     const gl = this.gl;
+    const bmp = c.transferToImageBitmap();
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    // The canvas holds premultiplied colors, as the buffers here do.
+    // Premultiplied colors, as the buffers here hold.
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, c);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    bmp.close();
   }
 
   /** A mipmapped single-channel texture array for tips or grains. */
@@ -714,8 +720,8 @@ export class GLRenderer implements Renderer {
       if (done) {
         this.gl.deleteTexture(h.tex);
         this.hot.delete(id);
-        this.invalidate();
       }
+      this.invalidate(); // gone: draw the tiles; else check again next frame
     }
     for (const id of want) {
       if (!this.hot.has(id)) this.hot.set(id, { tex: this.makeTexture(), rect: null, version: -1, viewVersion: -1, settleAt: null });

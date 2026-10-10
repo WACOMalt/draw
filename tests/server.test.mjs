@@ -291,7 +291,7 @@ try {
   check(anonImp.status === 201 && /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(anonImp.data.key) && anonImp.data.strokes === 2 && anonImp.data.skipped === 0, 'plain JSON file imports as a temporary canvas (round trip)');
   check((await new Browser().upload(gz, { name: 'nope-name' })).status === 401, 'named import needs an account');
   check((await funky.upload(Buffer.from('not a drawing'), {})).data?.error === 'bad_file', 'a file that is not .bdraw is refused');
-  check((await funky.upload(Buffer.from(JSON.stringify({ ...bfile, version: 3 })), {})).data?.error === 'file_too_new', 'a file from a newer version is refused');
+  check((await funky.upload(Buffer.from(JSON.stringify({ ...bfile, version: 99 })), {})).data?.error === 'file_too_new', 'a file from a newer version is refused');
   const noHeader = await fetch(BASE + '/api/import', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: gz });
   check(noHeader.status === 403, 'import without X-Draw-Options is refused (CSRF)');
   check((await funky.upload(gz, {}, { Origin: 'https://evil.example' })).status === 403, 'import from a foreign Origin is refused');
@@ -571,6 +571,124 @@ try {
     const gImp = await gb.upload(Buffer.from(JSON.stringify(file)), {});
     const gw = await first(await new Browser().join(gImp.data.key));
     check(gImp.status === 201 && gImp.data.skipped === 0 && gw.layers.find((l) => l.id === 'impLAYER1')?.parent === 'impGROUP1' && gw.strokes.length === 1, 'groups: a .bdraw with a group imports, layers listed before their group');
+  }
+
+  // --- vector shapes ---------------------------------------------------------------------------
+  {
+    const sb = new Browser();
+    await account(sb, 'shapes@example.com', 'Shape Tester');
+    const sc = (await sb.api('POST', '/api/sessions', { name: 'shapes-test' })).data.key;
+    const o = await sb.join(sc);
+    const w = await first(o);
+    const L1 = layerId(w);
+    let opn = 300;
+    const send = (op) => o.send({ t: 'op', opId: `s${opn++}xxxxx`, op });
+    const echo = (pred) => o.next((m) => m.t === 'op' && pred(m.op), 2000);
+    const rejected = (n) => o.next((m) => m.t === 'reject' && m.opId === `s${n}xxxxx`, 2000);
+    const tryOp = async (op) => {
+      const n = opn;
+      send(op);
+      return o.next((m) => (m.t === 'reject' && m.opId === `s${n}xxxxx`) || (m.t === 'op' && m.opId === `s${n}xxxxx`), 2000);
+    };
+    const rect = (id, extra = {}) => ({
+      id, layerId: 'shapeLAYER1', kind: 'rect', name: 'Rectangle 1', z: 1, w: 100, h: 50, m: [1, 0, 0, 1, 10, 20],
+      radii: [4, 4, 4, 4], fill: '#7c3aed', stroke: null, strokeWidth: 2, align: 'inside', cap: 'round', join: 'miter', ...extra,
+    });
+
+    send({ type: 'layer.add', layer: { id: 'shapeLAYER1', kind: 'shape', name: 'Shapes 1', order: 2, blend: 'normal', opacity: 1, visible: true } });
+    check(!!(await echo((op) => op.type === 'layer.add' && op.layer.kind === 'shape')), 'shapes: add a shape layer');
+    send({ type: 'shape.add', shape: rect('shapeRECT01') });
+    const added = await echo((op) => op.type === 'shape.add');
+    check(added?.op.shape.id === 'shapeRECT01' && added.op.shape.author === w.clientId && added.op.shape.seq === added.seq, 'shapes: add a rectangle (author and seq set)');
+
+    // Checks: where a shape may go, and what makes a valid one.
+    let r = await tryOp({ type: 'shape.add', shape: rect('shapeONPAINT', { layerId: L1 }) });
+    check(r?.t === 'reject' && /shape layers/.test(r.reason), 'shapes: a paint layer takes no shapes');
+    r = await tryOp({ type: 'stroke.add', stroke: { ...strokeOp(L1).op.stroke, layerId: 'shapeLAYER1' } });
+    check(r?.t === 'reject' && /not paint/.test(r.reason), 'shapes: a shape layer takes no strokes');
+    r = await tryOp({ type: 'shape.add', shape: { ...rect('shapePOLY01'), kind: 'polygon' } });
+    check(r?.t === 'reject' && /needs sides/.test(r.reason), 'shapes: a polygon needs its sides');
+    r = await tryOp({ type: 'shape.add', shape: { ...rect('shapePOLY02'), kind: 'polygon', sides: 2 } });
+    check(r?.t === 'reject', 'shapes: a polygon has at least 3 sides');
+    r = await tryOp({ type: 'shape.add', shape: { ...rect('shapeSTAR01'), kind: 'star', points: 5, innerRatio: 0 } });
+    check(r?.t === 'reject', 'shapes: a star inner ratio must be above 0');
+    r = await tryOp({ type: 'shape.add', shape: rect('shapeCOLOR1', { fill: 'red' }) });
+    check(r?.t === 'reject', 'shapes: colors are #rrggbb or null');
+    r = await tryOp({ type: 'shape.add', shape: rect('shapeFAR001', { m: [1, 0, 0, 1, 2e15, 0] }) });
+    check(r?.t === 'reject', 'shapes: a frame out of range is refused');
+    r = await tryOp({ type: 'shape.add', shape: rect('shapeRECT01') });
+    check(r?.t === 'reject', 'shapes: a duplicate id is refused');
+    r = await tryOp({ type: 'shape.add', shape: { ...rect('shapeLINE01'), kind: 'line', line: [0, 0, 100, 50], fill: '#ff0000', align: 'outside' } });
+    check(r?.t === 'op' && r.op.shape.fill === null && r.op.shape.align === 'center' && r.op.shape.radii === undefined, 'shapes: a line has no fill, a center stroke, and no settings of other kinds');
+
+    // Partial updates: the result must still be a valid shape of its kind.
+    r = await tryOp({ type: 'shape.update', id: 'shapeRECT01', props: { fill: null, stroke: '#112233', radii: [0, 8, 0, 8], sides: 7 } });
+    check(r?.t === 'op', 'shapes: update some props');
+    r = await tryOp({ type: 'shape.update', id: 'shapeRECT01', props: { w: -5 } });
+    check(r?.t === 'reject', 'shapes: an update that breaks the shape is refused');
+    r = await tryOp({ type: 'shape.update', id: 'shapeRECT01', props: {} });
+    check(r?.t === 'reject', 'shapes: an empty update is refused');
+    let w2 = await first(await sb.join(sc));
+    let sh = w2.shapes.find((x) => x.id === 'shapeRECT01');
+    check(sh?.fill === null && sh.stroke === '#112233' && sh.radii.join() === '0,8,0,8' && sh.sides === undefined && sh.w === 100, 'shapes: updates persist; settings of other kinds are dropped');
+    check(w2.features.includes('shapes'), 'shapes: welcome lists the shapes feature');
+
+    // Remove and restore (undo): the restore carries the whole shape for late joiners.
+    send({ type: 'shape.remove', id: 'shapeRECT01' });
+    await echo((op) => op.type === 'shape.remove');
+    w2 = await first(await sb.join(sc));
+    check(!w2.shapes.some((x) => x.id === 'shapeRECT01'), 'shapes: a removed shape is not in the welcome');
+    r = await tryOp({ type: 'shape.update', id: 'shapeRECT01', props: { fill: '#000000' } });
+    check(r?.t === 'reject', 'shapes: a removed shape takes no updates');
+    send({ type: 'shape.restore', id: 'shapeRECT01' });
+    const restored = await echo((op) => op.type === 'shape.restore');
+    check(restored?.op.shape?.stroke === '#112233', 'shapes: restore brings the shape back, with its body');
+
+    // Layer transform: the shape matrix follows; out of range is refused.
+    send({ type: 'layer.transform', id: 'shapeLAYER1', m: [0, 2, -2, 0, 5, 5] });
+    await echo((op) => op.type === 'layer.transform');
+    w2 = await first(await sb.join(sc));
+    sh = w2.shapes.find((x) => x.id === 'shapeRECT01');
+    check(sh?.m.join() === '0,2,-2,0,-35,25' && sh.w === 100, 'shapes: a layer transform composes into the shape matrix');
+    r = await tryOp({ type: 'layer.transform', id: 'shapeLAYER1', m: [1, 0, 0, 1, 2e15, 0] });
+    check(r?.t === 'reject', 'shapes: a layer transform out of range is refused');
+
+    // Duplicate the layer: the shapes are copied with new ids.
+    send({ type: 'layer.duplicate', id: 'shapeLAYER1', newId: 'shapeLAYER2', name: 'Copy', order: 3, parent: null });
+    await echo((op) => op.type === 'layer.duplicate');
+    w2 = await first(await sb.join(sc));
+    const copies = w2.shapes.filter((x) => x.layerId === 'shapeLAYER2');
+    check(copies.length === 2 && copies.every((c) => !['shapeRECT01', 'shapeLINE01'].includes(c.id)), 'shapes: a layer duplicate copies its shapes');
+
+    // Viewers: no shape ops, no live shapes; they see the live shapes of editors.
+    const v = await new Browser().join(sc);
+    const vw = await first(v);
+    check(vw?.role === 'viewer' && vw.shapes.length === 4, 'shapes: a viewer gets the shapes');
+    v.send({ t: 'op', opId: 'vshape1xxx', op: { type: 'shape.add', shape: rect('shapeVIEW01') } });
+    check((await v.next((m) => m.t === 'reject' && m.opId === 'vshape1xxx'))?.reason === 'view only', 'shapes: a viewer cannot add shapes');
+    v.send({ t: 'shape.live', shapes: [rect('shapeVLIVE1')] });
+    o.send({ t: 'shape.live', shapes: [rect('shapeLIVE01', { w: 60 })] });
+    const seen = await v.next((m) => m.t === 'shape.live', 2000);
+    check(seen?.by === w.clientId && seen.shapes[0].w === 60, 'shapes: live shapes reach other people');
+    check(!(await o.next((m) => m.t === 'shape.live', 500)), 'shapes: live shapes from a viewer are dropped');
+    o.send({ t: 'shape.live', shapes: [rect('shapeLIVE02', { kind: 'star' })] });
+    check(!(await v.next((m) => m.t === 'shape.live' && m.shapes[0]?.id === 'shapeLIVE02', 500)), 'shapes: malformed live shapes are dropped');
+
+    // A .bdraw (version 3) with shapes: the bad one is skipped; a newer version is refused.
+    const fileShapes = [
+      rect('impSHAPE01', { layerId: 'impSHAPEL1', author: 'someone', seq: 5 }),
+      { ...rect('impSHAPE02', { layerId: 'impSHAPEL1' }), kind: 'polygon', sides: 1 },
+    ];
+    const file = {
+      format: 'bdraw', version: 3, app: 'test', savedAt: '',
+      layers: [{ id: 'impSHAPEL1', name: 'Shapes', order: 1, blend: 'normal', opacity: 1, visible: true, deleted: false, kind: 'shape' }],
+      strokes: [],
+      shapes: fileShapes,
+    };
+    const imp = await sb.upload(Buffer.from(JSON.stringify(file)), {});
+    const iw = await first(await new Browser().join(imp.data.key));
+    check(imp.status === 201 && imp.data.shapes === 1 && imp.data.skipped === 1 && iw.shapes[0]?.author === 'someone', 'shapes: a .bdraw with shapes imports (author kept, a bad shape skipped)');
+    check((await sb.upload(Buffer.from(JSON.stringify({ ...file, version: 4 })), {})).data?.error === 'file_too_new', 'shapes: a newer .bdraw version is refused');
   }
 
   // --- admins manage every owned canvas like its owner ------------------------------------------
