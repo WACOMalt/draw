@@ -29,7 +29,7 @@
   const KEY = 'draw.export';
   const saved = (() => {
     try {
-      return JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<{ area: string; mp: number | 'screen'; aspect: string; format: string }>;
+      return JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<{ area: string; mp: number | 'screen'; aspect: string; format: string; transparent: boolean }>;
     } catch {
       return {};
     }
@@ -40,9 +40,11 @@
   let size = $state<number | 'screen'>(saved.mp === 'screen' || (typeof saved.mp === 'number' && saved.mp > 0) ? saved.mp : 'screen');
   let aspect = $state(saved.aspect ?? 'area');
   let format = $state<ImageFormat>(saved.format === 'tiff' ? 'tiff' : 'png');
+  /** No paper: the file keeps an alpha channel. */
+  let transparent = $state(saved.transparent === true);
   $effect(() => {
     try {
-      localStorage.setItem(KEY, JSON.stringify({ area, mp: size, aspect, format }));
+      localStorage.setItem(KEY, JSON.stringify({ area, mp: size, aspect, format, transparent }));
     } catch {
       // storage may be unavailable
     }
@@ -116,8 +118,8 @@
   const height = $derived(Math.max(1, Math.round(width / ratio)));
   /** The same size as a multiple of the screen's resolution (1× = what the screen shows now). */
   const screens = $derived(width / ((bounds.x1 - bounds.x0) * density));
-  const raw = $derived(rawSize(width, height));
-  const big = $derived(format === 'tiff' && needsBigTiff(width, height));
+  const raw = $derived(rawSize(width, height, transparent));
+  const big = $derived(format === 'tiff' && needsBigTiff(width, height, transparent));
 
   /** Why this export cannot run, or null. */
   const problem = $derived.by(() => {
@@ -167,6 +169,7 @@
         bounds: $state.snapshot(bounds),
         ...size,
         format,
+        transparent,
         sink,
         onProgress: (p, i, n) => ((progress = p), (piece = i), (pieces = n)),
         onFinishing: () => (phase = 'finishing'),
@@ -240,6 +243,14 @@
     <div class="seg">
       <button class:on={format === 'png'} disabled={running} onclick={() => (format = 'png')}>PNG</button>
       <button class:on={format === 'tiff'} disabled={running} onclick={() => (format = 'tiff')}>TIFF</button>
+    </div>
+  </div>
+
+  <div class="field">
+    <span class="label">Background</span>
+    <div class="seg">
+      <button class:on={!transparent} disabled={running} onclick={() => (transparent = false)}>Paper</button>
+      <button class:on={transparent} disabled={running} title="Only the drawing: the paper is left out, the file keeps transparency" onclick={() => (transparent = true)}>Transparent</button>
     </div>
   </div>
   <p class="muted note">

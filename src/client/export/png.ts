@@ -1,6 +1,6 @@
 // Streaming PNG writer: rows go in from the top, compressed data goes out to the sink as it
 // is made. Only one zlib stream and one previous row are held in memory.
-// RGB, 8 bits per channel, the "Sub" filter on every row (good for drawings, cheap to compute).
+// RGB (or RGBA with `alpha`), 8 bits per channel, the "Sub" filter on every row (good for drawings, cheap to compute).
 
 import type { Sink } from './sink';
 
@@ -32,6 +32,8 @@ export class PngWriter {
     private sink: Sink,
     private width: number,
     private height: number,
+    /** Keep the alpha channel (a transparent background): RGBA instead of RGB. */
+    private alpha = false,
   ) {
     const cs = new CompressionStream('deflate'); // zlib format, as PNG needs
     this.zWriter = cs.writable.getWriter() as WritableStreamDefaultWriter<Uint8Array>;
@@ -83,22 +85,23 @@ export class PngWriter {
     dv.setUint32(0, this.width);
     dv.setUint32(4, this.height);
     ihdr[8] = 8; // bit depth
-    ihdr[9] = 2; // RGB
+    ihdr[9] = this.alpha ? 6 : 2; // RGBA or RGB
     await this.chunk('IHDR', ihdr);
   }
 
-  /** `rgba` holds `rows` full rows (width × 4 bytes each); alpha is dropped. */
+  /** `rgba` holds `rows` full rows (width × 4 bytes each); alpha is dropped unless `alpha`. */
   async addRows(rgba: Uint8ClampedArray, rows: number): Promise<void> {
     const w = this.width;
-    const stride = 1 + w * 3;
+    const ch = this.alpha ? 4 : 3;
+    const stride = 1 + w * ch;
     const out = new Uint8Array(stride * rows);
     for (let y = 0; y < rows; y++) {
       const o = y * stride;
       out[o] = 1; // Sub: each byte minus the same channel of the pixel to its left
       let si = y * w * 4;
       let di = o + 1;
-      let pr = 0, pg = 0, pb = 0;
-      for (let x = 0; x < w; x++, si += 4, di += 3) {
+      let pr = 0, pg = 0, pb = 0, pa = 0;
+      for (let x = 0; x < w; x++, si += 4, di += ch) {
         const r = rgba[si], g = rgba[si + 1], b = rgba[si + 2];
         out[di] = r - pr;
         out[di + 1] = g - pg;
@@ -106,6 +109,11 @@ export class PngWriter {
         pr = r;
         pg = g;
         pb = b;
+        if (ch === 4) {
+          const a = rgba[si + 3];
+          out[di + 3] = a - pa;
+          pa = a;
+        }
       }
     }
     await this.zWriter.ready;

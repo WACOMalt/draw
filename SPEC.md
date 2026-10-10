@@ -423,11 +423,12 @@ One "Export image" button in the top bar (on phones, in the ⋮ menu) opens the 
 - Area: the current view, or everything on the visible layers.
 - Shape: as on screen (or as drawn, for everything), or 1:1, 4:3, 3:2, 16:9, 21:9, 4:5, 2:3 or 9:16. The area is centered and widened to the shape, never cut. Paper fills the rest.
 - Size: a pixel count. "Screen" is the pixel count of the view at the screen's resolution now (with the screen's shape, that is a snapshot of the screen). Presets 4, 12, 24, 50, 100, 250 and 500 MP, 1, 2.5, 10 and 50 GP, or any number of megapixels. The area is fitted to that count and keeps its shape: width = √(pixels × aspect). The dialog also shows the size as a multiple of the detail on screen now.
+- Background: Paper (the paper color fills everything) or Transparent (no paper: the file keeps an alpha channel, with straight, not premultiplied, colors: an RGBA PNG, or a TIFF with 4 samples and unassociated alpha). The choice is kept per device.
 - Formats:
 
 | Format | Limit here | Notes |
 |---|---|---|
-| PNG | 500 000 px wide (a strip of 256 rows is held in memory), 2^31 − 1 px high | Opens everywhere. RGB, the Sub filter, one zlib stream. |
+| PNG | 500 000 px wide (a strip of 256 rows is held in memory), 2^31 − 1 px high | Opens everywhere. RGB (RGBA when transparent), the Sub filter, one zlib stream. |
 | TIFF | 2^32 − 1 px per side | Tiled (256 × 256), Deflate with the horizontal predictor. BigTIFF (64-bit offsets) when the image is over 4 GB uncompressed. GIMP 2.10.32+, Photoshop, Krita and GDAL read BigTIFF. |
 
 - Rendering: an off-screen WebGL2 renderer with its own copy of the document renders pieces of up to 2048 × 2048 px, each to completion, with the same code as the screen. The pieces go into the encoder as they are done. About 24 megapixels per second on a desktop GPU.
