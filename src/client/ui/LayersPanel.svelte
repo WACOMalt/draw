@@ -749,12 +749,25 @@
   }
   .footer {
     display: flex;
-    flex-wrap: wrap;
+    /* One row: with up to 11 buttons (a shape layer, the phone sheet) they get narrower instead of wrapping. */
+    flex-wrap: nowrap;
     align-items: center;
     gap: 2px;
     padding: 4px 6px;
     border-top: 1px solid var(--border);
     background: var(--bg-1);
+  }
+  .footer :global(button.icon) {
+    flex: 0 1 26px;
+    min-width: 20px;
+  }
+  .footer .menuwrap {
+    display: flex;
+    flex: 0 1 26px;
+    min-width: 20px;
+  }
+  .footer .menuwrap :global(button.icon) {
+    flex: 1 1 auto;
   }
   .grow {
     flex: 1;
@@ -774,8 +787,10 @@
     .grip {
       width: 26px;
     }
-    .footer :global(button.icon) {
-      width: 40px;
+    .footer :global(button.icon),
+    .footer .menuwrap {
+      flex-basis: 40px;
+      min-width: 28px;
       height: 40px;
     }
   }
