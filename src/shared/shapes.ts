@@ -131,9 +131,15 @@ function roundedPolygon(p: number[], radius: number): Contour {
   const segs: Seg[] = [];
   const c0 = corners[0];
   if (c0.arc) segs.push(c0.arc);
+  // An edge that the two arcs fill completely (the rounding as large as fits) has no straight
+  // part left: leave out that empty line. Its direction is noise, and a stroke drew a miter
+  // spike on it.
+  let size = 0;
+  for (let i = 0; i < p.length; i++) size = Math.max(size, Math.abs(p[i]));
+  const eps = size * 1e-9;
   for (let i = 1; i <= n; i++) {
-    const c = corners[i % n];
-    segs.push({ t: 'L', x: c.t1[0], y: c.t1[1] });
+    const prev = corners[i - 1], c = corners[i % n];
+    if (Math.hypot(c.t1[0] - prev.t2[0], c.t1[1] - prev.t2[1]) > eps) segs.push({ t: 'L', x: c.t1[0], y: c.t1[1] });
     if (i < n && c.arc) segs.push(c.arc);
   }
   return { x: c0.t1[0], y: c0.t1[1], closed: true, segs };
