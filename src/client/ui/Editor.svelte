@@ -10,6 +10,7 @@
   import ColorPanel from './ColorPanel.svelte';
   import LayersPanel from './LayersPanel.svelte';
   import StatusBar from './StatusBar.svelte';
+  import SettingsDialog from './SettingsDialog.svelte';
   import MobileBar, { type SheetName } from './MobileBar.svelte';
   import Sheet from './Sheet.svelte';
   import Icon from './Icon.svelte';
@@ -121,6 +122,7 @@
       ed.denied = null;
       ed.shareOpen = false;
       ed.exportOpen = false;
+      ed.settingsOpen = false;
       ed.transform = null;
       ed.selection = [];
       ed.shapes = [];
@@ -240,6 +242,7 @@
       </Modal>
     {/if}
     {#if ed.exportOpen && engine}<ExportDialog {engine} {code} />{/if}
+    {#if ed.settingsOpen}<SettingsDialog onClose={() => (ed.settingsOpen = false)} />{/if}
     {#if narrow}
       <MobileBar {engine} bind:sheet />
     {:else}

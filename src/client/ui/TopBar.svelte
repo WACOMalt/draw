@@ -95,7 +95,9 @@
           <button role="menuitem" onclick={() => act(pickFile)}><Icon name="open" />Open a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => engine?.saveBdraw())}><Icon name="save" />Save to a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => (ed.exportOpen = true))}><Icon name="download" />Export an image…</button>
+          <button role="menuitem" onclick={() => act(() => (ed.settingsOpen = true))}><Icon name="settings" />Settings…</button>
           <button role="menuitem" onclick={() => act(onLeave)}><Icon name="exit" />Leave this canvas</button>
+          <div class="info" title="Renderer, bits per channel of its buffers, render scale and profile; app version">{ed.renderer} · v{__APP_VERSION__}</div>
         </div>
       {/if}
     </div>
@@ -103,6 +105,7 @@
     <button class="icon" title="Open a .bdraw file as a new canvas (Ctrl+O)" onclick={pickFile}><Icon name="open" /></button>
     <button class="icon" title="Save to a .bdraw file (Ctrl+S)" onclick={() => engine?.saveBdraw()}><Icon name="save" /></button>
     <button class="icon" title="Export an image: the screen or larger, any shape, PNG or TIFF" onclick={() => (ed.exportOpen = true)}><Icon name="download" /></button>
+    <button class="icon" title="Settings" onclick={() => (ed.settingsOpen = true)}><Icon name="settings" /></button>
     <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
   {/if}
 </header>
@@ -219,6 +222,14 @@
   }
   .menu button:hover {
     background: var(--bg-3);
+  }
+  .menu .info {
+    margin-top: 4px;
+    padding: 8px 10px 4px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-dim);
+    white-space: nowrap;
   }
   @media (max-width: 760px), (max-height: 520px) and (pointer: coarse) {
     header {
