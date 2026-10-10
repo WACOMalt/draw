@@ -3,6 +3,14 @@ import { wsUrl } from '../config';
 
 export type NetStatus = 'connecting' | 'online' | 'offline';
 
+/** What the engine talks to: the server (Net), or a canvas on this device (local/localNet.ts). */
+export interface Channel {
+  readonly online: boolean;
+  send(msg: ClientMsg): boolean;
+  reconnect(): void;
+  close(): void;
+}
+
 /** WebSocket with automatic reconnect. Messages sent while offline are dropped. */
 export class Net {
   private ws: WebSocket | null = null;

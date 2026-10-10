@@ -1,24 +1,36 @@
 // Draw for Linux: the web app in Chromium (Electron).
 //
 // The Tauri runtime on Linux is WebKitGTK: it gives web pages no pen pressure, and with the
-// NVIDIA driver its WebGL is much slower than a browser's. Chromium has neither problem. The
-// window shows the hosted site, so the app updates with the server. Windows (WebView2, also
-// Chromium) and macOS stay on Tauri (src-tauri/).
+// NVIDIA driver its WebGL is much slower than a browser's. Chromium has neither problem. Windows
+// (WebView2, also Chromium) and macOS stay on Tauri (src-tauri/).
+//
+// The page comes with the app (app/, the same build as the Tauri apps), not from the server:
+// the app starts without a connection, and its version is the version on the package. It is
+// served at tauri://localhost, the origin of the Tauri app on macOS, which servers already
+// allow for their API (CORS_ORIGINS): a new origin would fail on servers not yet updated.
 //
 // Native parts: .bdraw files the system opens the app with (sent to the page through
 // preload.cjs), the .bdraw MIME type for AppImages (Gear Lever does not install it), and a
 // file manager thumbnailer for .bdraw (draw-thumbnailer.sh), and updates from the GitHub
 // releases (update.cjs).
 
-const { app, BrowserWindow, Menu, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, net, protocol, session, shell } = require('electron');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const updates = require('./update.cjs');
 
-const SITE = (process.env.DRAW_URL || 'https://draw.bsums.xyz').replace(/\/+$/, '');
-const ORIGIN = new URL(SITE).origin;
+const APP_ORIGIN = 'tauri://localhost';
+const APP_DIR = path.join(__dirname, 'app');
+/** Apps before v0.2.48 showed this site: its storage and login move to the bundled page once. */
+const OLD_SITE = 'https://draw.bsums.xyz';
 const MAX_FILE = 64 * 1024 * 1024;
+
+// Before ready: the bundled page's scheme behaves as https (secure context, fetch, workers).
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'tauri', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true, codeCache: true } },
+]);
 
 // Native Wayland on a Wayland desktop, X11 elsewhere. On Wayland, Chromium reads the tablet
 // through zwp_tablet_v2 (pen type and pressure). Under XWayland with the NVIDIA driver the GPU
@@ -58,13 +70,80 @@ function sendPending() {
   }
 }
 
-const isOurs = (url) => {
+/** A URL of the bundled page. (Node gives a custom scheme the origin "null": compare text.) */
+const isOurs = (url) => url === APP_ORIGIN || url.startsWith(`${APP_ORIGIN}/`);
+
+/**
+ * Serves the bundled page. A file of app/ is itself; any other path is a route of the page
+ * (/s/CODE): index.html. Missing build files (/assets/...) are 404. Nothing outside app/.
+ */
+function serveApp() {
+  protocol.handle('tauri', (req) => {
+    if (!isOurs(req.url)) return new Response('', { status: 404 });
+    const pathname = decodeURIComponent(req.url.slice(APP_ORIGIN.length).split(/[?#]/)[0] || '/');
+    // A blank page on this origin, to write the moved storage (moveSiteStorage).
+    if (pathname === '/__draw_storage') return new Response('<!doctype html>', { headers: { 'content-type': 'text/html' } });
+    let file = path.normalize(path.join(APP_DIR, pathname));
+    if (file !== APP_DIR && !file.startsWith(APP_DIR + path.sep)) return new Response('', { status: 404 });
+    let isFile = false;
+    try {
+      isFile = fs.statSync(file).isFile();
+    } catch {
+      // not there
+    }
+    if (!isFile) {
+      if (pathname.startsWith('/assets/')) return new Response('', { status: 404 });
+      file = path.join(APP_DIR, 'index.html');
+    }
+    return net.fetch(pathToFileURL(file).toString());
+  });
+}
+
+/**
+ * Apps before v0.2.48 showed the hosted site: their recent canvases, settings, anonymous
+ * identity (the owner of temporary canvases) and login are in that origin's storage. Copies
+ * them to the bundled page's origin, once, before the page starts: no network needed (the old
+ * origin's page is answered here). Keys the new origin already has stay. The login cookie
+ * becomes the page's bearer token (the server takes the same session token both ways). On an
+ * error it tries again at the next start.
+ */
+async function moveSiteStorage() {
+  const flag = path.join(app.getPath('userData'), 'site-storage-moved');
+  if (fs.existsSync(flag)) return;
+  const ses = session.defaultSession;
+  const oldOrigin = new URL(OLD_SITE).origin;
+  let win = null;
   try {
-    return new URL(url).origin === ORIGIN;
-  } catch {
-    return false;
+    const [cookie] = await ses.cookies.get({ url: OLD_SITE, name: 'draw_session' });
+    // The old site's offline worker would answer the old origin's page with the old app.
+    await ses.clearStorageData({ origin: oldOrigin, storages: ['serviceworkers'] });
+    ses.protocol.handle('https', (req) =>
+      new URL(req.url).origin === oldOrigin ? new Response('<!doctype html>', { headers: { 'content-type': 'text/html' } }) : net.fetch(req, { bypassCustomProtocolHandlers: true }),
+    );
+    win = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true } });
+    let entries = [];
+    try {
+      await win.loadURL(`${OLD_SITE}/__draw_storage`);
+      entries = JSON.parse(await win.webContents.executeJavaScript('JSON.stringify(Object.entries(localStorage))'));
+    } finally {
+      ses.protocol.unhandle('https');
+    }
+    if (cookie?.value) entries.push(['draw.token', cookie.value]);
+    if (entries.length) {
+      await win.loadURL(`${APP_ORIGIN}/__draw_storage`);
+      await win.webContents.executeJavaScript(
+        `(${(list) => {
+          for (const [k, v] of list) if (localStorage.getItem(k) === null) localStorage.setItem(k, v);
+        }})(${JSON.stringify(entries)})`,
+      );
+    }
+    fs.writeFileSync(flag, `${new Date().toISOString()} ${entries.length} keys\n`);
+  } catch (e) {
+    console.error(`draw: moving the site's storage failed: ${e.message}`);
+  } finally {
+    win?.destroy();
   }
-};
+}
 
 function createWindow() {
   win = new BrowserWindow({
@@ -84,13 +163,13 @@ function createWindow() {
   });
   const wc = win.webContents;
 
-  // Only the site runs in the window. Everything else opens in the default browser.
+  // Only the bundled page runs in the window. Everything else opens in the default browser.
   wc.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
   wc.on('will-navigate', (e, url) => {
-    if (isOurs(url) || url.startsWith('file:')) return;
+    if (isOurs(url)) return;
     e.preventDefault();
     if (/^https?:/i.test(url)) void shell.openExternal(url);
   });
@@ -98,13 +177,8 @@ function createWindow() {
   wc.on('did-start-navigation', (details) => {
     if (details.isMainFrame && !details.isSameDocument) pageReady = false;
   });
-  // No connection: a small page with a retry button instead of Chromium's error page.
-  wc.on('did-fail-load', (_e, code, _desc, url, isMainFrame) => {
-    if (!isMainFrame || code === -3 /* aborted */ || !isOurs(url)) return;
-    void win.loadFile(path.join(__dirname, 'offline.html'), { query: { site: SITE } });
-  });
 
-  void win.loadURL(SITE);
+  void win.loadURL(`${APP_ORIGIN}/`);
 }
 
 // The page asks for the opened files when it is ready for them (files.ts watchOpenedFiles).
@@ -114,7 +188,7 @@ ipcMain.on('opened-files-ready', (e) => {
   sendPending();
 });
 
-// Updates (update.cjs). Only the site's page may ask.
+// Updates (update.cjs). Only the bundled page may ask.
 const fromPage = (e) => win && e.sender === win.webContents && isOurs(e.senderFrame?.url ?? '');
 ipcMain.handle('update-check', (e) => (fromPage(e) ? updates.check() : null));
 ipcMain.handle('update-download', (e) => {
@@ -205,8 +279,10 @@ function registerThumbnailer() {
 if (!THUMBNAIL) collect(process.argv);
 Menu.setApplicationMenu(null);
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (THUMBNAIL) return;
+  serveApp();
+  await moveSiteStorage();
   createWindow();
   setTimeout(() => {
     registerMimeForAppImage();
@@ -229,5 +305,6 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (!THUMBNAIL) app.quit();
+  // Not the hidden window of moveSiteStorage, before the main window opens.
+  if (!THUMBNAIL && win) app.quit();
 });

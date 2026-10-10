@@ -2,7 +2,7 @@
   import type { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
 
-  let { engine, onLeave }: { engine: Engine | null; onLeave: () => void } = $props();
+  let { engine, onLeave, local = false }: { engine: Engine | null; onLeave: () => void; local?: boolean } = $props();
   let password = $state('');
 
   function join(e: SubmitEvent) {
@@ -41,9 +41,20 @@
       <h2>This canvas expired</h2>
       <p>Temporary canvases are deleted 5 days after they are made, unless their creator logs in and keeps them.</p>
       <div class="actions"><button class="primary" onclick={onLeave}>Home</button></div>
+    {:else if ed.denied === 'open_elsewhere'}
+      <h2>Open in another window</h2>
+      <p>This canvas is on this device, and another window has it open. Close it there, then try again.</p>
+      <div class="actions">
+        <button class="primary" onclick={() => location.reload()}>Try again</button>
+        <button onclick={onLeave}>Home</button>
+      </div>
+    {:else if ed.denied === 'storage_failed'}
+      <h2>Cannot read or write this canvas</h2>
+      <p>The device's storage for Draw failed (it may be full). Save the canvas to a .bdraw file to keep it.</p>
+      <div class="actions"><button class="primary" onclick={onLeave}>Home</button></div>
     {:else}
       <h2>This canvas was deleted</h2>
-      <p>Its owner deleted it.</p>
+      <p>{local ? 'It is no longer on this device.' : 'Its owner deleted it.'}</p>
       <div class="actions"><button class="primary" onclick={onLeave}>Home</button></div>
     {/if}
   </div>

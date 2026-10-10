@@ -19,8 +19,35 @@
   import ExportDialog from './ExportDialog.svelte';
   import TransformOverlay from './TransformOverlay.svelte';
   import SelectOverlay from './SelectOverlay.svelte';
+  import Modal from './Modal.svelte';
+  import NewCanvasForm from './NewCanvasForm.svelte';
+  import { deleteLocal, getLocal } from '../local/store';
 
-  let { code, onLeave }: { code: string; onLeave: () => void } = $props();
+  /** `local`: a canvas on this device (code is its id): no server until it is put online. */
+  let { code, onLeave, local = false }: { code: string; onLeave: () => void; local?: boolean } = $props();
+  /** A canvas on this device: its name. */
+  let localName = $state<string | null>(null);
+  /** "Put online": the canvas as a .bdraw file, for the new-canvas form. */
+  let putOnline = $state<Blob | null>(null);
+
+  async function startPutOnline() {
+    if (!engine) return;
+    await engine.flushLocal();
+    putOnline = await engine.bdrawBlob();
+  }
+
+  /** The canvas is online now: it leaves this device, and the editor opens the online one. */
+  async function wentOnline(key: string) {
+    putOnline = null;
+    // The dialog's history entry (back.ts) goes first, or its history.back() would return here.
+    for (let i = 0; i < 50 && history.state?.drawPopup; i++) await new Promise((r) => setTimeout(r, 20));
+    try {
+      await deleteLocal(code);
+    } catch (e) {
+      console.warn('local canvas: delete failed', e);
+    }
+    window.dispatchEvent(new CustomEvent('draw:navigate', { detail: `/s/${encodeURIComponent(key)}` }));
+  }
 
   let canvas = $state<HTMLCanvasElement>()!;
   let brushCursor = $state<HTMLDivElement>()!;
@@ -51,7 +78,17 @@
   onMount(() => {
     let e: Engine | null = null;
     let dead = false;
-    fetch(`${API_BASE}/api/sessions/${encodeURIComponent(code)}`)
+    if (local) {
+      // A canvas on this device: no server to ask (LocalNet answers if it is gone).
+      e = engine = new Engine(code, canvas, brushCursor, null, true);
+      e.setPathsCanvas(pathsCanvas);
+      e.updateCursor();
+      (window as unknown as { __draw: unknown }).__draw = { ed, engine: e };
+      void getLocal(code).then((c) => {
+        localName = c?.name ?? 'Canvas';
+        if (e) e.fileName = localName;
+      }, () => (localName = 'Canvas'));
+    } else fetch(`${API_BASE}/api/sessions/${encodeURIComponent(code)}`)
       .then((r) => r.json())
       .then((body) => {
         if (dead) return;
@@ -132,7 +169,7 @@
   </div>
 {:else}
   <div class="editor" class:narrow>
-    <TopBar {engine} {code} {narrow} {onLeave} />
+    <TopBar {engine} {code} {narrow} {onLeave} localName={local ? (localName ?? '') : null} onPutOnline={startPutOnline} />
     {#if !narrow}<Toolbar {engine} />{/if}
     <div class="stage" style:--opts-h="{ed.optsHeight}px">
       {#if !narrow}<OptionsBar {engine} />{/if}
@@ -165,7 +202,7 @@
       {#if ed.transform && engine}
         {#key ed.transform.id}<TransformOverlay {engine} id={ed.transform.id} />{/key}
       {/if}
-      {#if ed.denied}<AccessScreen {engine} {onLeave} />{/if}
+      {#if ed.denied}<AccessScreen {engine} {onLeave} {local} />{/if}
       <div class="viewctl">
         <button
           class:on={ed.showMarkers}
@@ -193,6 +230,15 @@
       {/if}
     </div>
     {#if ed.shareOpen}<ShareDialog {code} {engine} onDeleted={onLeave} />{/if}
+    {#if putOnline}
+      <Modal title="Put this canvas online" onClose={() => (putOnline = null)}>
+        <p class="muted">
+          It becomes an online canvas, which you share with a link. It then leaves this device: save it to a .bdraw file first if you want a copy that
+          stays here.
+        </p>
+        <NewCanvasForm file={putOnline} fileName={localName ?? undefined} onCreated={wentOnline} />
+      </Modal>
+    {/if}
     {#if ed.exportOpen && engine}<ExportDialog {engine} {code} />{/if}
     {#if narrow}
       <MobileBar {engine} bind:sheet />

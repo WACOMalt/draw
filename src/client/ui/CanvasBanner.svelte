@@ -35,6 +35,8 @@
   </div>
 {:else if ed.role === 'viewer'}
   <div class="banner view">View only</div>
+{:else if ed.canvas?.local}
+  <div class="banner">Only on this device · Put it online to share it</div>
 {/if}
 
 {#if claiming && ed.canvas?.canClaim}<ClaimDialog {code} onClose={() => (claiming = false)} />{/if}

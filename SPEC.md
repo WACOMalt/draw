@@ -20,7 +20,8 @@ In scope:
 - Live view of the strokes and cursors of other users
 - Sessions that stay after a server restart
 - Export of the current view as PNG
-- Save a canvas to a `.bdraw` file, and open a `.bdraw` file as a new online canvas (section 9.2)
+- Save a canvas to a `.bdraw` file, and open a `.bdraw` file as a new canvas, online or on this device (section 9.2)
+- Canvases on this device: drawn with no server and no connection, put online later to share them (section 9.9)
 - Sessions with a random code or with a name that a person selects
 - Phone and tablet use: touch gestures and a phone layout
 - Installation as a Progressive Web App (PWA)
@@ -488,7 +489,7 @@ What Discord, X/Twitter, Slack, Mastodon, iMessage and others show for a `/s/` o
 
 The Android app and the Linux AppImage update themselves from the latest GitHub release. Code: `src/client/update.svelte.ts` (the logic), `ui/UpdateDialog.svelte`, `src-tauri/gen/android/.../AppUpdate.kt`, `electron/update.cjs`.
 
-- Check: a little after start, then every 6 hours while the app is open (and when an Android app comes back after 6 hours). The start page has "Check for updates". The Linux app loads its page from the server, so the page's version is the server's version: when the app is newer, the start page shows both ("v0.2.44 (server) · app v0.2.46"), and the "up to date" message names the server version too. Update the server to make them the same. `releases/latest` must not be a draft or a pre-release, and its tag must be newer than the app. The dialog lists the commit subjects since the installed version (GitHub's compare API).
+- Check: a little after start, then every 6 hours while the app is open (and when an Android app comes back after 6 hours). The start page has "Check for updates". `releases/latest` must not be a draft or a pre-release, and its tag must be newer than the app. The dialog lists the commit subjects since the installed version (GitHub's compare API).
 - Dialog: Update, Later, Skip this version (not offered again until a newer one), and "Check automatically" (off: only the start page button checks). Stored in `localStorage` `draw.update`.
 - Android: the page finds the asset `Draw_<ver>_android.apk`, and the app (as `window.DrawAppUpdate`) downloads it into its cache from GitHub hosts only, makes sure the file is a package of this app, and opens Android's installer. Android installs it only when the release key signed it. The first time, the dialog explains how to allow Draw to install apps and opens that setting (permission `REQUEST_INSTALL_PACKAGES`).
 - AppImage: the app reads the release, downloads `Draw_<ver>_amd64.AppImage` (every redirect must stay on a GitHub host) next to the running file, checks the size, the SHA-256 that GitHub lists for the asset and the AppImage header, and renames it over the running AppImage. The path does not change, so Gear Lever's entry and desktop launchers keep working. "Restart now" starts the new file; otherwise the next start runs it. A folder the user cannot write gets the release link instead.
@@ -567,6 +568,19 @@ Toolbar order: brush, eraser, stroke eraser, the colors, eyedropper, Select, Pen
 
 **Painting on a shape layer.** The brush, the eraser and the stroke eraser (on the active layer only) do not paint on a shape layer. A message tells the person to select a paint layer, or to add one.
 
+### 9.9 Canvases on this device
+
+A canvas can live on the device only, with no server. Every app has these canvases: the browser, the desktop apps and the Android app. Code: `src/client/local/`.
+
+- Make one: "New canvas on this device" on the start page, or "Open on this device only" for a `.bdraw` file. When "New canvas" cannot reach the server, the app makes the canvas on the device. A message tells why. Opening a file does the same.
+- Address: `/l/ID`. (An online canvas is `/s/CODE`.) The start page lists these canvases under "only on this device", the latest change first. A × deletes one after a confirm, because no other copy exists.
+- Storage: the IndexedDB database `draw-local`. It keeps a canvas as the server does: a row for each canvas (`canvases`) and the op log (`ops`, keyed by canvas and seq). Opening a canvas replays its log. A new canvas gets the date and time as its name ("Drawing, 10 Oct 14:32"). A canvas from a file gets the file name.
+- Behavior: `LocalNet` takes the place of the WebSocket. It answers the engine as the server answers one person. A `hello` gets a `welcome` with the document and the role `editor`. An `op` goes through `validateOp` and the op rules of the server (`src/shared/docState.ts`, shared with `session.ts`). Then `LocalNet` confirms or rejects it. Thus drawing, shapes, layers, undo, redo, export and `.bdraw` files work as on an online canvas. Live strokes, cursors and link previews are for other people, so `LocalNet` drops them. It writes ops in batches, 50 ms after a change.
+- One window at a time: a Web Lock (`draw-local-ID`) holds an open canvas. Another window shows "Open in another window". Two windows would both number their ops.
+- Signs: the top bar shows the name and "Put online". The banner says "Only on this device · Put it online to share it". The status bar says "on this device".
+- Put online: the app sends the canvas to the server as a `.bdraw` file. It uses the form for a new canvas: temporary without an account, named, private or public with one. Then the canvas leaves the device, and the app opens the online canvas. To keep a copy on the device, save a `.bdraw` file first.
+- A `.bdraw` file opened on the device: the app reads it there (gzip through `DecompressionStream`). It applies the checks and the order of the server's import (`importOps`). The app leaves out damaged items and shows their count.
+
 ## 10. Deployment
 
 - Build: `npm run build` writes `dist/client` (Vite) and `dist/server/index.js` (esbuild).
@@ -588,7 +602,9 @@ Android app (Tauri v2, `src-tauri/gen/android/`):
 
 Desktop app on Linux (Electron, `electron/`):
 
-- WebKitGTK (the Tauri engine on Linux) gives pages no pen pressure, merges pointer moves, and with the NVIDIA driver its WebGL is much slower than a browser's. Thus the Linux app is Chromium (Electron). The window shows `https://draw.bsums.xyz` (`DRAW_URL` changes it). Thus the app updates with the server. Only that origin runs in the window. Other links open in the default browser. Without a connection, a local page offers "Try again".
+- WebKitGTK (the Tauri engine on Linux) gives pages no pen pressure, merges pointer moves, and with the NVIDIA driver its WebGL is much slower than a browser's. Thus the Linux app is Chromium (Electron).
+- The page comes with the app, as in the Tauri apps: `npm run linux:app` builds the client with `vite build --mode tauri` (it talks to `https://draw.bsums.xyz`) and copies it to `electron/app/`. Thus the app starts without a connection, and the version on the page is the version of the package. The app serves the page at `tauri://localhost` (`protocol.handle`): a file of `app/` is itself, any other path is the page's `index.html` (the routes, as `/s/CODE`). This is the origin of the Tauri app on macOS, which servers already allow for `/api` (`CORS_ORIGINS`). Thus the app also works with a server that is not updated. Only this origin runs in the window. Other links open in the default browser.
+- Move from the hosted site: apps before v0.2.48 showed `https://draw.bsums.xyz`, so their storage is under that origin. A newer app moves it once, at its first start, before the page opens. It copies the old origin's `localStorage` to the page's origin: recent canvases, settings, and the anonymous identity that owns temporary canvases. Keys that the new origin already has stay. The login cookie becomes the page's bearer token, because the server takes the same session token both ways. The move needs no network: the app answers the old origin's page itself. The file `site-storage-moved` in the app's data folder marks it done.
 - Pen input, pressure, and WebGL come from Chromium, as in a browser (section 9.1). On a Wayland desktop, the app uses native Wayland (pen through `zwp_tablet_v2`). Under XWayland with the NVIDIA driver, the GPU process crashed and WebGL was lost (RTX 3090, KDE Plasma). `DRAW_OZONE=x11` forces X11.
 - `.bdraw` files: the app is single-instance. Paths from the command line go to the page through the preload bridge (`window.drawDesktop.onOpenFile`). Downloads use the Chromium save dialog. The AppImage registers the MIME type for the user, as the Tauri AppImage did.
 - Packages: AppImage, `.deb`, `.rpm` from electron-builder, with the same file names as before. Thus updaters (Gear Lever) continue to work.

@@ -1,4 +1,5 @@
-# The Linux desktop app: Chromium (Electron) showing https://draw.bsums.xyz.
+# The Linux desktop app: Chromium (Electron) with the page bundled (app/: the app build of the
+# client, as for Tauri; it talks to https://draw.bsums.xyz).
 # Build: npm run linux:build (from the repository root). Output: dist/electron.
 appId: xyz.bsums.draw
 productName: Draw
@@ -9,8 +10,8 @@ directories:
 files:
   - main.cjs
   - preload.cjs
-  - offline.html
   - package.json
+  - app/**
   - thumbnail.cjs
   - update.cjs
   - thumb/**

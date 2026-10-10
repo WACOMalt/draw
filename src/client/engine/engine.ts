@@ -28,7 +28,8 @@ import { PUBLIC_ORIGIN } from '../config';
 import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
 import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
-import { Net } from './net';
+import { Net, type Channel } from './net';
+import { LocalNet } from '../local/localNet';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
@@ -143,7 +144,7 @@ export class Engine {
   private doc = new Doc();
   /** The Select and Shapes tools. */
   readonly shapes: ShapeTool;
-  private net: Net;
+  private net: Channel;
   private undoStack: UndoEntry[] = [];
   private redoStack: UndoEntry[] = [];
   private stroke: ActiveStroke | null = null;
@@ -193,6 +194,8 @@ export class Engine {
     private canvas: HTMLCanvasElement,
     private brushCursor: HTMLElement,
     frame: Bounds | null = null,
+    /** A canvas on this device (local/store.ts): no server. */
+    private onDevice = false,
   ) {
     this.frame = frame;
     const k = new URLSearchParams(location.search).get('k');
@@ -223,7 +226,7 @@ export class Engine {
     this.watchPixelRatio();
     this.resize();
 
-    this.net = new Net(
+    this.net = new (onDevice ? LocalNet : Net)(
       code,
       (m) => this.onServer(m),
       (s) => (ed.status = s),
@@ -2105,10 +2108,17 @@ export class Engine {
     }
   }
 
+  /** The name for saved files: the code, or a device canvas's name (Editor sets it). */
+  fileName = '';
+
+  private get baseName(): string {
+    return (this.fileName || this.code).replace(/[\\/:*?"<>|]+/g, '-').trim() || 'canvas';
+  }
+
   async exportPng(): Promise<void> {
     const blob = await this.comp.exportPng();
     if (!blob) return;
-    await saveBlob(blob, `draw-${this.code}.png`, { name: 'PNG image', extensions: ['png'] });
+    await saveBlob(blob, `draw-${this.baseName}.png`, { name: 'PNG image', extensions: ['png'] });
   }
 
   /**
@@ -2116,6 +2126,16 @@ export class Engine {
    * image for file manager thumbnails (left out if it cannot be made, e.g. without WebGL2).
    */
   async saveBdraw(): Promise<void> {
+    await saveBlob(await this.bdrawBlob(), `${this.baseName}.${BDRAW_EXT}`, { name: 'Draw canvas', extensions: [BDRAW_EXT] });
+  }
+
+  /** A canvas on this device: resolves when its ops are in storage. */
+  flushLocal(): Promise<void> {
+    return this.net instanceof LocalNet ? this.net.flush() : Promise.resolve();
+  }
+
+  /** The canvas as a .bdraw file (also how a device canvas goes online). */
+  async bdrawBlob(): Promise<Blob> {
     let preview: string | undefined;
     const all = this.contentBounds();
     if (all) {
@@ -2127,8 +2147,8 @@ export class Engine {
         console.warn('bdraw preview', e);
       }
     }
-    const source = { key: this.code, url: `${PUBLIC_ORIGIN}/s/${this.code}` };
+    const source = this.onDevice ? undefined : { key: this.code, url: `${PUBLIC_ORIGIN}/s/${this.code}` };
     const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview, this.doc.shapes.values());
-    await saveBlob(await encodeBdraw(file), `${this.code}.${BDRAW_EXT}`, { name: 'Draw canvas', extensions: [BDRAW_EXT] });
+    return encodeBdraw(file);
   }
 }

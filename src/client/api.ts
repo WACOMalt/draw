@@ -1,7 +1,7 @@
 // JSON calls to the server. The web app authenticates with its session cookie, the desktop app
 // with a bearer token (its page lives on another origin, so cookies would be third-party).
 
-import { API_BASE, IS_TAURI } from './config';
+import { API_BASE, BUNDLED } from './config';
 import { desktopToken } from './identity';
 import { ed, type User } from './state.svelte';
 
@@ -23,7 +23,7 @@ export async function api<T = Record<string, unknown>>(method: string, path: str
       method,
       headers,
       body: raw ? body : body !== undefined ? JSON.stringify(body) : undefined,
-      credentials: IS_TAURI ? 'omit' : 'same-origin',
+      credentials: BUNDLED ? 'omit' : 'same-origin',
     });
     const data = (await res.json().catch(() => ({}))) as T & { error?: string };
     return { status: res.status, ok: res.ok, data };

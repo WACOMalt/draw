@@ -23,6 +23,9 @@
     }
   });
 
+  /** A canvas on this device (local/): /l/ID. */
+  const localId = $derived(/^\/l\/([\w-]{1,40})\/?$/.exec(path)?.[1] ?? null);
+
   /** Desktop-app sign-in waiting for approval in this browser (?device=CODE). */
   let deviceCode = $state<string | null>(null);
 
@@ -92,12 +95,16 @@
   {#key code}
     <Editor {code} onLeave={() => go('/')} />
   {/key}
+{:else if localId}
+  {#key localId}
+    <Editor code={localId} local onLeave={() => go('/')} />
+  {/key}
 {:else}
-  <Landing onOpen={(c, k) => go(`/s/${c}${k ? `?k=${encodeURIComponent(k)}` : ''}`)} />
+  <Landing onOpen={(c, k) => go(`/s/${c}${k ? `?k=${encodeURIComponent(k)}` : ''}`)} onOpenLocal={(id) => go(`/l/${id}`)} />
 {/if}
 
 {#if ed.openFile && !ed.auth}
-  {#key ed.openFile}<OpenFileDialog onOpen={(key) => go(`/s/${encodeURIComponent(key)}`)} />{/key}
+  {#key ed.openFile}<OpenFileDialog onOpen={(key) => go(`/s/${encodeURIComponent(key)}`)} onOpenLocal={(id) => go(`/l/${id}`)} />{/key}
 {/if}
 
 {#if ed.auth}<AuthDialog />{/if}

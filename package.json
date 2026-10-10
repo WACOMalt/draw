@@ -17,8 +17,9 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
-    "linux:dev": "npm run build:thumb && electron electron",
-    "linux:build": "npm run build:thumb && electron-builder --projectDir electron --linux",
+    "linux:dev": "npm run linux:app && electron electron",
+    "linux:build": "npm run linux:app && electron-builder --projectDir electron --linux",
+    "linux:app": "npm run build:tauri-client && rm -rf electron/app && cp -r dist/tauri electron/app && npm run build:thumb",
     "test:server": "npm run build:server && node tests/server.test.mjs",
     "build:thumb": "vite build --config vite.thumb.config.ts"
   },

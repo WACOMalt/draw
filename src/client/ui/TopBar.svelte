@@ -8,7 +8,22 @@
   import { pickFile } from '../files';
   import { dismiss } from '../dismiss';
 
-  let { engine, code, narrow, onLeave }: { engine: Engine | null; code: string; narrow: boolean; onLeave: () => void } = $props();
+  let {
+    engine,
+    code,
+    narrow,
+    onLeave,
+    localName = null,
+    onPutOnline,
+  }: {
+    engine: Engine | null;
+    code: string;
+    narrow: boolean;
+    onLeave: () => void;
+    /** A canvas on this device: its name (null: an online canvas). */
+    localName?: string | null;
+    onPutOnline?: () => void;
+  } = $props();
   /** Narrow screens: file actions and Leave go in a menu, so the bar fits on a 320 px phone. */
   let more = $state(false);
   function act(f: () => void) {
@@ -39,7 +54,11 @@
 
 <header>
   <div class="brand"><span class="dot"></span>Draw</div>
-  {#if ed.role === 'owner'}
+  {#if localName !== null}
+    <button class="code share" title="Only this device has this canvas. Put it online to share it." onclick={onPutOnline}>
+      <Icon name="link" /><span><span class="word">Put online{" "}</span><span class="lname">{localName}</span></span>
+    </button>
+  {:else if ed.role === 'owner'}
     <button class="code share" title="Share: people, links, password" onclick={() => (ed.shareOpen = true)}>
       <Icon name="link" /><span><span class="word">Share{" "}</span>{code}</span>
     </button>
@@ -126,6 +145,11 @@
   .share {
     color: var(--text);
     border-color: var(--accent-dim);
+  }
+  .lname {
+    font-family: inherit;
+    letter-spacing: 0;
+    color: var(--text-dim);
   }
   .sep {
     width: 1px;
