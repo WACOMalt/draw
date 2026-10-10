@@ -327,8 +327,12 @@ export class Engine {
     this.comp.resize(this.rect.width, this.rect.height, dpr);
     ed.renderer = `${this.comp.kind === 'webgl2' ? 'WebGL2' : 'Canvas 2D'} · ${this.comp.precision}-bit · ${+dpr.toFixed(2)}×${this.comp.profile.name === 'full' ? '' : ` · ${this.comp.profile.name}`}`;
     // An embed keeps its frame filling the box until the viewer moves the view.
-    if (this.frame && !this.moved) return this.showFrame();
-    this.syncView();
+    if (this.frame && !this.moved) this.showFrame();
+    else this.syncView();
+    // The resize cleared the canvas. Draw now, in this task: the browser paints after the
+    // ResizeObserver callbacks, so it never shows the blank canvas (black while dragging the
+    // window edge, or when the options bar grew a row).
+    this.comp.renderNow();
   }
 
   /**

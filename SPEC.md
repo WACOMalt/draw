@@ -176,6 +176,8 @@ The client has two renderers with one interface (`src/client/engine/renderer.ts`
 
 `?renderer=2d` in the URL forces the Canvas 2D renderer, for comparison. The status bar shows the renderer and its bits per channel. Both renderers use the same dab walker and the same stroke index (`strokeIndex.ts`), so they give the same image. Only the precision is different: with 100 overlapping dabs at 1% flow, the WebGL2 result is within 1 level of the exact value, and the 8-bit result is 8 levels off.
 
+Resize: a change of the canvas size clears the canvas. The engine draws the next frame at once, in its ResizeObserver callback (`renderNow`), before the browser paints. Thus a window resize never shows a black canvas. Frames drawn this way do not count for the frame-speed measures.
+
 ### 6.1 Tiles and level of detail
 
 - A tile is 256 × 256 device pixels for one layer.
@@ -486,7 +488,7 @@ What Discord, X/Twitter, Slack, Mastodon, iMessage and others show for a `/s/` o
 
 The Android app and the Linux AppImage update themselves from the latest GitHub release. Code: `src/client/update.svelte.ts` (the logic), `ui/UpdateDialog.svelte`, `src-tauri/gen/android/.../AppUpdate.kt`, `electron/update.cjs`.
 
-- Check: a little after start, then every 6 hours while the app is open (and when an Android app comes back after 6 hours). The start page has "Check for updates". `releases/latest` must not be a draft or a pre-release, and its tag must be newer than the app. The dialog lists the commit subjects since the installed version (GitHub's compare API).
+- Check: a little after start, then every 6 hours while the app is open (and when an Android app comes back after 6 hours). The start page has "Check for updates". The Linux app loads its page from the server, so the page's version is the server's version: when the app is newer, the start page shows both ("v0.2.44 (server) · app v0.2.46"), and the "up to date" message names the server version too. Update the server to make them the same. `releases/latest` must not be a draft or a pre-release, and its tag must be newer than the app. The dialog lists the commit subjects since the installed version (GitHub's compare API).
 - Dialog: Update, Later, Skip this version (not offered again until a newer one), and "Check automatically" (off: only the start page button checks). Stored in `localStorage` `draw.update`.
 - Android: the page finds the asset `Draw_<ver>_android.apk`, and the app (as `window.DrawAppUpdate`) downloads it into its cache from GitHub hosts only, makes sure the file is a package of this app, and opens Android's installer. Android installs it only when the release key signed it. The first time, the dialog explains how to allow Draw to install apps and opens that setting (permission `REQUEST_INSTALL_PACKAGES`).
 - AppImage: the app reads the release, downloads `Draw_<ver>_amd64.AppImage` (every redirect must stay on a GitHub host) next to the running file, checks the size, the SHA-256 that GitHub lists for the asset and the AppImage header, and renames it over the running AppImage. The path does not change, so Gear Lever's entry and desktop launchers keep working. "Restart now" starts the new file; otherwise the next start runs it. A folder the user cannot write gets the release link instead.

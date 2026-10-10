@@ -27,6 +27,11 @@ export interface Renderer {
   toWorld(cssX: number, cssY: number): [number, number];
   toScreen(wx: number, wy: number): [number, number];
   invalidate(): void;
+  /**
+   * Draws a frame now, not at the next animation frame. A resize clears the canvas: drawn at
+   * once, the blank canvas never reaches the screen (a window resize showed black throughout).
+   */
+  renderNow(): void;
 
   setLayers(layers: Layer[]): void;
   resetStrokes(strokes: Stroke[], seq: number): void;

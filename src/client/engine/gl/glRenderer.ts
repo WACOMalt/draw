@@ -507,6 +507,21 @@ export class GLRenderer implements Renderer {
     if (!this.raf && !this.offline) this.raf = requestAnimationFrame(() => this.render());
   }
 
+  /** True during renderNow: a frame out of the animation-frame rhythm (no speed measures). */
+  private outOfBand = false;
+
+  renderNow(): void {
+    if (this.offline) return;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.dirty = true;
+    this.outOfBand = true;
+    try {
+      this.render();
+    } finally {
+      this.outOfBand = false;
+    }
+  }
+
   /** Offline: brings every tile of the view up to date and composites it. */
   renderSync(): void {
     for (let i = 0; i < 1000; i++) {
@@ -1377,14 +1392,16 @@ export class GLRenderer implements Renderer {
     //    longer ones cut it. While the view moves, tiles get a smaller share.
     const start = performance.now();
     const interval = start - this.lastFrameAt;
-    this.lastFrameAt = start;
-    this.watchSpeed(interval, start);
+    if (!this.outOfBand) {
+      this.lastFrameAt = start;
+      this.watchSpeed(interval, start);
+    }
     // Moving: the view changed just now, or this device draws a stroke (it must stay smooth).
     let drawing = false;
     for (const l of this.live.values()) if (!l.remote && !l.ended) drawing = true;
     const moving = start - this.lastViewChange < MOVING_MS || drawing;
     const target = moving ? MOVING_TARGET_MS : STILL_TARGET_MS;
-    if (this.tileWorkLastFrame && interval < 150) {
+    if (this.tileWorkLastFrame && interval < 150 && !this.outOfBand) {
       const b = moving ? this.fillMoving : this.fillBudget;
       const next = interval > target * 1.15 ? Math.max(FILL_MIN, b * 0.75) : interval < target * 0.85 ? Math.min(FILL_MAX, b * 1.1) : b;
       if (moving) this.fillMoving = next;
