@@ -234,6 +234,8 @@ class EditorState {
   shareOpen = $state(false);
   /** The large image export dialog. */
   exportOpen = $state(false);
+  /** App settings on this device (SettingsDialog). */
+  settingsOpen = $state(false);
   /** The layer or group being transformed (free transform: the overlay shows its handles). */
   transform = $state<{ id: string } | null>(null);
   /** Groups closed in the layers panel (this device only). */

@@ -8,8 +8,8 @@
 //   slow before (see slowDevice). At most 1.5×, 8-bit tiles (half the memory and bandwidth),
 //   fewer tiles, one coarser level instead of two.
 //
-// Override with ?perf=full|phone|light or localStorage 'draw.perf' (the same values; 'auto' or
-// nothing: detect).
+// Override in Settings (localStorage 'draw.perf'), or with ?perf=full|phone|light in the URL. 'auto'
+// or nothing: detect.
 
 export type PerfName = 'full' | 'phone' | 'light';
 
@@ -62,16 +62,46 @@ function gpuName(gl: WebGL2RenderingContext | null): string {
 
 /** The profile for this device. `gl`: the context the renderer will use (to name its GPU). */
 export function perfProfile(gl: WebGL2RenderingContext | null): PerfProfile {
-  const forced = new URLSearchParams(location.search).get('perf') ?? stored('draw.perf');
+  lastAuto = detect(gl);
+  const forced = new URLSearchParams(location.search).get('perf') ?? stored(PERF_KEY);
   if (forced && forced in PROFILES) return PROFILES[forced as PerfName];
-  if (!matchMedia('(pointer: coarse)').matches) return PROFILES.full;
+  return PROFILES[lastAuto.name];
+}
+
+/** What detection picks, and why (Settings shows it). */
+function detect(gl: WebGL2RenderingContext | null): { name: PerfName; why: string } {
+  if (!matchMedia('(pointer: coarse)').matches) return { name: 'full', why: 'a mouse or a pen' };
   const nav = navigator as Navigator & { deviceMemory?: number };
-  const weak =
-    stored(SLOW_KEY) === '1' ||
-    (nav.deviceMemory ?? 8) <= 3 ||
-    (navigator.hardwareConcurrency ?? 8) <= 4 ||
-    WEAK_GPU.test(gpuName(gl));
-  return PROFILES[weak ? 'light' : 'phone'];
+  const mem = nav.deviceMemory ?? 8, cores = navigator.hardwareConcurrency ?? 8;
+  if (stored(SLOW_KEY) === '1') return { name: 'light', why: 'this device was too slow before' };
+  if (mem <= 3) return { name: 'light', why: `${mem} GB of memory` };
+  if (cores <= 4) return { name: 'light', why: `${cores} cores` };
+  if (WEAK_GPU.test(gpuName(gl))) return { name: 'light', why: 'an older GPU' };
+  return { name: 'phone', why: 'a touch screen' };
+}
+
+let lastAuto: { name: PerfName; why: string } | null = null;
+
+/** What detection picked at the last renderer start, and why. Null before the first start. */
+export function autoPerf(): { name: PerfName; why: string } | null {
+  return lastAuto;
+}
+
+const PERF_KEY = 'draw.perf';
+
+/** The profile chosen in Settings, or 'auto' (detect). The renderer reads it at its start. */
+export function perfSetting(): PerfName | 'auto' {
+  const v = stored(PERF_KEY);
+  return v && v in PROFILES ? (v as PerfName) : 'auto';
+}
+
+export function setPerfSetting(v: PerfName | 'auto'): void {
+  try {
+    if (v === 'auto') localStorage.removeItem(PERF_KEY);
+    else localStorage.setItem(PERF_KEY, v);
+  } catch {
+    // not kept: the next start detects again
+  }
 }
 
 /** Remembers that this device was too slow, so the next start uses the light profile. */
