@@ -36,6 +36,7 @@ import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { ShapeTool } from './shapeTool';
 import { takeDismissed } from '../dismiss';
 import { slowDevice } from './perf';
+import { onBackLeave } from '../back';
 
 // Float64 keeps about 15 significant digits, so zoom is limited, not truly infinite.
 // This range stays precise for drawings within about 1e4 world units of where you work.
@@ -47,6 +48,13 @@ const CURSOR_MS = 50;
 const MARKERS_MS = 120;
 /** A second finger within this time after the first cancels the first finger's stroke. */
 const GESTURE_GRACE_MS = 300;
+/**
+ * Android's back gesture is a swipe in from a side of the screen. The page gets its start as a
+ * stroke, then a pointercancel, which ends the stroke. A stroke that starts this close to a side
+ * (CSS px) and ends this short a time before Back leaves the canvas is the gesture: it goes.
+ */
+const BACK_EDGE_PX = 48;
+const BACK_GESTURE_MS = 1000;
 /** Max duration and movement of a two/three-finger tap (undo/redo). */
 const TAP_MS = 300;
 const TAP_SLOP = 12;
@@ -94,6 +102,8 @@ interface ActiveStroke {
   native: { dx: number; dy: number; trail: [number, number][] } | null;
   /** Painting on a layer mask: its id. */
   mask?: string;
+  /** It started at a side of the screen, where Android's back gesture starts (BACK_EDGE_PX). */
+  edge: boolean;
 }
 
 /** Drops tip and dynamics fields that hold their default: plain strokes stay as small as before. */
@@ -148,6 +158,8 @@ export class Engine {
   private undoStack: UndoEntry[] = [];
   private redoStack: UndoEntry[] = [];
   private stroke: ActiveStroke | null = null;
+  /** The last committed stroke, when it started at a side of the screen (dropBackGesture). */
+  private edgeStroke: { id: string; endedAt: number } | null = null;
   private pan: { pointerId: number; x: number; y: number } | null = null;
   private picking: number | null = null;
   /** Magnifier press: a click zooms in or out at x0,y0, a sideways drag zooms smoothly. */
@@ -238,6 +250,7 @@ export class Engine {
     this.listen(canvas, 'pointerup', (e) => this.onPointerUp(e as PointerEvent));
     this.listen(canvas, 'pointercancel', (e) => this.onPointerUp(e as PointerEvent));
     this.listen(canvas, 'pointerleave', () => this.onPointerLeave());
+    if (!frame) this.cleanup.push(onBackLeave(() => this.dropBackGesture()));
     this.listen(canvas, 'wheel', (e) => this.onWheel(e as WheelEvent), { passive: false });
     this.listen(canvas, 'contextmenu', (e) => e.preventDefault());
     if (!frame) {
@@ -874,6 +887,24 @@ export class Engine {
     else if (g.maxTouches === 3) this.redo();
   }
 
+  /**
+   * Back leaves the canvas. A stroke in progress is part of the back gesture: it goes, with no
+   * commit (destroy would commit it). So does a stroke from a side of the screen that ended just
+   * before: a pointercancel committed it when the system took over the swipe.
+   */
+  private dropBackGesture(): void {
+    this.cancelStroke();
+    const b = this.edgeStroke;
+    this.edgeStroke = null;
+    if (!b || performance.now() - b.endedAt > BACK_GESTURE_MS) return;
+    this.sendOp({ type: 'stroke.remove', id: b.id });
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (top?.undo.length === 1 && top.undo[0].type === 'stroke.remove' && top.undo[0].id === b.id) {
+      this.undoStack.pop();
+      this.syncUndo();
+    }
+  }
+
   /** Drops the stroke in progress without committing it. */
   private cancelStroke(): void {
     const st = this.stroke;
@@ -1016,6 +1047,7 @@ export class Engine {
       pointerId: e.pointerId,
       pointerType: e.pointerType,
       startedAt: performance.now(),
+      edge: e.pointerType !== 'mouse' && (e.clientX < BACK_EDGE_PX || e.clientX > window.innerWidth - BACK_EDGE_PX),
       count: 0,
       pts: [],
       unsent: [],
@@ -1141,6 +1173,7 @@ export class Engine {
     }
     this.sendOp({ type: 'stroke.add', stroke: { id: st.id, layerId: st.layerId, brush: st.brush, pts: st.pts, ...(st.mask ? { mask: st.mask } : {}) } });
     this.pushUndo({ undo: [{ type: 'stroke.remove', id: st.id }], redo: [{ type: 'stroke.restore', id: st.id }] });
+    this.edgeStroke = st.edge ? { id: st.id, endedAt: performance.now() } : null;
     if (st.brush.tool === 'paint' && !st.mask) this.addSwatch(st.brush.color);
   }
 
