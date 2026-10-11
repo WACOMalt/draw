@@ -169,6 +169,8 @@ const prefs = load('draw.prefs', {
   penStyle: {} as Partial<PenStyle>,
   /** Clicks on empty canvas keep the selection (only Esc and Deselect clear it). */
   keepSelection: false,
+  /** Taps and drags add to the selection or remove from it, as with Shift (for touch screens). */
+  addSelection: false,
 });
 
 class EditorState {
@@ -193,6 +195,7 @@ class EditorState {
   shapeStyle = $state<ShapeStyle>({ ...SHAPE_STYLE, ...prefs.shapeStyle });
   penStyle = $state<PenStyle>({ ...PEN_STYLE, ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);
+  addSelection = $state(prefs.addSelection);
   /** Height of the floating options bar over the canvas (CSS px from the canvas top; 0: none). */
   optsHeight = $state(0);
   /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
@@ -277,6 +280,7 @@ class EditorState {
       shapeStyle: $state.snapshot(this.shapeStyle),
       penStyle: $state.snapshot(this.penStyle),
       keepSelection: this.keepSelection,
+      addSelection: this.addSelection,
     });
   }
 }

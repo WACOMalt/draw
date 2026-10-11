@@ -134,7 +134,7 @@
   /** A shape row: selects the shape (Shift: adds or removes it), with the Select tool. */
   function pickShape(e: PointerEvent, s: Shape) {
     if (!engine) return;
-    const ids = e.shiftKey ? (ed.selection.includes(s.id) ? ed.selection.filter((id) => id !== s.id) : [...ed.selection, s.id]) : [s.id];
+    const ids = e.shiftKey || ed.addSelection ? (ed.selection.includes(s.id) ? ed.selection.filter((id) => id !== s.id) : [...ed.selection, s.id]) : [s.id];
     if (ed.tool !== 'select' && ed.tool !== 'shape') {
       ed.tool = 'select';
       engine.updateCursor();
@@ -153,7 +153,7 @@
     const id = partId(c.id, i);
     if (ed.partsOf !== c.id) engine.shapes.enterParts(c.id);
     if (ed.partsOf !== c.id) return;
-    engine.shapes.select(e.shiftKey ? (ed.selection.includes(id) ? ed.selection.filter((s) => s !== id) : [...ed.selection, id]) : [id]);
+    engine.shapes.select(e.shiftKey || ed.addSelection ? (ed.selection.includes(id) ? ed.selection.filter((s) => s !== id) : [...ed.selection, id]) : [id]);
   }
 
   function renameShape(id: string, value: string) {
