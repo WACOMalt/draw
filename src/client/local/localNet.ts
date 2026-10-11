@@ -85,7 +85,8 @@ export class LocalNet {
 
   send(msg: ClientMsg): boolean {
     if (this.closed) return false;
-    void this.ready.then((ok) => ok && !this.closed && this.handle(msg));
+    // Also after a close that comes before the canvas is ready: close writes after these run.
+    void this.ready.then((ok) => ok && this.handle(msg));
     return true;
   }
 
@@ -172,7 +173,10 @@ export class LocalNet {
 
   close(): void {
     if (this.closed) return;
-    void this.flush().finally(() => this.releaseLock?.());
+    // After the messages sent before the close (send): leaving the canvas sends the stroke in
+    // progress, or removes a back-gesture stroke (Engine.onBackLeave), in the same moment. They
+    // were dropped.
+    void this.ready.then(() => this.flush()).finally(() => this.releaseLock?.());
     this.closed = true;
     this.onStatus('offline');
   }

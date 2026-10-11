@@ -12,6 +12,7 @@ interface Open {
 }
 
 const open: Open[] = [];
+const leaveHooks = new Set<() => void>();
 let hasEntry = false;
 /** Our own history.back() calls: their popstate is not a Back press. */
 let ownPops = 0;
@@ -47,6 +48,15 @@ export function closeOnBack(close: () => void): () => void {
   };
 }
 
+/**
+ * Call `fn` when Back leaves the page's view (no popup takes it), before App.svelte reacts: its
+ * handler unmounts the editor in the same event. Returns the function that removes the hook.
+ */
+export function onBackLeave(fn: () => void): () => void {
+  leaveHooks.add(fn);
+  return () => leaveHooks.delete(fn);
+}
+
 // Capture phase on window: before the app's own popstate handler (App.svelte).
 window.addEventListener(
   'popstate',
@@ -56,7 +66,11 @@ window.addEventListener(
       e.stopImmediatePropagation();
       return;
     }
-    if (!hasEntry) return; // a page navigation
+    if (!hasEntry) {
+      // A page navigation.
+      for (const f of [...leaveHooks]) f();
+      return;
+    }
     hasEntry = false;
     const top = open.pop();
     if (!top) return;
