@@ -110,6 +110,11 @@ const DRAG_PX = 3;
 const DRAG_PX_TOUCH = 7;
 /** A second click within this time and distance is a double-click. */
 const DOUBLE_MS = 350;
+
+/** A press adds to the selection or removes from it: Shift, or "Add to selection" (touch screens). */
+function adds(e: PointerEvent): boolean {
+  return e.shiftKey || ed.addSelection;
+}
 /** How far outside a corner a press rotates (CSS px). */
 const ROTATE_PX = 26;
 
@@ -141,6 +146,11 @@ interface Edit {
   box: Box | null;
   /** Alt+drag: `orig` are copies (new ids) that the drag places; the originals stay. */
   dup: string[] | null;
+  /**
+   * Shift or "Add to selection": the shape under a press inside the box. A click (no drag) adds
+   * it to the selection or removes it; a drag moves the selection as usual.
+   */
+  toggle: string | null;
 }
 
 interface Create {
@@ -512,7 +522,10 @@ export class ShapeTool {
     }
     if (zone) {
       if (!ed.canEdit) return showToast('View only: you can look around but not change shapes');
-      return this.beginEdit(e, x, y, zone.kind === 'move' ? 'move' : zone.kind, zone);
+      this.beginEdit(e, x, y, zone.kind === 'move' ? 'move' : zone.kind, zone);
+      // The box covers every selected shape, so a click there is the only way to remove one.
+      if (this.edit && zone.kind === 'move' && adds(e)) this.edit.toggle = this.shapeAt(x, y, touch)?.id ?? null;
+      return;
     }
     let hit = this.shapeAt(x, y, touch);
     if (ed.partsOf && !zone && splitPartId(hit?.id ?? '')?.[0] !== ed.partsOf) {
@@ -522,9 +535,10 @@ export class ShapeTool {
     }
     // Keep selection: a press outside the box neither swaps nor drops the selection, and starts
     // no selection rectangle. Shift+click still adds or removes; Esc and Deselect still clear.
-    const locked = this.locked() && !e.shiftKey;
+    const add = adds(e);
+    const locked = this.locked() && !add;
     if (hit) {
-      if (e.shiftKey) {
+      if (add) {
         this.select(ed.selection.includes(hit.id) ? ed.selection.filter((id) => id !== hit.id) : [...ed.selection, hit.id]);
         return;
       }
@@ -534,7 +548,7 @@ export class ShapeTool {
       return;
     }
     if (locked) return;
-    this.marquee = { pointerId: e.pointerId, touch, s0: [x, y], s1: [x, y], add: e.shiftKey, moved: false };
+    this.marquee = { pointerId: e.pointerId, touch, s0: [x, y], s1: [x, y], add, moved: false };
   }
 
   /** Keep selection is on and something is selected: clicks outside the box change nothing. */
@@ -872,6 +886,7 @@ export class ShapeTool {
       end: zone.kind === 'endpoint' ? zone.end : 0,
       box: bb,
       dup: dup ? sel.map((s) => s.id) : null,
+      toggle: null,
     };
     this.hover = null;
   }
@@ -1038,6 +1053,10 @@ export class ShapeTool {
     if (cancel || !g.moved) {
       this.clearDrafts();
       if (g.dup) this.select(g.dup);
+      else if (!cancel && g.toggle) {
+        const id = g.toggle;
+        this.select(ed.selection.includes(id) ? ed.selection.filter((k) => k !== id) : [...ed.selection, id]);
+      }
       return;
     }
     if (g.dup) {
@@ -1497,14 +1516,14 @@ export class ShapeTool {
     if (hit?.kind === 'anchor') {
       const ks = keyOf(hit.key);
       let sel = pe.points;
-      if (e.shiftKey) sel = sel.includes(ks) ? sel.filter((k) => k !== ks) : [...sel, ks];
+      if (adds(e)) sel = sel.includes(ks) ? sel.filter((k) => k !== ks) : [...sel, ks];
       else if (!sel.includes(ks)) sel = [ks];
       this.setPoints(sel);
       if (sel.includes(ks)) this.pdrag = { ...base, kind: 'anchor', keys: sel.map(parseKey), which: 'out', s1: [x, y], add: false };
       return;
     }
     // Elsewhere: a drag selects points by rectangle; a click outside the shape goes back to it.
-    this.pdrag = { ...base, kind: 'marquee', keys: [], which: 'out', s1: [x, y], add: e.shiftKey };
+    this.pdrag = { ...base, kind: 'marquee', keys: [], which: 'out', s1: [x, y], add: adds(e) };
   }
 
   private pointMove(x: number, y: number, shift: boolean, alt: boolean): void {

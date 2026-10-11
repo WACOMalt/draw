@@ -491,6 +491,13 @@
       >
       <button
         class="icon wide"
+        class:on={ed.addSelection}
+        aria-pressed={ed.addSelection}
+        title="While on, a click on a shape adds it to the selection or removes it, and a drag on empty canvas adds the shapes in its rectangle: the same as Shift. For touch screens."
+        onclick={() => (ed.addSelection = !ed.addSelection)}>Add to selection</button
+      >
+      <button
+        class="icon wide"
         disabled={!selShapes.length || !ed.canEdit || !!ed.partsOf}
         title="Copies of the selected shapes, a little down and right, on top of them (Ctrl+D). Alt+drag a selection to drag a copy away."
         onclick={() => engine?.shapes.duplicate()}>Duplicate</button

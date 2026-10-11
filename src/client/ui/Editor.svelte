@@ -138,7 +138,7 @@
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.penStyle, ed.keepSelection]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.penStyle, ed.keepSelection, ed.addSelection]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
