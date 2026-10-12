@@ -27,6 +27,7 @@ import type { Renderer } from './renderer';
 import { Doc, type Bounds } from './doc';
 import { computeMarkers, unionAll } from './navigator';
 import { PUBLIC_ORIGIN } from '../config';
+import { canFullScreen, toggleFullScreen } from '../fullscreen.svelte';
 import { BDRAW_EXT, makeBdraw } from '../../shared/bdraw';
 import { encodeBdraw, pickFile, saveBlob } from '../files';
 import { anonSecret, desktopToken, followRename, grants, links } from '../identity';
@@ -2095,6 +2096,12 @@ export class Engine {
     const zoomKey = mod && (key === '=' || key === '+' || key === '-' || key === '0' || key === '1');
     const textField = t && (t.tagName === 'TEXTAREA' || t.isContentEditable || (t instanceof HTMLInputElement && t.type !== 'number'));
     if (!down || (typing && !(zoomKey && !textField))) return;
+    if (e.key === 'F11' && canFullScreen) {
+      // The app's own full screen (the Linux app has no menu with F11; a browser's F11 is the browser's).
+      e.preventDefault();
+      void toggleFullScreen();
+      return;
+    }
     if (mod) {
       if (key === 'z') {
         e.preventDefault();
