@@ -65,6 +65,15 @@ jobs:
       # and tauri.conf.json (bundle.iOS, the .bdraw file type) carry the settings.
       - run: npx tauri ios init --ci
 
+      # The app icon: init puts Tauri's own in the project. From the Draw icon, opaque and full
+      # bleed (iOS rounds the corners itself). Written to a temporary folder, then into the
+      # project, so the desktop icons in src-tauri/icons stay as they are.
+      - name: App icon
+        run: |
+          npx tauri icon src-tauri/icons/ios-1024.png --ios-color '#262626' -o "$RUNNER_TEMP/icons"
+          cp "$RUNNER_TEMP"/icons/ios/*.png src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/
+          ls src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/
+
       - name: Build the app (unsigned)
         run: npx tauri ios build --ci --no-sign
 
