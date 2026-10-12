@@ -30,6 +30,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKWebView"] }
 block2 = "0.6"
 
+# iOS: the web view's scroll view settings (lib.rs, ios_webview).
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
 [profile.release]
 codegen-units = 1
 lto = true

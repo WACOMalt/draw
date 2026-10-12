@@ -98,6 +98,29 @@ fn register_mime_for_appimage() {
     }
 }
 
+/// iOS: the page lays itself out around the notch and the home bar (viewport-fit=cover and
+/// env(safe-area-inset-*)), so the web view must not move its content for them as well. By
+/// default WKWebView's scroll view does: the page then started under the clock, and its height
+/// lost the insets, which left a white band at the bottom. Also no rubber-band bounce.
+#[cfg(target_os = "ios")]
+fn ios_webview(webview: *mut std::ffi::c_void) {
+    use objc2::{msg_send, runtime::AnyObject};
+    let wv = webview as *mut AnyObject;
+    if wv.is_null() {
+        return;
+    }
+    // SAFETY: Tauri gives the WKWebView of the window, on the main thread.
+    unsafe {
+        let sv: *mut AnyObject = msg_send![wv, scrollView];
+        if sv.is_null() {
+            return;
+        }
+        let never: isize = 2; // UIScrollViewContentInsetAdjustmentNever
+        let _: () = msg_send![sv, setContentInsetAdjustmentBehavior: never];
+        let _: () = msg_send![sv, setBounces: false];
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -117,7 +140,11 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 window.with_webview(|webview| pen::attach(webview.inner()))?;
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(target_os = "ios")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.with_webview(|webview| ios_webview(webview.inner()))?;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
             let _ = app;
             Ok(())
         })
