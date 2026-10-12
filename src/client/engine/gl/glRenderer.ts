@@ -47,6 +47,16 @@ interface Grid {
   s: number;
 }
 
+/** A world rectangle. */
+interface Box {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+const apply = (m: Affine, x: number, y: number): [number, number] => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+
 /** Thrown to end the backdrop render of a blur adjustment layer when it reaches that layer. */
 const STOP = Symbol('stop');
 
@@ -1719,6 +1729,7 @@ export class GLRenderer implements Renderer {
         return this.buf(fg, 'layer');
       },
       (kg) => this.layerPixels(layer, kg, false),
+      () => this.nodeBounds(layer, false),
     );
   }
 
@@ -1733,6 +1744,7 @@ export class GLRenderer implements Renderer {
       own,
       (fg) => this.renderGroup(node, fg, depth),
       (kg) => this.groupPixels(node, kg, depth, false),
+      () => this.nodeBounds(node.layer, false),
     );
   }
 
@@ -2023,9 +2035,10 @@ export class GLRenderer implements Renderer {
           add(effectSigma(e, fx), e.dx, e.dy);
           continue;
         }
-        const kg = this.kaleidoscopeGrid(this.kaleidoscopeSteps(e));
-        if (kg) out.push({ lod: kg.lod, tx0: kg.tx0, ty0: kg.ty0, tx1: kg.tx1, ty1: kg.ty1 });
-        // The other effects of the layer, inside the kaleidoscope frame: the same tiles.
+        // The other effects of the layer, inside the kaleidoscope frames: the same tiles.
+        for (const kg of this.kaleidoscopeFrames(this.kaleidoscopeSteps(e), this.nodeBounds(l, false)).frames) {
+          out.push({ lod: kg.lod, tx0: kg.tx0, ty0: kg.ty0, tx1: kg.tx1, ty1: kg.ty1 });
+        }
       }
     }
     return out;
@@ -2079,7 +2092,7 @@ export class GLRenderer implements Renderer {
    * pixels before effects; glows and the shadow with the blur of a blur effect added) and draws
    * onto the result so far. Returns the result.
    */
-  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target): Target {
+  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target, content: () => Box | null): Target {
     const gl = this.gl;
     let cur = own;
     let flip = false;
@@ -2124,7 +2137,7 @@ export class GLRenderer implements Renderer {
       cur = out;
     }
     const kal = fx.find((e) => e.type === 'kaleidoscope');
-    return kal ? this.kaleidoscope(kal, g, cur, whole) : cur;
+    return kal ? this.kaleidoscope(kal, g, cur, whole, content) : cur;
   }
 
   /** Copy i of a kaleidoscope: the step transform applied i times (world to world), i = 1..count. */
@@ -2137,33 +2150,105 @@ export class GLRenderer implements Renderer {
   }
 
   /**
-   * The kaleidoscope frame: the world the copies show on screen comes from (each copy's
-   * transform undone on the view, all in one box), at the finest scale a copy needs (a copy that
-   * grows needs more detail), at most 4096 px per side and 8 megapixels. Null: nothing to show.
+   * World bounds of what a layer or group draws: its strokes, shapes (with drafts) and strokes in
+   * progress, its children for a group, grown by its blur, glows and shadow, and with its
+   * kaleidoscope copies unless `kaleidoscope` is false. Null: nothing.
    */
-  private kaleidoscopeGrid(steps: Affine[]): Grid | null {
+  private nodeBounds(l: Layer, kaleidoscope = true): Box | null {
+    const acc: { b: Box | null } = { b: null };
+    const add = (x0: number, y0: number, x1: number, y1: number) => {
+      if (!(x1 >= x0 && y1 >= y0)) return;
+      const b = acc.b;
+      acc.b = b ? { x0: Math.min(b.x0, x0), y0: Math.min(b.y0, y0), x1: Math.max(b.x1, x1), y1: Math.max(b.y1, y1) } : { x0, y0, x1, y1 };
+    };
+    if (l.kind === 'group') {
+      for (const c of this.layers) {
+        if (c.parent !== l.id || !c.visible) continue;
+        if (c.kind === 'adjust') {
+          // A blur inside the group spreads what is below it.
+          const q = acc.b;
+          if (q && c.adjust?.type === 'blur') {
+            const p = 3 * c.adjust.radius;
+            add(q.x0 - p, q.y0 - p, q.x1 + p, q.y1 + p);
+          }
+          continue;
+        }
+        const cb = this.nodeBounds(c);
+        if (cb) add(cb.x0, cb.y0, cb.x1, cb.y1);
+      }
+    } else if (l.kind !== 'adjust') {
+      if (this.shapeLayers.has(l.id)) for (const s of this.liveShapes(l.id)) {
+        const r = shapeRec(s);
+        add(r.x0, r.y0, r.x1, r.y1);
+      }
+      else for (const r of this.index.byLayer.get(l.id) ?? []) add(r.x0, r.y0, r.x1, r.y1);
+      for (const lv of this.livesFor(l.id)) {
+        for (let i = 0; i + 2 < lv.dabs.length; i += DAB_STRIDE) add(lv.dabs[i] - lv.dabs[i + 2], lv.dabs[i + 1] - lv.dabs[i + 2], lv.dabs[i] + lv.dabs[i + 2], lv.dabs[i + 1] + lv.dabs[i + 2]);
+      }
+    }
+    const own = acc.b;
+    if (!own) return null;
+    const fx = activeEffects(l);
+    for (const e of fx) {
+      if (e.type === 'kaleidoscope') continue;
+      const p = 3 * effectSigma(e, fx), dx = e.dx ?? 0, dy = e.dy ?? 0;
+      add(own.x0 + dx - p, own.y0 + dy - p, own.x1 + dx + p, own.y1 + dy + p);
+    }
+    const kal = kaleidoscope ? fx.find((e) => e.type === 'kaleidoscope') : undefined;
+    if (kal) {
+      const one: Box = acc.b!;
+      for (const m of this.kaleidoscopeSteps(kal)) {
+        const pts = [apply(m, one.x0, one.y0), apply(m, one.x1, one.y0), apply(m, one.x0, one.y1), apply(m, one.x1, one.y1)];
+        add(Math.min(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[1])));
+      }
+    }
+    return acc.b;
+  }
+
+  /**
+   * The kaleidoscope frames: where the copies on screen come from. Copies are grouped by how much
+   * they grow or shrink (powers of 2). A group's frame covers the layer's content (`content`)
+   * where a copy of the group shows it on screen (the view, each copy's transform undone), at
+   * the detail its largest copy needs, at most 4096 px per side and 8 megapixels. Thus a spiral
+   * of small copies does not blur the large ones. `of[i]`: the frame of copy i (−1: off screen).
+   */
+  private kaleidoscopeFrames(steps: Affine[], content: Box | null): { frames: Grid[]; of: number[] } {
     const ds = this.view.zoom * this.dpr;
     const vw = (this.canvas.width || 1) / ds, vh = (this.canvas.height || 1) / ds;
     const v = this.view;
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, grow = 0;
-    for (const m of steps) {
+    const of = steps.map(() => -1);
+    if (!content) return { frames: [], of };
+    const groups = new Map<number, { box: Box; grow: number; copies: number[] }>();
+    steps.forEach((m, i) => {
       const inv = invert(m);
-      if (!inv) continue;
-      for (const [px, py] of [[v.x, v.y], [v.x + vw, v.y], [v.x, v.y + vh], [v.x + vw, v.y + vh]]) {
-        const x = inv[0] * px + inv[2] * py + inv[4], y = inv[1] * px + inv[3] * py + inv[5];
-        x0 = Math.min(x0, x);
-        y0 = Math.min(y0, y);
-        x1 = Math.max(x1, x);
-        y1 = Math.max(y1, y);
-      }
-      grow = Math.max(grow, Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])));
+      if (!inv) return;
+      const pts = [apply(inv, v.x, v.y), apply(inv, v.x + vw, v.y), apply(inv, v.x, v.y + vh), apply(inv, v.x + vw, v.y + vh)];
+      // The part of the content this copy shows on screen.
+      const x0 = Math.max(content.x0, Math.min(...pts.map((p) => p[0]))), y0 = Math.max(content.y0, Math.min(...pts.map((p) => p[1])));
+      const x1 = Math.min(content.x1, Math.max(...pts.map((p) => p[0]))), y1 = Math.min(content.y1, Math.max(...pts.map((p) => p[1])));
+      if (!(x1 > x0 && y1 > y0)) return;
+      const grow = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
+      const key = Math.round(Math.log2(Math.max(grow, 1e-9)));
+      const g = groups.get(key);
+      if (g) {
+        g.box = { x0: Math.min(g.box.x0, x0), y0: Math.min(g.box.y0, y0), x1: Math.max(g.box.x1, x1), y1: Math.max(g.box.y1, y1) };
+        g.grow = Math.max(g.grow, grow);
+        g.copies.push(i);
+      } else groups.set(key, { box: { x0, y0, x1, y1 }, grow, copies: [i] });
+    });
+    const frames: Grid[] = [];
+    for (const [key, g] of groups) {
+      const { x0, y0, x1, y1 } = g.box;
+      // A pixel of margin, so the edge of the content is not cut by the filter.
+      let s = ds * Math.min(4, Math.max(g.grow, 1e-9));
+      s = Math.min(s, 4096 / (x1 - x0), 4096 / (y1 - y0), Math.sqrt(8e6 / ((x1 - x0) * (y1 - y0))));
+      const m = 2 / s;
+      // Sizes in steps of 64 px, so the buffers are not made again at every small move.
+      const w = Math.max(64, Math.ceil(((x1 - x0 + 2 * m) * s) / 64) * 64), h = Math.max(64, Math.ceil(((y1 - y0 + 2 * m) * s) / 64) * 64);
+      for (const i of g.copies) of[i] = frames.length;
+      frames.push(this.frameGrid(x0 - m, y0 - m, w, h, s, `kal${key}:`));
     }
-    if (!(x1 > x0 && y1 > y0)) return null;
-    let s = ds * Math.min(4, Math.max(grow, 1e-6));
-    s = Math.min(s, 4096 / (x1 - x0), 4096 / (y1 - y0), Math.sqrt(8e6 / ((x1 - x0) * (y1 - y0))));
-    // Sizes in steps of 64 px, so the buffers are not made again at every small move.
-    const w = Math.max(64, Math.ceil(((x1 - x0) * s) / 64) * 64), h = Math.max(64, Math.ceil(((y1 - y0) * s) / 64) * 64);
-    return this.frameGrid(x0, y0, w, h, s, 'kal:');
+    return { frames, of };
   }
 
   /** A frame of w × h px whose top left is world (wx, wy), at s px per world unit. */
@@ -2193,25 +2278,28 @@ export class GLRenderer implements Renderer {
    * (`whole` renders the layer there), so what a copy turns into view from off screen shows;
    * inside another frame they come from `cur` itself.
    */
-  private kaleidoscope(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target): Target {
-    const gl = this.gl;
+  private kaleidoscope(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target, content: () => Box | null): Target {
     const steps = this.kaleidoscopeSteps(e);
-    let src = cur;
-    let from: Affine = [1 / g.s, 0, 0, 1 / g.s, g.wx, g.wy]; // source px → world
+    // Each copy's source: a kaleidoscope frame on the screen, else this frame's buffer.
+    const own = { t: cur, from: [1 / g.s, 0, 0, 1 / g.s, g.wx, g.wy] as Affine }; // source px → world
+    let srcOf: ({ t: Target; from: Affine } | null)[] = steps.map(() => own);
     if (g.ns === '') {
-      const kg = this.kaleidoscopeGrid(steps);
-      if (kg) {
-        src = whole(kg);
-        from = [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy];
-      }
+      const { frames, of } = this.kaleidoscopeFrames(steps, content());
+      // Render every frame first: each has its own buffers, so they all stay until drawn.
+      const srcs = frames.map((kg) => ({ t: whole(kg), from: [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy] as Affine }));
+      srcOf = of.map((f) => (f < 0 ? null : srcs[f]));
     }
     const to: Affine = [g.s, 0, 0, g.s, -g.wx * g.s, -g.wy * g.s]; // world → frame px
     const out = this.buf(g, 'kalOut');
     this.bindTarget(out);
     this.clear();
     const copies = () => {
-      const list = e.order === 'behind' ? [...steps].reverse() : steps; // copy 1 nearest the layer
-      for (const m of list) this.drawXform(src, out, compose(to, compose(m, from)));
+      const order = steps.map((_, i) => i);
+      if (e.order === 'behind') order.reverse(); // copy 1 nearest the layer
+      for (const i of order) {
+        const src = srcOf[i];
+        if (src) this.drawXform(src.t, out, compose(to, compose(steps[i], src.from)));
+      }
     };
     if (e.order === 'behind') copies();
     this.blendFor(false);
