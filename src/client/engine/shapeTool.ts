@@ -102,7 +102,9 @@ export interface ShapeHost {
 type Pt = [number, number];
 
 /** The props a gesture or an edit may change, compared to make the ops. */
-const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'curve', 'parts', 'arc', 'hole', 'preset', 'dash', 'arrows', 'fill', 'stroke', 'strokeWidth', 'align', 'cap', 'join'];
+const PROP_KEYS: (keyof ShapeUpdate)[] = ['kind', 'name', 'z', 'w', 'h', 'm', 'radii', 'radiiLinked', 'sides', 'points', 'innerRatio', 'rounding', 'line', 'path', 'curve', 'parts', 'arc', 'hole', 'preset', 'dash', 'arrows', 'fill', 'stroke', 'fillOpacity', 'strokeOpacity', 'strokeWidth', 'align', 'cap', 'join'];
+/** A prop as an update op carries it: a missing opacity is 1 (opaque), so undo can set it back. */
+const propOf = (s: Shape, k: keyof ShapeUpdate) => (k === 'fillOpacity' || k === 'strokeOpacity' ? (s[k] ?? 1) : s[k]);
 
 const LIVE_MS = 40;
 /** Movement (CSS px) before a press counts as a drag: smaller jitters change nothing. */
@@ -779,6 +781,7 @@ export class ShapeTool {
       m: [1, 0, 0, 1, x0, y0],
       fill: kind === 'line' ? null : st.fill,
       stroke: kind === 'line' ? (st.stroke ?? st.fill ?? ed.fg) : st.stroke,
+      ...opacities(kind === 'line' ? 1 : st.fillOpacity, kind === 'line' && !st.stroke ? st.fillOpacity : st.strokeOpacity),
       strokeWidth: px(kind === 'line' ? Math.max(1, st.strokeWidth) : st.strokeWidth),
       align: kind === 'line' ? 'center' : st.align,
       cap: st.cap,
@@ -1140,9 +1143,10 @@ export class ShapeTool {
       if (!o) continue;
       const props: ShapeUpdate = {}, old: ShapeUpdate = {};
       for (const k of PROP_KEYS) {
-        if (JSON.stringify(n[k]) === JSON.stringify(o[k])) continue;
-        (props as Record<string, unknown>)[k] = n[k];
-        (old as Record<string, unknown>)[k] = o[k];
+        const nv = propOf(n, k), ov = propOf(o, k);
+        if (JSON.stringify(nv) === JSON.stringify(ov)) continue;
+        (props as Record<string, unknown>)[k] = nv;
+        (old as Record<string, unknown>)[k] = ov;
       }
       if (!Object.keys(props).length) continue;
       redo.push({ type: 'shape.update', id: n.id, props });
@@ -1266,6 +1270,7 @@ export class ShapeTool {
       parts: list.map((s) => partOf(s, op, T)),
       fill: base.fill,
       stroke: base.stroke,
+      ...opacities(base.fillOpacity ?? 1, base.strokeOpacity ?? 1),
       strokeWidth: base.strokeWidth * Math.sqrt(Math.abs(base.m[0] * base.m[3] - base.m[1] * base.m[2])),
       align: base.align,
       cap: base.cap,
@@ -1803,6 +1808,7 @@ export class ShapeTool {
         m: [1, 0, 0, 1, pen.o[0], pen.o[1]],
         fill: st.fill,
         stroke: st.stroke ?? (st.fill ? null : ed.fg),
+        ...opacities(st.fillOpacity ?? 1, st.stroke ? (st.strokeOpacity ?? 1) : 1),
         strokeWidth: Math.max(0.5, st.strokeWidth) / z,
         align: st.align,
         cap: st.cap,
@@ -2076,6 +2082,11 @@ export class ShapeTool {
 }
 
 // --- helpers ---------------------------------------------------------------------------------------
+
+/** Fill and stroke opacity props: only those below 1 (opaque is the default, left out). */
+function opacities(fill: number, stroke: number): Pick<Shape, 'fillOpacity' | 'strokeOpacity'> {
+  return { ...(fill < 1 ? { fillOpacity: fill } : {}), ...(stroke < 1 ? { strokeOpacity: stroke } : {}) };
+}
 
 /** The curve of a shape's path (non-path shapes become Bezier paths). */
 const curveOf = (s: Shape) => (s.kind === 'path' ? s.curve : undefined);

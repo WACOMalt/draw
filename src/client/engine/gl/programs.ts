@@ -54,12 +54,17 @@ precision highp float;
 in vec2 vUv;
 uniform sampler2D uTex;
 uniform float uDither;
+uniform float uCell; // checkerboard cell in device pixels, under a see-through paper
 out vec4 o;
 float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 void main() {
-  vec4 c = texture(uTex, vUv);
+  vec4 c = texture(uTex, vUv); // premultiplied
+  // Where the composite is not opaque (a see-through paper), a checkerboard shows through.
+  vec2 cell = floor(gl_FragCoord.xy / uCell);
+  float k = mod(cell.x + cell.y, 2.0) < 1.0 ? 1.0 : 0.8;
+  vec3 rgb = c.rgb + k * (1.0 - c.a);
   float n = (hash(gl_FragCoord.xy) + hash(gl_FragCoord.yx + 7.1) - 1.0) / 255.0; // triangular
-  o = vec4(clamp(c.rgb + n * uDither, 0.0, 1.0), 1.0);
+  o = vec4(clamp(rgb + n * uDither, 0.0, 1.0), 1.0);
 }`;
 
 /**
@@ -351,7 +356,7 @@ export function createPrograms(gl: WebGL2RenderingContext) {
   return {
     copy: link(gl, QUAD_VS, COPY_FS, [...quad, 'uTex', 'uOpacity']),
     xform: link(gl, XFORM_VS, COPY_FS, ['uM', 'uSrcSize', 'uTarget', 'uTex', 'uOpacity']),
-    present: link(gl, QUAD_VS, PRESENT_FS, [...quad, 'uTex', 'uDither']),
+    present: link(gl, QUAD_VS, PRESENT_FS, [...quad, 'uTex', 'uDither', 'uCell']),
     blend: link(gl, QUAD_VS, BLEND_FS, [...quad, 'uBack', 'uLayer', 'uOpacity', 'uMode', 'uAtop']),
     mask: link(gl, QUAD_VS, MASK_FS, [...quad, 'uMask']),
     adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity']),

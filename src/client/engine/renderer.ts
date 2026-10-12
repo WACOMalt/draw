@@ -2,7 +2,7 @@
 // - GLRenderer: WebGL2, half-float buffers, shader blend modes (preferred)
 // - Canvas2DRenderer: Canvas 2D + tile worker, 8-bit (fallback without WebGL2)
 
-import type { Affine, Brush, Layer, Shape, Stroke } from '../../shared/types';
+import type { Affine, Brush, Layer, Paper, Shape, Stroke } from '../../shared/types';
 import type { PerfProfile } from './perf';
 
 export interface ViewState {
@@ -69,7 +69,12 @@ export interface Renderer {
   /** The transform is applied: keep the preview until the layer's tiles show it, then drop it. */
   settleTransformPreview(): void;
 
-  /** Composited color under a CSS-pixel position, as #rrggbb. */
-  sample(cssX: number, cssY: number): string;
+  /** The bottom of the stack. Where its alpha is below 1, the screen shows a checkerboard. */
+  setPaper(p: Paper): void;
+  /**
+   * The color of the drawing under a CSS-pixel position, as #rrggbb: composited without the
+   * paper, un-premultiplied. Null where nothing is drawn.
+   */
+  sample(cssX: number, cssY: number): string | null;
   exportPng(): Promise<Blob | null>;
 }

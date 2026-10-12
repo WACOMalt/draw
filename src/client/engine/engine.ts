@@ -14,6 +14,7 @@ import {
   type Layer,
   type LayerProps,
   type Op,
+  type Paper,
   type ServerMsg,
   type Shape,
   type Stroke,
@@ -382,10 +383,55 @@ export class Engine {
     this.comp.setView(-this.rect.width / 2, -this.rect.height / 2, 1);
   }
 
+  // --- brush size pin ------------------------------------------------------------------------------
+  // A pinned brush keeps its size in world units: the size in screen pixels (what the options
+  // show and the cursor draws) follows the zoom. A size edit while pinned (slider, [ and ])
+  // pins the new size: it differs from the last size set here.
+
+  /** The screen size this code last set for each pinned brush, and the zoom then. */
+  private pinShown = { brush: NaN, eraser: NaN };
+  private pinZoom = 1;
+
+  /** The world size of a pinned brush (with a size edit since the last sync), or null. */
+  private pinnedWorld(key: 'brush' | 'eraser'): number | null {
+    const pin = ed.sizePin[key];
+    if (pin === null) return null;
+    const size = ed[key].size;
+    return size === this.pinShown[key] ? pin : size / this.pinZoom;
+  }
+
+  /** Pins the brush size to the canvas, or unpins it. */
+  togglePin(key: 'brush' | 'eraser'): void {
+    if (ed.sizePin[key] !== null) {
+      ed.sizePin[key] = null;
+      return;
+    }
+    const zoom = this.comp.view.zoom;
+    ed.sizePin[key] = ed[key].size / zoom;
+    this.pinShown[key] = ed[key].size;
+    this.pinZoom = zoom;
+  }
+
+  /** Sets the screen size of each pinned brush from its world size and the zoom. */
+  private syncPins(): void {
+    const zoom = this.comp.view.zoom;
+    for (const key of ['brush', 'eraser'] as const) {
+      const world = this.pinnedWorld(key);
+      if (world === null) continue;
+      ed.sizePin[key] = world;
+      // The slider's range. A stroke takes the world size, also past the range (beginStroke).
+      const size = Math.min(LIMITS.maxBrushPx, Math.max(1, Math.round(world * zoom * 100) / 100));
+      ed[key].size = size;
+      this.pinShown[key] = size;
+    }
+    this.pinZoom = zoom;
+  }
+
   private saveTimer: number | undefined;
   private syncView(): void {
     const v = this.comp.view;
     ed.view = { x: v.x, y: v.y, zoom: v.zoom };
+    this.syncPins();
     if (this.frame) return; // no markers, and nothing saved for an embed
     this.updateBrushCursor();
     this.scheduleMarkers();
@@ -467,8 +513,9 @@ export class Engine {
   }
 
   /** Confirmed document state for an off-screen render (exports, previews). */
-  snapshot(): { layers: Layer[]; strokes: Stroke[]; shapes: Shape[]; seq: number } {
+  snapshot(): { layers: Layer[]; strokes: Stroke[]; shapes: Shape[]; seq: number; paper: Paper } {
     return {
+      paper: this.doc.paperView(),
       layers: this.doc.displayLayers(),
       strokes: [...this.doc.strokes.values()].filter((st) => !st.deleted),
       shapes: [...this.doc.shapes.values()].filter((sh) => !sh.deleted),
@@ -1007,7 +1054,9 @@ export class Engine {
   }
 
   private pick(x: number, y: number): void {
-    ed.fg = this.comp.sample(x, y);
+    // Where nothing is drawn, the color stays (the paper is not a color to pick).
+    const c = this.comp.sample(x, y);
+    if (c) ed.fg = c;
   }
 
   addSwatch(color: string): void {
@@ -1031,11 +1080,13 @@ export class Engine {
     }
     const tool = eraserEnd ? 'eraser' : this.effectiveTool();
     const settings = tool === 'eraser' ? ed.eraser : ed.brush;
-    // Size is in screen pixels: what you see is what you draw, at any zoom.
+    // Size is in screen pixels: what you see is what you draw, at any zoom. A pinned size is in
+    // world units.
     const zoom = this.comp.view.zoom;
+    const world = this.pinnedWorld(tool === 'eraser' ? 'eraser' : 'brush') ?? settings.size / zoom;
     const brush: Brush = cleanBrush({
       ...settings,
-      size: Math.min(LIMITS.maxBrushWorld, Math.max(LIMITS.minBrushWorld, settings.size / zoom)),
+      size: Math.min(LIMITS.maxBrushWorld, Math.max(LIMITS.minBrushWorld, world)),
       tool: tool === 'eraser' ? 'erase' : 'paint',
       // A mask stores grey: black hides, white shows.
       color: mask ? greyOf(ed.fg) : ed.fg,
@@ -1183,7 +1234,7 @@ export class Engine {
     const opId = newId();
     this.doc.addPending(opId, op);
     this.net.send({ t: 'op', opId, op });
-    if (op.type.startsWith('layer.')) this.refreshLayers();
+    if (op.type.startsWith('layer.') || op.type === 'paper.set') this.refreshLayers();
     else if (op.type.startsWith('shape.')) this.shapes.docChanged();
   }
 
@@ -1232,6 +1283,8 @@ export class Engine {
     const layers = this.doc.displayLayers();
     ed.layers = layers;
     this.comp.setLayers(layers);
+    ed.paper = this.doc.paperView();
+    this.comp.setPaper(ed.paper);
     if (!layers.some((l) => l.id === ed.activeLayerId)) ed.activeLayerId = layers.at(-1)?.id ?? null;
     if (ed.maskTarget && !layers.find((l) => l.id === ed.activeLayerId)?.mask) this.setMaskTarget(false);
     this.shapes.docChanged();
@@ -1411,6 +1464,26 @@ export class Engine {
       redo: [{ type: 'layer.update', id, props }],
       key: key ? `${id}:${key}` : undefined,
     });
+  }
+
+  /**
+   * Sets the canvas paper. `live`: part of a drag (the color picker): the changes of one drag,
+   * and of quick edits after it, make one undo step.
+   */
+  setPaper(p: Paper, live = false): void {
+    if (!ed.canEdit) return;
+    const old = this.doc.paperView();
+    if (old.color === p.color && old.alpha === p.alpha) return;
+    const op: Op = { type: 'paper.set', paper: { ...p } };
+    this.sendOp(op);
+    const top = this.undoStack.at(-1);
+    const now = Date.now();
+    if (top && top.key === 'paper' && now - top.t < 2000 && this.redoStack.length === 0) {
+      top.redo = [op];
+      top.t = now;
+      return;
+    }
+    this.pushUndo({ undo: [{ type: 'paper.set', paper: { ...old } }], redo: [op], key: live ? 'paper' : undefined });
   }
 
   /** dir +1 moves the layer up (toward the top) among the layers of its group, -1 down. */
@@ -1864,7 +1937,7 @@ export class Engine {
         ed.denied = null;
         if (m.grant) grants.set(this.code, m.grant);
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
-        this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? []);
+        this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);
         ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
@@ -2127,8 +2200,8 @@ export class Engine {
     const seq = this.doc.seq;
     this.previewAt = Date.now();
     try {
-      const { layers, strokes, shapes } = this.snapshot();
-      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes);
+      const { layers, strokes, shapes, paper } = this.snapshot();
+      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes, paper);
       if (!png || png.size > maxBytes) return;
       const bmp = await createImageBitmap(png);
       const ok = bmp.width === W && bmp.height === H;
@@ -2173,15 +2246,15 @@ export class Engine {
     const all = this.contentBounds();
     if (all) {
       try {
-        const { layers, strokes, shapes, seq } = this.snapshot();
-        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512, shapes);
+        const { layers, strokes, shapes, seq, paper } = this.snapshot();
+        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512, shapes, paper);
         if (png) preview = await blobToDataUrl(png);
       } catch (e) {
         console.warn('bdraw preview', e);
       }
     }
     const source = this.onDevice ? undefined : { key: this.code, url: `${PUBLIC_ORIGIN}/s/${this.code}` };
-    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview, this.doc.shapes.values());
+    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview, this.doc.shapes.values(), this.doc.paper);
     return encodeBdraw(file);
   }
 }

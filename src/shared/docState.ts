@@ -3,8 +3,10 @@
 // use it, so an op means the same in both places.
 
 import {
+  DEFAULT_PAPER,
   LIMITS,
   type AppliedOp,
+  type Paper,
   type Layer,
   type Op,
   type Shape,
@@ -23,6 +25,7 @@ export class DocState {
   layers = new Map<string, Layer>();
   strokes = new Map<string, Stroke>();
   shapes = new Map<string, Shape>();
+  paper: Paper = { ...DEFAULT_PAPER };
 
   /** Replays a persisted op. No checks: the op passed them when it was first accepted. */
   applyStored(op: AppliedOp, by: string, seq: number): void {
@@ -163,6 +166,9 @@ export class DocState {
         if (plan.kind) this.layers.get(op.layerId)!.kind = plan.kind;
         return op;
       }
+      case 'paper.set':
+        this.paper = { ...op.paper };
+        return op;
       case 'layer.remove': {
         const l = this.layers.get(op.id);
         if (!l || l.deleted) throw new OpError('no such layer');
@@ -223,6 +229,7 @@ export function importOps(
   strokes: unknown[],
   shapes: unknown[],
   commit: (op: Op, by: string) => void,
+  paper?: unknown,
 ): { layers: number; strokes: number; shapes: number; skipped: number } {
   const n = { layers: 0, strokes: 0, shapes: 0, skipped: 0 };
   const tryCommit = (op: () => Op, by: string, kind: 'layers' | 'strokes' | 'shapes') => {
@@ -259,6 +266,14 @@ export function importOps(
     const author = field(sh, 'author');
     const by = typeof author === 'string' && /^[\w-]{1,40}$/.test(author) ? author : 'import';
     tryCommit(() => validateOp({ type: 'shape.add', shape: sh }), by, 'shapes');
+  }
+  // The paper: a bad one is left out (the canvas keeps the default), not counted.
+  if (paper !== undefined) {
+    try {
+      commit(validateOp({ type: 'paper.set', paper }), 'import');
+    } catch (e) {
+      if (!(e instanceof ValidationError || e instanceof OpError)) throw e;
+    }
   }
   return n;
 }

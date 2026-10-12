@@ -1,7 +1,8 @@
 <script lang="ts">
   // A Fill or Stroke swatch for shapes. A click opens a small color picker with a "None" choice,
-  // the foreground and background colors and the recent colors. A drag in the picker previews
-  // the color (oninput); the release sets it (onchange: one undo step).
+  // the foreground and background colors, the recent colors, and an opacity bar. A drag in the
+  // picker previews the color (oninput) or the opacity (onopacity, done false); the release sets
+  // it (onchange, onopacity with done: one undo step).
   import { hexToHsv, hsvToHex, parseHex, type HSV } from '../color';
   import { ed } from '../state.svelte';
   import { dismiss } from '../dismiss';
@@ -9,17 +10,37 @@
   let {
     label,
     value,
+    opacity = 1,
     big = false,
+    up = false,
     oninput,
     onchange,
+    onopacity,
   }: {
     label: string;
     value: string | null;
+    /** 0 to 1. */
+    opacity?: number;
     /** Phone sheet: a larger swatch. */
     big?: boolean;
+    /** The picker opens above the swatch (a swatch at the bottom of a panel). */
+    up?: boolean;
     oninput: (v: string | null) => void;
     onchange: (v: string | null) => void;
+    /** A new opacity; `done`: the drag ended or the number was typed (one undo step). */
+    onopacity?: (a: number, done: boolean) => void;
   } = $props();
+
+  /** The color at its opacity, over a checkerboard: what the swatch and the opacity bar show. */
+  const CHECKER = 'repeating-conic-gradient(#fff 0 25%, #ccc 0 50%) 0 0 / 8px 8px';
+  const withAlpha = (c: string, a: number) => c + Math.round(a * 255).toString(16).padStart(2, '0');
+  const swatchBg = $derived(value ? (opacity < 1 ? `linear-gradient(${withAlpha(value, opacity)}, ${withAlpha(value, opacity)}), ${CHECKER}` : value) : undefined);
+  const barBg = $derived(`linear-gradient(to right, ${withAlpha(value ?? ed.fg, 0)}, ${withAlpha(value ?? ed.fg, 1)}), ${CHECKER}`);
+  const percent = $derived(Math.round(opacity * 100));
+
+  function setAlpha(a: number, done: boolean) {
+    onopacity?.(Math.round(Math.min(1, Math.max(0, a)) * 100) / 100, done);
+  }
 
   let open = $state(false);
   let left = $state(false);
@@ -50,24 +71,25 @@
     onchange(c);
   }
 
-  function area(el: HTMLElement, fn: (fx: number, fy: number) => HSV) {
+  /** A drag area: `set` gets the pointer's place as fractions of the area, and whether it ended. */
+  function area(el: HTMLElement, set: (fx: number, fy: number, done: boolean) => void) {
     let id: number | null = null;
-    const at = (e: PointerEvent) => {
+    const at = (e: PointerEvent, done: boolean) => {
       const r = el.getBoundingClientRect();
-      return fn(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)));
+      set(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)), done);
     };
     const down = (e: PointerEvent) => {
       id = e.pointerId;
       el.setPointerCapture(e.pointerId);
-      setHsv(at(e), false);
+      at(e, false);
     };
     const move = (e: PointerEvent) => {
-      if (e.pointerId === id) setHsv(at(e), false);
+      if (e.pointerId === id) at(e, false);
     };
     const up = (e: PointerEvent) => {
       if (e.pointerId !== id) return;
       id = null;
-      setHsv(at(e), true);
+      at(e, true);
     };
     el.addEventListener('pointerdown', down);
     el.addEventListener('pointermove', move);
@@ -82,16 +104,17 @@
       },
     };
   }
-  const svArea = (el: HTMLElement) => area(el, (fx, fy) => ({ h: hsv.h, s: fx, v: 1 - fy }));
-  const hueArea = (el: HTMLElement) => area(el, (fx) => ({ ...hsv, h: Math.min(359.9, fx * 360) }));
+  const svArea = (el: HTMLElement) => area(el, (fx, fy, done) => setHsv({ h: hsv.h, s: fx, v: 1 - fy }, done));
+  const hueArea = (el: HTMLElement) => area(el, (fx, _fy, done) => setHsv({ ...hsv, h: Math.min(359.9, fx * 360) }, done));
+  const alphaArea = (el: HTMLElement) => area(el, (fx, _fy, done) => setAlpha(fx, done));
 
   const quick = $derived([...new Set([ed.fg, ed.bg, ...ed.swatches])].slice(0, 16));
 </script>
 
 <span class="wrap" use:dismiss={{ open, close: () => (open = false) }}>
-  <button class="sw" class:big class:none={!value} style:background={value ?? undefined} title="{label}: {value ?? 'none'}" aria-label="{label} color" aria-expanded={open} onclick={show}></button>
+  <button class="sw" class:big class:none={!value} style:background={swatchBg} title="{label}: {value ?? 'none'}{value && opacity < 1 ? ` at ${percent}%` : ''}" aria-label="{label} color" aria-expanded={open} onclick={show}></button>
   {#if open}
-    <div class="pop" class:left data-over-canvas role="dialog" aria-label="{label} color">
+    <div class="pop" class:left class:up data-over-canvas role="dialog" aria-label="{label} color">
       <div class="row">
         <button class="none-btn" class:on={!value} onclick={() => pick(null)}><span class="sw none small"></span>None</button>
         <label class="hex">#<input type="text" maxlength="7" bind:value={hex} onchange={() => {
@@ -106,6 +129,17 @@
       <div class="hue" use:hueArea>
         <div class="hknob" style:left="{(hsv.h / 360) * 100}%"></div>
       </div>
+      {#if onopacity}
+        <div class="row">
+          <div class="alpha" style:background={barBg} use:alphaArea title="Opacity" aria-label="Opacity">
+            <div class="hknob" style:left="{opacity * 100}%"></div>
+          </div>
+          <label class="pct"><input type="number" min="0" max="100" step="1" value={percent} aria-label="{label} opacity" onchange={(e) => {
+            const v = +e.currentTarget.value;
+            if (Number.isFinite(v)) setAlpha(v / 100, true);
+          }} />%</label>
+        </div>
+      {/if}
       <div class="quick">
         {#each quick as c, i (c)}
           <button style:background={c} title={i === 0 ? `Foreground ${c}` : i === 1 ? `Background ${c}` : c} aria-label={c} onclick={() => pick(c)}></button>
@@ -162,6 +196,10 @@
   .pop.left {
     left: 0;
     right: auto;
+  }
+  .pop.up {
+    top: auto;
+    bottom: calc(100% + 6px);
   }
   .row {
     display: flex;
@@ -227,6 +265,24 @@
     box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
     pointer-events: none;
   }
+  .alpha {
+    position: relative;
+    flex: 1;
+    height: 12px;
+    border-radius: 3px;
+    cursor: ew-resize;
+    touch-action: none;
+  }
+  .pct {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    color: var(--text-dim);
+  }
+  .pct input {
+    width: 44px;
+    text-align: right;
+  }
   .quick {
     display: grid;
     grid-template-columns: repeat(8, 1fr);
@@ -242,7 +298,8 @@
     .sv {
       height: 150px;
     }
-    .hue {
+    .hue,
+    .alpha {
       height: 22px;
     }
     .hknob {

@@ -52,38 +52,62 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
     const y = A[1] * local[i] + A[3] * local[i + 1] + A[5];
     safe = Math.abs(x) < SAFE && Math.abs(y) < SAFE;
   }
-  if (s.kind === 'compound') return drawCompound(ctx, s, A, w, h, fill, stroke, align, band);
+  const fa = s.fillOpacity ?? 1, sa = s.strokeOpacity ?? 1;
+  if (s.kind === 'compound') return drawCompound(ctx, s, A, w, h, fill, stroke, align, band, fa, sa);
   const contours = shapeContours(s);
   // Arrows and dashes: the stroke follows other contours than the fill, and heads are added.
   const styled = stroke && (s.dash || s.arrows) ? styledStroke(s, contours, A, [-PAD, -PAD, w + PAD, h + PAD], reach * maxScale(A), TOL) : null;
   const lines = styled?.lines ?? contours;
   const paths = safe ? nativePaths(contours, lines, A, band) : exactPaths(contours, lines, A, band, s, w, h);
-  const drawHeads = () => {
-    if (!styled?.heads.length) return;
+  const arrowheads = styled?.heads.length ? styled.heads : null;
+  const drawHeads = (c: Ctx2D) => {
+    if (!arrowheads) return;
     // The arrowheads, in target pixels, in the stroke color.
     const p = new Path2D();
-    for (const q of styled.heads) {
+    for (const q of arrowheads) {
       p.moveTo(q[0], q[1]);
       for (let i = 2; i < q.length; i += 2) p.lineTo(q[i], q[i + 1]);
       p.closePath();
     }
+    c.save();
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.fillStyle = stroke!;
+    c.fill(p, 'nonzero');
+    c.restore();
+  };
+  // A see-through stroke with arrowheads draws as one: both go opaque onto a scratch canvas,
+  // which then goes on at the stroke's opacity (else the line shows darker under each head).
+  const asGroup = sa < 1 && !!arrowheads;
+  const strokeOn = (draw: (c: Ctx2D) => void) => {
+    if (!asGroup) {
+      ctx.globalAlpha = sa;
+      draw(ctx);
+      ctx.globalAlpha = 1;
+      return;
+    }
+    const g = canvasFor(3, w, h);
+    g.setTransform(ctx.getTransform());
+    draw(g);
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = stroke!;
-    ctx.fill(p, 'nonzero');
+    ctx.globalAlpha = sa;
+    ctx.drawImage(g.canvas, 0, 0);
     ctx.restore();
   };
-  if (!paths) return drawHeads();
+  if (!paths) return strokeOn(drawHeads);
   ctx.save();
   ctx.setTransform(paths.m[0], paths.m[1], paths.m[2], paths.m[3], paths.m[4], paths.m[5]);
-  const drawStroke = () => {
+  // An outside stroke under an opaque fill: the fill covers its inner half, and no seam shows. A
+  // see-through fill would show that half: then the stroke is cut to the outside instead.
+  const under = !!stroke && align === 'outside' && !!fill && fa >= 1;
+  const drawStroke = (ctx: Ctx2D) => {
     ctx.strokeStyle = ctx.fillStyle = stroke!;
     if (align === 'inside') {
       ctx.save();
       ctx.clip(paths.outline, 'nonzero');
-      paths.stroke();
+      paths.stroke(ctx);
       ctx.restore();
-    } else if (align === 'outside' && !fill) {
+    } else if (align === 'outside' && !under) {
       // Everything but the inside: the target box with the outline as a hole.
       const inv = invert(paths.m);
       if (!inv) return;
@@ -99,19 +123,23 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
       q.addPath(paths.outline);
       ctx.save();
       ctx.clip(q, 'evenodd');
-      paths.stroke();
+      paths.stroke(ctx);
       ctx.restore();
-    } else paths.stroke();
+    } else paths.stroke(ctx);
   };
-  // An outside stroke under the fill: the fill covers its inner half, and no seam shows.
-  if (stroke && align === 'outside' && fill) drawStroke();
+  const strokeAndHeads = (c: Ctx2D) => {
+    drawStroke(c);
+    drawHeads(c);
+  };
+  if (under) strokeOn(strokeAndHeads);
   if (fill) {
     ctx.fillStyle = fill;
+    ctx.globalAlpha = fa;
     ctx.fill(paths.outline, 'nonzero');
+    ctx.globalAlpha = 1;
   }
-  if (stroke && !(align === 'outside' && fill)) drawStroke();
+  if (stroke && !under) strokeOn(strokeAndHeads);
   ctx.restore();
-  drawHeads();
 
   /** Canvas paths in local units, drawn through A: the fill outline, and the stroke along `lines`. */
   function nativePaths(cs: Contour[], lines: Contour[], A: Affine, band: number) {
@@ -120,12 +148,12 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
     return {
       m: A,
       outline,
-      stroke: () => {
-        ctx.lineWidth = band;
-        ctx.lineCap = s.cap;
-        ctx.lineJoin = s.join;
-        ctx.miterLimit = MITER_LIMIT;
-        ctx.stroke(along);
+      stroke: (c: Ctx2D) => {
+        c.lineWidth = band;
+        c.lineCap = s.cap;
+        c.lineJoin = s.join;
+        c.miterLimit = MITER_LIMIT;
+        c.stroke(along);
       },
     };
   }
@@ -180,11 +208,11 @@ function drawShape(ctx: Ctx2D, s: Shape, ox: number, oy: number, sc: number, w: 
       for (const c of lines) for (const p of strokePolygons(flattenContour(c, A, TOL, box, band / 2), band / 2, s.cap, s.join, A, box, TOL)) addPoly(strokePath, p);
     }
     if (!any) return null;
-    return { m: [1, 0, 0, 1, 0, 0] as Affine, outline, stroke: () => ctx.fill(strokePath, 'nonzero') };
+    return { m: [1, 0, 0, 1, 0, 0] as Affine, outline, stroke: (c: Ctx2D) => c.fill(strokePath, 'nonzero') };
   }
 }
 
-/** Canvases for compound shapes (the result mask, the stroke, the fill), reused. */
+/** Scratch canvases, reused: for compound shapes the result mask, the stroke and the fill; 3: a see-through stroke drawn as one (drawShape). */
 const scratch: OffscreenCanvas[] = [];
 function canvasFor(i: number, w: number, h: number): OffscreenCanvasRenderingContext2D {
   let c = scratch[i];
@@ -209,7 +237,7 @@ const COMPOSITE: Record<string, GlobalCompositeOperation> = { unite: 'source-ove
  * cut to a box around the target that the stroke band cannot cross from outside; the sides of
  * that box are not outline.
  */
-function drawCompound(ctx: Ctx2D, s: Shape, A: Affine, w: number, h: number, fill: string | null, stroke: string | null, align: string, band: number): void {
+function drawCompound(ctx: Ctx2D, s: Shape, A: Affine, w: number, h: number, fill: string | null, stroke: string | null, align: string, band: number, fa: number, sa: number): void {
   const k = Math.sqrt(Math.abs(A[0] * A[3] - A[1] * A[2]));
   const hw = (band / 2) * k; // half the band, in target pixels
   const reach = hw * (s.join === 'miter' ? MITER_LIMIT : 1);
@@ -266,22 +294,27 @@ function drawCompound(ctx: Ctx2D, s: Shape, A: Affine, w: number, h: number, fil
   }
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // An outside stroke under an opaque fill (no seam); under a see-through fill it is cut to the
+  // outside, as without a fill.
+  const under = !!stroke && align === 'outside' && !!fill && fa >= 1;
   const drawStroke = () => {
     if (!strokePath) return;
-    if (align === 'center' || (align === 'outside' && fill)) {
+    ctx.globalAlpha = sa;
+    if (align === 'center' || under) {
       ctx.fillStyle = stroke!;
       ctx.fill(strokePath, 'nonzero');
-      return;
+    } else {
+      // Inside: only within the result; outside: only outside it.
+      const st = canvasFor(1, w, h);
+      st.fillStyle = stroke!;
+      st.fill(strokePath, 'nonzero');
+      st.globalCompositeOperation = align === 'inside' ? 'destination-in' : 'destination-out';
+      st.drawImage(mask.canvas, 0, 0);
+      ctx.drawImage(st.canvas, 0, 0);
     }
-    // Inside: only within the result; outside without a fill: only outside it.
-    const st = canvasFor(1, w, h);
-    st.fillStyle = stroke!;
-    st.fill(strokePath, 'nonzero');
-    st.globalCompositeOperation = align === 'inside' ? 'destination-in' : 'destination-out';
-    st.drawImage(mask.canvas, 0, 0);
-    ctx.drawImage(st.canvas, 0, 0);
+    ctx.globalAlpha = 1;
   };
-  if (align === 'outside' && fill) drawStroke();
+  if (under) drawStroke();
   if (fill) {
     // The color, cut to the mask. (A mask colored with source-in came out black on a reused canvas in Chrome.)
     const f = canvasFor(2, w, h);
@@ -289,8 +322,10 @@ function drawCompound(ctx: Ctx2D, s: Shape, A: Affine, w: number, h: number, fil
     f.fillRect(0, 0, w, h);
     f.globalCompositeOperation = 'destination-in';
     f.drawImage(mask.canvas, 0, 0);
+    ctx.globalAlpha = fa;
     ctx.drawImage(f.canvas, 0, 0);
+    ctx.globalAlpha = 1;
   }
-  if (!(align === 'outside' && fill)) drawStroke();
+  if (!under) drawStroke();
   ctx.restore();
 }

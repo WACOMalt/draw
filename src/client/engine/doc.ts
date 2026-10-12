@@ -4,7 +4,7 @@
 import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shared/layers';
 import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
 import { planFromPaint, planToPaint, vectorShape } from '../../shared/flatten';
-import { LIMITS, type AppliedOp, type Layer, type Op, type Shape, type Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, LIMITS, type AppliedOp, type Layer, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
 
 export interface PendingOp {
   opId: string;
@@ -97,9 +97,12 @@ export class Doc {
   /** Increments when strokes change; consumers cache against it. */
   version = 0;
   pending: PendingOp[] = [];
+  /** The confirmed paper. */
+  paper: Paper = { ...DEFAULT_PAPER };
 
-  reset(seq: number, layers: Layer[], strokes: Stroke[], shapes: Shape[] = []): void {
+  reset(seq: number, layers: Layer[], strokes: Stroke[], shapes: Shape[] = [], paper: Paper = DEFAULT_PAPER): void {
     this.seq = seq;
+    this.paper = { ...paper };
     this.layers = new Map(layers.map((l) => [l.id, l]));
     this.strokes = new Map(strokes.map((s) => [s.id, s]));
     this.bounds = new Map(strokes.map((s) => [s.id, strokeBounds(s)]));
@@ -229,6 +232,9 @@ export class Doc {
         this.bounds.delete(op.id);
         this.version++;
         break;
+      case 'paper.set':
+        this.paper = { ...op.paper };
+        break;
       default:
         applyLayerOp(this.layers, op);
     }
@@ -241,6 +247,15 @@ export class Doc {
    */
   displayLayers(): Layer[] {
     return paintOrder(this.layerView().values());
+  }
+
+  /** The paper as the user sees it: the last pending paper change, else the confirmed paper. */
+  paperView(): Paper {
+    for (let i = this.pending.length - 1; i >= 0; i--) {
+      const op = this.pending[i].op;
+      if (op.type === 'paper.set') return op.paper;
+    }
+    return this.paper;
   }
 
   /** All layers (deleted ones too) with the pending ops applied. */

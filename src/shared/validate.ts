@@ -252,6 +252,10 @@ export function validateOp(v: unknown): Op {
     case 'shape.remove':
     case 'shape.restore':
       return { type: o.type, id: id(o.id) };
+    case 'paper.set': {
+      const p = obj(o.paper, 'paper');
+      return { type: 'paper.set', paper: { color: validateColor(p.color), alpha: num(p.alpha, 0, 1, 'paper alpha') } };
+    }
     case 'layer.duplicate':
       return {
         type: 'layer.duplicate',
@@ -322,7 +326,7 @@ function compoundParts(v: unknown): CompoundPart[] {
     });
     for (const c of shape.path ?? []) points += c.pts.length / POINT_STRIDE;
     if (points > LIMITS.maxPathPoints) fail('too many path points');
-    const { id: _i, layerId: _l, name: _n, z: _z, fill: _f, stroke: _s, strokeWidth: _w, align: _a, cap: _c, join: _j, dash: _d, arrows: _r, ...geo } = shape;
+    const { id: _i, layerId: _l, name: _n, z: _z, fill: _f, stroke: _s, fillOpacity: _fo, strokeOpacity: _so, strokeWidth: _w, align: _a, cap: _c, join: _j, dash: _d, arrows: _r, ...geo } = shape;
     const part = { ...geo, op } as CompoundPart;
     if (o.name !== undefined) part.name = str(o.name, LIMITS.maxShapeName, 'part name');
     return part;
@@ -352,6 +356,8 @@ function shapeProps(v: unknown, partial: boolean): ShapeUpdate {
   }
   if (want('fill')) out.fill = colorOrNull(p.fill);
   if (want('stroke')) out.stroke = colorOrNull(p.stroke);
+  if (p.fillOpacity !== undefined) out.fillOpacity = num(p.fillOpacity, 0, 1, 'fillOpacity');
+  if (p.strokeOpacity !== undefined) out.strokeOpacity = num(p.strokeOpacity, 0, 1, 'strokeOpacity');
   if (want('strokeWidth')) out.strokeWidth = len(p.strokeWidth, 'strokeWidth');
   if (want('align')) out.align = oneOf(p.align, STROKE_ALIGNS, 'align');
   if (want('cap')) out.cap = oneOf(p.cap, LINE_CAPS, 'cap');
@@ -447,6 +453,9 @@ export function validateShapeInput(v: unknown): ShapeInput {
   if ((kind === 'polygon' || kind === 'star') && p.rounding !== undefined) out.rounding = p.rounding;
   if (p.dash?.some((d) => d > 0)) out.dash = p.dash;
   if (p.arrows && (p.arrows[0] !== 'none' || p.arrows[1] !== 'none')) out.arrows = p.arrows;
+  // Opacity 1 is the default: left out, so opaque shapes stay as older clients know them.
+  if (kind !== 'line' && p.fillOpacity !== undefined && p.fillOpacity < 1) out.fillOpacity = p.fillOpacity;
+  if (p.strokeOpacity !== undefined && p.strokeOpacity < 1) out.strokeOpacity = p.strokeOpacity;
   if (!cornersWithin(out, LIMITS.maxCoord)) fail('shape out of range');
   return stripForKind(out);
 }

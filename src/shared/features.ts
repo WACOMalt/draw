@@ -1,7 +1,7 @@
 // Which newer document features a canvas uses. The server lists them in `welcome`; a client
 // that does not know one of them asks for an update instead of drawing the canvas wrong.
 
-import type { Brush, DocFeature, Layer, Shape, Stroke } from './types';
+import { isDefaultPaper, type Brush, type DocFeature, type Layer, type Paper, type Shape, type Stroke } from './types';
 
 /** True when the brush draws differently from the plain round brush of older clients. */
 export function brushHasDynamics(b: Brush): boolean {
@@ -17,17 +17,19 @@ export function brushHasDynamics(b: Brush): boolean {
 }
 
 /** Features of a shape's geometry and style (also of a part, or of a vector stroke). */
-function shapeFeatures(s: Partial<Pick<Shape, 'kind' | 'arc' | 'hole' | 'dash' | 'arrows' | 'curve'>>, f: Set<DocFeature>): void {
+function shapeFeatures(s: Partial<Pick<Shape, 'kind' | 'arc' | 'hole' | 'dash' | 'arrows' | 'curve' | 'fillOpacity' | 'strokeOpacity'>>, f: Set<DocFeature>): void {
   if (s.kind === 'path') f.add('paths');
   if (s.curve === 'spline') f.add('splines');
   if (s.kind === 'custom') f.add('custom');
   if (s.arc || s.hole) f.add('arcs');
   if (s.dash?.some((d) => d > 0)) f.add('dashes');
   if (s.arrows?.some((a) => a !== 'none')) f.add('arrows');
+  if ((s.fillOpacity ?? 1) < 1 || (s.strokeOpacity ?? 1) < 1) f.add('shapeAlpha');
 }
 
-export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, shapes: Iterable<Shape> = []): DocFeature[] {
+export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, shapes: Iterable<Shape> = [], paper?: Paper): DocFeature[] {
   const f = new Set<DocFeature>();
+  if (paper && !isDefaultPaper(paper)) f.add('paper');
   for (const l of layers) {
     if (l.deleted) continue;
     if (l.kind === 'adjust') f.add('adjust');

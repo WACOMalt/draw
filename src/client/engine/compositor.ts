@@ -2,7 +2,7 @@
 // layer opacity and blend modes, onto the visible canvas.
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
-import type { Affine, BlendMode, Brush, Layer, LayerBlend, Shape, Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type Paper, type Shape, type Stroke } from '../../shared/types';
 import { byZ } from '../../shared/shapes';
 import { ShapeIndex, shapeRec } from './shapeIndex';
 import { drawShapes } from './shapeRaster';
@@ -134,7 +134,12 @@ export class Canvas2DRenderer implements Renderer {
   private tail = 0;
   private lastViewMsg = '';
   private current: TileView | null = null;
-  paper = '#ffffff';
+  /** The bottom of the stack. Where its alpha is below 1, the screen shows a checkerboard. */
+  private paper: Paper = { ...DEFAULT_PAPER };
+  private checker: CanvasPattern | null = null;
+  /** The eyedropper's frame: the stack without the paper, drawn here instead of on screen. */
+  private pickBuf: OffscreenCanvasRenderingContext2D | null = null;
+  private picking = false;
   onFrame: (() => void) | null = null;
 
   constructor(private canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
@@ -162,6 +167,7 @@ export class Canvas2DRenderer implements Renderer {
     this.cssW = Math.max(1, cssW);
     this.cssH = Math.max(1, cssH);
     this.dpr = dpr;
+    this.checker = null;
     this.canvas.width = Math.round(this.cssW * dpr);
     this.canvas.height = Math.round(this.cssH * dpr);
     this.scratch.width = this.canvas.width;
@@ -495,7 +501,7 @@ export class Canvas2DRenderer implements Renderer {
       this.tail = TAIL_FRAMES;
     } else this.tail--;
     this.frame++;
-    const ctx = this.ctx;
+    const ctx: Ctx = this.picking ? this.pickBuf! : this.ctx;
     const ds = this.view.zoom * this.dpr;
     const lod = lodFor(ds);
     const tw = tileWorld(lod);
@@ -528,8 +534,19 @@ export class Canvas2DRenderer implements Renderer {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
-    ctx.fillStyle = this.paper;
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    if (this.picking) ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    else {
+      // Canvas 2D has no premultiplied stack to keep separate: under a see-through paper the
+      // layers blend onto the checkerboard too (the WebGL2 renderer keeps them apart).
+      if (this.paper.alpha < 1) {
+        ctx.fillStyle = this.checkerPattern(ctx);
+        ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+      }
+      ctx.globalAlpha = this.paper.alpha;
+      ctx.fillStyle = this.paper.color;
+      ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+      ctx.globalAlpha = 1;
+    }
 
     const X = (tx: number) => Math.round((tx * tw - vx) * ds);
     const Y = (ty: number) => Math.round((ty * tw - vy) * ds);
@@ -807,11 +824,40 @@ export class Canvas2DRenderer implements Renderer {
 
   // --- readback ---------------------------------------------------------------------------
 
-  /** Composited color under a CSS-pixel position, as #rrggbb. */
-  sample(cssX: number, cssY: number): string {
+  setPaper(p: Paper): void {
+    if (p.color === this.paper.color && p.alpha === this.paper.alpha) return;
+    this.paper = { ...p };
+    this.invalidate();
+  }
+
+  private checkerPattern(ctx: Ctx): CanvasPattern {
+    if (this.checker) return this.checker;
+    const n = Math.max(1, Math.round(8 * this.dpr));
+    const c = new OffscreenCanvas(n * 2, n * 2);
+    const g = c.getContext('2d')!;
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 0, n * 2, n * 2);
+    g.fillStyle = '#cccccc';
+    g.fillRect(n, 0, n, n);
+    g.fillRect(0, n, n, n);
+    return (this.checker = ctx.createPattern(c, 'repeat')!);
+  }
+
+  /** The color of the drawing under a CSS-pixel position, without the paper. Null where nothing is drawn. */
+  sample(cssX: number, cssY: number): string | null {
     const x = Math.max(0, Math.min(this.canvas.width - 1, Math.round(cssX * this.dpr)));
     const y = Math.max(0, Math.min(this.canvas.height - 1, Math.round(cssY * this.dpr)));
-    const [r, g, b] = this.ctx.getImageData(x, y, 1, 1).data;
+    const w = this.canvas.width, h = this.canvas.height;
+    if (this.pickBuf?.canvas.width !== w || this.pickBuf.canvas.height !== h) this.pickBuf = new OffscreenCanvas(w, h).getContext('2d', { willReadFrequently: true })!;
+    this.picking = true;
+    try {
+      this.renderNow();
+    } finally {
+      this.picking = false;
+    }
+    const [r, g, b, a] = this.pickBuf.getImageData(x, y, 1, 1).data;
+    this.renderNow();
+    if (a === 0) return null;
     return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
   }
 
