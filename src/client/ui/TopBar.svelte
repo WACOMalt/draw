@@ -123,12 +123,13 @@
 <style>
   header {
     grid-area: top;
-    min-height: 36px;
-    padding-top: env(safe-area-inset-top);
+    min-height: calc(36px + env(safe-area-inset-top));
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 0 8px;
+    /* Below the clock and the notch (iOS), and clear of a notch at the side in landscape. One
+       padding rule: a padding shorthand after padding-top used to set it back to 0. */
+    padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left));
     background: var(--bg-1);
     border-bottom: 1px solid var(--border);
   }

@@ -31,7 +31,8 @@
     display: flex;
     align-items: center;
     gap: 18px;
-    padding: 0 10px;
+    /* Above the home indicator (iPad). */
+    padding: 0 max(10px, env(safe-area-inset-right)) env(safe-area-inset-bottom) max(10px, env(safe-area-inset-left));
     background: var(--bg-1);
     border-top: 1px solid var(--border);
     font-size: 11px;
