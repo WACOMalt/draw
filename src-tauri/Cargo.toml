@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-opener = "2"
 
 # Pen pressure (src/pen.rs). Same versions as Tauri's own, so nothing is built twice.
 [target.'cfg(target_os = "linux")'.dependencies]

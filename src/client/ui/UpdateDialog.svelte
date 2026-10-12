@@ -16,6 +16,8 @@
         <b>Draw {u.version}</b> is out. You have {u.current}.
         {#if u.how === 'manual'}
           Update it with your package manager, or get it from the release page.
+        {:else if u.how === 'ios'}
+          Get the new .ipa from the release page and install it with your sideloading app (AltStore, SideStore or Sideloadly), over this one.
         {/if}
       </p>
       {#if u.changes.length}
@@ -26,7 +28,7 @@
       {/if}
       <div class="actions">
         <button class="primary" onclick={startUpdate}>
-          {u.how === 'manual' ? 'Open the release page' : u.size ? `Update (${mb(u.size)})` : 'Update'}
+          {u.how === 'manual' || u.how === 'ios' ? 'Open the release page' : u.size ? `Update (${mb(u.size)})` : 'Update'}
         </button>
         <button onclick={close}>Later</button>
       </div>

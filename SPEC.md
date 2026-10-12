@@ -541,6 +541,14 @@ The Android app and the Linux AppImage update themselves from the latest GitHub 
 - Android: the page finds the asset `Draw_<ver>_android.apk`, and the app (as `window.DrawAppUpdate`) downloads it into its cache from GitHub hosts only, makes sure the file is a package of this app, and opens Android's installer. Android installs it only when the release key signed it. The first time, the dialog explains how to allow Draw to install apps and opens that setting (permission `REQUEST_INSTALL_PACKAGES`).
 - AppImage: the app reads the release, downloads `Draw_<ver>_amd64.AppImage` (every redirect must stay on a GitHub host) next to the running file, checks the size, the SHA-256 that GitHub lists for the asset and the AppImage header, and renames it over the running AppImage. The path does not change, so Gear Lever's entry and desktop launchers keep working. "Restart now" starts the new file; otherwise the next start runs it. A folder the user cannot write gets the release link instead.
 - `.deb` and `.rpm`: the dialog says a new version exists and opens the release page; the package manager updates the app.
+- iOS (sideloaded): the dialog says a new version exists (the asset `Draw_<ver>_ios.ipa`) and opens the release page in the browser (Tauri opener plugin). The person installs the new .ipa over the old one with their sideloading app.
+
+### 9.7.1 iOS app
+
+- The same Tauri app as Android, for iPhone and iPad with iOS 15 or later (WebGL2). `ios.yml` builds it on macOS runners: `tauri ios init --ci` generates the Xcode project (`src-tauri/gen/apple` is not kept in the repository), then `tauri ios build --no-sign` makes an unsigned `Draw_<ver>_ios.ipa`. There is no Apple developer account: AltStore, SideStore or Sideloadly sign the .ipa with the person's own Apple ID. A free Apple ID signs for 7 days; the sideloading app renews it. The run also makes `Draw_<ver>_ios-simulator.zip` (Apple silicon Simulator) for appetize.io. The release workflow calls `ios.yml` and attaches both files. A failed iOS build does not stop the release.
+- `src-tauri/Info.ios.plist` goes into the app's Info.plist: files in the Files app, every orientation, Split View, and pointer events from a trackpad.
+- Apple Pencil: WebKit reports the Pencil as pointer type `pen`, with pressure and tilt, so it draws as any pen does. After the first pen stroke, a finger pans and zooms instead of drawing (palm rejection). The page uses `getCoalescedEvents` where WebKit has it.
+- There is no full screen button: the app fills the screen.
 - The web app and the Windows and macOS apps show nothing.
 - Keep the asset names above and the `--latest` publish in `.github/workflows/release.yml`, or the apps stop finding updates. Apps before v0.2.35 have no updater: update those by hand one time.
 
