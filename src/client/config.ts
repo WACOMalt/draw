@@ -12,6 +12,12 @@ export const PUBLIC_ORIGIN = env || location.origin;
 
 export const IS_TAURI = '__TAURI_INTERNALS__' in window;
 
+/** iPhone or iPad (an iPad's Safari says Macintosh, but has a touch screen). */
+export const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+
+/** The iOS app (Tauri, sideloaded: there is no App Store build). */
+export const IS_IOS_APP = IS_TAURI && IS_IOS;
+
 /**
  * The page comes with the app (every desktop and mobile app), not from the server: the server is
  * another origin, so it signs in with a bearer token instead of a cookie.

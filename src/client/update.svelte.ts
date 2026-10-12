@@ -6,9 +6,12 @@
 //   release, downloads the new AppImage and puts it in place of the running one. A .deb or .rpm
 //   install only hears that there is a new version and gets a link to the release.
 //
+// - iOS (sideloaded, no App Store): the page reads the latest release and offers its page; the
+//   new .ipa installs with the sideloading app (AltStore, SideStore, Sideloadly).
+//
 // The web app and the Windows and macOS apps have no updater here: they show nothing.
 
-import { ELECTRON } from './config';
+import { ELECTRON, IS_IOS_APP, IS_TAURI } from './config';
 import { showToast } from './state.svelte';
 
 const REPO = 'WACOMalt/draw';
@@ -27,15 +30,15 @@ const ANDROID = (window as unknown as { DrawAppUpdate?: AndroidBridge }).DrawApp
 const DESKTOP = ELECTRON?.updates ?? null;
 
 /** This app can tell about (and on Android and AppImage, install) its updates. */
-export const CAN_UPDATE = ANDROID !== null || DESKTOP !== null;
+export const CAN_UPDATE = ANDROID !== null || DESKTOP !== null || IS_IOS_APP;
 
 export interface Update {
   version: string;
   current: string;
   /** The release on GitHub. */
   page: string;
-  /** 'android' and 'appimage' install from the dialog; 'manual' links to the release. */
-  how: 'android' | 'appimage' | 'manual';
+  /** 'android' and 'appimage' install from the dialog; 'manual' and 'ios' link to the release. */
+  how: 'android' | 'appimage' | 'manual' | 'ios';
   /** Download size in bytes (0: unknown). */
   size: number;
   /** Android: the APK. */
@@ -115,6 +118,18 @@ async function changesBetween(from: string, to: string): Promise<string[]> {
   }
 }
 
+/** The latest release has an asset matching `name` and is newer than this app. */
+async function releaseCheck(name: RegExp, how: Update['how']): Promise<{ current: string; update: Update | null }> {
+  const r = await fetch(LATEST, { headers: { Accept: 'application/vnd.github+json' } });
+  if (!r.ok) throw new Error(`GitHub: HTTP ${r.status}`);
+  const rel = (await r.json()) as { tag_name: string; html_url: string; draft: boolean; prerelease: boolean; assets: { name: string; browser_download_url: string; size: number }[] };
+  const version = rel.tag_name.replace(/^v/, '');
+  const asset = rel.assets.find((a) => name.test(a.name));
+  const current = __APP_VERSION__;
+  if (rel.draft || rel.prerelease || !asset || !isNewer(version, current)) return { current, update: null };
+  return { current, update: { version, current, page: rel.html_url, how, size: asset.size, changes: [] } };
+}
+
 async function androidCheck(): Promise<{ current: string; update: Update | null }> {
   const r = await fetch(LATEST, { headers: { Accept: 'application/vnd.github+json' } });
   if (!r.ok) throw new Error(`GitHub: HTTP ${r.status}`);
@@ -153,7 +168,7 @@ export async function checkForUpdates(manual = false): Promise<void> {
   upd.checking = true;
   lastCheck = Date.now();
   try {
-    const { current, update: u } = ANDROID ? await androidCheck() : await desktopCheck();
+    const { current, update: u } = ANDROID ? await androidCheck() : IS_IOS_APP ? await releaseCheck(/^Draw_[\d.]+_ios\.ipa$/, 'ios') : await desktopCheck();
     if (!u) {
       if (manual) showToast(`Draw is up to date (v${current})`);
       return;
@@ -190,6 +205,20 @@ export function watchUpdates(): void {
   });
 }
 
+/** Opens a link in the browser: a Tauri app through its opener plugin (its web view opens no new windows). */
+async function openExternal(url: string): Promise<void> {
+  if (IS_TAURI) {
+    try {
+      const { openUrl } = await import('@tauri-apps/plugin-opener');
+      await openUrl(url);
+      return;
+    } catch (e) {
+      console.warn('open link', e);
+    }
+  }
+  window.open(url, '_blank', 'noopener');
+}
+
 /** Android: download events from AppUpdate.kt. */
 let androidWait: { resolve: () => void; reject: (e: Error) => void } | null = null;
 (window as unknown as { __drawUpdate?: (e: AndroidEvent) => void }).__drawUpdate = (e) => {
@@ -213,8 +242,8 @@ function androidInstall() {
 export async function startUpdate(): Promise<void> {
   const u = upd.update;
   if (!u || upd.phase === 'downloading') return;
-  if (u.how === 'manual') {
-    window.open(u.page, '_blank', 'noopener');
+  if (u.how === 'manual' || u.how === 'ios') {
+    void openExternal(u.page);
     upd.open = false;
     return;
   }

@@ -8,7 +8,7 @@
 mod pen;
 
 use std::{collections::HashSet, path::PathBuf, sync::Mutex};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 use tauri::Manager;
 
 #[derive(Default)]
@@ -108,6 +108,8 @@ pub fn run() {
         .manage(opened)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // Links out of the app (the release page of an update) open in the browser.
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![take_opened_files, read_opened_file])
         .setup(|app| {
             // Pen pressure from the native layer (see pen.rs).

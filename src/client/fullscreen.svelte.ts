@@ -2,9 +2,10 @@
 // - browsers and the Linux app (Electron): the Fullscreen API of the page;
 // - Windows and macOS (Tauri): the window's own full screen;
 // - Android: the app hides the status and navigation bars (window.DrawFullScreen, FullScreen.kt).
-// iPhone Safari has no full screen for a page: no button there.
+// iPhone Safari has no full screen for a page, and the iOS app always fills the screen: no
+// button there.
 
-import { IS_TAURI } from './config';
+import { IS_IOS, IS_TAURI } from './config';
 
 interface AndroidFullScreen {
   set(full: boolean): void;
@@ -13,12 +14,12 @@ interface AndroidFullScreen {
 const android = (window as unknown as { DrawFullScreen?: AndroidFullScreen }).DrawFullScreen ?? null;
 
 /** Tauri on a desktop (Android has its own bridge). */
-const tauriDesktop = IS_TAURI && !android;
+const tauriDesktop = IS_TAURI && !android && !IS_IOS;
 
 export const fullScreen = $state({ on: false });
 
 /** This platform can go full screen. */
-export const canFullScreen = !!android || tauriDesktop || !!document.fullscreenEnabled;
+export const canFullScreen = !!android || tauriDesktop || (!IS_TAURI && !!document.fullscreenEnabled);
 
 async function tauriWindow() {
   const { getCurrentWindow } = await import('@tauri-apps/api/window');

@@ -7,6 +7,7 @@
   ],
   "permissions": [
     "core:default",
+    "opener:allow-open-url",
     "core:window:allow-set-fullscreen",
     "core:window:allow-is-fullscreen",
     "dialog:allow-save",
