@@ -24,6 +24,8 @@
     depth: number;
     group: boolean;
     open: boolean;
+    /** The effects of a group, listed after its layers (they draw under them). */
+    fx?: boolean;
   }
 
   const tree = $derived(layerTree(ed.layers));
@@ -38,6 +40,7 @@
         const open = (group || n.layer.kind === 'shape') && !ed.collapsed.has(n.layer.id);
         out.push({ layer: n.layer, depth, group, open });
         if (open) walk(n.children, depth + 1);
+        if (group && n.layer.effects?.length) out.push({ layer: n.layer, depth, group: false, open: false, fx: true });
       }
     };
     walk(tree, 0);
@@ -225,7 +228,7 @@
     if (!target) return;
     if (d.where === 'into') {
       // At the top of the group.
-      const top = rows.find((r) => r.layer.parent === target.id && r.layer.id !== id);
+      const top = rows.find((r) => !r.fx && r.layer.parent === target.id && r.layer.id !== id);
       engine.moveTo(id, target.id, top?.layer.id ?? null, null);
       if (ed.collapsed.has(target.id)) toggleOpen(target.id);
       return;
@@ -258,8 +261,11 @@
   </div>
 
   <ul bind:this={list} class:dragging={!!dragId} onpointermove={dragMove} onpointerup={dragEnd} onpointercancel={dragEnd}>
-    {#each rows as row (row.layer.id)}
+    {#each rows as row (row.fx ? `${row.layer.id}:fx` : row.layer.id)}
       {@const layer = row.layer}
+      {#if row.fx}
+        {@render effectRows(layer, row.depth)}
+      {:else}
       {@const isActive = layer.id === ed.activeLayerId}
       <li
         data-id={layer.id}
@@ -358,24 +364,8 @@
           {/if}
         </span>
       </li>
-      {#if layer.effects?.length}
-        <!-- The layer's effects, as in Photoshop: an eye each; a click opens the settings. -->
-        {#each EFFECT_TYPES.filter((t) => layer.effects!.some((e) => e.type === t)) as t (t)}
-          {@const on = layer.effects.find((e) => e.type === t)!.enabled}
-          <li class="effect" class:off={!on} style:--depth={row.depth + 1} onpointerdown={() => engine?.setActiveLayer(layer.id)} ondblclick={() => openEffects(layer.id)}>
-            <button
-              class="icon eye"
-              title={on ? 'Turn the effect off' : 'Turn the effect on'}
-              disabled={!ed.canEdit || !ed.effectsOk}
-              onpointerdown={(e) => e.stopPropagation()}
-              onclick={() => toggleEffect(layer, t)}
-            >
-              <Icon name={on ? 'eye' : 'eyeoff'} />
-            </button>
-            <span class="name" role="button" tabindex="-1" title="Open the settings" onclick={() => openEffects(layer.id)} onkeydown={(e) => e.key === 'Enter' && openEffects(layer.id)}>{EFFECT_LABEL[t]}</span>
-          </li>
-        {/each}
-      {/if}
+      <!-- A layer's effects right under it; a group's after its layers (rows marked fx). -->
+      {#if layer.effects?.length && !row.group}{@render effectRows(layer, row.depth)}{/if}
       {#if layer.kind === 'shape' && row.open}
         {#each shapesBy.get(layer.id) ?? [] as sh (sh.id)}
           <li class="shape" class:active={ed.selection.includes(sh.id)} style:--depth={row.depth + 1} onpointerdown={(e) => pickShape(e, sh)}>
@@ -428,8 +418,30 @@
           {/if}
         {/each}
       {/if}
+      {/if}
     {/each}
   </ul>
+
+  <!-- A layer's effects, as in Photoshop: an eye each; a click opens the settings. -->
+  {#snippet effectRows(layer: Layer, depth: number)}
+    {#each EFFECT_TYPES.filter((t) => layer.effects?.some((e) => e.type === t)) as t (t)}
+      {@const on = !!layer.effects?.find((e) => e.type === t)?.enabled}
+      <li class="effect" class:off={!on} style:--depth={depth + 1} onpointerdown={() => engine?.setActiveLayer(layer.id)} ondblclick={() => openEffects(layer.id)}>
+        <button
+          class="icon eye"
+          title={on ? 'Turn the effect off' : 'Turn the effect on'}
+          disabled={!ed.canEdit || !ed.effectsOk}
+          onpointerdown={(e) => e.stopPropagation()}
+          onclick={() => toggleEffect(layer, t)}
+        >
+          <Icon name={on ? 'eye' : 'eyeoff'} />
+        </button>
+        <span class="name" role="button" tabindex="-1" title="Open the settings" onclick={() => openEffects(layer.id)} onkeydown={(e) => e.key === 'Enter' && openEffects(layer.id)}
+          >{EFFECT_LABEL[t]}{#if layer.kind === 'group'}<span class="of"> · {layer.name}</span>{/if}</span
+        >
+      </li>
+    {/each}
+  {/snippet}
 
   <!-- The bottom of the stack. None: alpha 0 (the color stays for when it comes back). -->
   <div class="paper" title="The paper under all layers. Below 100% opacity the screen shows a checkerboard, and exports on the paper keep the transparency.">
@@ -741,6 +753,9 @@
   }
   li.effect .name {
     cursor: pointer;
+  }
+  li.effect .of {
+    color: var(--text-faint);
   }
   li.effect.off .name {
     opacity: 0.5;
