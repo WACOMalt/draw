@@ -68,7 +68,7 @@ export class DocState {
         if (this.liveLayers() >= LIMITS.maxLayers) throw new OpError('too many layers');
         this.checkParent(op.layer.parent ?? null, op.layer.kind === 'group' ? 1 : 0);
         const { effects, ...layer } = op.layer;
-        if (effects?.length && !takesEffects(layer.kind)) throw new OpError('effects are for paint and shape layers');
+        if (effects?.length && !takesEffects(layer.kind)) throw new OpError('adjustment layers take no effects');
         this.layers.set(op.layer.id, { ...layer, ...(effects?.length ? { effects } : {}), deleted: false });
         return op;
       }
@@ -80,7 +80,7 @@ export class DocState {
           if (op.props.parent && subtreeIds(this.layers.values(), l.id).has(op.props.parent)) throw new OpError('a group cannot go into itself');
           this.checkParent(op.props.parent, subtreeHeight(this.layers.values(), l.id));
         }
-        if (op.props.effects && !takesEffects(l.kind)) throw new OpError('effects are for paint and shape layers');
+        if (op.props.effects && !takesEffects(l.kind)) throw new OpError('adjustment layers take no effects');
         Object.assign(l, op.props);
         if (l.parent === null) delete l.parent;
         if (!l.effects?.length) delete l.effects;

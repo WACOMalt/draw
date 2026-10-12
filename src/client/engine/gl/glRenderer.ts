@@ -1668,6 +1668,8 @@ export class GLRenderer implements Renderer {
     // The transform preview shows on screen only (an effect frame draws the tiles as they are).
     if (this.preview?.id === l.id && g.ns === '') return this.drawPreview(node, pair, g, atop, depth);
     if (l.kind !== 'group') return this.compositeLayer(l, pair, g, atop);
+    // A group with effects draws its layers together first (as if isolated), then the effects.
+    if (activeEffects(l).length) return this.blendOnto(this.groupPixels(node, g, depth), modeOf(l.blend), l.opacity, pair, atop);
     if (l.blend === 'pass' && !atop) {
       // Pass through: the group's layers blend straight onto what is below, as if not grouped.
       if (l.opacity >= 1) return this.compositeNodes(node.children, pair, g, depth + 1);
@@ -1695,12 +1697,29 @@ export class GLRenderer implements Renderer {
     return p.a;
   }
 
-  /** A layer's or group's own pixels, before its blend and opacity. */
+  /** A layer's or group's own pixels with its effects, before its blend and opacity. */
   private nodePixels(node: LayerNode, g: Grid, depth: number): Target {
-    if (node.layer.kind === 'group') return this.renderGroup(node, g, depth);
-    this.renderLayer(node.layer, g);
+    if (node.layer.kind === 'group') return this.groupPixels(node, g, depth);
+    return this.layerPixels(node.layer, g);
+  }
+
+  /** A layer's pixels (renderLayer) with its effects. */
+  private layerPixels(layer: Layer, g: Grid): Target {
+    this.renderLayer(layer, g);
+    const fx = activeEffects(layer);
+    if (!fx.length) return this.buf(g, 'layer');
+    return this.applyEffects(fx, g, this.buf(g, 'layer'), (fg) => {
+      this.renderLayer(layer, fg);
+      return this.buf(fg, 'layer');
+    });
+  }
+
+  /** An isolated group's pixels (renderGroup) with its effects. */
+  private groupPixels(node: LayerNode, g: Grid, depth: number): Target {
+    const own = this.renderGroup(node, g, depth);
     const fx = activeEffects(node.layer);
-    return fx.length ? this.applyEffects(node.layer, fx, g) : this.buf(g, 'layer');
+    if (!fx.length) return own;
+    return this.applyEffects(fx, g, own, (fg) => this.renderGroup(node, fg, depth));
   }
 
   // --- transform preview ----------------------------------------------------------------------
@@ -1817,11 +1836,7 @@ export class GLRenderer implements Renderer {
   /** Draws one layer onto `pair.a`. Returns the pair with the result in `a`. */
   private compositeLayer(layer: Layer, pair: Pair, g: Grid, atop: boolean): Pair {
     if (layer.kind === 'adjust') return this.applyAdjust(layer, pair, g);
-    const fx = activeEffects(layer);
-    if (fx.length) {
-      this.renderLayer(layer, g);
-      return this.blendOnto(this.applyEffects(layer, fx, g), layer.blend, layer.opacity, pair, atop);
-    }
+    if (activeEffects(layer).length) return this.blendOnto(this.layerPixels(layer, g), layer.blend, layer.opacity, pair, atop);
     const mode = BLEND_MODES.indexOf(modeOf(layer.blend));
     if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
       // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
@@ -2037,13 +2052,13 @@ export class GLRenderer implements Renderer {
   }
 
   /**
-   * A layer's effects onto its pixels (the frame's 'layer' buffer, from renderLayer). Each effect
-   * reads its own blurred source (the layer before effects; glows and the shadow with the blur of
-   * a blur effect added) and draws onto the result so far. Returns the result.
+   * Effects onto a layer's or group's own pixels (`own`, in frame g). `source` renders those
+   * pixels in another frame (an effect frame). Each effect reads its own blurred source (the
+   * pixels before effects; glows and the shadow with the blur of a blur effect added) and draws
+   * onto the result so far. Returns the result.
    */
-  private applyEffects(layer: Layer, fx: LayerEffect[], g: Grid): Target {
+  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target): Target {
     const gl = this.gl;
-    const own = this.buf(g, 'layer');
     let cur = own;
     let flip = false;
     for (const e of fx) {
@@ -2054,8 +2069,7 @@ export class GLRenderer implements Renderer {
       if (g.ns === '') {
         // Screen: from an effect frame, with the pixels around the view.
         const f = this.fxGrid(sigma, dx, dy);
-        this.renderLayer(layer, f.g);
-        src = this.gaussian(this.buf(f.g, 'layer'), f.sigma, `${f.g.ns}g`);
+        src = this.gaussian(source(f.g), f.sigma, `${f.g.ns}g`);
         // Frame position (0..1) → world → the source point (moved back by the offset) → its texture.
         const fg = f.g;
         map = [(g.w / g.s) * (fg.s / fg.w), (g.h / g.s) * (fg.s / fg.h), (g.wx - dx - fg.wx) * (fg.s / fg.w), (g.wy - dy - fg.wy) * (fg.s / fg.h)];

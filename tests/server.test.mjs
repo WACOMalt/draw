@@ -688,7 +688,11 @@ try {
     r = await tryOp({ type: 'layer.add', layer: { id: 'blurADJ0001', kind: 'adjust', name: 'Blur', order: 9, blend: 'normal', opacity: 1, visible: true, adjust: { type: 'blur', radius: 12 } } });
     check(r?.t === 'op', 'blur adjustment: add one');
     r = await tryOp({ type: 'layer.update', id: 'blurADJ0001', props: { effects: [{ type: 'blur', enabled: true, radius: 4 }] } });
-    check(r?.t === 'reject' && /paint and shape/.test(r.reason), 'effects: not on an adjustment layer');
+    check(r?.t === 'reject' && /adjustment/.test(r.reason), 'effects: not on an adjustment layer');
+    r = await tryOp({ type: 'layer.add', layer: { id: 'fxGROUP0001', kind: 'group', name: 'G', order: 10, blend: 'pass', opacity: 1, visible: true, effects: [shadow] } });
+    check(r?.t === 'op' && r.op.layer.effects?.length === 1, 'effects: on a group');
+    send({ type: 'layer.remove', id: 'fxGROUP0001' });
+    await echo((op) => op.type === 'layer.remove' && op.id === 'fxGROUP0001');
     r = await tryOp({ type: 'layer.update', id: 'blurADJ0001', props: { adjust: { type: 'blur', radius: -1 } } });
     check(r?.t === 'reject', 'blur adjustment: the radius is not negative');
     w2 = await first(await sb.join(sc));

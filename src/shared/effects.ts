@@ -2,8 +2,8 @@
 
 import type { Adjust, Affine, Layer, LayerEffect } from './types';
 
-/** Layers that can have effects: paint and shape layers. */
-export const takesEffects = (kind: Layer['kind']) => kind === undefined || kind === 'paint' || kind === 'shape';
+/** Layers that can have effects: paint and shape layers, and groups. */
+export const takesEffects = (kind: Layer['kind']) => kind === undefined || kind === 'paint' || kind === 'shape' || kind === 'group';
 
 /**
  * Effects after a layer transform: lengths scale by √|det m| (the average scale, as brush

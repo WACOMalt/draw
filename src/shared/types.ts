@@ -94,7 +94,7 @@ export const DEFAULT_ADJUST: Record<AdjustType, Adjust> = {
 };
 
 /**
- * Layer effects of a paint or shape layer, at most one of each type. They draw in a fixed order:
+ * Layer effects of a paint or shape layer or a group, at most one of each type. They draw in a fixed order:
  * blur changes the layer's pixels; drop shadow and outer glow go behind them, made from their
  * blurred alpha; inner glow goes on top, inside their alpha. All lengths are world units, so an
  * effect keeps its size on the canvas at any zoom.
@@ -153,7 +153,7 @@ export interface Layer {
   /** Clipped to the nearest layer below that is not clipped (the base of the clipping group). */
   clip?: boolean;
   mask?: LayerMask | null;
-  /** Layer effects (paint and shape layers). Absent: none. */
+  /** Layer effects (paint and shape layers, groups). Absent: none. */
   effects?: LayerEffect[];
 }
 

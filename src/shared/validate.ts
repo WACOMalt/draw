@@ -269,7 +269,7 @@ export function validateOp(v: unknown): Op {
       if (kind === 'adjust' && !props.adjust) fail('adjustment layer without adjust');
       if (props.blend === 'pass' && kind !== 'group') fail('pass through is for groups');
       if (props.effects !== undefined) {
-        if (props.effects && !takesEffects(kind)) fail('effects are for paint and shape layers');
+        if (props.effects && !takesEffects(kind)) fail('adjustment layers take no effects');
         if (!props.effects) delete props.effects;
       }
       return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };

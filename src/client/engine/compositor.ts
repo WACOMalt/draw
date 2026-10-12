@@ -592,6 +592,8 @@ export class Canvas2DRenderer implements Renderer {
     const l = node.layer;
     if (this.preview?.id === l.id) return this.drawPreview(dst, node, g, atop, depth);
     if (l.kind !== 'group') return this.drawLayerOnto(dst, l, g, atop);
+    // A group with effects draws its layers together first (as if isolated), then the effects.
+    if (activeEffects2d(l).length) return this.put(dst, this.nodePixels(node, g, depth), l.opacity, atop ? 'source-atop' : op(l.blend));
     if (l.blend === 'pass' && !atop) {
       if (l.opacity >= 1) return this.drawNodes(dst, node.children, g, depth + 1);
       const save = this.clearBuffer(`pass${depth}`);
@@ -610,10 +612,14 @@ export class Canvas2DRenderer implements Renderer {
   }
 
   private nodePixels(node: LayerNode, g: Grid, depth: number): OffscreenCanvas {
-    if (node.layer.kind === 'group') return this.renderGroup(node, g, depth);
+    if (node.layer.kind === 'group') {
+      const own = this.renderGroup(node, g, depth);
+      const gfx = activeEffects2d(node.layer);
+      return gfx.length ? this.applyEffects(gfx, own) : own;
+    }
     this.renderLayer(node.layer, g);
     const fx = activeEffects2d(node.layer);
-    return fx.length ? this.applyEffects(fx) : this.scratch;
+    return fx.length ? this.applyEffects(fx, this.scratch) : this.scratch;
   }
 
   private drawPreview(dst: Ctx, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
@@ -711,7 +717,7 @@ export class Canvas2DRenderer implements Renderer {
     const fx = activeEffects2d(layer);
     if (fx.length) {
       this.renderLayer(layer, g);
-      this.put(dst, this.applyEffects(fx), layer.opacity, atop ? 'source-atop' : op(layer.blend));
+      this.put(dst, this.applyEffects(fx, this.scratch), layer.opacity, atop ? 'source-atop' : op(layer.blend));
       return;
     }
     if (!atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
@@ -771,8 +777,8 @@ export class Canvas2DRenderer implements Renderer {
   // renderer, nothing off screen blurs in at the edges (a blur adjustment repeats the edge pixels
   // instead), and the spread of glows is left out.
 
-  /** A layer's effects onto its pixels in the scratch canvas. Returns the result buffer. */
-  private applyEffects(fx: LayerEffect[]): OffscreenCanvas {
+  /** Effects onto a layer's or group's pixels (`src`, screen-sized). Returns the result buffer. */
+  private applyEffects(fx: LayerEffect[], src: OffscreenCanvas): OffscreenCanvas {
     const ds = this.view.zoom * this.dpr;
     const blur = fx.find((e) => e.type === 'blur')?.radius ?? 0;
     const out = this.clearBuffer('fxOut');
@@ -781,7 +787,7 @@ export class Canvas2DRenderer implements Renderer {
       if (e.type !== 'dropShadow' && e.type !== 'outerGlow') continue;
       const t = this.clearBuffer('fxTmp');
       t.ctx.filter = `blur(${Math.hypot(e.radius, blur) * ds}px)`;
-      t.ctx.drawImage(this.scratch, (e.dx ?? 0) * ds, (e.dy ?? 0) * ds);
+      t.ctx.drawImage(src, (e.dx ?? 0) * ds, (e.dy ?? 0) * ds);
       t.ctx.filter = 'none';
       t.ctx.globalCompositeOperation = 'source-in';
       t.ctx.fillStyle = e.color ?? '#000000';
@@ -791,7 +797,7 @@ export class Canvas2DRenderer implements Renderer {
     // The layer, blurred or not, with its inner glow.
     const c = this.clearBuffer('fxContent');
     if (blur > 0) c.ctx.filter = `blur(${blur * ds}px)`;
-    c.ctx.drawImage(this.scratch, 0, 0);
+    c.ctx.drawImage(src, 0, 0);
     c.ctx.filter = 'none';
     const inner = fx.find((e) => e.type === 'innerGlow');
     if (inner) {
@@ -800,7 +806,7 @@ export class Canvas2DRenderer implements Renderer {
       t.ctx.fillStyle = inner.color ?? '#000000';
       t.ctx.fillRect(0, 0, t.canvas.width, t.canvas.height);
       t.ctx.globalCompositeOperation = 'destination-out';
-      t.ctx.drawImage(this.scratch, 0, 0);
+      t.ctx.drawImage(src, 0, 0);
       const b = this.clearBuffer('fxTmp2');
       b.ctx.filter = `blur(${Math.hypot(inner.radius, blur) * ds}px)`;
       b.ctx.drawImage(t.canvas, 0, 0);

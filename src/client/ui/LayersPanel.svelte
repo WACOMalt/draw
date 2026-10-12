@@ -500,7 +500,7 @@
           ? fxShown
             ? 'Close the layer effects'
             : 'Layer effects: blur, drop shadow, glows (or double-click the layer)'
-          : 'Layer effects are for paint and shape layers'}
+          : 'Adjustment layers take no effects'}
       class:on={fxShown}
       disabled={!canFx}
       onclick={() => active && openEffects(active.id, true)}>fx</button
