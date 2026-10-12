@@ -8,7 +8,7 @@
   import { OP_LABEL, partId } from '../../shared/compound';
   import { layerTree, subtreeIds, type LayerNode } from '../../shared/layers';
   import { Engine } from '../engine/engine';
-  import { ed } from '../state.svelte';
+  import { ed, showToast } from '../state.svelte';
   import AdjustPanel from './AdjustPanel.svelte';
   import { takesEffects } from '../../shared/effects';
   import Icon from './Icon.svelte';
@@ -47,11 +47,12 @@
 
   let editing = $state<string | null>(null);
   let adjustMenu = $state(false);
-  const canFx = $derived(!!active && takesEffects(active.kind));
+  const canFx = $derived(!!active && takesEffects(active.kind) && ed.effectsOk);
   const fxShown = $derived(!!active && ed.effectsLayer === active.id);
   const EFFECT_LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow' };
   /** Opens the effects window of a layer (or closes it when it is open). */
   function openEffects(id: string, toggle = false) {
+    if (!ed.effectsOk) return showToast('Layer effects need a newer server. Canvases on this device have them.');
     ed.effectsLayer = toggle && ed.effectsLayer === id ? null : id;
   }
   /** An effect's eye in the list: on or off, its settings kept. */
@@ -277,7 +278,7 @@
         }}
         ondblclick={(e) => {
           // As in Photoshop: a double-click on the row (not on the name, which renames) opens the effects.
-          if ((e.target as Element).closest('.txt, input, button') || !takesEffects(layer.kind)) return;
+          if ((e.target as Element).closest('.txt, input, button') || !takesEffects(layer.kind) || !ed.effectsOk) return;
           openEffects(layer.id);
         }}
       >
@@ -365,7 +366,7 @@
             <button
               class="icon eye"
               title={on ? 'Turn the effect off' : 'Turn the effect on'}
-              disabled={!ed.canEdit}
+              disabled={!ed.canEdit || !ed.effectsOk}
               onpointerdown={(e) => e.stopPropagation()}
               onclick={() => toggleEffect(layer, t)}
             >
@@ -473,6 +474,8 @@
           {#each ADJUST_TYPES as t}
             <button
               role="menuitem"
+              disabled={t === 'blur' && !ed.effectsOk}
+              title={t === 'blur' && !ed.effectsOk ? 'Needs a newer server. Canvases on this device have it.' : undefined}
               onclick={() => {
                 adjustMenu = false;
                 engine?.addAdjustmentLayer(t);
@@ -491,7 +494,13 @@
     {/if}
     <button
       class="icon fxbtn"
-      title={canFx ? (fxShown ? 'Close the layer effects' : 'Layer effects: blur, drop shadow, glows (or double-click the layer)') : 'Layer effects are for paint and shape layers'}
+      title={!ed.effectsOk
+        ? 'Layer effects need a newer server. Canvases on this device have them.'
+        : canFx
+          ? fxShown
+            ? 'Close the layer effects'
+            : 'Layer effects: blur, drop shadow, glows (or double-click the layer)'
+          : 'Layer effects are for paint and shape layers'}
       class:on={fxShown}
       disabled={!canFx}
       onclick={() => active && openEffects(active.id, true)}>fx</button

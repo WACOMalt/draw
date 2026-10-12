@@ -17,7 +17,7 @@
   const close = () => (ed.effectsLayer = null);
 
   $effect(() => {
-    if (!layer || !takesEffects(layer.kind)) close();
+    if (!layer || !takesEffects(layer.kind) || !ed.effectsOk) close();
   });
 
   onMount(() => {

@@ -1945,6 +1945,8 @@ export class Engine {
         ed.denied = null;
         if (m.grant) grants.set(this.code, m.grant);
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
+        // A server from before effects sends no list: it refuses effects and blur layers.
+        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur');
         this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);

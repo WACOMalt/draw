@@ -268,6 +268,12 @@ class EditorState {
   exportPicking = $state(false);
   /** The layer whose effects window is open, or null. */
   effectsLayer = $state<string | null>(null);
+  /** Features the server accepts (welcome.supports). */
+  serverSupports = $state<readonly string[]>([]);
+  /** The server takes layer effects and blur adjustment layers. */
+  get effectsOk(): boolean {
+    return this.serverSupports.includes('effects');
+  }
   /** App settings on this device (SettingsDialog). */
   settingsOpen = $state(false);
   /** The layer or group being transformed (free transform: the overlay shows its handles). */

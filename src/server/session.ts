@@ -1,6 +1,6 @@
 import type { WebSocket } from 'ws';
 import { newId } from '../shared/ids';
-import { LIMITS, PREVIEW_LIMITS, type AppliedOp, type ClientMsg, type Op, type Peer, type ServerMsg } from '../shared/types';
+import { DOC_FEATURES, LIMITS, PREVIEW_LIMITS, type AppliedOp, type ClientMsg, type Op, type Peer, type ServerMsg } from '../shared/types';
 import { ValidationError, validateBrush, validateColor, validateId, validateNumber, validateOp, validatePoints, validateShapeInput, validateString } from '../shared/validate';
 import { docFeatures } from '../shared/features';
 import { DocState, OpError, importOps } from '../shared/docState';
@@ -302,6 +302,7 @@ export class Session {
         canvas: this.info(client),
         grant: access.grant,
         features: docFeatures(this.doc.layers.values(), this.doc.strokes.values(), this.doc.shapes.values(), this.doc.paper),
+        supports: [...DOC_FEATURES],
         previewSeq: this.store.previewInfo(this.code)?.seq ?? null,
       });
       if (!client.embed) this.broadcast({ t: 'peer.join', peer: client.peer }, client);

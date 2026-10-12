@@ -491,6 +491,12 @@ export type ServerMsg =
       grant?: string;
       /** Features the document uses. A client that does not know one asks for an update. */
       features?: string[];
+      /**
+       * Features the server accepts (DOC_FEATURES of its version). Absent: a server from before
+       * effects; the client then keeps the controls of newer features off, so an app newer than
+       * its server does not offer changes the server refuses.
+       */
+      supports?: string[];
       /** Seq that the stored link preview shows; null: none yet. Editors send a newer one. */
       previewSeq?: number | null;
     }
