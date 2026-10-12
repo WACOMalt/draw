@@ -289,6 +289,13 @@ try {
   const roundTrip = { format: 'bdraw', version: 1, app: 'test', savedAt: '', layers: iw.layers, strokes: iw.strokes };
   const anonImp = await new Browser().upload(Buffer.from(JSON.stringify(roundTrip)), {});
   check(anonImp.status === 201 && /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(anonImp.data.key) && anonImp.data.strokes === 2 && anonImp.data.skipped === 0, 'plain JSON file imports as a temporary canvas (round trip)');
+  // Version 8: the paper (color and alpha). A bad paper is left out; the drawing still imports.
+  const paperImp = await new Browser().upload(Buffer.from(JSON.stringify({ ...roundTrip, version: 8, paper: { color: '#203040', alpha: 0.25 } })), {});
+  const paperW = await first(await new Browser().join(paperImp.data.key));
+  check(paperImp.status === 201 && paperW.paper?.color === '#203040' && paperW.paper.alpha === 0.25 && paperW.features.includes('paper'), 'a .bdraw v8 imports its paper; welcome lists the paper feature');
+  const badPaper = await new Browser().upload(Buffer.from(JSON.stringify({ ...roundTrip, version: 8, paper: { color: 'blue', alpha: 2 } })), {});
+  const badW = await first(await new Browser().join(badPaper.data.key));
+  check(badPaper.status === 201 && badW.paper?.color === '#ffffff' && badW.paper.alpha === 1 && !badW.features.includes('paper') && badW.strokes.length === 2, 'a bad paper in a file is left out');
   check((await new Browser().upload(gz, { name: 'nope-name' })).status === 401, 'named import needs an account');
   check((await funky.upload(Buffer.from('not a drawing'), {})).data?.error === 'bad_file', 'a file that is not .bdraw is refused');
   check((await funky.upload(Buffer.from(JSON.stringify({ ...bfile, version: 99 })), {})).data?.error === 'file_too_new', 'a file from a newer version is refused');
@@ -621,6 +628,24 @@ try {
     r = await tryOp({ type: 'shape.add', shape: { ...rect('shapeLINE01'), kind: 'line', line: [0, 0, 100, 50], fill: '#ff0000', align: 'outside' } });
     check(r?.t === 'op' && r.op.shape.fill === null && r.op.shape.align === 'center' && r.op.shape.radii === undefined, 'shapes: a line has no fill, a center stroke, and no settings of other kinds');
 
+    // Opacity of the fill and the stroke: 0 to 1, opaque is left out (older apps open it).
+    r = await tryOp({ type: 'shape.add', shape: rect('shapeALPHA1', { fillOpacity: 0.4, strokeOpacity: 1, stroke: '#000000' }) });
+    check(r?.t === 'op' && r.op.shape.fillOpacity === 0.4 && r.op.shape.strokeOpacity === undefined, 'shape opacity: a see-through fill is kept, an opaque stroke is left out');
+    r = await tryOp({ type: 'shape.add', shape: rect('shapeALPHA2', { fillOpacity: 1.5 }) });
+    check(r?.t === 'reject', 'shape opacity: above 1 is refused');
+    r = await tryOp({ type: 'shape.add', shape: { ...rect('shapeALPHA3'), kind: 'line', line: [0, 0, 9, 9], stroke: '#000000', fillOpacity: 0.5, strokeOpacity: 0.5 } });
+    check(r?.t === 'op' && r.op.shape.fillOpacity === undefined && r.op.shape.strokeOpacity === 0.5, 'shape opacity: a line has a stroke opacity only');
+    r = await tryOp({ type: 'shape.update', id: 'shapeALPHA1', props: { strokeOpacity: 0.3 } });
+    check(r?.t === 'op', 'shape opacity: update the stroke opacity');
+
+    // The paper: synced, validated, in the welcome.
+    r = await tryOp({ type: 'paper.set', paper: { color: '#ff8800', alpha: 0.5 } });
+    check(r?.t === 'op' && r.op.paper.color === '#ff8800' && r.op.paper.alpha === 0.5, 'paper: set the color and alpha');
+    r = await tryOp({ type: 'paper.set', paper: { color: '#ff8800', alpha: -1 } });
+    check(r?.t === 'reject', 'paper: alpha below 0 is refused');
+    r = await tryOp({ type: 'paper.set', paper: { color: 'orange', alpha: 1 } });
+    check(r?.t === 'reject', 'paper: colors are #rrggbb');
+
     // Partial updates: the result must still be a valid shape of its kind.
     r = await tryOp({ type: 'shape.update', id: 'shapeRECT01', props: { fill: null, stroke: '#112233', radii: [0, 8, 0, 8], sides: 7 } });
     check(r?.t === 'op', 'shapes: update some props');
@@ -632,6 +657,12 @@ try {
     let sh = w2.shapes.find((x) => x.id === 'shapeRECT01');
     check(sh?.fill === null && sh.stroke === '#112233' && sh.radii.join() === '0,8,0,8' && sh.sides === undefined && sh.w === 100, 'shapes: updates persist; settings of other kinds are dropped');
     check(w2.features.includes('shapes'), 'shapes: welcome lists the shapes feature');
+    check(w2.features.includes('shapeAlpha') && w2.shapes.find((x) => x.id === 'shapeALPHA1')?.strokeOpacity === 0.3, 'shape opacity: persists; welcome lists the shapeAlpha feature');
+    check(w2.paper?.color === '#ff8800' && w2.paper.alpha === 0.5 && w2.features.includes('paper'), 'paper: persists; welcome lists the paper feature');
+    for (const id of ['shapeALPHA1', 'shapeALPHA3']) {
+      send({ type: 'shape.remove', id });
+      await echo((op) => op.type === 'shape.remove' && op.id === id);
+    }
 
     // Remove and restore (undo): the restore carries the whole shape for late joiners.
     send({ type: 'shape.remove', id: 'shapeRECT01' });

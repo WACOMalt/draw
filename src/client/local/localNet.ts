@@ -103,10 +103,11 @@ export class LocalNet {
           layers: [...this.doc.layers.values()],
           strokes: [...this.doc.strokes.values()].filter((s) => !s.deleted),
           shapes: [...this.doc.shapes.values()].filter((s) => !s.deleted),
+          paper: this.doc.paper,
           peers: [],
           role: 'editor',
           canvas: { key: this.id, owned: false, ownerName: null, expiresAt: null, canClaim: false, local: true },
-          features: docFeatures(this.doc.layers.values(), this.doc.strokes.values(), this.doc.shapes.values()),
+          features: docFeatures(this.doc.layers.values(), this.doc.strokes.values(), this.doc.shapes.values(), this.doc.paper),
           previewSeq: null,
         });
       case 'op': {

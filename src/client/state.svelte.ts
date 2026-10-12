@@ -1,7 +1,7 @@
 // Reactive editor state shared by the Svelte UI and the engine.
 
 import { DEFAULT_BRUSH } from '../shared/brush';
-import type { ArrowKind, Brush, CanvasInfo, CustomShape, DeniedReason, Layer, LineCap, Role, Shape, ShapeKind, StrokeAlign } from '../shared/types';
+import { DEFAULT_PAPER, type ArrowKind, type Brush, type CanvasInfo, type CustomShape, type DeniedReason, type Layer, type LineCap, type Paper, type Role, type Shape, type ShapeKind, type StrokeAlign } from '../shared/types';
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
@@ -18,8 +18,8 @@ export type Tool = 'brush' | 'eraser' | 'strokeEraser' | 'eyedropper' | 'select'
  * The style of new Pen paths (lengths in screen pixels, as ShapeStyle), their curve, and the
  * smoothness of new spline points (-1 through, 0 corner, 1 soft).
  */
-export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'strokeWidth' | 'align' | 'cap' | 'dash' | 'arrows'> & { curve: 'bezier' | 'spline'; smooth: number };
-const PEN_STYLE: PenStyle = { fill: null, stroke: '#1d3557', strokeWidth: 3, align: 'center', cap: 'round', dash: [], arrows: ['none', 'none'], curve: 'bezier', smooth: 0.5 };
+export type PenStyle = Pick<ShapeStyle, 'fill' | 'stroke' | 'fillOpacity' | 'strokeOpacity' | 'strokeWidth' | 'align' | 'cap' | 'dash' | 'arrows'> & { curve: 'bezier' | 'spline'; smooth: number };
+const PEN_STYLE: PenStyle = { fill: null, stroke: '#1d3557', fillOpacity: 1, strokeOpacity: 1, strokeWidth: 3, align: 'center', cap: 'round', dash: [], arrows: ['none', 'none'], curve: 'bezier', smooth: 0.5 };
 
 /** The kinds the Shapes tool draws (paths come from the Pen, compounds from Combine). */
 export const DRAW_KINDS = ['rect', 'ellipse', 'polygon', 'star', 'line', 'custom'] as const satisfies readonly ShapeKind[];
@@ -32,6 +32,9 @@ export type DrawKind = (typeof DRAW_KINDS)[number];
 export interface ShapeStyle {
   fill: string | null;
   stroke: string | null;
+  /** 0 to 1. */
+  fillOpacity: number;
+  strokeOpacity: number;
   strokeWidth: number;
   align: StrokeAlign;
   cap: LineCap;
@@ -135,6 +138,8 @@ const { tool: _t, color: _c, ...brushDefaults } = DEFAULT_BRUSH;
 const SHAPE_STYLE: ShapeStyle = {
   fill: '#7c3aed',
   stroke: null,
+  fillOpacity: 1,
+  strokeOpacity: 1,
   strokeWidth: 4,
   align: 'inside',
   cap: 'round',
@@ -178,6 +183,11 @@ class EditorState {
   brush = $state<BrushSettings>({ ...brushDefaults, ...prefs.brush });
   eraser = $state<BrushSettings>({ ...brushDefaults, ...prefs.eraser });
   smoothing = $state(prefs.smoothing);
+  /**
+   * Brush size pinned to the canvas: the size in world units (null: not pinned). While pinned,
+   * the size in screen pixels follows the zoom (a zoom in makes the brush bigger on screen).
+   */
+  sizePin = $state<{ brush: number | null; eraser: number | null }>({ brush: null, eraser: null });
   showMarkers = $state(prefs.showMarkers);
   /** Finger strokes take their pressure from the contact size (where the browser reports it). */
   touchPressure = $state(prefs.touchPressure);
@@ -211,6 +221,8 @@ class EditorState {
   overlay = $state<SelectOverlay | null>(null);
 
   layers = $state<Layer[]>([]); // bottom to top
+  /** The canvas paper (color and alpha), with pending changes. */
+  paper = $state<Paper>({ ...DEFAULT_PAPER });
   activeLayerId = $state<string | null>(null);
   peers = $state<PeerView[]>([]);
   clientId = $state<string | null>(null);
@@ -260,6 +272,11 @@ class EditorState {
   /** Settings of the tool that paints now (brush or eraser). */
   get activeBrush(): BrushSettings {
     return this.tool === 'eraser' ? this.eraser : this.brush;
+  }
+
+  /** Which brush the options show and the size pin applies to. */
+  get activeBrushKey(): 'brush' | 'eraser' {
+    return this.tool === 'eraser' ? 'eraser' : 'brush';
   }
 
   persist(): void {

@@ -5,7 +5,7 @@
   // off screen and stream to the file, so the size is limited by the format and the disk, not
   // by memory. The settings are kept for next time.
   import type { Engine } from '../engine/engine';
-  import { exportImage, rawSize, type ImageFormat } from '../export/exportImage';
+  import { exportImage, hasAlpha, rawSize, type ImageFormat } from '../export/exportImage';
   import { toAspect } from '../export/region';
   import { PNG_MAX_SIDE } from '../export/png';
   import { MEMORY_LIMIT, NotSavedError, openSink, sinkKind } from '../export/sink';
@@ -118,8 +118,10 @@
   const height = $derived(Math.max(1, Math.round(width / ratio)));
   /** The same size as a multiple of the screen's resolution (1× = what the screen shows now). */
   const screens = $derived(width / ((bounds.x1 - bounds.x0) * density));
-  const raw = $derived(rawSize(width, height, transparent));
-  const big = $derived(format === 'tiff' && needsBigTiff(width, height, transparent));
+  /** The file keeps an alpha channel: no paper, or a see-through paper. */
+  const alpha = $derived(hasAlpha(transparent, ed.paper));
+  const raw = $derived(rawSize(width, height, alpha));
+  const big = $derived(format === 'tiff' && needsBigTiff(width, height, alpha));
 
   /** Why this export cannot run, or null. */
   const problem = $derived.by(() => {
@@ -249,7 +251,7 @@
   <div class="field">
     <span class="label">Background</span>
     <div class="seg">
-      <button class:on={!transparent} disabled={running} onclick={() => (transparent = false)}>Paper</button>
+      <button class:on={!transparent} disabled={running} title={ed.paper.alpha < 1 ? 'On the paper: the file keeps the transparency of the see-through paper' : 'On the paper'} onclick={() => (transparent = false)}>Paper</button>
       <button class:on={transparent} disabled={running} title="Only the drawing: the paper is left out, the file keeps transparency" onclick={() => (transparent = true)}>Transparent</button>
     </div>
   </div>

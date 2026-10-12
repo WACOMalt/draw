@@ -1,7 +1,7 @@
 // The large image export: a world rectangle at a chosen pixel size, rendered in pieces by an
 // off-screen renderer and streamed into a PNG or a tiled (Big)TIFF file.
 
-import type { Layer, Shape, Stroke } from '../../shared/types';
+import type { Layer, Paper, Shape, Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { PngWriter } from './png';
 import { PIECE, RegionRenderer } from './region';
@@ -21,6 +21,8 @@ export interface ExportJob {
   format: ImageFormat;
   /** No paper: the file keeps an alpha channel (RGBA PNG, or TIFF with unassociated alpha). */
   transparent: boolean;
+  /** The canvas paper. A see-through paper also gives the file an alpha channel. */
+  paper: Paper;
   sink: Sink;
   /** done: 0..1; piece: pieces rendered so far, of `pieces`. */
   onProgress: (done: number, piece: number, pieces: number) => void;
@@ -35,16 +37,20 @@ const STRIP = 256;
 /** Lets the page paint (progress bar, cancel button) between pieces. */
 const breathe = () => new Promise((r) => setTimeout(r, 0));
 
+/** The file keeps an alpha channel: no paper, or a see-through paper. */
+export const hasAlpha = (transparent: boolean, paper: Paper) => transparent || paper.alpha < 1;
+
 export async function exportImage(job: ExportJob): Promise<void> {
   const { bounds, width, height, sink, signal } = job;
   const scale = width / (bounds.x1 - bounds.x0);
-  const rr = new RegionRenderer(job.layers, job.strokes, job.seq, job.shapes, job.transparent);
+  const rr = new RegionRenderer(job.layers, job.strokes, job.seq, job.shapes, job.transparent, job.paper);
+  const alpha = hasAlpha(job.transparent, job.paper);
   const at = (px: number, py: number): [number, number] => [bounds.x0 + px / scale, bounds.y0 + py / scale];
   let piece = 0;
   try {
     if (job.format === 'png') {
       const pieces = Math.ceil(height / STRIP) * Math.ceil(width / PIECE);
-      const png = new PngWriter(sink, width, height, job.transparent);
+      const png = new PngWriter(sink, width, height, alpha);
       await png.begin();
       const strip = new Uint8ClampedArray(width * STRIP * 4);
       for (let y = 0; y < height; y += STRIP) {
@@ -63,7 +69,7 @@ export async function exportImage(job: ExportJob): Promise<void> {
       await png.end();
     } else {
       const pieces = Math.ceil(height / PIECE) * Math.ceil(width / PIECE);
-      const tiff = new TiffWriter(sink, width, height, job.transparent);
+      const tiff = new TiffWriter(sink, width, height, alpha);
       await tiff.begin();
       // Pieces are whole tiles (PIECE is a multiple of TIFF_TILE).
       for (let y = 0; y < height; y += PIECE) {

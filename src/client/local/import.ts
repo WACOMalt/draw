@@ -40,11 +40,18 @@ export async function createLocalFromFile(name: string, blob: Blob): Promise<{ i
   const c = await createLocal(name);
   const doc = new DocState();
   const ops: StoredOp[] = [];
-  const n = importOps(doc, file.layers, file.strokes, file.shapes ?? [], (op, by) => {
-    const seq = ops.length + 1;
-    const applied = doc.apply(op, by, seq);
-    ops.push({ canvas: c.id, seq, by, op: applied });
-  });
+  const n = importOps(
+    doc,
+    file.layers,
+    file.strokes,
+    file.shapes ?? [],
+    (op, by) => {
+      const seq = ops.length + 1;
+      const applied = doc.apply(op, by, seq);
+      ops.push({ canvas: c.id, seq, by, op: applied });
+    },
+    file.paper,
+  );
   try {
     await appendOps(c.id, ops);
   } catch (e) {

@@ -3,7 +3,7 @@
 // .bdraw preview, and the link preview image.
 
 import { FULL_PROFILE } from '../engine/perf';
-import type { Layer, Shape, Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, type Layer, type Paper, type Shape, type Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { GLRenderer } from '../engine/gl/glRenderer';
 
@@ -16,21 +16,24 @@ export class RegionRenderer {
   private w = 0;
   private h = 0;
 
-  /**
-   * Throws when WebGL2 is not available. `transparent`: no paper; the pixels keep their alpha
-   * (straight, not premultiplied).
-   */
+  /** The pixels keep their alpha (straight, not premultiplied): no paper, or a see-through one. */
+  private alpha: boolean;
+
+  /** Throws when WebGL2 is not available. `transparent`: no paper. */
   constructor(
     layers: Layer[],
     strokes: Stroke[],
     seq: number,
     shapes: Shape[] = [],
-    private transparent = false,
+    transparent = false,
+    paper: Paper = DEFAULT_PAPER,
   ) {
+    this.alpha = transparent || paper.alpha < 1;
     const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false });
     if (!gl) throw new Error('WebGL2 is not available');
     this.r = new GLRenderer(this.canvas, gl, true, FULL_PROFILE);
     this.r.transparent = transparent;
+    this.r.setPaper(paper);
     this.r.setLayers(layers);
     this.r.resetStrokes(strokes, seq);
     this.r.resetShapes(shapes);
@@ -48,7 +51,7 @@ export class RegionRenderer {
     }
     this.r.setView(x, y, scale);
     this.r.renderSync();
-    const px = this.r.readRGBA(this.transparent);
+    const px = this.r.readRGBA(this.alpha);
     if (!px) throw new Error('The graphics context was lost');
     return px;
   }
@@ -58,14 +61,30 @@ export class RegionRenderer {
   }
 }
 
-/** A PNG of `b` fitted into at most maxW × maxH pixels (aspect kept), on the paper color. */
-export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number, shapes: Shape[] = []): Promise<Blob | null> {
+/**
+ * The paper for a preview image: opaque, a see-through paper shown over white. `p` can come from
+ * a file: anything that is not a paper gives the default paper.
+ */
+export function flatPaper(p: unknown): Paper {
+  const q = p as Partial<Paper> | null | undefined;
+  if (typeof q?.color !== 'string' || !/^#[0-9a-f]{6}$/i.test(q.color) || typeof q.alpha !== 'number' || !(q.alpha >= 0 && q.alpha <= 1)) return DEFAULT_PAPER;
+  const n = parseInt(q.color.slice(1), 16), a = q.alpha;
+  const mix = (c: number) => Math.round(255 - (255 - c) * a);
+  const hex = [mix((n >> 16) & 255), mix((n >> 8) & 255), mix(n & 255)].map((c) => c.toString(16).padStart(2, '0')).join('');
+  return { color: '#' + hex, alpha: 1 };
+}
+
+/**
+ * A PNG of `b` fitted into at most maxW × maxH pixels (aspect kept), on the paper (see flatPaper:
+ * link previews and thumbnails are opaque).
+ */
+export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number, shapes: Shape[] = [], paper?: unknown): Promise<Blob | null> {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
   if (!(bw > 0 && bh > 0)) return null;
   const scale = Math.min(maxW / bw, maxH / bh);
   const w = Math.max(1, Math.min(PIECE, Math.round(bw * scale)));
   const h = Math.max(1, Math.min(PIECE, Math.round(bh * scale)));
-  const rr = new RegionRenderer(layers, strokes, seq, shapes);
+  const rr = new RegionRenderer(layers, strokes, seq, shapes, false, flatPaper(paper));
   try {
     const px = rr.render(b.x0, b.y0, scale, w, h);
     const c = new OffscreenCanvas(w, h);

@@ -3,7 +3,7 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, lowFlow, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Shape, type Stroke } from '../../../shared/types';
+import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
 import { byZ } from '../../../shared/shapes';
 import { compose, effectivelyVisible, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
@@ -176,9 +176,12 @@ export class GLRenderer implements Renderer {
   readonly kind = 'webgl2';
   precision: 8 | 16 = 8;
   readonly view: ViewState = { x: 0, y: 0, zoom: 1 };
-  paper = '#ffffff';
+  /** The bottom of the stack. Where its alpha is below 1, the screen shows a checkerboard. */
+  private paper: Paper = { ...DEFAULT_PAPER };
   /** Exports with a transparent background: the stack starts empty instead of with the paper. */
   transparent = false;
+  /** One frame for the eyedropper: no paper, no present. */
+  private pickPass = false;
 
   private progs!: Programs;
   private quadVbo!: WebGLBuffer;
@@ -533,7 +536,6 @@ export class GLRenderer implements Renderer {
     }
   }
 
-  /** The composited view as 8-bit RGBA, top row first (alpha is always 255). */
   /**
    * The composite as 8-bit RGBA, top row first. `alpha`: keep the alpha channel (a transparent
    * export), with the colors un-premultiplied; otherwise the pixels are opaque.
@@ -550,7 +552,14 @@ export class GLRenderer implements Renderer {
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
     this.freeTarget(out);
     if (!alpha) {
-      for (let i = 3; i < px.length; i += 4) px[i] = 255;
+      // Opaque: over white where the paper is see-through (the colors are premultiplied).
+      for (let i = 0; i < px.length; i += 4) {
+        const k = 255 - px[i + 3];
+        px[i] += k;
+        px[i + 1] += k;
+        px[i + 2] += k;
+        px[i + 3] = 255;
+      }
       return px;
     }
     for (let i = 0; i < px.length; i += 4) {
@@ -1527,15 +1536,17 @@ export class GLRenderer implements Renderer {
     if (this.hot.size || this.drafts.size) this.updateHot(grid);
     let main: Pair = { a: this.compA, b: this.compB };
     this.bindTarget(main.a);
-    const [pr, pg, pb] = hexToRgb(this.paper);
-    if (this.transparent) this.clear(0, 0, 0, 0);
-    else this.clear(pr, pg, pb, 1);
+    // The paper, premultiplied (the buffers hold premultiplied color).
+    const [pr, pg, pb] = hexToRgb(this.paper.color);
+    const pa = this.transparent || this.pickPass ? 0 : this.paper.alpha;
+    this.clear(pr * pa, pg * pa, pb * pa, pa);
     main = this.compositeNodes(this.tree, main, grid, 0);
     this.compA = main.a;
     this.compB = main.b;
     this.settlePreview(grid);
 
     // 4. Present with dither.
+    if (this.pickPass) return;
     this.bindTarget(null);
     gl.disable(gl.BLEND);
     const p = this.progs.present;
@@ -1544,6 +1555,7 @@ export class GLRenderer implements Renderer {
     gl.bindTexture(gl.TEXTURE_2D, this.compA.tex);
     gl.uniform1i(p.u.uTex, 0);
     gl.uniform1f(p.u.uDither, this.precision === 16 ? 1 : 0);
+    gl.uniform1f(p.u.uCell, Math.max(1, Math.round(8 * this.dpr)));
     this.quad(p, null, [0, 0, this.canvas.width, this.canvas.height]);
 
     gl.flush();
@@ -1964,9 +1976,25 @@ export class GLRenderer implements Renderer {
 
   // --- readback ------------------------------------------------------------------------------------
 
-  sample(cssX: number, cssY: number): string {
-    if (this.lost) return '#ffffff';
+  setPaper(p: Paper): void {
+    if (p.color === this.paper.color && p.alpha === this.paper.alpha) return;
+    this.paper = { ...p };
+    this.invalidate();
+  }
+
+  /**
+   * The color of the drawing under a CSS-pixel position, without the paper: a frame composited
+   * on an empty stack, un-premultiplied. Null where nothing is drawn.
+   */
+  sample(cssX: number, cssY: number): string | null {
+    if (this.lost) return null;
     const gl = this.gl;
+    this.pickPass = true;
+    try {
+      this.renderNow();
+    } finally {
+      this.pickPass = false;
+    }
     const x = Math.max(0, Math.min(this.compA.w - 1, Math.floor(cssX * this.dpr)));
     const y = Math.max(0, Math.min(this.compA.h - 1, Math.floor(cssY * this.dpr)));
     this.bindTarget(this.pickT);
@@ -1975,7 +2003,11 @@ export class GLRenderer implements Renderer {
     this.copy(this.compA.tex, this.pickT, [0, 0, 1, 1], 1, [u, v, u, v]);
     const px = new Uint8Array(4);
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    return '#' + [px[0], px[1], px[2]].map((c) => c.toString(16).padStart(2, '0')).join('');
+    // The screen again, with the paper.
+    this.renderNow();
+    const a = px[3];
+    if (a === 0) return null;
+    return '#' + [px[0], px[1], px[2]].map((c) => Math.min(255, Math.round((c * 255) / a)).toString(16).padStart(2, '0')).join('');
   }
 
   async exportPng(): Promise<Blob | null> {

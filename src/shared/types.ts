@@ -277,6 +277,10 @@ export interface ShapeProps {
   fill: string | null;
   /** #rrggbb, or null: no stroke. */
   stroke: string | null;
+  /** Fill opacity, 0 to 1 (absent: 1, opaque). */
+  fillOpacity?: number;
+  /** Stroke opacity, 0 to 1 (absent: 1, opaque). */
+  strokeOpacity?: number;
   strokeWidth: number;
   /** Lines and paths with an open contour always stroke on the center. */
   align: StrokeAlign;
@@ -304,7 +308,17 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows'] as const;
+/** The paper under all layers of a canvas. */
+export interface Paper {
+  /** #rrggbb */
+  color: string;
+  /** 0 to 1: 0 is transparent (a checkerboard on screen), 1 opaque. */
+  alpha: number;
+}
+export const DEFAULT_PAPER: Paper = { color: '#ffffff', alpha: 1 };
+export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p.alpha >= 1;
+
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -343,7 +357,9 @@ export type Op =
    */
   | { type: 'shapes.toPaint'; key: string; ids: string[]; layerId: string }
   /** The undo of shapes.toPaint (same key, ids, layerId): the strokes go, the shapes come back. */
-  | { type: 'shapes.fromPaint'; key: string; ids: string[]; layerId: string };
+  | { type: 'shapes.fromPaint'; key: string; ids: string[]; layerId: string }
+  /** The paper under all layers: its color and opacity (0: transparent, as a transparent export). */
+  | { type: 'paper.set'; paper: Paper };
 
 /** An op as the server broadcasts it: restore ops carry the full object so late joiners can apply them. */
 export type AppliedOp =
@@ -435,6 +451,8 @@ export type ServerMsg =
       strokes: Stroke[];
       /** Live shapes (not deleted). Absent from servers before shapes. */
       shapes?: Shape[];
+      /** The paper. Absent: DEFAULT_PAPER (and from servers before paper colors). */
+      paper?: Paper;
       peers: Peer[];
       role: Role;
       canvas: CanvasInfo;

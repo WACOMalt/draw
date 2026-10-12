@@ -106,6 +106,8 @@
     return {
       fill: first.fill,
       stroke: first.stroke,
+      fillOpacity: first.fillOpacity ?? 1,
+      strokeOpacity: first.strokeOpacity ?? 1,
       strokeWidth: first.strokeWidth * k,
       align: first.align,
       cap: first.cap,
@@ -137,12 +139,14 @@
   function setShape(style: Partial<ShapeStyle>, fn: (s: Shape, k: number) => Partial<ShapeProps> | null, live = false) {
     // The Pen keeps a style of its own (its paths start without a fill).
     if (ed.tool === 'pen') {
-      for (const k of ['fill', 'stroke', 'strokeWidth', 'align', 'cap', 'dash', 'arrows'] as const) if (k in style) (ed.penStyle as Record<string, unknown>)[k] = style[k];
+      for (const k of ['fill', 'stroke', 'fillOpacity', 'strokeOpacity', 'strokeWidth', 'align', 'cap', 'dash', 'arrows'] as const) if (k in style) (ed.penStyle as Record<string, unknown>)[k] = style[k];
     } else Object.assign(ed.shapeStyle, style);
     if (selShapes.length) engine?.shapes.editSelected((s) => fn(s, kOf(s)), live);
   }
   const setFill = (v: string | null, live = false) => setShape({ fill: v }, (s) => (s.kind === 'line' ? null : { fill: v }), live);
   const setStroke = (v: string | null, live = false) => setShape({ stroke: v }, () => ({ stroke: v }), live);
+  const setFillOpacity = (a: number, done: boolean) => setShape({ fillOpacity: a }, (s) => (s.kind === 'line' ? null : { fillOpacity: a }), !done);
+  const setStrokeOpacity = (a: number, done: boolean) => setShape({ strokeOpacity: a }, () => ({ strokeOpacity: a }), !done);
   const setWidth = (px: number, live = false) =>
     setShape({ strokeWidth: px }, (s, k) => ({ strokeWidth: px / k, ...(s.stroke ? {} : { stroke: ed.shapeStyle.stroke ?? ed.fg }) }), live);
   const setAlign = (a: StrokeAlign) => setShape({ align: a }, (s) => (centerOnly(s) ? null : { align: a }));
@@ -277,9 +281,9 @@
   {#if showStyle}
     <div class="colorsrow">
       {#if has('rect', 'ellipse', 'polygon', 'star', 'path', 'compound', 'custom')}
-        <span class="field"><span>Fill</span><ShapeColor big={stacked} label="Fill" value={st.fill} oninput={(v) => setFill(v, true)} onchange={(v) => setFill(v)} /></span>
+        <span class="field"><span>Fill</span><ShapeColor big={stacked} label="Fill" value={st.fill} opacity={st.fillOpacity} oninput={(v) => setFill(v, true)} onchange={(v) => setFill(v)} onopacity={setFillOpacity} /></span>
       {/if}
-      <span class="field"><span>Stroke</span><ShapeColor big={stacked} label="Stroke" value={st.stroke} oninput={(v) => setStroke(v, true)} onchange={(v) => setStroke(v)} /></span>
+      <span class="field"><span>Stroke</span><ShapeColor big={stacked} label="Stroke" value={st.stroke} opacity={st.strokeOpacity} oninput={(v) => setStroke(v, true)} onchange={(v) => setStroke(v)} onopacity={setStrokeOpacity} /></span>
     </div>
     {#key `${first?.id}:${ed.selection.length}`}
       <Slider wide={stacked} label="Width" value={st.strokeWidth} min={0.5} max={LIMITS.maxBrushPx} step={0.1} log width={80} title="Stroke width, in screen pixels at the current zoom" oninput={(v) => setWidth(v, true)} onchange={(v) => setWidth(v)} />
@@ -526,7 +530,27 @@
         {/if}
       </span>
     {/if}
-    <Slider wide={stacked} label="Size" bind:value={b.size} min={1} max={LIMITS.maxBrushPx} log width={110} title="Screen pixels at the current zoom. [ and ]" />
+    {@const pinned = ed.sizePin[ed.activeBrushKey] !== null}
+    <span class="sizepin">
+      <Slider
+        wide={stacked}
+        label="Size"
+        bind:value={b.size}
+        min={1}
+        max={LIMITS.maxBrushPx}
+        log
+        width={110}
+        title={pinned ? 'Pinned to the canvas: screen pixels now, the brush grows and shrinks with the zoom. [ and ]' : 'Screen pixels at the current zoom. [ and ]'}
+      />
+      <button
+        class="icon"
+        class:on={pinned}
+        title={pinned ? 'Unpin the size: it stays the same on screen at any zoom' : 'Pin the size to the canvas: a zoom in makes the brush bigger on screen, as on paper'}
+        aria-label="Pin the brush size to the canvas"
+        aria-pressed={pinned}
+        onclick={() => engine?.togglePin(ed.activeBrushKey)}><Icon name="pushpin" /></button
+      >
+    </span>
     <Slider wide={stacked} label="Opacity" bind:value={b.opacity} min={0.01} max={1} step={0.01} percent title="Keys 1–0. Caps the whole stroke." />
     <Slider wide={stacked} label="Flow" bind:value={b.flow} min={0.005} max={1} step={0.001} percent log title="Shift+1–0. Paint per dab: builds up where dabs overlap." />
     <Slider wide={stacked} label="Hardness" bind:value={b.hardness} min={0} max={1} step={0.01} percent title="Shift+[ and Shift+]" />
@@ -653,6 +677,18 @@
     flex: 1;
     height: 36px;
     font-size: 12px;
+  }
+  .sizepin {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .stacked .sizepin {
+    display: flex;
+    gap: 6px;
+  }
+  .stacked .sizepin :global(.slider) {
+    flex: 1;
   }
   .toggles {
     display: flex;

@@ -12,6 +12,7 @@
   import AdjustPanel from './AdjustPanel.svelte';
   import Icon from './Icon.svelte';
   import Slider from './Slider.svelte';
+  import ShapeColor from './ShapeColor.svelte';
   import { dismiss } from '../dismiss';
 
   /** sheet: the phone's layers sheet. It keeps the Transform button (no tool bar on phones). */
@@ -380,6 +381,21 @@
     {/each}
   </ul>
 
+  <!-- The bottom of the stack. None: alpha 0 (the color stays for when it comes back). -->
+  <div class="paper" title="The paper under all layers. Below 100% opacity the screen shows a checkerboard, and exports on the paper keep the transparency.">
+    <span class="lbl">Paper</span>
+    <span class="pct">{ed.paper.alpha > 0 ? `${Math.round(ed.paper.alpha * 100)}%` : 'None'}</span>
+    <ShapeColor
+      label="Paper"
+      up
+      value={ed.paper.alpha > 0 ? ed.paper.color : null}
+      opacity={ed.paper.alpha}
+      oninput={(v) => engine?.setPaper(v ? { color: v, alpha: ed.paper.alpha || 1 } : { ...ed.paper, alpha: 0 }, true)}
+      onchange={(v) => engine?.setPaper(v ? { color: v, alpha: ed.paper.alpha || 1 } : { ...ed.paper, alpha: 0 })}
+      onopacity={(a, done) => engine?.setPaper({ ...ed.paper, alpha: a }, !done)}
+    />
+  </div>
+
   {#if active && (active.kind === 'adjust' || active.mask)}
     <div class="props">
       {#if active.kind === 'adjust'}
@@ -746,6 +762,21 @@
   }
   .menu button:hover {
     background: #2d3d4d;
+  }
+  .paper {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 34px;
+    padding: 0 8px 0 10px;
+    border-top: 1px solid var(--border);
+  }
+  .paper .lbl {
+    flex: 1;
+  }
+  .paper .pct {
+    color: #999;
+    font-size: 12px;
   }
   .footer {
     display: flex;
