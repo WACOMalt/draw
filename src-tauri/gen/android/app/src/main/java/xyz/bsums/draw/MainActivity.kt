@@ -30,7 +30,10 @@ class MainActivity : TauriActivity() {
   }
 
   // Updates from the GitHub releases (AppUpdate.kt): the page calls window.DrawAppUpdate.
+  // Full screen (FullScreen.kt): window.DrawFullScreen.
   override fun onWebViewCreate(webView: WebView) {
     webView.addJavascriptInterface(AppUpdate(this, webView), "DrawAppUpdate")
+    // Full screen (FullScreen.kt): the page calls window.DrawFullScreen.
+    webView.addJavascriptInterface(FullScreen(this), "DrawFullScreen")
   }
 }

@@ -7,6 +7,7 @@
   import AccountButton from './AccountButton.svelte';
   import { pickFile } from '../files';
   import { dismiss } from '../dismiss';
+  import { canFullScreen, fullScreen, toggleFullScreen } from '../fullscreen.svelte';
 
   let {
     engine,
@@ -95,6 +96,9 @@
           <button role="menuitem" onclick={() => act(pickFile)}><Icon name="open" />Open a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => engine?.saveBdraw())}><Icon name="save" />Save to a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => (ed.exportOpen = true))}><Icon name="download" />Export an image…</button>
+          {#if canFullScreen}
+            <button role="menuitem" onclick={() => act(toggleFullScreen)}><Icon name={fullScreen.on ? 'shrink' : 'expand'} />{fullScreen.on ? 'Leave full screen' : 'Full screen'}</button>
+          {/if}
           <button role="menuitem" onclick={() => act(() => (ed.settingsOpen = true))}><Icon name="settings" />Settings…</button>
           <button role="menuitem" onclick={() => act(onLeave)}><Icon name="exit" />Leave this canvas</button>
           <div class="info" title="Renderer, bits per channel of its buffers, render scale and profile; app version">{ed.renderer} · v{__APP_VERSION__}</div>
@@ -105,6 +109,11 @@
     <button class="icon" title="Open a .bdraw file as a new canvas (Ctrl+O)" onclick={pickFile}><Icon name="open" /></button>
     <button class="icon" title="Save to a .bdraw file (Ctrl+S)" onclick={() => engine?.saveBdraw()}><Icon name="save" /></button>
     <button class="icon" title="Export an image: the screen or larger, any shape, PNG or TIFF" onclick={() => (ed.exportOpen = true)}><Icon name="download" /></button>
+    {#if canFullScreen}
+      <button class="icon" title={fullScreen.on ? 'Leave full screen (F11)' : 'Full screen (F11)'} aria-pressed={fullScreen.on} onclick={toggleFullScreen}
+        ><Icon name={fullScreen.on ? 'shrink' : 'expand'} /></button
+      >
+    {/if}
     <button class="icon" title="Settings" onclick={() => (ed.settingsOpen = true)}><Icon name="settings" /></button>
     <button class="icon" title="Leave this canvas" onclick={onLeave}><Icon name="exit" /></button>
   {/if}
