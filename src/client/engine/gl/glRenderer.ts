@@ -3,11 +3,11 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, lowFlow, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
-import { takesEffects } from '../../../shared/effects';
+import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, LIMITS, type Affine, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
+import { kaleidoscopeStep, takesEffects } from '../../../shared/effects';
 import { MARGIN, blurLevel, kernel } from '../blur';
 import { byZ } from '../../../shared/shapes';
-import { compose, effectivelyVisible, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
+import { compose, effectivelyVisible, invert, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
@@ -53,7 +53,9 @@ const STOP = Symbol('stop');
 /** The enabled effects of a paint or shape layer, in the order they draw. */
 function activeEffects(l: Layer): LayerEffect[] {
   if (!l.effects?.length || !takesEffects(l.kind)) return [];
-  return EFFECT_TYPES.map((t) => l.effects!.find((e) => e.type === t && e.enabled)).filter((e): e is LayerEffect => !!e && (e.type !== 'blur' || e.radius > 0));
+  return EFFECT_TYPES.map((t) => l.effects!.find((e) => e.type === t && e.enabled)).filter(
+    (e): e is LayerEffect => !!e && (e.type === 'kaleidoscope' ? (e.count ?? 0) >= 1 : e.type !== 'blur' || e.radius > 0),
+  );
 }
 
 /** The blur an effect needs: glows and the shadow come from the blurred layer when it has a blur. */
@@ -1704,22 +1706,34 @@ export class GLRenderer implements Renderer {
   }
 
   /** A layer's pixels (renderLayer) with its effects. */
-  private layerPixels(layer: Layer, g: Grid): Target {
+  private layerPixels(layer: Layer, g: Grid, kaleidoscope = true): Target {
     this.renderLayer(layer, g);
-    const fx = activeEffects(layer);
+    const fx = activeEffects(layer).filter((e) => kaleidoscope || e.type !== 'kaleidoscope');
     if (!fx.length) return this.buf(g, 'layer');
-    return this.applyEffects(fx, g, this.buf(g, 'layer'), (fg) => {
-      this.renderLayer(layer, fg);
-      return this.buf(fg, 'layer');
-    });
+    return this.applyEffects(
+      fx,
+      g,
+      this.buf(g, 'layer'),
+      (fg) => {
+        this.renderLayer(layer, fg);
+        return this.buf(fg, 'layer');
+      },
+      (kg) => this.layerPixels(layer, kg, false),
+    );
   }
 
   /** An isolated group's pixels (renderGroup) with its effects. */
-  private groupPixels(node: LayerNode, g: Grid, depth: number): Target {
+  private groupPixels(node: LayerNode, g: Grid, depth: number, kaleidoscope = true): Target {
     const own = this.renderGroup(node, g, depth);
-    const fx = activeEffects(node.layer);
+    const fx = activeEffects(node.layer).filter((e) => kaleidoscope || e.type !== 'kaleidoscope');
     if (!fx.length) return own;
-    return this.applyEffects(fx, g, own, (fg) => this.renderGroup(node, fg, depth));
+    return this.applyEffects(
+      fx,
+      g,
+      own,
+      (fg) => this.renderGroup(node, fg, depth),
+      (kg) => this.groupPixels(node, kg, depth, false),
+    );
   }
 
   // --- transform preview ----------------------------------------------------------------------
@@ -2004,7 +2018,15 @@ export class GLRenderer implements Renderer {
       if (!effectivelyVisible(this.byId, l)) continue;
       if (l.kind === 'adjust' && l.adjust?.type === 'blur' && l.adjust.radius > 0 && l.opacity > 0) add(l.adjust.radius);
       const fx = activeEffects(l);
-      for (const e of fx) add(effectSigma(e, fx), e.dx, e.dy);
+      for (const e of fx) {
+        if (e.type !== 'kaleidoscope') {
+          add(effectSigma(e, fx), e.dx, e.dy);
+          continue;
+        }
+        const kg = this.kaleidoscopeGrid(this.kaleidoscopeSteps(e));
+        if (kg) out.push({ lod: kg.lod, tx0: kg.tx0, ty0: kg.ty0, tx1: kg.tx1, ty1: kg.ty1 });
+        // The other effects of the layer, inside the kaleidoscope frame: the same tiles.
+      }
     }
     return out;
   }
@@ -2057,11 +2079,12 @@ export class GLRenderer implements Renderer {
    * pixels before effects; glows and the shadow with the blur of a blur effect added) and draws
    * onto the result so far. Returns the result.
    */
-  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target): Target {
+  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target): Target {
     const gl = this.gl;
     let cur = own;
     let flip = false;
     for (const e of fx) {
+      if (e.type === 'kaleidoscope') continue; // last, on the result (below)
       const sigma = effectSigma(e, fx);
       const dx = e.dx ?? 0, dy = e.dy ?? 0;
       let src: Target;
@@ -2100,7 +2123,119 @@ export class GLRenderer implements Renderer {
       gl.activeTexture(gl.TEXTURE0);
       cur = out;
     }
-    return cur;
+    const kal = fx.find((e) => e.type === 'kaleidoscope');
+    return kal ? this.kaleidoscope(kal, g, cur, whole) : cur;
+  }
+
+  /** Copy i of a kaleidoscope: the step transform applied i times (world to world), i = 1..count. */
+  private kaleidoscopeSteps(e: LayerEffect): Affine[] {
+    const step = kaleidoscopeStep(e);
+    const out: Affine[] = [];
+    let m: Affine = [1, 0, 0, 1, 0, 0];
+    for (let i = 0; i < Math.min(LIMITS.maxKaleidoscope, e.count ?? 0); i++) out.push((m = compose(step, m)));
+    return out;
+  }
+
+  /**
+   * The kaleidoscope frame: the world the copies show on screen comes from (each copy's
+   * transform undone on the view, all in one box), at the finest scale a copy needs (a copy that
+   * grows needs more detail), at most 4096 px per side and 8 megapixels. Null: nothing to show.
+   */
+  private kaleidoscopeGrid(steps: Affine[]): Grid | null {
+    const ds = this.view.zoom * this.dpr;
+    const vw = (this.canvas.width || 1) / ds, vh = (this.canvas.height || 1) / ds;
+    const v = this.view;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, grow = 0;
+    for (const m of steps) {
+      const inv = invert(m);
+      if (!inv) continue;
+      for (const [px, py] of [[v.x, v.y], [v.x + vw, v.y], [v.x, v.y + vh], [v.x + vw, v.y + vh]]) {
+        const x = inv[0] * px + inv[2] * py + inv[4], y = inv[1] * px + inv[3] * py + inv[5];
+        x0 = Math.min(x0, x);
+        y0 = Math.min(y0, y);
+        x1 = Math.max(x1, x);
+        y1 = Math.max(y1, y);
+      }
+      grow = Math.max(grow, Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])));
+    }
+    if (!(x1 > x0 && y1 > y0)) return null;
+    let s = ds * Math.min(4, Math.max(grow, 1e-6));
+    s = Math.min(s, 4096 / (x1 - x0), 4096 / (y1 - y0), Math.sqrt(8e6 / ((x1 - x0) * (y1 - y0))));
+    // Sizes in steps of 64 px, so the buffers are not made again at every small move.
+    const w = Math.max(64, Math.ceil(((x1 - x0) * s) / 64) * 64), h = Math.max(64, Math.ceil(((y1 - y0) * s) / 64) * 64);
+    return this.frameGrid(x0, y0, w, h, s, 'kal:');
+  }
+
+  /** A frame of w × h px whose top left is world (wx, wy), at s px per world unit. */
+  private frameGrid(wx: number, wy: number, w: number, h: number, s: number, ns: string): Grid {
+    const lod = lodFor(s);
+    const tw = tileWorld(lod);
+    return {
+      lod,
+      tx0: Math.floor(wx / tw),
+      ty0: Math.floor(wy / tw),
+      tx1: Math.floor((wx + w / s) / tw),
+      ty1: Math.floor((wy + h / s) / tw),
+      X: (tx) => Math.round((tx * tw - wx) * s),
+      Y: (ty) => Math.round((ty * tw - wy) * s),
+      w,
+      h,
+      ns,
+      wx,
+      wy,
+      s,
+    };
+  }
+
+  /**
+   * Kaleidoscope: `cur` (the layer with its other effects) and its copies, in front of it or
+   * behind it, into one buffer. On the screen the copies come from the kaleidoscope frame
+   * (`whole` renders the layer there), so what a copy turns into view from off screen shows;
+   * inside another frame they come from `cur` itself.
+   */
+  private kaleidoscope(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target): Target {
+    const gl = this.gl;
+    const steps = this.kaleidoscopeSteps(e);
+    let src = cur;
+    let from: Affine = [1 / g.s, 0, 0, 1 / g.s, g.wx, g.wy]; // source px → world
+    if (g.ns === '') {
+      const kg = this.kaleidoscopeGrid(steps);
+      if (kg) {
+        src = whole(kg);
+        from = [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy];
+      }
+    }
+    const to: Affine = [g.s, 0, 0, g.s, -g.wx * g.s, -g.wy * g.s]; // world → frame px
+    const out = this.buf(g, 'kalOut');
+    this.bindTarget(out);
+    this.clear();
+    const copies = () => {
+      const list = e.order === 'behind' ? [...steps].reverse() : steps; // copy 1 nearest the layer
+      for (const m of list) this.drawXform(src, out, compose(to, compose(m, from)));
+    };
+    if (e.order === 'behind') copies();
+    this.blendFor(false);
+    this.copy(cur.tex, out, [0, 0, out.w, out.h]);
+    if (e.order !== 'behind') copies();
+    return out;
+  }
+
+  /** `src` onto `dst` through S (source px → target px), source-over. */
+  private drawXform(src: Target, dst: Target, S: Affine): void {
+    const gl = this.gl;
+    this.bindTarget(dst);
+    this.blendFor(false);
+    const p = this.progs.xform;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(p.u.uTex, 0);
+    gl.uniform1f(p.u.uOpacity, 1);
+    gl.uniformMatrix3fv(p.u.uM, false, [S[0], S[1], 0, S[2], S[3], 0, S[4], S[5], 1]);
+    gl.uniform2f(p.u.uSrcSize, src.w, src.h);
+    gl.uniform2f(p.u.uTarget, dst.w, dst.h);
+    gl.bindVertexArray(this.quadVao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
   /**

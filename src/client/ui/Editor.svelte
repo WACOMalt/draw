@@ -20,6 +20,7 @@
   import ExportDialog from './ExportDialog.svelte';
   import ExportPick from './ExportPick.svelte';
   import EffectsWindow from './EffectsWindow.svelte';
+  import KaleidoscopeGizmo from './KaleidoscopeGizmo.svelte';
   import TransformOverlay from './TransformOverlay.svelte';
   import SelectOverlay from './SelectOverlay.svelte';
   import Modal from './Modal.svelte';
@@ -207,7 +208,7 @@
       {/if}
       <CanvasBanner {code} />
       {#if ed.exportOpen && ed.exportPicking && engine}<ExportPick {engine} />{/if}
-      {#if ed.effectsLayer && engine}<EffectsWindow {engine} />{/if}
+      {#if ed.effectsLayer && engine}<KaleidoscopeGizmo {engine} /><EffectsWindow {engine} />{/if}
       {#if ed.transform && engine}
         {#key ed.transform.id}<TransformOverlay {engine} id={ed.transform.id} />{/key}
       {/if}

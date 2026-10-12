@@ -96,10 +96,11 @@ export const DEFAULT_ADJUST: Record<AdjustType, Adjust> = {
 /**
  * Layer effects of a paint or shape layer or a group, at most one of each type. They draw in a fixed order:
  * blur changes the layer's pixels; drop shadow and outer glow go behind them, made from their
- * blurred alpha; inner glow goes on top, inside their alpha. All lengths are world units, so an
+ * blurred alpha; inner glow goes on top, inside their alpha. Kaleidoscope comes last: copies of
+ * the result, each moved by the step transform once more. All lengths are world units, so an
  * effect keeps its size on the canvas at any zoom.
  */
-export const EFFECT_TYPES = ['blur', 'dropShadow', 'outerGlow', 'innerGlow'] as const;
+export const EFFECT_TYPES = ['blur', 'dropShadow', 'outerGlow', 'innerGlow', 'kaleidoscope'] as const;
 export type EffectType = (typeof EFFECT_TYPES)[number];
 export interface LayerEffect {
   type: EffectType;
@@ -111,9 +112,20 @@ export interface LayerEffect {
   opacity?: number;
   /** Glows and shadow: 0 to 0.99, makes the edge harder (the blurred alpha divided by 1 − spread). */
   spread?: number;
-  /** Drop shadow: the offset, world units. */
+  /** Drop shadow: the offset, world units. Kaleidoscope: the move of each step. */
   dx?: number;
   dy?: number;
+  /**
+   * Kaleidoscope: `count` copies (1 to 64), copy i moved by the step transform i times. The step
+   * turns by `angle` degrees and scales by `scale` about the pivot (cx, cy), then moves by (dx, dy).
+   * `order`: the copies go in front of the layer or behind it. (`radius` is 0.)
+   */
+  count?: number;
+  angle?: number;
+  scale?: number;
+  cx?: number;
+  cy?: number;
+  order?: 'front' | 'behind';
 }
 
 /**
@@ -524,6 +536,8 @@ export const LIMITS = {
   /** Groups inside groups, at most. */
   maxGroupDepth: 8,
   maxLayerName: 64,
+  /** Copies a kaleidoscope effect draws. */
+  maxKaleidoscope: 64,
   maxPeerName: 32,
   /** Brush size in the UI, in screen pixels. */
   maxBrushPx: 1000,

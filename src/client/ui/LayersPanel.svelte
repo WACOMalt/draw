@@ -52,7 +52,7 @@
   let adjustMenu = $state(false);
   const canFx = $derived(!!active && takesEffects(active.kind) && ed.effectsOk);
   const fxShown = $derived(!!active && ed.effectsLayer === active.id);
-  const EFFECT_LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow' };
+  const EFFECT_LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow', kaleidoscope: 'Kaleidoscope' };
   /** Opens the effects window of a layer (or closes it when it is open). */
   function openEffects(id: string, toggle = false) {
     if (!ed.effectsOk) return showToast('Layer effects need a newer server. Canvases on this device have them.');

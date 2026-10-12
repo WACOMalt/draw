@@ -2,8 +2,8 @@
 // layer opacity and blend modes, onto the visible canvas.
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
-import { DEFAULT_PAPER, EFFECT_TYPES, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke } from '../../shared/types';
-import { takesEffects } from '../../shared/effects';
+import { DEFAULT_PAPER, EFFECT_TYPES, LIMITS, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { kaleidoscopeStep, takesEffects } from '../../shared/effects';
 import { byZ } from '../../shared/shapes';
 import { ShapeIndex, shapeRec } from './shapeIndex';
 import { drawShapes } from './shapeRaster';
@@ -814,7 +814,32 @@ export class Canvas2DRenderer implements Renderer {
       this.put(c.ctx, b.canvas, inner.opacity ?? 1, 'source-atop');
     }
     this.put(out.ctx, c.canvas, 1, 'source-over');
-    return out.canvas;
+    const kal = fx.find((e) => e.type === 'kaleidoscope');
+    return kal ? this.kaleidoscope(kal, out.canvas) : out.canvas;
+  }
+
+  /** Kaleidoscope copies of `src` (screen-sized): what is on screen only, in this fallback. */
+  private kaleidoscope(e: LayerEffect, src: OffscreenCanvas): OffscreenCanvas {
+    const ds = this.view.zoom * this.dpr, v = this.view;
+    const to: Affine = [ds, 0, 0, ds, -v.x * ds, -v.y * ds];
+    const from: Affine = [1 / ds, 0, 0, 1 / ds, v.x, v.y];
+    const step = kaleidoscopeStep(e);
+    const steps: Affine[] = [];
+    let m: Affine = [1, 0, 0, 1, 0, 0];
+    for (let i = 0; i < Math.min(LIMITS.maxKaleidoscope, e.count ?? 0); i++) steps.push((m = compose(step, m)));
+    const r = this.clearBuffer('kalOut');
+    const copies = () => {
+      for (const s of e.order === 'behind' ? [...steps].reverse() : steps) {
+        const S = compose(to, compose(s, from));
+        r.ctx.setTransform(S[0], S[1], S[2], S[3], S[4], S[5]);
+        r.ctx.drawImage(src, 0, 0);
+      }
+      r.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    };
+    if (e.order === 'behind') copies();
+    r.ctx.drawImage(src, 0, 0);
+    if (e.order !== 'behind') copies();
+    return r.canvas;
   }
 
   /** `src` blurred by `px`, with its edge pixels repeated past the edges (no fade to transparent). */
