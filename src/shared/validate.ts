@@ -3,6 +3,7 @@
 import {
   ADJUST_TYPES,
   BLEND_MODES,
+  EFFECT_TYPES,
   BRUSH_TIPS,
   GRAINS,
   LAYER_KINDS,
@@ -22,6 +23,7 @@ import {
   type Brush,
   type BrushSettings,
   type LayerBlend,
+  type LayerEffect,
   type LayerMask,
   type LayerProps,
   type Op,
@@ -34,6 +36,7 @@ import {
   POINT_TYPES,
 } from './types';
 import { validAffine } from './layers';
+import { takesEffects } from './effects';
 import { cornersWithin, stripForKind } from './shapes';
 
 export class ValidationError extends Error {}
@@ -157,7 +160,33 @@ export function validateAdjust(v: unknown): Adjust {
       };
     case 'brightContrast':
       return { type, brightness: signed(a.brightness, 'brightness'), contrast: signed(a.contrast, 'contrast') };
+    case 'blur':
+      return { type, radius: num(a.radius, 0, LIMITS.maxBrushWorld, 'adjust.radius') };
   }
+}
+
+/** Layer effects: at most one of each type. null and [] mean none. */
+export function validateEffects(v: unknown): LayerEffect[] | null {
+  if (v === null) return null;
+  if (!Array.isArray(v) || v.length > EFFECT_TYPES.length) fail('bad effects');
+  const seen = new Set<string>();
+  const out = v.map((x): LayerEffect => {
+    const e = obj(x, 'effect');
+    const type = oneOf(e.type, EFFECT_TYPES, 'effect.type');
+    if (seen.has(type)) fail('duplicate effect');
+    seen.add(type);
+    const fx: LayerEffect = { type, enabled: bool(e.enabled, 'effect.enabled'), radius: num(e.radius, 0, LIMITS.maxBrushWorld, 'effect.radius') };
+    if (type === 'blur') return fx;
+    fx.color = validateColor(e.color);
+    fx.opacity = num(e.opacity, 0, 1, 'effect.opacity');
+    fx.spread = e.spread === undefined ? 0 : num(e.spread, 0, 0.99, 'effect.spread');
+    if (type === 'dropShadow') {
+      fx.dx = num(e.dx, -LIMITS.maxCoord, LIMITS.maxCoord, 'effect.dx');
+      fx.dy = num(e.dy, -LIMITS.maxCoord, LIMITS.maxCoord, 'effect.dy');
+    }
+    return fx;
+  });
+  return out.length ? out : null;
 }
 
 function layerMask(v: unknown): LayerMask | null {
@@ -198,6 +227,7 @@ function layerProps(v: unknown, partial: boolean): Partial<LayerProps> {
   if (p.clip !== undefined) out.clip = bool(p.clip, 'clip');
   if (p.mask !== undefined) out.mask = layerMask(p.mask);
   if (p.parent !== undefined) out.parent = p.parent === null ? null : id(p.parent, 'parent');
+  if (p.effects !== undefined) out.effects = validateEffects(p.effects);
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -238,6 +268,10 @@ export function validateOp(v: unknown): Op {
       const props = layerProps(l, false) as LayerProps;
       if (kind === 'adjust' && !props.adjust) fail('adjustment layer without adjust');
       if (props.blend === 'pass' && kind !== 'group') fail('pass through is for groups');
+      if (props.effects !== undefined) {
+        if (props.effects && !takesEffects(kind)) fail('effects are for paint and shape layers');
+        if (!props.effects) delete props.effects;
+      }
       return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
     }
     case 'layer.update':

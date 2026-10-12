@@ -2,6 +2,7 @@
 // server has not echoed yet. The UI shows confirmed state with pending layer ops on top.
 
 import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shared/layers';
+import { transformLayerLengths } from '../../shared/effects';
 import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
 import { planFromPaint, planToPaint, vectorShape } from '../../shared/flatten';
 import { DEFAULT_PAPER, LIMITS, type AppliedOp, type Layer, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
@@ -14,13 +15,14 @@ export interface PendingOp {
 function applyLayerOp(layers: Map<string, Layer>, op: Op | AppliedOp): boolean {
   switch (op.type) {
     case 'layer.add':
-      layers.set(op.layer.id, { ...op.layer, deleted: false });
+      layers.set(op.layer.id, { ...op.layer, deleted: false } as Layer);
       return true;
     case 'layer.update': {
       const l = layers.get(op.id);
       if (l) {
-        const next = { ...l, ...op.props };
+        const next = { ...l, ...op.props } as Layer;
         if (next.parent === null) delete next.parent;
+        if (!next.effects?.length) delete next.effects;
         layers.set(op.id, next);
       }
       return true;
@@ -152,6 +154,11 @@ export class Doc {
           this.strokes.set(st.id, next);
           this.bounds.set(st.id, strokeBounds(next));
           changed.push(next);
+        }
+        // Effect lengths and blur radii scale with the layers.
+        for (const lid of ids) {
+          const l = this.layers.get(lid);
+          if (l) this.layers.set(lid, transformLayerLengths(l, op.m));
         }
         this.version++;
         return { changed, added: [], shapes, shapesGone: [] };

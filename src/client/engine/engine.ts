@@ -132,7 +132,7 @@ function greyOf(hex: string): string {
 }
 
 /** What a layer property is when it is not set: undo must send a value, not undefined. */
-const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null };
+const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null, effects: null };
 
 /** Squared distance between the segments a–b and c–d (zero when they cross). */
 function segDist2(ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number): number {
@@ -1345,6 +1345,7 @@ export class Engine {
     curves: 'Curves',
     hueSat: 'Hue/Saturation',
     brightContrast: 'Brightness/Contrast',
+    blur: 'Gaussian blur',
   };
 
   /** An adjustment layer above the active layer. It changes everything below it. */
@@ -1361,7 +1362,8 @@ export class Engine {
         blend: 'normal',
         opacity: 1,
         visible: true,
-        adjust: DEFAULT_ADJUST[type],
+        // A new blur is 8 px on screen now (the radius is in world units).
+        adjust: type === 'blur' ? { type: 'blur', radius: 8 / this.comp.view.zoom } : DEFAULT_ADJUST[type],
       },
     });
     this.pushUndo({ undo: [{ type: 'layer.remove', id }], redo: [{ type: 'layer.restore', id }] });
