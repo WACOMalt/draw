@@ -19,6 +19,7 @@
   import ShareDialog from './ShareDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
   import ExportPick from './ExportPick.svelte';
+  import EffectsWindow from './EffectsWindow.svelte';
   import TransformOverlay from './TransformOverlay.svelte';
   import SelectOverlay from './SelectOverlay.svelte';
   import Modal from './Modal.svelte';
@@ -125,6 +126,7 @@
       ed.exportOpen = false;
       ed.exportPicking = false;
       ed.exportRegion = null;
+      ed.effectsLayer = null;
       ed.settingsOpen = false;
       ed.transform = null;
       ed.selection = [];
@@ -205,6 +207,7 @@
       {/if}
       <CanvasBanner {code} />
       {#if ed.exportOpen && ed.exportPicking && engine}<ExportPick {engine} />{/if}
+      {#if ed.effectsLayer && engine}<EffectsWindow {engine} />{/if}
       {#if ed.transform && engine}
         {#key ed.transform.id}<TransformOverlay {engine} id={ed.transform.id} />{/key}
       {/if}

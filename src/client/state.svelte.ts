@@ -266,6 +266,8 @@ class EditorState {
   exportRegion = $state<ExportRegion | null>(null);
   /** The region picker is on the canvas (the export dialog hides meanwhile). */
   exportPicking = $state(false);
+  /** The layer whose effects window is open, or null. */
+  effectsLayer = $state<string | null>(null);
   /** App settings on this device (SettingsDialog). */
   settingsOpen = $state(false);
   /** The layer or group being transformed (free transform: the overlay shows its handles). */

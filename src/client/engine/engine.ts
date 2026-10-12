@@ -12,6 +12,7 @@ import {
   type AdjustType,
   type Brush,
   type Layer,
+  type LayerEffect,
   type LayerProps,
   type Op,
   type Paper,
@@ -1374,6 +1375,11 @@ export class Engine {
   /** Changes adjustment settings. Changes within 2 s merge into one undo step. */
   setAdjust(id: string, adjust: Adjust): void {
     this.updateLayer(id, { adjust }, 'adjust');
+  }
+
+  /** Sets a layer's effects (none: removes them). Changes within 2 s merge into one undo step. */
+  setEffects(id: string, effects: LayerEffect[]): void {
+    this.updateLayer(id, { effects: effects.length ? effects : null }, 'effects');
   }
 
   /** Adds an empty (all white) mask and selects it for painting. */

@@ -2,7 +2,7 @@
   // The layers panel: a tree, top layer first, groups as folders (Photoshop style). A row's grip
   // drags it (mouse, pen or finger): drop on the upper or lower part of a row to go above or below
   // it, on the middle of a group to go into it. Groups open and close with their arrow.
-  import { ADJUST_TYPES, BLEND_MODES, LIMITS, type Layer, type LayerBlend, type Shape } from '../../shared/types';
+  import { ADJUST_TYPES, BLEND_MODES, EFFECT_TYPES, LIMITS, type EffectType, type Layer, type LayerBlend, type LayerEffect, type Shape } from '../../shared/types';
   import { shapeLabel } from '../engine/shapeTool';
   import PresetIcon from './PresetIcon.svelte';
   import { OP_LABEL, partId } from '../../shared/compound';
@@ -10,6 +10,7 @@
   import { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
   import AdjustPanel from './AdjustPanel.svelte';
+  import { takesEffects } from '../../shared/effects';
   import Icon from './Icon.svelte';
   import Slider from './Slider.svelte';
   import ShapeColor from './ShapeColor.svelte';
@@ -46,6 +47,21 @@
 
   let editing = $state<string | null>(null);
   let adjustMenu = $state(false);
+  const canFx = $derived(!!active && takesEffects(active.kind));
+  const fxShown = $derived(!!active && ed.effectsLayer === active.id);
+  const EFFECT_LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow' };
+  /** Opens the effects window of a layer (or closes it when it is open). */
+  function openEffects(id: string, toggle = false) {
+    ed.effectsLayer = toggle && ed.effectsLayer === id ? null : id;
+  }
+  /** An effect's eye in the list: on or off, its settings kept. */
+  function toggleEffect(layer: Layer, type: EffectType) {
+    const list = ($state.snapshot(layer.effects) as LayerEffect[] | undefined) ?? [];
+    const e = list.find((x) => x.type === type);
+    if (!e) return;
+    e.enabled = !e.enabled;
+    engine?.setEffects(layer.id, list);
+  }
 
   /** Drawn clipped: a clipped layer with a sibling below it that is not clipped (and not an adjustment). */
   const clippedIds = $derived.by(() => {
@@ -259,6 +275,11 @@
           engine?.setMaskTarget(false);
           engine?.shapes.layerPicked(layer.id);
         }}
+        ondblclick={(e) => {
+          // As in Photoshop: a double-click on the row (not on the name, which renames) opens the effects.
+          if ((e.target as Element).closest('.txt, input, button') || !takesEffects(layer.kind)) return;
+          openEffects(layer.id);
+        }}
       >
         <span class="grip" title="Drag to move (into a group: drop on its middle)" role="button" tabindex="-1" onpointerdown={(e) => grab(e, layer.id)}>
           <Icon name="grip" />
@@ -295,11 +316,12 @@
             }}
           />
         {:else}
-          <span class="name" class:hidden={!layer.visible} class:target={isActive && !ed.maskTarget} role="button" tabindex="-1" ondblclick={() => (editing = layer.id)} title="Double-click to rename">
+          <span class="name" class:hidden={!layer.visible} class:target={isActive && !ed.maskTarget}>
             {#if layer.kind === 'adjust'}<span class="kind" title="Adjustment layer"><Icon name="adjust" /></span>{/if}
             {#if layer.kind === 'shape'}<span class="kind" title="Shape layer: holds shapes"><Icon name="shapes" /></span>{/if}
             {#if row.group}<span class="kind" title="Group"><Icon name="folder" /></span>{/if}
-            {layer.name}
+            <!-- Double-click the name to rename it; elsewhere on the row, to open the effects. -->
+            <span class="txt" role="button" tabindex="-1" ondblclick={() => (editing = layer.id)} title={takesEffects(layer.kind) ? 'Double-click to rename (elsewhere on the row: effects)' : 'Double-click to rename'}>{layer.name}</span>
           </span>
         {/if}
         {#if layer.mask}
@@ -324,8 +346,35 @@
           {/each}
           {#if layer.blend !== 'normal' && layer.blend !== 'pass'}<span class="tag">{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
           {#if layer.opacity < 1}<span class="tag">{Math.round(layer.opacity * 100)}%</span>{/if}
+          {#if layer.effects?.length}
+            <button
+              class="tag fx"
+              class:off={!layer.effects.some((e) => e.enabled)}
+              title="Layer effects: open the settings"
+              onpointerdown={(e) => e.stopPropagation()}
+              onclick={() => openEffects(layer.id)}>fx</button
+            >
+          {/if}
         </span>
       </li>
+      {#if layer.effects?.length}
+        <!-- The layer's effects, as in Photoshop: an eye each; a click opens the settings. -->
+        {#each EFFECT_TYPES.filter((t) => layer.effects!.some((e) => e.type === t)) as t (t)}
+          {@const on = layer.effects.find((e) => e.type === t)!.enabled}
+          <li class="effect" class:off={!on} style:--depth={row.depth + 1} onpointerdown={() => engine?.setActiveLayer(layer.id)} ondblclick={() => openEffects(layer.id)}>
+            <button
+              class="icon eye"
+              title={on ? 'Turn the effect off' : 'Turn the effect on'}
+              disabled={!ed.canEdit}
+              onpointerdown={(e) => e.stopPropagation()}
+              onclick={() => toggleEffect(layer, t)}
+            >
+              <Icon name={on ? 'eye' : 'eyeoff'} />
+            </button>
+            <span class="name" role="button" tabindex="-1" title="Open the settings" onclick={() => openEffects(layer.id)} onkeydown={(e) => e.key === 'Enter' && openEffects(layer.id)}>{EFFECT_LABEL[t]}</span>
+          </li>
+        {/each}
+      {/if}
       {#if layer.kind === 'shape' && row.open}
         {#each shapesBy.get(layer.id) ?? [] as sh (sh.id)}
           <li class="shape" class:active={ed.selection.includes(sh.id)} style:--depth={row.depth + 1} onpointerdown={(e) => pickShape(e, sh)}>
@@ -440,6 +489,13 @@
         <Icon name="group" />
       </button>
     {/if}
+    <button
+      class="icon fxbtn"
+      title={canFx ? (fxShown ? 'Close the layer effects' : 'Layer effects: blur, drop shadow, glows (or double-click the layer)') : 'Layer effects are for paint and shape layers'}
+      class:on={fxShown}
+      disabled={!canFx}
+      onclick={() => active && openEffects(active.id, true)}>fx</button
+    >
     <button
       class="icon"
       title={active?.mask ? 'Delete the layer mask' : 'Add a layer mask'}
@@ -571,6 +627,14 @@
     border-radius: 3px;
     padding: 0 4px;
   }
+  .tag.fx,
+  .fxbtn {
+    font-style: italic;
+    font-weight: 600;
+  }
+  .tag.fx {
+    color: var(--accent);
+  }
   li {
     padding-left: calc(2px + var(--depth, 0) * 14px);
     position: relative;
@@ -656,6 +720,33 @@
     height: 28px;
     padding-left: calc(30px + var(--depth, 0) * 14px);
   }
+  li.effect {
+    height: 24px;
+    font-size: 11.5px;
+    padding-left: calc(22px + var(--depth, 0) * 14px);
+    color: var(--text-dim);
+  }
+  li.effect .eye {
+    width: 22px;
+    height: 20px;
+  }
+  li.effect .name {
+    cursor: pointer;
+  }
+  li.effect.off .name {
+    opacity: 0.5;
+    text-decoration: line-through;
+  }
+  button.tag {
+    border: none;
+    cursor: pointer;
+    line-height: inherit;
+    height: auto;
+    min-width: 0;
+  }
+  .tag.fx.off {
+    opacity: 0.5;
+  }
   li.shape .kind {
     margin-right: 0;
   }
@@ -701,6 +792,9 @@
     flex-direction: column;
     gap: 6px;
     flex: none;
+    /* The effects can be long: they scroll, and the layer list keeps its rows. */
+    max-height: 55%;
+    overflow-y: auto;
     max-height: 55%;
     overflow-y: auto;
   }
