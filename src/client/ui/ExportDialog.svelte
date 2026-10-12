@@ -1,5 +1,6 @@
 <script lang="ts">
-  // Export an image: the current view or everything, in its own shape or a common aspect ratio
+  // Export an image: the current view, everything, or a region picked on the canvas (Pick: the
+  // dialog hides while ExportPick shows a crop box), in its own shape or a common aspect ratio
   // (the area is centered and widened to it, never cut), at a chosen pixel count ("Screen" is
   // the resolution of the screen now), as PNG or tiled TIFF (BigTIFF past 4 GB). Pieces render
   // off screen and stream to the file, so the size is limited by the format and the disk, not
@@ -7,6 +8,7 @@
   import type { Engine } from '../engine/engine';
   import { exportImage, hasAlpha, rawSize, type ImageFormat } from '../export/exportImage';
   import { toAspect } from '../export/region';
+  import { ASPECTS } from '../export/aspects';
   import { PNG_MAX_SIDE } from '../export/png';
   import { MEMORY_LIMIT, NotSavedError, openSink, sinkKind } from '../export/sink';
   import { TIFF_MAX_SIDE, needsBigTiff } from '../export/tiff';
@@ -15,8 +17,9 @@
 
   let { engine, code }: { engine: Engine; code: string } = $props();
 
-  // Read once: the dialog covers the canvas, so the view does not move while it is open.
-  const view = (() => engine.viewRect())();
+  // Read when the dialog opens and after a pick: the dialog covers the canvas, so the view does
+  // not move while it shows.
+  let view = $state((() => engine.viewRect())());
   const content = (() => engine.contentBounds())();
   const density = (() => engine.deviceScale)(); // device px per world unit at 1×
   const memoryOnly = sinkKind() === 'memory';
@@ -24,7 +27,7 @@
   const gl = (() => engine.comp.kind === 'webgl2')();
 
   /** Megapixels of the current view at the screen's resolution: the "Screen" preset. */
-  const screenMp = (view.w * view.h * (window.devicePixelRatio || 1) ** 2) / 1e6;
+  const screenMp = $derived((view.w * view.h * (window.devicePixelRatio || 1) ** 2) / 1e6);
 
   const KEY = 'draw.export';
   const saved = (() => {
@@ -35,7 +38,23 @@
     }
   })();
 
-  let area = $state<'view' | 'all'>(saved.area === 'all' && content ? 'all' : 'view');
+  let area = $state<'view' | 'all' | 'pick'>(saved.area === 'all' && content ? 'all' : saved.area === 'pick' && ed.exportRegion ? 'pick' : 'view');
+  const region = $derived(area === 'pick' ? ed.exportRegion : null);
+
+  /** The region before the picker opened: a new one after it closes means Accept. */
+  let before = ed.exportRegion;
+  // Closing the dialog (or leaving the canvas) also ends a pick.
+  $effect(() => () => (ed.exportPicking = false));
+  function pick() {
+    before = ed.exportRegion;
+    ed.exportPicking = true;
+  }
+  $effect(() => {
+    if (ed.exportPicking) return;
+    view = engine.viewRect();
+    if (ed.exportRegion && ed.exportRegion !== before) area = 'pick';
+    before = ed.exportRegion;
+  });
   /** Target size in megapixels, or the screen's resolution. */
   let size = $state<number | 'screen'>(saved.mp === 'screen' || (typeof saved.mp === 'number' && saved.mp > 0) ? saved.mp : 'screen');
   let aspect = $state(saved.aspect ?? 'area');
@@ -91,31 +110,21 @@
 
   /** Megapixel presets: camera sizes up to gigapixel panoramas. */
   const PRESETS = [4, 12, 24, 50, 100, 250, 500, 1000, 2500, 10_000, 50_000];
-  /** Width : height. "area" keeps the shape of the view or of the drawing. */
-  const ASPECTS: [id: string, w: number, h: number][] = [
-    ['1:1', 1, 1],
-    ['4:3', 4, 3],
-    ['3:2', 3, 2],
-    ['16:9', 16, 9],
-    ['21:9', 21, 9],
-    ['4:5', 4, 5],
-    ['2:3', 2, 3],
-    ['9:16', 9, 16],
-  ];
   const label = (m: number) => (m >= 1000 ? `${m / 1000} GP` : `${m} MP`);
   /** PNG strips hold width × 256 rows in memory; keep that under about 512 MB. */
   const PNG_MAX_WIDTH = 500_000;
 
   const areaBounds = $derived(area === 'all' && content ? content : view.bounds);
-  /** The area centered and widened to the chosen shape. */
+  /** The area centered and widened to the chosen shape (a picked region has its own). */
   const bounds = $derived.by(() => {
+    if (region) return region.bounds;
     const a = ASPECTS.find(([id]) => id === aspect);
     return a ? toAspect(areaBounds, a[1], a[2]) : areaBounds;
   });
   // width × height = mp × 10^6, with the shape of the frame.
   const ratio = $derived((bounds.x1 - bounds.x0) / (bounds.y1 - bounds.y0));
-  const width = $derived(Math.max(1, Math.round(Math.sqrt(Math.max(0, mp) * 1e6 * ratio))));
-  const height = $derived(Math.max(1, Math.round(width / ratio)));
+  const width = $derived(region ? region.w : Math.max(1, Math.round(Math.sqrt(Math.max(0, mp) * 1e6 * ratio))));
+  const height = $derived(region ? region.h : Math.max(1, Math.round(width / ratio)));
   /** The same size as a multiple of the screen's resolution (1× = what the screen shows now). */
   const screens = $derived(width / ((bounds.x1 - bounds.x0) * density));
   /** The file keeps an alpha channel: no paper, or a see-through paper. */
@@ -125,7 +134,7 @@
 
   /** Why this export cannot run, or null. */
   const problem = $derived.by(() => {
-    if (!(mp > 0) || !Number.isFinite(mp)) return 'Enter a size above 0 megapixels.';
+    if (!region && (!(mp > 0) || !Number.isFinite(mp))) return 'Enter a size above 0 megapixels.';
     if (format === 'png' && (width > PNG_MAX_WIDTH || height > PNG_MAX_SIDE)) return `PNG export goes up to ${PNG_MAX_WIDTH.toLocaleString()} px wide here. Use TIFF for larger images.`;
     if (format === 'tiff' && (width > TIFF_MAX_SIDE || height > TIFF_MAX_SIDE)) return 'TIFF goes up to 4 294 967 295 px per side.';
     if (memoryOnly && raw > MEMORY_LIMIT * 4) return 'This browser keeps the whole file in memory. Use Chrome, Edge or the Draw app for an image this large.';
@@ -192,6 +201,7 @@
   }
 </script>
 
+{#if !ed.exportPicking}
 <Modal title="Export image" onClose={() => (running ? controller?.abort() : (ed.exportOpen = false))}>
   {#if !gl}
     <p class="warn">This device has no WebGL2, so Draw can only save a snapshot of the screen (PNG, as you see it).</p>
@@ -201,9 +211,19 @@
     <div class="seg">
       <button class:on={area === 'view'} disabled={running} onclick={() => (area = 'view')}>Current view</button>
       <button class:on={area === 'all'} disabled={running || !content} onclick={() => (area = 'all')}>Everything</button>
+      <button class:on={area === 'pick'} disabled={running} title="Drag a box on the canvas, and set its shape and size in pixels" onclick={pick}>Pick…</button>
     </div>
   </div>
 
+  {#if region}
+  <div class="field">
+    <span class="label">Region</span>
+    <div class="seg">
+      <span class="picked">{region.w.toLocaleString()} × {region.h.toLocaleString()} px</span>
+      <button disabled={running} title="Show the box on the canvas again" onclick={pick}>Adjust…</button>
+    </div>
+  </div>
+  {:else}
   <div class="field">
     <span class="label">Shape</span>
     <div class="seg wrap">
@@ -239,6 +259,7 @@
       >
     </div>
   </div>
+  {/if}
 
   <div class="field">
     <span class="label">Format</span>
@@ -310,6 +331,7 @@
     </div>
   {/if}
 </Modal>
+{/if}
 
 <style>
   .field {
@@ -340,6 +362,10 @@
     color: var(--text);
     border-color: var(--accent-dim);
     background: #24394c;
+  }
+  .picked {
+    align-self: center;
+    font-variant-numeric: tabular-nums;
   }
   .custom {
     display: flex;
