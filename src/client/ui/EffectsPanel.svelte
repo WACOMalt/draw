@@ -11,12 +11,13 @@
 
   let { engine, layer }: { engine: Engine | null; layer: Layer } = $props();
 
-  const LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow' };
+  const LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow', kaleidoscope: 'Kaleidoscope' };
   const HINT: Record<EffectType, string> = {
     blur: 'A Gaussian blur of the layer',
     dropShadow: 'The layer’s shape, blurred, in a color, moved and behind it',
     outerGlow: 'The layer’s shape, blurred, in a color, behind it',
     innerGlow: 'A color from the edges inward, inside the layer',
+    kaleidoscope: 'Copies of the layer, each turned, scaled and moved by the step once more (a gizmo on the canvas)',
   };
 
   /** A new effect, with sizes in screen pixels now. */
@@ -31,6 +32,11 @@
         return { type, enabled: true, radius: 10 * px, color: '#ffd84d', opacity: 0.8, spread: 0 };
       case 'innerGlow':
         return { type, enabled: true, radius: 6 * px, color: '#ffffff', opacity: 0.8, spread: 0 };
+      case 'kaleidoscope': {
+        // Six around the middle of the view.
+        const [cx, cy] = viewCenter();
+        return { type, enabled: true, radius: 0, count: 5, angle: 60, scale: 1, cx, cy, dx: 0, dy: 0, order: 'behind' };
+      }
     }
   }
 
@@ -68,6 +74,12 @@
     send();
   }
 
+  /** The world point in the middle of the view. */
+  function viewCenter(): [number, number] {
+    const r = engine?.viewRect().bounds;
+    return r ? [(r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2] : [0, 0];
+  }
+
   // Screen pixels now ↔ world units.
   const px = (world: number) => world * ed.view.zoom;
   const world = (screen: number) => screen / ed.view.zoom;
@@ -89,7 +101,7 @@
         <input type="checkbox" checked={!!e?.enabled} onchange={(ev) => toggle(t, ev.currentTarget.checked)} />
         {LABEL[t]}
       </label>
-      {#if e && e.type !== 'blur'}
+      {#if e && e.type !== 'blur' && e.type !== 'kaleidoscope'}
         <ShapeColor
           label={LABEL[t]}
           value={e.color ?? '#000000'}
@@ -100,7 +112,40 @@
         />
       {/if}
     </div>
-    {#if e?.enabled}
+    {#if e?.enabled && t === 'kaleidoscope'}
+      {@const n = e.count ?? 1}
+      <div class="params">
+        <label class="field" title="Copies of the layer (1 to 64)"
+          >Count <input
+            type="number"
+            min="1"
+            max="64"
+            step="1"
+            value={n}
+            onchange={(ev) => {
+              const v = Math.round(+ev.currentTarget.value);
+              if (v >= 1) set(t, { count: Math.min(64, v) });
+            }}
+          /></label
+        >
+        <div class="field">
+          <Slider label="Angle" value={e.angle ?? 0} min={-180} max={180} step={0.1} width={80} title="Degrees each copy turns past the one before" oninput={(v) => set(t, { angle: v })} />
+          <button class="small" title="Even around a full turn: 360° ÷ (count + 1)" onclick={() => set(t, { angle: Math.round((360 / (n + 1)) * 1000) / 1000 })}>Even</button>
+        </div>
+        <Slider label="Scale" value={e.scale ?? 1} min={0.05} max={4} step={0.001} percent log width={100} title="Each copy's size, from the one before" oninput={(v) => set(t, { scale: v })} />
+        <Slider label="Move X" value={px(e.dx ?? 0)} min={-500} max={500} step={0.1} width={100} title="Screen pixels now: each copy moves this far from the one before" oninput={(v) => set(t, { dx: world(v) })} />
+        <Slider label="Move Y" value={px(e.dy ?? 0)} min={-500} max={500} step={0.1} width={100} title="Screen pixels now" oninput={(v) => set(t, { dy: world(v) })} />
+        <div class="field">
+          <span>Copies</span>
+          <div class="seg">
+            <button class="small" class:on={e.order === 'behind'} onclick={() => set(t, { order: 'behind' })}>Behind</button>
+            <button class="small" class:on={e.order === 'front'} onclick={() => set(t, { order: 'front' })}>In front</button>
+          </div>
+        </div>
+        <button class="small" title="The pivot to the middle of the view" onclick={() => { const [cx, cy] = viewCenter(); set(t, { cx, cy }); }}>Pivot to the middle</button>
+        <p class="hint">On the canvas: drag the round pivot, the square to move each step, and the arrow tip to turn and scale (Shift: 15° steps).</p>
+      </div>
+    {:else if e?.enabled}
       <div class="params">
         <Slider
           label={t === 'blur' ? 'Radius' : 'Size'}
@@ -142,6 +187,30 @@
     align-items: center;
     gap: 6px;
     margin: 0;
+  }
+  .field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin: 0;
+  }
+  .field input {
+    width: 60px;
+  }
+  .seg {
+    display: flex;
+    gap: 4px;
+  }
+  button.on {
+    color: var(--text);
+    border-color: var(--accent-dim);
+    background: #24394c;
+  }
+  .hint {
+    margin: 0;
+    font-size: 11px;
+    color: var(--text-faint);
   }
   .params {
     display: flex;

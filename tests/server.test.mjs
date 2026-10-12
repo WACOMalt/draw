@@ -691,6 +691,15 @@ try {
     check(r?.t === 'reject' && /adjustment/.test(r.reason), 'effects: not on an adjustment layer');
     r = await tryOp({ type: 'layer.add', layer: { id: 'fxGROUP0001', kind: 'group', name: 'G', order: 10, blend: 'pass', opacity: 1, visible: true, effects: [shadow] } });
     check(r?.t === 'op' && r.op.layer.effects?.length === 1, 'effects: on a group');
+    const kal = { type: 'kaleidoscope', enabled: true, radius: 0, count: 5, angle: 60, scale: 1, cx: 10, cy: 20, dx: 0, dy: 0, order: 'behind' };
+    r = await tryOp({ type: 'layer.update', id: 'fxGROUP0001', props: { effects: [kal] } });
+    check(r?.t === 'op' && r.op.props.effects[0].count === 5 && r.op.props.effects[0].order === 'behind', 'kaleidoscope: count, step and pivot');
+    r = await tryOp({ type: 'layer.update', id: 'fxGROUP0001', props: { effects: [{ ...kal, count: 2.5 }] } });
+    check(r?.t === 'reject', 'kaleidoscope: a whole count');
+    r = await tryOp({ type: 'layer.update', id: 'fxGROUP0001', props: { effects: [{ ...kal, count: 65 }] } });
+    check(r?.t === 'reject', 'kaleidoscope: at most 64 copies');
+    r = await tryOp({ type: 'layer.update', id: 'fxGROUP0001', props: { effects: [{ ...kal, order: 'sideways' }] } });
+    check(r?.t === 'reject', 'kaleidoscope: in front or behind');
     send({ type: 'layer.remove', id: 'fxGROUP0001' });
     await echo((op) => op.type === 'layer.remove' && op.id === 'fxGROUP0001');
     r = await tryOp({ type: 'layer.update', id: 'blurADJ0001', props: { adjust: { type: 'blur', radius: -1 } } });

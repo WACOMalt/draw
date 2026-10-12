@@ -17,8 +17,25 @@ export function transformEffects(effects: LayerEffect[], m: Affine): LayerEffect
       out.dx = m[0] * e.dx + m[2] * e.dy;
       out.dy = m[1] * e.dx + m[3] * e.dy;
     }
+    // The kaleidoscope pivot moves with the layer (its turn and scale stay).
+    if (e.cx !== undefined && e.cy !== undefined) {
+      out.cx = m[0] * e.cx + m[2] * e.cy + m[4];
+      out.cy = m[1] * e.cx + m[3] * e.cy + m[5];
+    }
     return out;
   });
+}
+
+/**
+ * The step transform of a kaleidoscope effect (world to world): turn by `angle` and scale by
+ * `scale` about the pivot, then move by (dx, dy). Copy i is this transform applied i times.
+ */
+export function kaleidoscopeStep(e: LayerEffect): Affine {
+  const a = ((e.angle ?? 0) * Math.PI) / 180, k = e.scale ?? 1;
+  const c = Math.cos(a) * k, s = Math.sin(a) * k;
+  const cx = e.cx ?? 0, cy = e.cy ?? 0;
+  // p' = R·S·(p − pivot) + pivot + offset
+  return [c, s, -s, c, cx - c * cx + s * cy + (e.dx ?? 0), cy - s * cx - c * cy + (e.dy ?? 0)];
 }
 
 /** A blur adjustment after a layer transform (a group with it inside): the radius scales. */

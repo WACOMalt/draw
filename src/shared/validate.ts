@@ -177,6 +177,23 @@ export function validateEffects(v: unknown): LayerEffect[] | null {
     seen.add(type);
     const fx: LayerEffect = { type, enabled: bool(e.enabled, 'effect.enabled'), radius: num(e.radius, 0, LIMITS.maxBrushWorld, 'effect.radius') };
     if (type === 'blur') return fx;
+    if (type === 'kaleidoscope') {
+      const c = LIMITS.maxCoord;
+      if (!Number.isInteger(e.count)) fail('bad effect.count');
+      return {
+        type,
+        enabled: fx.enabled,
+        radius: 0,
+        count: num(e.count, 1, LIMITS.maxKaleidoscope, 'effect.count'),
+        angle: num(e.angle, -360, 360, 'effect.angle'),
+        scale: num(e.scale, 0.01, 100, 'effect.scale'),
+        cx: num(e.cx, -c, c, 'effect.cx'),
+        cy: num(e.cy, -c, c, 'effect.cy'),
+        dx: num(e.dx, -c, c, 'effect.dx'),
+        dy: num(e.dy, -c, c, 'effect.dy'),
+        order: oneOf(e.order, ['front', 'behind'] as const, 'effect.order'),
+      };
+    }
     fx.color = validateColor(e.color);
     fx.opacity = num(e.opacity, 0, 1, 'effect.opacity');
     fx.spread = e.spread === undefined ? 0 : num(e.spread, 0, 0.99, 'effect.spread');
