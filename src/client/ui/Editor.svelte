@@ -270,7 +270,8 @@
     display: grid;
     /* The options bar floats over the stage (OptionsBar.svelte): when it wraps to more rows,
        nothing moves. */
-    grid-template-rows: 36px minmax(0, 1fr) 24px;
+    /* The bars grow by the safe areas (iOS): the clock above, the home indicator below. */
+    grid-template-rows: calc(36px + env(safe-area-inset-top)) minmax(0, 1fr) calc(24px + env(safe-area-inset-bottom));
     grid-template-columns: 44px minmax(0, 1fr) 264px;
     grid-template-areas:
       'top top top'
