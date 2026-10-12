@@ -16,10 +16,11 @@ export const BDRAW_MIME = 'application/x-bdraw';
  * 3: shape layers and `shapes`. 4: paths (kind 'path') and vector strokes (`vector`). 5: spline
  * paths (`curve: 'spline'`). 6: compound shapes (kind 'compound', `parts`). 7: ellipse arcs and
  * holes, custom shapes, dashes and arrowheads. 8: see-through shape fill and stroke
- * (`fillOpacity`, `strokeOpacity`) and the paper (`paper`). A file is written with the lowest
+ * (`fillOpacity`, `strokeOpacity`) and the paper (`paper`). 9: layer effects (`effects`) and blur
+ * adjustment layers. A file is written with the lowest
  * version that holds it, so older servers accept what they can read.
  */
-export const BDRAW_VERSION = 8;
+export const BDRAW_VERSION = 9;
 
 export interface BdrawFile {
   format: 'bdraw';
@@ -75,6 +76,7 @@ export function makeBdraw(
 /** The lowest version that holds these layers, strokes and shapes. */
 function fileVersion(layers: Layer[], strokes: Stroke[], shapes: Shape[], paper?: Paper): number {
   const f = docFeatures(layers, strokes, shapes, paper);
+  if (f.some((x) => x === 'effects' || x === 'blur')) return 9;
   if (f.some((x) => x === 'shapeAlpha' || x === 'paper')) return 8;
   if (f.some((x) => x === 'arcs' || x === 'custom' || x === 'dashes' || x === 'arrows')) return 7;
   if (shapes.some((s) => s.kind === 'compound') || strokes.some((s) => s.vector?.kind === 'compound')) return 6;

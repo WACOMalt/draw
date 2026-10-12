@@ -5,6 +5,7 @@
   import { toneFunction } from '../engine/adjust';
   import type { Engine } from '../engine/engine';
   import Slider from './Slider.svelte';
+  import { ed } from '../state.svelte';
 
   let { engine, layer }: { engine: Engine | null; layer: Layer } = $props();
 
@@ -146,6 +147,19 @@
   {:else if a.type === 'brightContrast'}
     <Slider label="Brightness" value={a.brightness} min={-1} max={1} step={0.01} percent width={110} oninput={set('brightness')} />
     <Slider label="Contrast" value={a.contrast} min={-1} max={1} step={0.01} percent width={110} oninput={set('contrast')} />
+  {:else if a.type === 'blur'}
+    <!-- The radius is in world units: the slider shows screen pixels at the current zoom. -->
+    <Slider
+      label="Radius"
+      value={a.radius * ed.view.zoom}
+      min={0}
+      max={1000}
+      step={0.1}
+      log
+      width={110}
+      title="Blur radius in screen pixels now. It stays the same on the canvas at any zoom."
+      oninput={(v) => set('radius')(v / ed.view.zoom)}
+    />
   {/if}
 </div>
 

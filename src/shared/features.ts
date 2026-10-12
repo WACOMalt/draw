@@ -37,6 +37,8 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, 
     if (l.mask) f.add('mask');
     if (l.kind === 'group' || l.parent) f.add('groups');
     if (l.kind === 'shape') f.add('shapes');
+    if (l.effects?.length) f.add('effects');
+    if (l.adjust?.type === 'blur') f.add('blur');
   }
   for (const s of strokes) {
     if (s.deleted) continue;

@@ -675,12 +675,39 @@ try {
     const restored = await echo((op) => op.type === 'shape.restore');
     check(restored?.op.shape?.stroke === '#112233', 'shapes: restore brings the shape back, with its body');
 
+    // Layer effects: at most one of each type, on paint and shape layers.
+    const shadow = { type: 'dropShadow', enabled: true, radius: 2, color: '#000000', opacity: 0.5, dx: 3, dy: 0 };
+    r = await tryOp({ type: 'layer.update', id: 'shapeLAYER1', props: { effects: [{ type: 'blur', enabled: true, radius: 4 }, shadow] } });
+    check(r?.t === 'op' && r.op.props.effects.length === 2 && r.op.props.effects[1].spread === 0, 'effects: a blur and a shadow on a shape layer');
+    r = await tryOp({ type: 'layer.update', id: 'shapeLAYER1', props: { effects: [shadow, shadow] } });
+    check(r?.t === 'reject', 'effects: one of each type');
+    r = await tryOp({ type: 'layer.update', id: 'shapeLAYER1', props: { effects: [{ type: 'bevel', enabled: true, radius: 1 }] } });
+    check(r?.t === 'reject', 'effects: an unknown type is refused');
+    r = await tryOp({ type: 'layer.update', id: 'shapeLAYER1', props: { effects: [{ ...shadow, color: 'black' }] } });
+    check(r?.t === 'reject', 'effects: colors are #rrggbb');
+    r = await tryOp({ type: 'layer.add', layer: { id: 'blurADJ0001', kind: 'adjust', name: 'Blur', order: 9, blend: 'normal', opacity: 1, visible: true, adjust: { type: 'blur', radius: 12 } } });
+    check(r?.t === 'op', 'blur adjustment: add one');
+    r = await tryOp({ type: 'layer.update', id: 'blurADJ0001', props: { effects: [{ type: 'blur', enabled: true, radius: 4 }] } });
+    check(r?.t === 'reject' && /adjustment/.test(r.reason), 'effects: not on an adjustment layer');
+    r = await tryOp({ type: 'layer.add', layer: { id: 'fxGROUP0001', kind: 'group', name: 'G', order: 10, blend: 'pass', opacity: 1, visible: true, effects: [shadow] } });
+    check(r?.t === 'op' && r.op.layer.effects?.length === 1, 'effects: on a group');
+    send({ type: 'layer.remove', id: 'fxGROUP0001' });
+    await echo((op) => op.type === 'layer.remove' && op.id === 'fxGROUP0001');
+    r = await tryOp({ type: 'layer.update', id: 'blurADJ0001', props: { adjust: { type: 'blur', radius: -1 } } });
+    check(r?.t === 'reject', 'blur adjustment: the radius is not negative');
+    w2 = await first(await sb.join(sc));
+    check(w2.features.includes('effects') && w2.features.includes('blur'), 'effects: welcome lists the effects and blur features');
+    send({ type: 'layer.remove', id: 'blurADJ0001' });
+    await echo((op) => op.type === 'layer.remove' && op.id === 'blurADJ0001');
+
     // Layer transform: the shape matrix follows; out of range is refused.
     send({ type: 'layer.transform', id: 'shapeLAYER1', m: [0, 2, -2, 0, 5, 5] });
     await echo((op) => op.type === 'layer.transform');
     w2 = await first(await sb.join(sc));
     sh = w2.shapes.find((x) => x.id === 'shapeRECT01');
     check(sh?.m.join() === '0,2,-2,0,-35,25' && sh.w === 100, 'shapes: a layer transform composes into the shape matrix');
+    const fxAfter = w2.layers.find((l) => l.id === 'shapeLAYER1')?.effects;
+    check(fxAfter?.[0].radius === 8 && fxAfter[1].radius === 4 && Math.abs(fxAfter[1].dx) < 1e-9 && fxAfter[1].dy === 6, 'effects: a layer transform scales the radii and turns the shadow');
     r = await tryOp({ type: 'layer.transform', id: 'shapeLAYER1', m: [1, 0, 0, 1, 2e15, 0] });
     check(r?.t === 'reject', 'shapes: a layer transform out of range is refused');
 
@@ -690,6 +717,10 @@ try {
     w2 = await first(await sb.join(sc));
     const copies = w2.shapes.filter((x) => x.layerId === 'shapeLAYER2');
     check(copies.length === 2 && copies.every((c) => !['shapeRECT01', 'shapeLINE01'].includes(c.id)), 'shapes: a layer duplicate copies its shapes');
+    check(w2.layers.find((l) => l.id === 'shapeLAYER2')?.effects?.length === 2, 'effects: a layer duplicate copies its effects');
+    r = await tryOp({ type: 'layer.update', id: 'shapeLAYER2', props: { effects: null } });
+    w2 = await first(await sb.join(sc));
+    check(r?.t === 'op' && w2.layers.find((l) => l.id === 'shapeLAYER2')?.effects === undefined, 'effects: null removes them');
 
     // Viewers: no shape ops, no live shapes; they see the live shapes of editors.
     const v = await new Browser().join(sc);

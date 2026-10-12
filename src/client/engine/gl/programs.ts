@@ -266,6 +266,7 @@ void main() {
 /**
  * Adjustment layer: changes the composite below it. uType 0: tone curve from a lookup texture
  * (levels, curves, brightness/contrast), applied to each channel. uType 1: hue/saturation.
+ * uType 2: Gaussian blur (uLut holds the blurred backdrop).
  * The amount is the layer opacity times the mask visibility. Alpha stays as it is.
  */
 const ADJUST_FS = `#version 300 es
@@ -278,6 +279,7 @@ uniform int uMaskOn;
 uniform int uType;
 uniform vec3 uHsl;        // hue shift (turns), saturation, lightness (-1..1)
 uniform float uOpacity;
+uniform vec4 uFxMap;      // uType 2: target position (0..1) to the blurred backdrop in uLut
 out vec4 o;
 vec3 rgb2hsl(vec3 c) {
   float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
@@ -308,6 +310,11 @@ void main() {
     vec4 m = texture(uMask, vScreen);
     amount *= clamp(dot(m.rgb, vec3(0.2126, 0.7152, 0.0722)) + 1.0 - m.a, 0.0, 1.0);
   }
+  if (uType == 2) {
+    // Blur: the blurred backdrop, alpha too (an edge over a see-through paper blurs as well).
+    o = mix(bk, texture(uLut, vScreen * uFxMap.xy + uFxMap.zw), amount);
+    return;
+  }
   if (bk.a <= 0.0 || amount <= 0.0) { o = bk; return; }
   vec3 c = clamp(bk.rgb / bk.a, 0.0, 1.0);
   vec3 r;
@@ -321,6 +328,60 @@ void main() {
     r = hsl2rgb(clamp(h, vec3(-10.0, 0.0, 0.0), vec3(10.0, 1.0, 1.0)));
   }
   o = vec4(mix(bk.rgb, r * bk.a, amount), bk.a);
+}`;
+
+/**
+ * One pass of a separable Gaussian blur (blur.ts): the center tap, then taps at ±uOff[i] texels
+ * along uStep, each between two texels so that bilinear filtering weighs both (linear sampling).
+ */
+const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform vec2 uStep;       // one texel along the blur direction, in texture coordinates
+uniform int uN;
+uniform float uOff[8];
+uniform float uW[8];
+out vec4 o;
+void main() {
+  vec4 c = texture(uTex, vUv) * uW[0];
+  for (int i = 1; i < 8; i++) {
+    if (i >= uN) break;
+    vec2 d = uStep * uOff[i];
+    c += (texture(uTex, vUv + d) + texture(uTex, vUv - d)) * uW[i];
+  }
+  o = c;
+}`;
+
+/**
+ * A layer effect onto the layer's pixels (uLayer, the size of the target). uFx is the blurred
+ * source, often smaller and with a margin: uFxMap takes a target position (0..1) to it.
+ * uMode 0: blur (the blurred pixels replace the layer's). 1: drop shadow or outer glow (the
+ * blurred alpha in a color, behind the layer). 2: inner glow (the blurred alpha of what is
+ * outside the layer, in a color, on the layer and only inside it). uSpread makes the edge harder.
+ */
+const FX_FS = `#version 300 es
+precision highp float;
+in vec2 vScreen;
+uniform sampler2D uLayer;
+uniform sampler2D uFx;
+uniform vec4 uFxMap;
+uniform int uMode;
+uniform vec3 uColor;
+uniform float uOpacity;
+uniform float uSpread;
+out vec4 o;
+void main() {
+  vec4 l = texture(uLayer, vScreen);
+  vec4 f = texture(uFx, vScreen * uFxMap.xy + uFxMap.zw);
+  if (uMode == 0) { o = f; return; }
+  if (uMode == 1) {
+    float a = clamp(f.a / (1.0 - uSpread), 0.0, 1.0) * uOpacity;
+    o = l + vec4(uColor * a, a) * (1.0 - l.a);
+    return;
+  }
+  float a = clamp((1.0 - f.a) / (1.0 - uSpread), 0.0, 1.0) * uOpacity;
+  o = vec4(l.rgb * (1.0 - a) + uColor * a * l.a, l.a);
 }`;
 
 export interface Program {
@@ -359,7 +420,9 @@ export function createPrograms(gl: WebGL2RenderingContext) {
     present: link(gl, QUAD_VS, PRESENT_FS, [...quad, 'uTex', 'uDither', 'uCell']),
     blend: link(gl, QUAD_VS, BLEND_FS, [...quad, 'uBack', 'uLayer', 'uOpacity', 'uMode', 'uAtop']),
     mask: link(gl, QUAD_VS, MASK_FS, [...quad, 'uMask']),
-    adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity']),
+    adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity', 'uFxMap']),
+    blur: link(gl, QUAD_VS, BLUR_FS, [...quad, 'uTex', 'uStep', 'uN', 'uOff', 'uW']),
+    fx: link(gl, QUAD_VS, FX_FS, [...quad, 'uLayer', 'uFx', 'uFxMap', 'uMode', 'uColor', 'uOpacity', 'uSpread']),
     dab: link(gl, DAB_VS, DAB_FS, [
       'uTarget',
       'uTip',

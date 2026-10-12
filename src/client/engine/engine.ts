@@ -12,6 +12,7 @@ import {
   type AdjustType,
   type Brush,
   type Layer,
+  type LayerEffect,
   type LayerProps,
   type Op,
   type Paper,
@@ -132,7 +133,7 @@ function greyOf(hex: string): string {
 }
 
 /** What a layer property is when it is not set: undo must send a value, not undefined. */
-const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null };
+const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null, effects: null };
 
 /** Squared distance between the segments a–b and c–d (zero when they cross). */
 function segDist2(ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number): number {
@@ -1345,6 +1346,7 @@ export class Engine {
     curves: 'Curves',
     hueSat: 'Hue/Saturation',
     brightContrast: 'Brightness/Contrast',
+    blur: 'Gaussian blur',
   };
 
   /** An adjustment layer above the active layer. It changes everything below it. */
@@ -1361,7 +1363,8 @@ export class Engine {
         blend: 'normal',
         opacity: 1,
         visible: true,
-        adjust: DEFAULT_ADJUST[type],
+        // A new blur is 8 px on screen now (the radius is in world units).
+        adjust: type === 'blur' ? { type: 'blur', radius: 8 / this.comp.view.zoom } : DEFAULT_ADJUST[type],
       },
     });
     this.pushUndo({ undo: [{ type: 'layer.remove', id }], redo: [{ type: 'layer.restore', id }] });
@@ -1372,6 +1375,11 @@ export class Engine {
   /** Changes adjustment settings. Changes within 2 s merge into one undo step. */
   setAdjust(id: string, adjust: Adjust): void {
     this.updateLayer(id, { adjust }, 'adjust');
+  }
+
+  /** Sets a layer's effects (none: removes them). Changes within 2 s merge into one undo step. */
+  setEffects(id: string, effects: LayerEffect[]): void {
+    this.updateLayer(id, { effects: effects.length ? effects : null }, 'effects');
   }
 
   /** Adds an empty (all white) mask and selects it for painting. */
@@ -1937,6 +1945,8 @@ export class Engine {
         ed.denied = null;
         if (m.grant) grants.set(this.code, m.grant);
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
+        // A server from before effects sends no list: it refuses effects and blur layers.
+        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur');
         this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);

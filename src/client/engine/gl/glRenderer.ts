@@ -3,7 +3,9 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, lowFlow, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
+import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, type Affine, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
+import { takesEffects } from '../../../shared/effects';
+import { MARGIN, blurLevel, kernel } from '../blur';
 import { byZ } from '../../../shared/shapes';
 import { compose, effectivelyVisible, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
@@ -23,7 +25,10 @@ interface Pair {
   b: Target;
 }
 
-/** The tile grid of the current frame. */
+/**
+ * A frame to composite into: the screen, or an effect frame (a blur source at a coarser level,
+ * with a margin around the view; see fxGrid). Its tiles, where they go, and its buffers.
+ */
 interface Grid {
   lod: number;
   tx0: number;
@@ -32,6 +37,29 @@ interface Grid {
   ty1: number;
   X: (tx: number) => number;
   Y: (ty: number) => number;
+  /** Buffer size in px, and the prefix of the buffer names ('' for the screen frame). */
+  w: number;
+  h: number;
+  ns: string;
+  /** The world point at px (0, 0), and px per world unit. */
+  wx: number;
+  wy: number;
+  s: number;
+}
+
+/** Thrown to end the backdrop render of a blur adjustment layer when it reaches that layer. */
+const STOP = Symbol('stop');
+
+/** The enabled effects of a paint or shape layer, in the order they draw. */
+function activeEffects(l: Layer): LayerEffect[] {
+  if (!l.effects?.length || !takesEffects(l.kind)) return [];
+  return EFFECT_TYPES.map((t) => l.effects!.find((e) => e.type === t && e.enabled)).filter((e): e is LayerEffect => !!e && (e.type !== 'blur' || e.radius > 0));
+}
+
+/** The blur an effect needs: glows and the shadow come from the blurred layer when it has a blur. */
+function effectSigma(e: LayerEffect, fx: LayerEffect[]): number {
+  if (e.type === 'blur') return e.radius;
+  return Math.hypot(e.radius, fx.find((x) => x.type === 'blur')?.radius ?? 0);
 }
 
 /**
@@ -194,7 +222,6 @@ export class GLRenderer implements Renderer {
 
   private compA!: Target;
   private compB!: Target;
-  private layerT!: Target;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
   private pickT!: Target;
   /** Screen buffers made only when a frame needs them: layer masks and clipping groups. */
@@ -435,11 +462,33 @@ export class GLRenderer implements Renderer {
     gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
   }
 
-  /** A screen-sized buffer that only some frames need, made on first use. */
-  private screen(name: string): Target {
+  /** A buffer that only some frames need, made on first use (screen-sized unless w and h say). */
+  private screen(name: string, w = this.canvas.width || 1, h = this.canvas.height || 1): Target {
     let t = this.extra.get(name);
-    if (!t) this.extra.set(name, (t = this.makeTarget(this.canvas.width || 1, this.canvas.height || 1)));
+    if (t && (t.w !== w || t.h !== h)) {
+      this.freeTarget(t);
+      t = undefined;
+    }
+    if (!t) this.extra.set(name, (t = this.makeTarget(w, h)));
     return t;
+  }
+
+  /** A buffer of a frame (the screen, or an effect frame). */
+  private buf(g: Grid, name: string): Target {
+    return this.screen(g.ns + name, g.w, g.h);
+  }
+
+  /** Where the screen (device px) lies in a frame: x, y, w, h in the frame's px. */
+  private screenRect(g: Grid): [number, number, number, number] {
+    const f = g.s / (this.view.zoom * this.dpr);
+    return [(this.view.x - g.wx) * g.s, (this.view.y - g.wy) * g.s, this.canvas.width * f, this.canvas.height * f];
+  }
+
+  /** The paper (premultiplied) into the bound buffer; none for a transparent export or a pick. */
+  private clearPaper(): void {
+    const [pr, pg, pb] = hexToRgb(this.paper.color);
+    const pa = this.transparent || this.pickPass ? 0 : this.paper.alpha;
+    this.clear(pr * pa, pg * pa, pb * pa, pa);
   }
 
   private freeTarget(t: Target): void {
@@ -450,14 +499,13 @@ export class GLRenderer implements Renderer {
   private allocScreenTargets(): void {
     const w = this.canvas.width || 1;
     const h = this.canvas.height || 1;
-    for (const t of [this.compA, this.compB, this.layerT]) if (t) this.freeTarget(t);
+    for (const t of [this.compA, this.compB]) if (t) this.freeTarget(t);
     for (const t of this.extra.values()) this.freeTarget(t);
     this.extra.clear();
     for (const t of this.livePool) this.freeTarget(t);
     this.livePool = [];
     this.compA = this.makeTarget(w, h);
     this.compB = this.makeTarget(w, h);
-    this.layerT = this.makeTarget(w, h);
     for (const l of this.live.values()) {
       if (l.target) this.freeTarget(l.target);
       l.target = null;
@@ -822,7 +870,12 @@ export class GLRenderer implements Renderer {
   private drawLayerContent(layer: string, g: Grid, target: Target, opacity: number): void {
     const h = this.hot.get(layer);
     if (h) {
-      if (h.rect) this.copy(h.tex, target, h.rect, opacity);
+      if (h.rect) {
+        // The buffer covers part of the screen: into an effect frame, through the screen's place.
+        const [ox, oy, sw] = this.screenRect(g), f = sw / this.canvas.width;
+        const [x, y, w, hh] = h.rect;
+        this.copy(h.tex, target, [ox + x * f, oy + y * f, w * f, hh * f], opacity);
+      }
       return;
     }
     this.drawLayerTiles(layer, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, target, opacity);
@@ -1469,7 +1522,9 @@ export class GLRenderer implements Renderer {
     const area = (r: TileRange) => (r.tx1 - r.tx0 + 1) * (r.ty1 - r.ty0 + 1) * keys.length;
     const ring = this.offline ? 0 : PREFETCH;
     const ranges: TileRange[] = [{ lod, tx0: tx0 - ring, ty0: ty0 - ring, tx1: tx1 + ring, ty1: ty1 + ring }];
-    let total = area(ranges[0]);
+    // Effect frames (blurs, glows, shadows) read these tiles: their level, with their margin.
+    for (const r of this.effectRanges()) ranges.push(r);
+    let total = ranges.reduce((n, r) => n + area(r), 0);
     for (let up = 1; up <= (this.offline ? 0 : this.profile.coarseLevels) && lod + up <= MAX_LOD; up++) {
       const ctw = tileWorld(lod + up);
       const m = (2 ** up - 1) / 2; // margin on each side, in views: 2× the view, then 4×
@@ -1532,14 +1587,17 @@ export class GLRenderer implements Renderer {
       ty1,
       X: (tx) => Math.round((tx * tw - vx) * ds),
       Y: (ty) => Math.round((ty * tw - vy) * ds),
+      w: this.canvas.width,
+      h: this.canvas.height,
+      ns: '',
+      wx: vx,
+      wy: vy,
+      s: ds,
     };
     if (this.hot.size || this.drafts.size) this.updateHot(grid);
     let main: Pair = { a: this.compA, b: this.compB };
     this.bindTarget(main.a);
-    // The paper, premultiplied (the buffers hold premultiplied color).
-    const [pr, pg, pb] = hexToRgb(this.paper.color);
-    const pa = this.transparent || this.pickPass ? 0 : this.paper.alpha;
-    this.clear(pr * pa, pg * pa, pb * pa, pa);
+    this.clearPaper();
     main = this.compositeNodes(this.tree, main, grid, 0);
     this.compA = main.a;
     this.compB = main.b;
@@ -1591,7 +1649,7 @@ export class GLRenderer implements Renderer {
         for (const c of clipped) pair = this.compositeNode(c, pair, g, false, depth);
       } else {
         const gl = this.gl;
-        let group: Pair = { a: this.screen(`clipA${depth}`), b: this.screen(`clipB${depth}`) };
+        let group: Pair = { a: this.buf(g, `clipA${depth}`), b: this.buf(g, `clipB${depth}`) };
         const src = this.nodePixels(base, g, depth);
         this.bindTarget(group.a);
         gl.disable(gl.BLEND);
@@ -1607,14 +1665,17 @@ export class GLRenderer implements Renderer {
   /** One layer or group onto `pair.a` (`atop`: only where `pair.a` has alpha, for clipping). */
   private compositeNode(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
     const l = node.layer;
-    if (this.preview?.id === l.id) return this.drawPreview(node, pair, g, atop, depth);
+    // The transform preview shows on screen only (an effect frame draws the tiles as they are).
+    if (this.preview?.id === l.id && g.ns === '') return this.drawPreview(node, pair, g, atop, depth);
     if (l.kind !== 'group') return this.compositeLayer(l, pair, g, atop);
+    // A group with effects draws its layers together first (as if isolated), then the effects.
+    if (activeEffects(l).length) return this.blendOnto(this.groupPixels(node, g, depth), modeOf(l.blend), l.opacity, pair, atop);
     if (l.blend === 'pass' && !atop) {
       // Pass through: the group's layers blend straight onto what is below, as if not grouped.
       if (l.opacity >= 1) return this.compositeNodes(node.children, pair, g, depth + 1);
       // With less opacity: composite them, then mix the result with the backdrop by the opacity.
       const gl = this.gl;
-      const save = this.screen(`pass${depth}`);
+      const save = this.buf(g, `pass${depth}`);
       this.bindTarget(save);
       gl.disable(gl.BLEND);
       this.copy(pair.a.tex, save, [0, 0, save.w, save.h]);
@@ -1629,18 +1690,36 @@ export class GLRenderer implements Renderer {
 
   /** An isolated group: its layers composited onto a clear buffer. Returns that buffer. */
   private renderGroup(node: LayerNode, g: Grid, depth: number): Target {
-    let p: Pair = { a: this.screen(`isoA${depth}`), b: this.screen(`isoB${depth}`) };
+    let p: Pair = { a: this.buf(g, `isoA${depth}`), b: this.buf(g, `isoB${depth}`) };
     this.bindTarget(p.a);
     this.clear();
     p = this.compositeNodes(node.children, p, g, depth + 1);
     return p.a;
   }
 
-  /** A layer's or group's own pixels, before its blend and opacity. */
+  /** A layer's or group's own pixels with its effects, before its blend and opacity. */
   private nodePixels(node: LayerNode, g: Grid, depth: number): Target {
-    if (node.layer.kind === 'group') return this.renderGroup(node, g, depth);
-    this.renderLayer(node.layer, g);
-    return this.layerT;
+    if (node.layer.kind === 'group') return this.groupPixels(node, g, depth);
+    return this.layerPixels(node.layer, g);
+  }
+
+  /** A layer's pixels (renderLayer) with its effects. */
+  private layerPixels(layer: Layer, g: Grid): Target {
+    this.renderLayer(layer, g);
+    const fx = activeEffects(layer);
+    if (!fx.length) return this.buf(g, 'layer');
+    return this.applyEffects(fx, g, this.buf(g, 'layer'), (fg) => {
+      this.renderLayer(layer, fg);
+      return this.buf(fg, 'layer');
+    });
+  }
+
+  /** An isolated group's pixels (renderGroup) with its effects. */
+  private groupPixels(node: LayerNode, g: Grid, depth: number): Target {
+    const own = this.renderGroup(node, g, depth);
+    const fx = activeEffects(node.layer);
+    if (!fx.length) return own;
+    return this.applyEffects(fx, g, own, (fg) => this.renderGroup(node, fg, depth));
   }
 
   // --- transform preview ----------------------------------------------------------------------
@@ -1757,6 +1836,7 @@ export class GLRenderer implements Renderer {
   /** Draws one layer onto `pair.a`. Returns the pair with the result in `a`. */
   private compositeLayer(layer: Layer, pair: Pair, g: Grid, atop: boolean): Pair {
     if (layer.kind === 'adjust') return this.applyAdjust(layer, pair, g);
+    if (activeEffects(layer).length) return this.blendOnto(this.layerPixels(layer, g), layer.blend, layer.opacity, pair, atop);
     const mode = BLEND_MODES.indexOf(modeOf(layer.blend));
     if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
       // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
@@ -1766,7 +1846,7 @@ export class GLRenderer implements Renderer {
       return pair;
     }
     this.renderLayer(layer, g);
-    return this.blendOnto(this.layerT, layer.blend, layer.opacity, pair, atop);
+    return this.blendOnto(this.buf(g, 'layer'), layer.blend, layer.opacity, pair, atop);
   }
 
   /** Blends a screen-sized buffer onto `pair.a` with a blend mode and opacity. */
@@ -1797,21 +1877,26 @@ export class GLRenderer implements Renderer {
     return { a: pair.b, b: pair.a };
   }
 
-  /** A layer's pixels, with its strokes in progress and its mask, into layerT (opacity 1). */
+  /**
+   * A layer's pixels, with its strokes in progress and its mask, into the frame's 'layer' buffer
+   * (opacity 1). Strokes in progress are screen buffers: an effect frame gets the part on screen.
+   */
   private renderLayer(layer: Layer, g: Grid): void {
     const gl = this.gl;
-    this.bindTarget(this.layerT);
+    const t = this.buf(g, 'layer');
+    this.bindTarget(t);
     this.clear();
     gl.disable(gl.BLEND);
-    this.drawLayerContent(layer.id, g, this.layerT, 1);
+    this.drawLayerContent(layer.id, g, t, 1);
+    const scr = this.screenRect(g);
     for (const l of this.livesFor(layer.id)) {
       this.blendFor(l.brush.tool === 'erase');
-      this.copy(l.target!.tex, this.layerT, [0, 0, this.layerT.w, this.layerT.h], l.brush.opacity);
+      this.copy(l.target!.tex, t, scr, l.brush.opacity);
     }
     if (!layer.mask?.enabled) return;
     const mask = this.renderMask(layer, g);
     // Multiply the layer by the mask visibility: dst * (1 - src.a), src.a = 1 - visibility.
-    this.bindTarget(this.layerT);
+    this.bindTarget(t);
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
@@ -1820,21 +1905,22 @@ export class GLRenderer implements Renderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, mask.tex);
     gl.uniform1i(p.u.uMask, 0);
-    this.quad(p, this.layerT, [0, 0, this.layerT.w, this.layerT.h]);
+    this.quad(p, t, [0, 0, t.w, t.h]);
   }
 
   /** The grey mask paint of a layer (tiles and strokes in progress) in the mask buffer. */
   private renderMask(layer: Layer, g: Grid): Target {
     const gl = this.gl;
     const key = maskKey(layer.id, layer.mask!.id);
-    const t = this.screen('mask');
+    const t = this.buf(g, 'mask');
     this.bindTarget(t);
     this.clear();
     gl.disable(gl.BLEND);
     this.drawLayerTiles(key, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, t, 1);
+    const scr = this.screenRect(g);
     for (const l of this.livesFor(key)) {
       this.blendFor(l.brush.tool === 'erase');
-      this.copy(l.target!.tex, t, [0, 0, t.w, t.h], l.brush.opacity);
+      this.copy(l.target!.tex, t, scr, l.brush.opacity);
     }
     return t;
   }
@@ -1860,13 +1946,212 @@ export class GLRenderer implements Renderer {
     return e.tex;
   }
 
+  // --- effects: blur, shadow and glows ------------------------------------------------------------
+  //
+  // A blur needs the pixels around what it shows: up to 3 standard deviations off screen. On the
+  // screen frame, each effect gets its own effect frame (fxGrid): the view plus a margin, at the
+  // coarser level where the blur is at most MAX_SIGMA px (blur.ts). Its source renders there from
+  // the tiles of that level (cheap: a big blur needs only coarse tiles), it blurs at that size, and
+  // the result is read back on the screen with bilinear filtering. Thus a blur costs about the
+  // same at 2 px and at 2000 px, and pixels off screen blur in at the edges.
+  //
+  // Inside an effect frame (the backdrop of a blur adjustment), effects of the layers below blur
+  // that frame's own buffers (with a pyramid when they are wide): no frames within frames.
+
+  /** The backdrop render of a blur adjustment stops at that layer (renderBackdrop). */
+  private stopAt: { id: string; ns: string; result: Target | null } | null = null;
+
+  /**
+   * The effect frame for a blur of `sigma` world units whose source is offset by (dx, dy) world
+   * units (a shadow): the view moved back by the offset, with a margin of MARGIN px, at 2^-k of
+   * the screen's resolution. `sigma` in the result: what is left to blur, in px of the frame.
+   */
+  private fxGrid(sigma: number, dx: number, dy: number): { g: Grid; sigma: number } {
+    const ds = this.view.zoom * this.dpr;
+    const lv = blurLevel(sigma * ds, false);
+    const s = ds / 2 ** lv.k;
+    const w = Math.ceil((this.canvas.width || 1) / 2 ** lv.k) + 2 * MARGIN;
+    const h = Math.ceil((this.canvas.height || 1) / 2 ** lv.k) + 2 * MARGIN;
+    const wx = this.view.x - dx - MARGIN / s, wy = this.view.y - dy - MARGIN / s;
+    const lod = lodFor(s);
+    const tw = tileWorld(lod);
+    const g: Grid = {
+      lod,
+      tx0: Math.floor(wx / tw),
+      ty0: Math.floor(wy / tw),
+      tx1: Math.floor((wx + w / s) / tw),
+      ty1: Math.floor((wy + h / s) / tw),
+      X: (tx) => Math.round((tx * tw - wx) * s),
+      Y: (ty) => Math.round((ty * tw - wy) * s),
+      w,
+      h,
+      ns: `fx${lv.k}:`,
+      wx,
+      wy,
+      s,
+    };
+    return { g, sigma: lv.sigma };
+  }
+
+  /** The tiles the effect frames of this frame read (render keeps them current). */
+  private effectRanges(): TileRange[] {
+    const out: TileRange[] = [];
+    const add = (sigma: number, dx = 0, dy = 0) => {
+      const { g } = this.fxGrid(sigma, dx, dy);
+      out.push({ lod: g.lod, tx0: g.tx0, ty0: g.ty0, tx1: g.tx1, ty1: g.ty1 });
+    };
+    for (const l of this.layers) {
+      if (!effectivelyVisible(this.byId, l)) continue;
+      if (l.kind === 'adjust' && l.adjust?.type === 'blur' && l.adjust.radius > 0 && l.opacity > 0) add(l.adjust.radius);
+      const fx = activeEffects(l);
+      for (const e of fx) add(effectSigma(e, fx), e.dx, e.dy);
+    }
+    return out;
+  }
+
+  /**
+   * A Gaussian blur of `src` by `sigma` of its px. Wide blurs halve the image first (a box filter
+   * per halving), so the kernel stays small. Returns a buffer that may be smaller than `src`; read
+   * it over the same texture coordinates (bilinear filtering scales it back). `ns` names the
+   * buffers.
+   */
+  private gaussian(src: Target, sigma: number, ns: string): Target {
+    const gl = this.gl;
+    const lv = blurLevel(sigma, true);
+    let cur = src;
+    for (let i = 1; i <= lv.k; i++) {
+      const d = this.screen(`${ns}d${i}`, Math.max(1, Math.ceil(cur.w / 2)), Math.max(1, Math.ceil(cur.h / 2)));
+      this.bindTarget(d);
+      gl.disable(gl.BLEND);
+      this.copy(cur.tex, d, [0, 0, d.w, d.h]);
+      cur = d;
+    }
+    const k = kernel(lv.sigma);
+    if (k.n === 1) return cur;
+    const across = this.screen(`${ns}x`, cur.w, cur.h);
+    const down = this.screen(`${ns}y`, cur.w, cur.h);
+    this.blurPass(cur, across, [1 / cur.w, 0], k);
+    this.blurPass(across, down, [0, 1 / cur.h], k);
+    return down;
+  }
+
+  private blurPass(src: Target, dst: Target, step: [number, number], k: { n: number; off: Float32Array; w: Float32Array }): void {
+    const gl = this.gl;
+    this.bindTarget(dst);
+    gl.disable(gl.BLEND);
+    const p = this.progs.blur;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(p.u.uTex, 0);
+    gl.uniform2f(p.u.uStep, step[0], step[1]);
+    gl.uniform1i(p.u.uN, k.n);
+    gl.uniform1fv(p.u.uOff, k.off);
+    gl.uniform1fv(p.u.uW, k.w);
+    this.quad(p, dst, [0, 0, dst.w, dst.h]);
+  }
+
+  /**
+   * Effects onto a layer's or group's own pixels (`own`, in frame g). `source` renders those
+   * pixels in another frame (an effect frame). Each effect reads its own blurred source (the
+   * pixels before effects; glows and the shadow with the blur of a blur effect added) and draws
+   * onto the result so far. Returns the result.
+   */
+  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target): Target {
+    const gl = this.gl;
+    let cur = own;
+    let flip = false;
+    for (const e of fx) {
+      const sigma = effectSigma(e, fx);
+      const dx = e.dx ?? 0, dy = e.dy ?? 0;
+      let src: Target;
+      let map: [number, number, number, number];
+      if (g.ns === '') {
+        // Screen: from an effect frame, with the pixels around the view.
+        const f = this.fxGrid(sigma, dx, dy);
+        src = this.gaussian(source(f.g), f.sigma, `${f.g.ns}g`);
+        // Frame position (0..1) → world → the source point (moved back by the offset) → its texture.
+        const fg = f.g;
+        map = [(g.w / g.s) * (fg.s / fg.w), (g.h / g.s) * (fg.s / fg.h), (g.wx - dx - fg.wx) * (fg.s / fg.w), (g.wy - dy - fg.wy) * (fg.s / fg.h)];
+      } else {
+        // Inside an effect frame: blur this frame's buffer.
+        src = this.gaussian(own, sigma * g.s, `${g.ns}g`);
+        map = [1, 1, (-dx * g.s) / g.w, (-dy * g.s) / g.h];
+      }
+      const out = this.buf(g, flip ? 'fxA' : 'fxB');
+      flip = !flip;
+      this.bindTarget(out);
+      gl.disable(gl.BLEND);
+      const p = this.progs.fx;
+      gl.useProgram(p.prog);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, cur.tex);
+      gl.uniform1i(p.u.uLayer, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, src.tex);
+      gl.uniform1i(p.u.uFx, 1);
+      gl.uniform4f(p.u.uFxMap, map[0], map[1], map[2], map[3]);
+      gl.uniform1i(p.u.uMode, e.type === 'blur' ? 0 : e.type === 'innerGlow' ? 2 : 1);
+      const [r, gg, b] = hexToRgb(e.color ?? '#000000');
+      gl.uniform3f(p.u.uColor, r, gg, b);
+      gl.uniform1f(p.u.uOpacity, e.opacity ?? 1);
+      gl.uniform1f(p.u.uSpread, Math.min(0.99, e.spread ?? 0));
+      this.quad(p, out, [0, 0, out.w, out.h]);
+      gl.activeTexture(gl.TEXTURE0);
+      cur = out;
+    }
+    return cur;
+  }
+
+  /**
+   * What a blur adjustment layer has below it, in an effect frame: the frame composites the
+   * layers as the screen does and stops at that layer (in a group or a clipping group, the
+   * backdrop is that group's buffer). Null if the layer is not reached.
+   */
+  private renderBackdrop(layer: Layer, fg: Grid): Target | null {
+    const pair: Pair = { a: this.buf(fg, 'compA'), b: this.buf(fg, 'compB') };
+    this.bindTarget(pair.a);
+    this.clearPaper();
+    this.stopAt = { id: layer.id, ns: fg.ns, result: null };
+    try {
+      this.compositeNodes(this.tree, pair, fg, 0);
+    } catch (e) {
+      if (e !== STOP) throw e;
+    }
+    const r = this.stopAt.result;
+    this.stopAt = null;
+    return r;
+  }
+
+  /** The blurred backdrop of a blur adjustment, and how frame positions (0..1) map onto it. */
+  private blurredBackdrop(layer: Layer, radius: number, pair: Pair, g: Grid): { t: Target; map: [number, number, number, number] } | null {
+    if (g.ns !== '') return { t: this.gaussian(pair.a, radius * g.s, `${g.ns}g`), map: [1, 1, 0, 0] };
+    const f = this.fxGrid(radius, 0, 0);
+    const back = this.renderBackdrop(layer, f.g);
+    if (!back) return null;
+    const fg = f.g;
+    const t = this.gaussian(back, f.sigma, `${fg.ns}g`);
+    return { t, map: [(g.w / g.s) * (fg.s / fg.w), (g.h / g.s) * (fg.s / fg.h), (g.wx - fg.wx) * (fg.s / fg.w), (g.wy - fg.wy) * (fg.s / fg.h)] };
+  }
+
   /** An adjustment layer: changes everything in `pair.a`, by its opacity and mask. */
   private applyAdjust(layer: Layer, pair: Pair, g: Grid): Pair {
+    if (this.stopAt && this.stopAt.id === layer.id && this.stopAt.ns === g.ns) {
+      // The backdrop render of this blur adjustment is done.
+      this.stopAt.result = pair.a;
+      throw STOP;
+    }
     const a = layer.adjust;
     if (!a || layer.opacity <= 0) return pair;
     const gl = this.gl;
+    let blur: { t: Target; map: [number, number, number, number] } | null = null;
+    if (a.type === 'blur') {
+      if (!(a.radius > 0)) return pair;
+      blur = this.blurredBackdrop(layer, a.radius, pair, g);
+      if (!blur) return pair;
+    }
     const mask = layer.mask?.enabled ? this.renderMask(layer, g) : null;
-    const lut = a.type === 'hueSat' ? null : this.lutFor(layer);
+    const lut = a.type === 'hueSat' || blur ? null : this.lutFor(layer);
     this.bindTarget(pair.b);
     gl.disable(gl.BLEND);
     const p = this.progs.adjust;
@@ -1875,13 +2160,15 @@ export class GLRenderer implements Renderer {
     gl.bindTexture(gl.TEXTURE_2D, pair.a.tex);
     gl.uniform1i(p.u.uBack, 0);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, lut ?? pair.a.tex);
+    gl.bindTexture(gl.TEXTURE_2D, blur ? blur.t.tex : (lut ?? pair.a.tex));
     gl.uniform1i(p.u.uLut, 1);
+    const m = blur?.map ?? [1, 1, 0, 0];
+    gl.uniform4f(p.u.uFxMap, m[0], m[1], m[2], m[3]);
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, mask ? mask.tex : pair.a.tex);
     gl.uniform1i(p.u.uMask, 2);
     gl.uniform1i(p.u.uMaskOn, mask ? 1 : 0);
-    gl.uniform1i(p.u.uType, a.type === 'hueSat' ? 1 : 0);
+    gl.uniform1i(p.u.uType, blur ? 2 : a.type === 'hueSat' ? 1 : 0);
     if (a.type === 'hueSat') gl.uniform3f(p.u.uHsl, a.hue / 360, a.saturation, a.lightness);
     gl.uniform1f(p.u.uOpacity, layer.opacity);
     this.quad(p, pair.b, [0, 0, pair.b.w, pair.b.h]);

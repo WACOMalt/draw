@@ -7,7 +7,7 @@
 // ops and spoil the log.
 
 import { newId } from '../../shared/ids';
-import type { AppliedOp, ClientMsg, ServerMsg } from '../../shared/types';
+import { DOC_FEATURES, type AppliedOp, type ClientMsg, type ServerMsg } from '../../shared/types';
 import { ValidationError, validateOp } from '../../shared/validate';
 import { DocState, OpError } from '../../shared/docState';
 import { docFeatures } from '../../shared/features';
@@ -108,6 +108,7 @@ export class LocalNet {
           role: 'editor',
           canvas: { key: this.id, owned: false, ownerName: null, expiresAt: null, canClaim: false, local: true },
           features: docFeatures(this.doc.layers.values(), this.doc.strokes.values(), this.doc.shapes.values(), this.doc.paper),
+          supports: [...DOC_FEATURES],
           previewSeq: null,
         });
       case 'op': {

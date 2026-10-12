@@ -71,7 +71,7 @@ export interface BrushPreset {
   createdAt: number;
 }
 
-export const ADJUST_TYPES = ['levels', 'curves', 'hueSat', 'brightContrast'] as const;
+export const ADJUST_TYPES = ['levels', 'curves', 'hueSat', 'brightContrast', 'blur'] as const;
 export type AdjustType = (typeof ADJUST_TYPES)[number];
 
 /** The settings of an adjustment layer. All values work on 0..1 color channels. */
@@ -81,14 +81,40 @@ export type Adjust =
   | { type: 'curves'; points: [number, number][] }
   /** hue in degrees (-180..180), saturation and lightness -1..1. */
   | { type: 'hueSat'; hue: number; saturation: number; lightness: number }
-  | { type: 'brightContrast'; brightness: number; contrast: number };
+  | { type: 'brightContrast'; brightness: number; contrast: number }
+  /** Gaussian blur of everything below. `radius`: the standard deviation in world units. */
+  | { type: 'blur'; radius: number };
 
 export const DEFAULT_ADJUST: Record<AdjustType, Adjust> = {
   levels: { type: 'levels', inBlack: 0, inWhite: 1, gamma: 1, outBlack: 0, outWhite: 1 },
   curves: { type: 'curves', points: [[0, 0], [1, 1]] },
   hueSat: { type: 'hueSat', hue: 0, saturation: 0, lightness: 0 },
   brightContrast: { type: 'brightContrast', brightness: 0, contrast: 0 },
+  blur: { type: 'blur', radius: 8 },
 };
+
+/**
+ * Layer effects of a paint or shape layer or a group, at most one of each type. They draw in a fixed order:
+ * blur changes the layer's pixels; drop shadow and outer glow go behind them, made from their
+ * blurred alpha; inner glow goes on top, inside their alpha. All lengths are world units, so an
+ * effect keeps its size on the canvas at any zoom.
+ */
+export const EFFECT_TYPES = ['blur', 'dropShadow', 'outerGlow', 'innerGlow'] as const;
+export type EffectType = (typeof EFFECT_TYPES)[number];
+export interface LayerEffect {
+  type: EffectType;
+  enabled: boolean;
+  /** The Gaussian standard deviation (as CSS blur()), world units. */
+  radius: number;
+  /** Glows and shadow: their color and opacity. */
+  color?: string;
+  opacity?: number;
+  /** Glows and shadow: 0 to 0.99, makes the edge harder (the blurred alpha divided by 1 − spread). */
+  spread?: number;
+  /** Drop shadow: the offset, world units. */
+  dx?: number;
+  dy?: number;
+}
 
 /**
  * A layer mask: strokes with `mask: id` on the layer. They paint grey on a white mask: black
@@ -127,6 +153,8 @@ export interface Layer {
   /** Clipped to the nearest layer below that is not clipped (the base of the clipping group). */
   clip?: boolean;
   mask?: LayerMask | null;
+  /** Layer effects (paint and shape layers, groups). Absent: none. */
+  effects?: LayerEffect[];
 }
 
 export interface Stroke {
@@ -302,7 +330,10 @@ export interface Shape extends ShapeInput {
   deleted?: boolean;
 }
 
-export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent'>;
+export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent'> & {
+  /** null or [] removes the effects. */
+  effects?: LayerEffect[] | null;
+};
 
 /** A 2D affine transform [a, b, c, d, e, f]: x' = a·x + c·y + e, y' = b·x + d·y + f. */
 export type Affine = [number, number, number, number, number, number];
@@ -318,7 +349,7 @@ export interface Paper {
 export const DEFAULT_PAPER: Paper = { color: '#ffffff', alpha: 1 };
 export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p.alpha >= 1;
 
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -460,6 +491,12 @@ export type ServerMsg =
       grant?: string;
       /** Features the document uses. A client that does not know one asks for an update. */
       features?: string[];
+      /**
+       * Features the server accepts (DOC_FEATURES of its version). Absent: a server from before
+       * effects; the client then keeps the controls of newer features off, so an app newer than
+       * its server does not offer changes the server refuses.
+       */
+      supports?: string[];
       /** Seq that the stored link preview shows; null: none yet. Editors send a newer one. */
       previewSeq?: number | null;
     }

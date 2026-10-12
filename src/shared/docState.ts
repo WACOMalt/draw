@@ -17,6 +17,7 @@ import { ValidationError, validateOp, validateShapeInput } from './validate';
 import { transformShapeMatrix } from './shapes';
 import { planFromPaint, planToPaint } from './flatten';
 import { depthOf, duplicateOf, effectivelyDeleted, subtreeHeight, subtreeIds, transformStroke } from './layers';
+import { takesEffects, transformLayerLengths } from './effects';
 
 /** An op that does not make sense for the current state (the client is told why). */
 export class OpError extends Error {}
@@ -66,7 +67,9 @@ export class DocState {
         if (this.layers.has(op.layer.id)) throw new OpError('duplicate layer');
         if (this.liveLayers() >= LIMITS.maxLayers) throw new OpError('too many layers');
         this.checkParent(op.layer.parent ?? null, op.layer.kind === 'group' ? 1 : 0);
-        this.layers.set(op.layer.id, { ...op.layer, deleted: false });
+        const { effects, ...layer } = op.layer;
+        if (effects?.length && !takesEffects(layer.kind)) throw new OpError('adjustment layers take no effects');
+        this.layers.set(op.layer.id, { ...layer, ...(effects?.length ? { effects } : {}), deleted: false });
         return op;
       }
       case 'layer.update': {
@@ -77,8 +80,10 @@ export class DocState {
           if (op.props.parent && subtreeIds(this.layers.values(), l.id).has(op.props.parent)) throw new OpError('a group cannot go into itself');
           this.checkParent(op.props.parent, subtreeHeight(this.layers.values(), l.id));
         }
+        if (op.props.effects && !takesEffects(l.kind)) throw new OpError('adjustment layers take no effects');
         Object.assign(l, op.props);
         if (l.parent === null) delete l.parent;
+        if (!l.effects?.length) delete l.effects;
         return op;
       }
       case 'layer.transform': {
@@ -101,6 +106,11 @@ export class DocState {
         }
         for (const [st, t] of changes) Object.assign(st, t);
         for (const [sh, m] of moved) sh.m = m;
+        // Effect lengths and blur radii scale with the layers.
+        for (const lid of ids) {
+          const x = this.layers.get(lid);
+          if (x) this.layers.set(lid, transformLayerLengths(x, op.m));
+        }
         return op;
       }
       case 'layer.duplicate': {

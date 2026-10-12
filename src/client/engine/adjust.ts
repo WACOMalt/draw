@@ -61,6 +61,7 @@ export function toneFunction(a: Adjust): ((x: number) => number) | null {
       };
     }
     case 'hueSat':
+    case 'blur':
       return null;
   }
 }
