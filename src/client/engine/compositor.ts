@@ -2,7 +2,8 @@
 // layer opacity and blend modes, onto the visible canvas.
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
-import { DEFAULT_PAPER, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, EFFECT_TYPES, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { takesEffects } from '../../shared/effects';
 import { byZ } from '../../shared/shapes';
 import { ShapeIndex, shapeRec } from './shapeIndex';
 import { drawShapes } from './shapeRaster';
@@ -611,7 +612,8 @@ export class Canvas2DRenderer implements Renderer {
   private nodePixels(node: LayerNode, g: Grid, depth: number): OffscreenCanvas {
     if (node.layer.kind === 'group') return this.renderGroup(node, g, depth);
     this.renderLayer(node.layer, g);
-    return this.scratch;
+    const fx = activeEffects2d(node.layer);
+    return fx.length ? this.applyEffects(fx) : this.scratch;
   }
 
   private drawPreview(dst: Ctx, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
@@ -706,6 +708,12 @@ export class Canvas2DRenderer implements Renderer {
   /** Draws one layer onto `dst` (the visible canvas or the group buffer). */
   private drawLayerOnto(dst: Ctx, layer: Layer, g: Grid, atop: boolean): void {
     if (layer.kind === 'adjust') return this.applyAdjust(dst, layer, g);
+    const fx = activeEffects2d(layer);
+    if (fx.length) {
+      this.renderLayer(layer, g);
+      this.put(dst, this.applyEffects(fx), layer.opacity, atop ? 'source-atop' : op(layer.blend));
+      return;
+    }
     if (!atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
       dst.globalAlpha = layer.opacity;
       dst.globalCompositeOperation = op(layer.blend);
@@ -758,10 +766,96 @@ export class Canvas2DRenderer implements Renderer {
     return m.canvas;
   }
 
+  // --- effects (fallback) ----------------------------------------------------------------------
+  // Canvas 2D filters on screen buffers: blur(σ px) is the same Gaussian. Unlike the WebGL2
+  // renderer, nothing off screen blurs in at the edges (a blur adjustment repeats the edge pixels
+  // instead), and the spread of glows is left out.
+
+  /** A layer's effects onto its pixels in the scratch canvas. Returns the result buffer. */
+  private applyEffects(fx: LayerEffect[]): OffscreenCanvas {
+    const ds = this.view.zoom * this.dpr;
+    const blur = fx.find((e) => e.type === 'blur')?.radius ?? 0;
+    const out = this.clearBuffer('fxOut');
+    // Drop shadow and outer glow: the blurred alpha in a color, behind.
+    for (const e of fx) {
+      if (e.type !== 'dropShadow' && e.type !== 'outerGlow') continue;
+      const t = this.clearBuffer('fxTmp');
+      t.ctx.filter = `blur(${Math.hypot(e.radius, blur) * ds}px)`;
+      t.ctx.drawImage(this.scratch, (e.dx ?? 0) * ds, (e.dy ?? 0) * ds);
+      t.ctx.filter = 'none';
+      t.ctx.globalCompositeOperation = 'source-in';
+      t.ctx.fillStyle = e.color ?? '#000000';
+      t.ctx.fillRect(0, 0, t.canvas.width, t.canvas.height);
+      this.put(out.ctx, t.canvas, e.opacity ?? 1, 'source-over');
+    }
+    // The layer, blurred or not, with its inner glow.
+    const c = this.clearBuffer('fxContent');
+    if (blur > 0) c.ctx.filter = `blur(${blur * ds}px)`;
+    c.ctx.drawImage(this.scratch, 0, 0);
+    c.ctx.filter = 'none';
+    const inner = fx.find((e) => e.type === 'innerGlow');
+    if (inner) {
+      // The color where the layer is not, blurred, drawn only inside the layer.
+      const t = this.clearBuffer('fxTmp');
+      t.ctx.fillStyle = inner.color ?? '#000000';
+      t.ctx.fillRect(0, 0, t.canvas.width, t.canvas.height);
+      t.ctx.globalCompositeOperation = 'destination-out';
+      t.ctx.drawImage(this.scratch, 0, 0);
+      const b = this.clearBuffer('fxTmp2');
+      b.ctx.filter = `blur(${Math.hypot(inner.radius, blur) * ds}px)`;
+      b.ctx.drawImage(t.canvas, 0, 0);
+      b.ctx.filter = 'none';
+      this.put(c.ctx, b.canvas, inner.opacity ?? 1, 'source-atop');
+    }
+    this.put(out.ctx, c.canvas, 1, 'source-over');
+    return out.canvas;
+  }
+
+  /** `src` blurred by `px`, with its edge pixels repeated past the edges (no fade to transparent). */
+  private blurClamped(src: CanvasImageSource & { width: number; height: number }, px: number): OffscreenCanvas {
+    const w = src.width, h = src.height, p = Math.min(Math.ceil(px * 3), 2048);
+    const pad = (this.padCanvas ??= new OffscreenCanvas(1, 1));
+    if (pad.width !== w + 2 * p || pad.height !== h + 2 * p) {
+      pad.width = w + 2 * p;
+      pad.height = h + 2 * p;
+    }
+    const c = pad.getContext('2d')!;
+    c.filter = 'none';
+    c.clearRect(0, 0, pad.width, pad.height);
+    c.drawImage(src, p, p);
+    // The edge rows and columns, stretched outward; then the corners.
+    c.drawImage(src, 0, 0, w, 1, p, 0, w, p);
+    c.drawImage(src, 0, h - 1, w, 1, p, p + h, w, p);
+    c.drawImage(src, 0, 0, 1, h, 0, p, p, h);
+    c.drawImage(src, w - 1, 0, 1, h, p + w, p, p, h);
+    c.drawImage(src, 0, 0, 1, 1, 0, 0, p, p);
+    c.drawImage(src, w - 1, 0, 1, 1, p + w, 0, p, p);
+    c.drawImage(src, 0, h - 1, 1, 1, 0, p + h, p, p);
+    c.drawImage(src, w - 1, h - 1, 1, 1, p + w, p + h, p, p);
+    const out = this.clearBuffer('blurAdj');
+    out.ctx.filter = `blur(${px}px)`;
+    out.ctx.drawImage(pad, -p, -p);
+    out.ctx.filter = 'none';
+    return out.canvas;
+  }
+  private padCanvas: OffscreenCanvas | null = null;
+
   /** An adjustment layer, on the CPU: changes every pixel of `dst` by opacity and mask. */
   private applyAdjust(dst: Ctx, layer: Layer, g: Grid): void {
     const a = layer.adjust;
     if (!a || layer.opacity <= 0) return;
+    if (a.type === 'blur') {
+      if (!(a.radius > 0)) return;
+      const b = this.blurClamped(dst.canvas, a.radius * this.view.zoom * this.dpr);
+      if (layer.mask?.enabled) {
+        const bc = this.buffer('blurAdj').ctx;
+        bc.globalCompositeOperation = 'destination-out';
+        bc.drawImage(this.maskHidden(layer, g), 0, 0);
+        bc.globalCompositeOperation = 'source-over';
+      }
+      this.put(dst, b, layer.opacity, 'source-over');
+      return;
+    }
     const w = dst.canvas.width, h = dst.canvas.height;
     const hd = layer.mask?.enabled ? this.maskHidden(layer, g).getContext('2d')!.getImageData(0, 0, w, h).data : null;
     const img = dst.getImageData(0, 0, w, h);
@@ -867,6 +961,12 @@ export class Canvas2DRenderer implements Renderer {
 }
 
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+
+/** The enabled effects of a paint or shape layer (the fallback draws them in its own order). */
+function activeEffects2d(l: Layer): LayerEffect[] {
+  if (!l.effects?.length || !takesEffects(l.kind)) return [];
+  return EFFECT_TYPES.map((t) => l.effects!.find((e) => e.type === t && e.enabled)).filter((e): e is LayerEffect => !!e && (e.type !== 'blur' || e.radius > 0));
+}
 
 interface Grid {
   lod: number;
