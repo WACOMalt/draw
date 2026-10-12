@@ -18,6 +18,7 @@
   import AccessScreen from './AccessScreen.svelte';
   import ShareDialog from './ShareDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
+  import ExportPick from './ExportPick.svelte';
   import TransformOverlay from './TransformOverlay.svelte';
   import SelectOverlay from './SelectOverlay.svelte';
   import Modal from './Modal.svelte';
@@ -122,6 +123,8 @@
       ed.denied = null;
       ed.shareOpen = false;
       ed.exportOpen = false;
+      ed.exportPicking = false;
+      ed.exportRegion = null;
       ed.settingsOpen = false;
       ed.transform = null;
       ed.selection = [];
@@ -201,6 +204,7 @@
         <div class="conn">{ed.status === 'connecting' ? 'Connecting…' : 'Offline, reconnecting…'}</div>
       {/if}
       <CanvasBanner {code} />
+      {#if ed.exportOpen && ed.exportPicking && engine}<ExportPick {engine} />{/if}
       {#if ed.transform && engine}
         {#key ed.transform.id}<TransformOverlay {engine} id={ed.transform.id} />{/key}
       {/if}

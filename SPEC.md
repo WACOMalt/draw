@@ -469,7 +469,13 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 
 One "Export image" button in the top bar (on phones, in the ⋮ menu) opens the export dialog. It keeps its settings for next time (in the browser).
 
-- Area: the current view, or everything on the visible layers.
+- Area: the current view, everything on the visible layers, or Pick (a region picked on the canvas).
+- Pick (`ExportPick.svelte`): the dialog hides, and the canvas shows a crop tool. Drag on the canvas to draw a box. Drag inside the box to move it, and drag a handle to resize it. A new drag outside draws a new box. The wheel, two fingers and the middle mouse button zoom and pan. The toolbar has:
+  - the shape lock: Free, or the shapes of the Shape row;
+  - the output width and height in pixels. With a shape chosen, a typed side sets the other side from the shape. With Free, the typed width × height becomes the shape of the box;
+  - Screen: the size follows the box at the screen's resolution now (the default);
+  - Cancel (Esc, Android Back) and Accept (Enter).
+  Accept gives the region the exact shape of the output (same center and width) and shows the dialog again, with "Region W × H px" and Adjust in place of Shape and Size. The region stays while the canvas is open (`ed.exportRegion`).
 - Shape: as on screen (or as drawn, for everything), or 1:1, 4:3, 3:2, 16:9, 21:9, 4:5, 2:3 or 9:16. The area is centered and widened to the shape, never cut. Paper fills the rest.
 - Size: a pixel count. "Screen" is the pixel count of the view at the screen's resolution now (with the screen's shape, that is a snapshot of the screen). Presets 4, 12, 24, 50, 100, 250 and 500 MP, 1, 2.5, 10 and 50 GP, or any number of megapixels. The area is fitted to that count and keeps its shape: width = √(pixels × aspect). The dialog also shows the size as a multiple of the detail on screen now.
 - Background: Paper (the paper fills everything; a see-through paper gives the file an alpha channel, as Transparent does) or Transparent (no paper: the file keeps an alpha channel, with straight, not premultiplied, colors: an RGBA PNG, or a TIFF with 4 samples and unassociated alpha). The choice is kept per device.

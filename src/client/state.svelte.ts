@@ -178,6 +178,14 @@ const prefs = load('draw.prefs', {
   addSelection: false,
 });
 
+export interface ExportRegion {
+  bounds: { x0: number; y0: number; x1: number; y1: number };
+  w: number;
+  h: number;
+  aspect: string | null;
+  auto: boolean;
+}
+
 class EditorState {
   tool = $state<Tool>('brush');
   brush = $state<BrushSettings>({ ...brushDefaults, ...prefs.brush });
@@ -249,6 +257,15 @@ class EditorState {
   shareOpen = $state(false);
   /** The large image export dialog. */
   exportOpen = $state(false);
+  /**
+   * The export region picked on the canvas (Export image, Area: Pick), kept while this canvas
+   * is open. `w` × `h` is the output in pixels. `aspect`: the shape lock of the picker (an id
+   * of ASPECTS, 'custom' for a typed size, null for free). `auto`: the size follows the box at
+   * the screen's resolution (no size was typed).
+   */
+  exportRegion = $state<ExportRegion | null>(null);
+  /** The region picker is on the canvas (the export dialog hides meanwhile). */
+  exportPicking = $state(false);
   /** App settings on this device (SettingsDialog). */
   settingsOpen = $state(false);
   /** The layer or group being transformed (free transform: the overlay shows its handles). */
