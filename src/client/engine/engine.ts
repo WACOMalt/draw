@@ -2102,6 +2102,12 @@ export class Engine {
       void toggleFullScreen();
       return;
     }
+    if (mod && (e.code === 'BracketRight' || e.code === 'BracketLeft') && ed.selection.length) {
+      // Selected shapes: Ctrl+] up one place, Ctrl+[ down (Shift: to the top or the bottom).
+      e.preventDefault();
+      this.shapes.arrange(ed.selection, e.code === 'BracketRight' ? 1 : -1, e.shiftKey);
+      return;
+    }
     if (mod) {
       if (key === 'z') {
         e.preventDefault();

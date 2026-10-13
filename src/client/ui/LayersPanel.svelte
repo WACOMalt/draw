@@ -83,6 +83,10 @@
   });
   /** Whether the active layer has a sibling below it (it can clip to it). */
   const hasBelow = $derived(!!active && !!engine?.canMove(active.id, -1));
+  /** Selected shapes: the footer's up and down move them among the shapes of their layer. */
+  const shapeSel = $derived(ed.selection.length > 0);
+  const shapeUp = $derived(ed.shapes.length >= 0 && shapeSel && !!engine?.shapes.canArrange(ed.selection, 1));
+  const shapeDown = $derived(ed.shapes.length >= 0 && shapeSel && !!engine?.shapes.canArrange(ed.selection, -1));
 
   const BLEND_LABEL: Record<LayerBlend, string> = {
     pass: 'Pass Through',
@@ -203,7 +207,36 @@
     drop = null;
   }
 
+  // Shapes: a drag among the shapes of the same layer changes their order.
+  let shapeDrag = $state<string | null>(null);
+  let shapeDrop = $state<{ id: string; where: 'above' | 'below' } | null>(null);
+
+  function grabShape(e: PointerEvent, id: string) {
+    if (e.button !== 0 || !ed.canEdit) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    } catch {
+      // the pointer is already gone
+    }
+    shapeDrag = id;
+    shapeDrop = null;
+  }
+
   function dragMove(e: PointerEvent) {
+    if (shapeDrag) {
+      const layer = ed.shapes.find((s) => s.id === shapeDrag)?.layerId;
+      shapeDrop = null;
+      for (const li of list.querySelectorAll<HTMLElement>('li[data-shape]')) {
+        const r = li.getBoundingClientRect();
+        if (e.clientY < r.top || e.clientY >= r.bottom) continue;
+        const id = li.dataset.shape!;
+        if (id !== shapeDrag && ed.shapes.find((s) => s.id === id)?.layerId === layer) shapeDrop = { id, where: e.clientY < r.top + r.height / 2 ? 'above' : 'below' };
+        return;
+      }
+      return;
+    }
     if (!dragId) return;
     const banned = subtreeIds(ed.layers, dragId);
     drop = null;
@@ -220,6 +253,14 @@
   }
 
   function dragEnd() {
+    if (shapeDrag) {
+      const id = shapeDrag, d = shapeDrop;
+      shapeDrag = null;
+      shapeDrop = null;
+      // "above" in the panel is higher in the stack: right above the target, or right below it.
+      if (d) engine?.shapes.moveShapeTo(id, d.where === 'above' ? d.id : null, d.where === 'below' ? d.id : null);
+      return;
+    }
     const id = dragId, d = drop;
     dragId = null;
     drop = null;
@@ -368,7 +409,17 @@
       {#if layer.effects?.length && !row.group}{@render effectRows(layer, row.depth)}{/if}
       {#if layer.kind === 'shape' && row.open}
         {#each shapesBy.get(layer.id) ?? [] as sh (sh.id)}
-          <li class="shape" class:active={ed.selection.includes(sh.id)} style:--depth={row.depth + 1} onpointerdown={(e) => pickShape(e, sh)}>
+          <li
+            class="shape"
+            data-shape={sh.id}
+            class:active={ed.selection.includes(sh.id)}
+            class:lifted={shapeDrag === sh.id}
+            class:drop-above={shapeDrop?.id === sh.id && shapeDrop.where === 'above'}
+            class:drop-below={shapeDrop?.id === sh.id && shapeDrop.where === 'below'}
+            style:--depth={row.depth + 1}
+            onpointerdown={(e) => pickShape(e, sh)}
+          >
+            <span class="grip" title="Drag to change the order" role="button" tabindex="-1" onpointerdown={(e) => grabShape(e, sh.id)}><Icon name="grip" /></span>
             <span class="kind">{#if sh.kind === 'custom' && sh.preset}<PresetIcon preset={sh.preset} size={14} />{:else}<Icon name={sh.kind} />{/if}</span>
             {#if editingShape === sh.id}
               <input
@@ -552,12 +603,32 @@
         <Icon name="transform" />
       </button>
     {/if}
-    <button class="icon" title="Move up" disabled={!active || !engine?.canMove(active.id, 1)} onclick={() => active && engine?.moveLayer(active.id, 1)}>
-      <Icon name="up" />
-    </button>
-    <button class="icon" title="Move down" disabled={!active || !engine?.canMove(active.id, -1)} onclick={() => active && engine?.moveLayer(active.id, -1)}>
-      <Icon name="down" />
-    </button>
+    {#if shapeSel}
+      <!-- With shapes selected, up and down change their order in their layer. -->
+      <button
+        class="icon"
+        title="Move the selected shapes up (Ctrl+]; Shift+click or Ctrl+Shift+]: to the top)"
+        disabled={!shapeUp || !ed.canEdit}
+        onclick={(e) => engine?.shapes.arrange(ed.selection, 1, e.shiftKey)}
+      >
+        <Icon name="up" />
+      </button>
+      <button
+        class="icon"
+        title="Move the selected shapes down (Ctrl+[; Shift+click or Ctrl+Shift+[: to the bottom)"
+        disabled={!shapeDown || !ed.canEdit}
+        onclick={(e) => engine?.shapes.arrange(ed.selection, -1, e.shiftKey)}
+      >
+        <Icon name="down" />
+      </button>
+    {:else}
+      <button class="icon" title="Move up" disabled={!active || !engine?.canMove(active.id, 1)} onclick={() => active && engine?.moveLayer(active.id, 1)}>
+        <Icon name="up" />
+      </button>
+      <button class="icon" title="Move down" disabled={!active || !engine?.canMove(active.id, -1)} onclick={() => active && engine?.moveLayer(active.id, -1)}>
+        <Icon name="down" />
+      </button>
+    {/if}
     <span class="grow"></span>
     <button class="icon" title={active?.kind === 'group' ? 'Delete the group and its layers' : 'Delete layer'} disabled={!active} onclick={() => active && engine?.deleteLayer(active.id)}>
       <Icon name="trash" />
