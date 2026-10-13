@@ -687,11 +687,137 @@ export class ShapeTool {
   }
 
   /** The layers panel made `layerId` active: a selection on other layers goes. */
-  layerPicked(layerId: string): void {
-    if (ed.selection.some((id) => this.current(id)?.layerId !== layerId)) {
+  /**
+   * A layer row was clicked: the layer is what the person works on now, so the shapes are
+   * deselected (the footer's up and down then move the layer, not shapes).
+   */
+  layerPicked(_layerId: string): void {
+    if (ed.selection.length) {
       ed.selection = [];
       this.scheduleOverlay();
     }
+  }
+
+  // --- order (depth) ----------------------------------------------------------------------------
+
+  /** The live shapes of a layer, bottom to top. */
+  private stack(layerId: string): Shape[] {
+    return [...this.view().values()].filter((s) => s.layerId === layerId && !s.deleted).sort(byZ);
+  }
+
+  /**
+   * Gives the shapes of a layer the order `ids` (bottom to top): new z only for the shapes that
+   * moved, between their new neighbors. One undo step.
+   */
+  private restack(layerId: string, ids: string[], undo: Op[], redo: Op[]): void {
+    const old = this.stack(layerId);
+    const zOf = new Map(old.map((s) => [s.id, s.z]));
+    const before = old.map((s) => s.id);
+    // The most shapes that can keep their z: the longest run of the new order that is in the old
+    // order too (longest increasing subsequence of old positions, patience sorting).
+    const pos = new Map(before.map((id, i) => [id, i]));
+    const seq = ids.map((id) => pos.get(id) ?? -1);
+    const tails: number[] = [], prev = new Array<number>(seq.length).fill(-1);
+    for (let j = 0; j < seq.length; j++) {
+      let a = 0, b = tails.length;
+      while (a < b) {
+        const mid = (a + b) >> 1;
+        if (seq[tails[mid]] < seq[j]) a = mid + 1;
+        else b = mid;
+      }
+      if (a > 0) prev[j] = tails[a - 1];
+      tails[a] = j;
+    }
+    const stay = new Set<string>();
+    for (let j = tails.length ? tails[tails.length - 1] : -1; j >= 0; j = prev[j]) stay.add(ids[j]);
+    const z = new Map<string, number>();
+    for (let j = 0; j < ids.length; ) {
+      if (stay.has(ids[j])) {
+        z.set(ids[j], zOf.get(ids[j])!);
+        j++;
+        continue;
+      }
+      // A run of moved shapes: spread them between the shape below and the next one that stays.
+      let k = j;
+      while (k < ids.length && !stay.has(ids[k])) k++;
+      const run = k - j;
+      let lo = j > 0 ? z.get(ids[j - 1])! : -Infinity;
+      let hi = k < ids.length ? zOf.get(ids[k])! : Infinity;
+      if (lo === -Infinity && hi === Infinity) [lo, hi] = [0, run + 1];
+      else if (lo === -Infinity) lo = hi - (run + 1);
+      else if (hi === Infinity) hi = lo + run + 1;
+      for (let r = 0; r < run; r++) z.set(ids[j + r], lo + ((hi - lo) * (r + 1)) / (run + 1));
+      j = k;
+    }
+    for (const id of ids) {
+      const nz = z.get(id)!, oz = zOf.get(id)!;
+      if (nz === oz) continue;
+      redo.push({ type: 'shape.update', id, props: { z: nz } });
+      undo.push({ type: 'shape.update', id, props: { z: oz } });
+    }
+  }
+
+  private sendOrder(undo: Op[], redo: Op[]): void {
+    if (!redo.length) return;
+    for (const op of redo) this.host.sendOp(op);
+    this.host.pushUndo({ undo, redo });
+    this.scheduleOverlay();
+  }
+
+  /**
+   * Moves shapes up (+1, toward the top) or down (−1) one place among the shapes of their layer,
+   * or to the top or the bottom (`end`). Each layer of the selection on its own. One undo step.
+   */
+  arrange(ids: string[], dir: 1 | -1, end = false): void {
+    if (!ed.canEdit || !ids.length) return;
+    const undo: Op[] = [], redo: Op[] = [];
+    const sel = new Set(ids);
+    const layers = new Set(ids.map((id) => this.current(id)?.layerId).filter((l): l is string => !!l));
+    for (const layerId of layers) {
+      const order = this.stack(layerId).map((s) => s.id);
+      let next: string[];
+      if (end) {
+        const moved = order.filter((id) => sel.has(id)), rest = order.filter((id) => !sel.has(id));
+        next = dir > 0 ? [...rest, ...moved] : [...moved, ...rest];
+      } else {
+        next = [...order];
+        // Each selected shape swaps with the shape past it, unless that one moves too.
+        if (dir > 0) for (let i = next.length - 2; i >= 0; i--) {
+          if (sel.has(next[i]) && !sel.has(next[i + 1])) [next[i], next[i + 1]] = [next[i + 1], next[i]];
+        }
+        else for (let i = 1; i < next.length; i++) {
+          if (sel.has(next[i]) && !sel.has(next[i - 1])) [next[i], next[i - 1]] = [next[i - 1], next[i]];
+        }
+      }
+      this.restack(layerId, next, undo, redo);
+    }
+    this.sendOrder(undo, redo);
+  }
+
+  /** Whether `arrange` would move any of the shapes (up: one is below an unselected shape). */
+  canArrange(ids: string[], dir: 1 | -1): boolean {
+    const sel = new Set(ids);
+    for (const layerId of new Set(ids.map((id) => this.current(id)?.layerId))) {
+      if (!layerId) continue;
+      const order = this.stack(layerId).map((s) => sel.has(s.id));
+      for (let i = 0; i + 1 < order.length; i++) if (dir > 0 ? order[i] && !order[i + 1] : !order[i] && order[i + 1]) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Moves a shape between two shapes of its layer (null: at that end): a drop in the layers
+   * panel. `below` and `above` are its new neighbors.
+   */
+  moveShapeTo(id: string, below: string | null, above: string | null): void {
+    const s = this.current(id);
+    if (!ed.canEdit || !s) return;
+    const order = this.stack(s.layerId).map((x) => x.id).filter((x) => x !== id);
+    const at = below ? order.indexOf(below) + 1 : above ? order.indexOf(above) : order.length;
+    order.splice(Math.max(0, at), 0, id);
+    const undo: Op[] = [], redo: Op[] = [];
+    this.restack(s.layerId, order, undo, redo);
+    this.sendOrder(undo, redo);
   }
 
   /** Esc: ends a press in progress, else deselects. */
