@@ -2022,6 +2022,8 @@ export class GLRenderer implements Renderer {
   /** The tiles the effect frames of this frame read (render keeps them current). */
   private effectRanges(): TileRange[] {
     const out: TileRange[] = [];
+    /** Kaleidoscope frames at their own detail: after every other range (see below). */
+    const fine: TileRange[] = [];
     const add = (sigma: number, dx = 0, dy = 0) => {
       const { g } = this.fxGrid(sigma, dx, dy);
       out.push({ lod: g.lod, tx0: g.tx0, ty0: g.ty0, tx1: g.tx1, ty1: g.ty1 });
@@ -2036,12 +2038,17 @@ export class GLRenderer implements Renderer {
           continue;
         }
         // The other effects of the layer, inside the kaleidoscope frames: the same tiles.
+        // A frame can lie far from the view, where no tile was ever made, and copies that grow
+        // need fine tiles: many. First the same area 4× coarser (a few tiles, ready soon), so
+        // drawTile has a parent to stretch, instead of blank parts until the fine tiles are in.
         for (const kg of this.kaleidoscopeFrames(this.kaleidoscopeSteps(e), this.nodeBounds(l, false)).frames) {
-          out.push({ lod: kg.lod, tx0: kg.tx0, ty0: kg.ty0, tx1: kg.tx1, ty1: kg.ty1 });
+          fine.push({ lod: kg.lod, tx0: kg.tx0, ty0: kg.ty0, tx1: kg.tx1, ty1: kg.ty1 });
+          const lod = Math.min(MAX_LOD, kg.lod + 2), tw = tileWorld(lod);
+          out.push({ lod, tx0: Math.floor(kg.wx / tw), ty0: Math.floor(kg.wy / tw), tx1: Math.floor((kg.wx + kg.w / kg.s) / tw), ty1: Math.floor((kg.wy + kg.h / kg.s) / tw) });
         }
       }
     }
-    return out;
+    return out.concat(fine);
   }
 
   /**
@@ -2206,11 +2213,14 @@ export class GLRenderer implements Renderer {
   }
 
   /**
-   * The kaleidoscope frames: where the copies on screen come from. Copies are grouped by how much
-   * they grow or shrink (powers of 2). A group's frame covers the layer's content (`content`)
-   * where a copy of the group shows it on screen (the view, each copy's transform undone), at
-   * the detail its largest copy needs, at most 4096 px per side and 8 megapixels. Thus a spiral
-   * of small copies does not blur the large ones. `of[i]`: the frame of copy i (−1: off screen).
+   * The kaleidoscope frames: where the copies on screen come from. A frame covers the layer's
+   * content (`content`) where its copies show it on screen (the view, each copy's transform
+   * undone), at the detail its largest copy needs: copies that grow get finer frames, and a copy
+   * that grows 10× shows a tenth of the view, so its frame stays near the screen's size.
+   * Copies share a frame when they grow by about the same (the nearest power of 2) and the
+   * frame stays within 2.5 screens of pixels; else they get frames of their own (24 at most).
+   * A frame is at most 4096 px per side and 8 megapixels. `of[i]`: the frame of copy i (−1:
+   * off screen).
    */
   private kaleidoscopeFrames(steps: Affine[], content: Box | null): { frames: Grid[]; of: number[] } {
     const ds = this.view.zoom * this.dpr;
@@ -2218,7 +2228,10 @@ export class GLRenderer implements Renderer {
     const v = this.view;
     const of = steps.map(() => -1);
     if (!content) return { frames: [], of };
-    const groups = new Map<number, { box: Box; grow: number; copies: number[] }>();
+    const groups: { key: number; box: Box; grow: number; copies: number[] }[] = [];
+    const budget = 2.5 * (this.canvas.width || 1) * (this.canvas.height || 1);
+    const cost = (b: Box, grow: number) => (b.x1 - b.x0) * (b.y1 - b.y0) * (ds * grow) ** 2;
+    const union = (a: Box, b: Box): Box => ({ x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) });
     steps.forEach((m, i) => {
       const inv = invert(m);
       if (!inv) return;
@@ -2229,24 +2242,32 @@ export class GLRenderer implements Renderer {
       if (!(x1 > x0 && y1 > y0)) return;
       const grow = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
       const key = Math.round(Math.log2(Math.max(grow, 1e-9)));
-      const g = groups.get(key);
+      const box = { x0, y0, x1, y1 };
+      // Join a frame of the same size group that stays within the budget; else a new one (or,
+      // past 24 frames, the frame that grows least).
+      const same = groups.filter((g) => g.key === key);
+      let g = same.find((x) => cost(union(x.box, box), Math.max(x.grow, grow)) <= budget);
+      if (!g && groups.length >= 24) {
+        const pick = same.length ? same : groups;
+        g = pick.reduce((a, b) => (cost(union(a.box, box), Math.max(a.grow, grow)) - cost(a.box, a.grow) <= cost(union(b.box, box), Math.max(b.grow, grow)) - cost(b.box, b.grow) ? a : b));
+      }
       if (g) {
-        g.box = { x0: Math.min(g.box.x0, x0), y0: Math.min(g.box.y0, y0), x1: Math.max(g.box.x1, x1), y1: Math.max(g.box.y1, y1) };
+        g.box = union(g.box, box);
         g.grow = Math.max(g.grow, grow);
         g.copies.push(i);
-      } else groups.set(key, { box: { x0, y0, x1, y1 }, grow, copies: [i] });
+      } else groups.push({ key, box, grow, copies: [i] });
     });
     const frames: Grid[] = [];
-    for (const [key, g] of groups) {
+    for (const g of groups) {
       const { x0, y0, x1, y1 } = g.box;
       // A pixel of margin, so the edge of the content is not cut by the filter.
-      let s = ds * Math.min(4, Math.max(g.grow, 1e-9));
+      let s = ds * Math.max(g.grow, 1e-9);
       s = Math.min(s, 4096 / (x1 - x0), 4096 / (y1 - y0), Math.sqrt(8e6 / ((x1 - x0) * (y1 - y0))));
       const m = 2 / s;
       // Sizes in steps of 64 px, so the buffers are not made again at every small move.
       const w = Math.max(64, Math.ceil(((x1 - x0 + 2 * m) * s) / 64) * 64), h = Math.max(64, Math.ceil(((y1 - y0 + 2 * m) * s) / 64) * 64);
       for (const i of g.copies) of[i] = frames.length;
-      frames.push(this.frameGrid(x0 - m, y0 - m, w, h, s, `kal${key}:`));
+      frames.push(this.frameGrid(x0 - m, y0 - m, w, h, s, `kal${frames.length}:`));
     }
     return { frames, of };
   }
