@@ -210,3 +210,29 @@ pub fn near() -> Painting {
     p.active().push(stroke(faint, 60, |t| (Vec3::new((t - 0.5) * 0.3, 1.31, 0.85), 1.0)));
     p
 }
+
+/// Layers: left, a blue band clipped to an orange blob (it shows only on the blob); middle, a
+/// green band with a mask painted black across its middle (hidden there); right, a group
+/// (multiply) of a yellow and a cyan band over a white band (the group darkens what is below it
+/// as one).
+pub fn layers() -> Painting {
+    use vdraw_core::{Blend, Layer, Mask};
+    let solid = |color, radius: f32| Brush { radius, color, pressure_size: false, ..Default::default() };
+    let line = |b: Brush, from: Vec3, to: Vec3| stroke(b, 40, move |t| (from.lerp(to, t), 1.0));
+    let mut p = Painting::default();
+    let z = 0.0;
+    // Left: the base, and the clipped band across it.
+    p.layers[0].name = "Blob".into();
+    p.layers[0].strokes.push(line(solid([0.9, 0.4, 0.1], 0.06), Vec3::new(-0.45, 1.35, z), Vec3::new(-0.35, 1.3, z)));
+    p.layers.push(Layer { id: 2, name: "Clipped".into(), clip: true, strokes: vec![line(solid([0.1, 0.3, 0.9], 0.02), Vec3::new(-0.55, 1.2, z + 0.05), Vec3::new(-0.25, 1.45, z + 0.05))], ..Default::default() });
+    // Middle: a band and its mask (black in the middle hides it).
+    let mask = Mask { enabled: true, strokes: vec![line(solid([0.0, 0.0, 0.0], 0.03), Vec3::new(0.0, 1.15, z + 0.1), Vec3::new(0.0, 1.5, z + 0.1))] };
+    p.layers.push(Layer { id: 3, name: "Masked".into(), mask: Some(mask), strokes: vec![line(solid([0.2, 0.75, 0.3], 0.03), Vec3::new(-0.15, 1.33, z), Vec3::new(0.15, 1.33, z))], ..Default::default() });
+    // Right: a white band, then a multiply group of two bands over it.
+    p.layers.push(Layer { id: 4, name: "White".into(), strokes: vec![line(solid([0.95, 0.95, 0.95], 0.04), Vec3::new(0.3, 1.2, z - 0.05), Vec3::new(0.3, 1.5, z - 0.05))], ..Default::default() });
+    p.layers.push(Layer { id: 6, name: "Yellow".into(), parent: Some(5), strokes: vec![line(solid([0.95, 0.85, 0.1], 0.025), Vec3::new(0.2, 1.4, z), Vec3::new(0.45, 1.4, z))], ..Default::default() });
+    p.layers.push(Layer { id: 7, name: "Cyan".into(), parent: Some(5), strokes: vec![line(solid([0.1, 0.8, 0.9], 0.025), Vec3::new(0.2, 1.28, z), Vec3::new(0.45, 1.28, z))], ..Default::default() });
+    p.layers.push(Layer { id: 5, name: "Group".into(), group: true, blend: Blend::Multiply, ..Default::default() });
+    p.normalize();
+    p
+}

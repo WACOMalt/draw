@@ -12,27 +12,30 @@ pub enum Tool {
     Brush,
     Eraser,
     StrokeEraser,
+    /// Picks the color of the painting where the pen points (all layers, as seen).
+    Eyedropper,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 3] = [Tool::Brush, Tool::Eraser, Tool::StrokeEraser];
-
     /// The 2D app's name for it (the tooltip and the options bar).
     pub fn name(self) -> &'static str {
         match self {
             Tool::Brush => "Brush",
             Tool::Eraser => "Eraser",
             Tool::StrokeEraser => "Stroke eraser",
+            Tool::Eyedropper => "Eyedropper",
         }
     }
 }
 
-/// The tools' settings. The brush and the eraser keep their own (as in the 2D app), the color
-/// is the brush's.
+/// The tools' settings. The brush and the eraser keep their own (as in the 2D app); the
+/// foreground color is the brush's.
 #[derive(Clone, Debug)]
 pub struct Tools {
     pub tool: Tool,
     pub brush: Brush,
+    /// The background color (linear RGB), as the 2D app's: swapped with the foreground.
+    pub bg: [f32; 3],
     pub eraser: Brush,
     /// How far the tip turns about the pen's axis, degrees, clockwise as the pen sees it (the
     /// 2D app's Angle): the brush's and the eraser's. At 0 the tip is wide across the hand.
@@ -47,7 +50,7 @@ impl Default for Tools {
     fn default() -> Self {
         // The 2D app's eraser: hardness 0.6, no pressure to size.
         let eraser = Brush { radius: 0.02, hardness: 0.6, pressure_size: false, erase: true, ..Default::default() };
-        Self { tool: Tool::Brush, brush: Brush::default(), eraser, angle: [0.0; 2], sweep_size: 0.03, sweep_all: true }
+        Self { tool: Tool::Brush, brush: Brush::default(), bg: [1.0; 3], eraser, angle: [0.0; 2], sweep_size: 0.03, sweep_all: true }
     }
 }
 
@@ -58,8 +61,19 @@ impl Tools {
         match self.tool {
             Tool::Brush => Some(Brush { erase: false, ..self.brush }),
             Tool::Eraser => Some(Brush { erase: true, ..self.eraser }),
-            Tool::StrokeEraser => None,
+            Tool::StrokeEraser | Tool::Eyedropper => None,
         }
+    }
+
+    /// Swaps the foreground and background colors (the 2D app's X).
+    pub fn swap_colors(&mut self) {
+        std::mem::swap(&mut self.brush.color, &mut self.bg);
+    }
+
+    /// Black on white (the 2D app's D).
+    pub fn default_colors(&mut self) {
+        self.brush.color = [0.0; 3];
+        self.bg = [1.0; 3];
     }
 
     /// The settings the panel shows for the painting tools, and their angle.
@@ -67,7 +81,7 @@ impl Tools {
         match self.tool {
             Tool::Brush => Some((&mut self.brush, &mut self.angle[0])),
             Tool::Eraser => Some((&mut self.eraser, &mut self.angle[1])),
-            Tool::StrokeEraser => None,
+            Tool::StrokeEraser | Tool::Eyedropper => None,
         }
     }
 

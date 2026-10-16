@@ -24,7 +24,7 @@ pub enum View {
 /// VR draws it (orbit views only). `sweep`: the stroke eraser's overlay, its ball (that radius)
 /// at the orbit target.
 #[allow(clippy::too_many_arguments)]
-pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, view: View, tip: Option<BrushTip>, bench: u32, panel: Option<crate::tools::Tool>, sweep: Option<f32>) -> Result<()> {
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, view: View, tip: Option<BrushTip>, bench: u32, panel: Option<(crate::tools::Tool, crate::panel::Tab)>, sweep: Option<f32>) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
@@ -40,7 +40,6 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
         View::Eye(eye) => (eye, None),
     };
-    let painting_mix = painting.mix;
     // The stroke eraser's overlay, its ball (radius `sweep`) at the orbit target.
     let mut lines = Vec::new();
     if let (Some(r), Some(cam)) = (sweep, cam) {
@@ -83,20 +82,31 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut ui = UiRenderer::new(gpu.clone(), OUT_FORMAT)?;
     let mut primitives = Vec::new();
     let mut placement = None;
-    if let (Some(tool), Some(cam)) = (panel, cam) {
-        let mut tools = crate::tools::Tools { tool, ..Default::default() };
-        tools.brush.hardness = 0.8;
-        tools.brush.roundness = 0.4;
-        tools.angle[0] = 30.0;
+    if let (Some((tool, tab)), Some(cam)) = (panel, cam) {
+        let mut painter = crate::painter::Painter::new(painting.clone());
+        painter.tools = crate::tools::Tools { tool, ..Default::default() };
+        painter.tools.brush.hardness = 0.8;
+        painter.tools.brush.roundness = 0.4;
+        painter.tools.angle[0] = 30.0;
+        let mut palettes = crate::palettes::Palettes::default();
+        palettes.create("My colors");
+        for hex in ["#e64a2e", "#31a8ff", "#f2c94c", "#5cb85c"] {
+            let _ = palettes.add(crate::palettes::PaletteColor { hex: hex.into(), name: None });
+        }
         // A full set of recent colors (two rows), as after a while of painting.
         let base = [[0xe6, 0x4a, 0x2e], [0x31, 0xa8, 0xff], [0xf2, 0xc9, 0x4c], [0x5c, 0xb8, 0x5c], [0x9b, 0x59, 0xd0], [0x1e, 0x1e, 0x1e], [0xff, 0xff, 0xff], [0x8a, 0x5a, 0x2b], [0x2b, 0x8a, 0x8a]];
         let recent: Vec<[u8; 3]> = base.iter().chain(base.iter().rev()).copied().collect();
-        let mut p = Panel::new(&tools.brush);
+        painter.recent = recent;
+        let mut p = Panel::new(&painter.tools.brush);
+        p.tab = tab;
+        if std::env::var("VDRAW_PALETTES").is_ok() {
+            p.show_palettes();
+        }
         let (right, up, forward) = cam.axes();
-        let place = Placement::centered(cam.eye() + forward * 0.45 + right * 0.12, right, -up, -forward);
+        let place = Placement::centered(cam.eye() + forward * 0.5, right, -up, -forward);
         // Twice: egui lays out sizes it measured in the frame before.
         for _ in 0..2 {
-            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false }, Model { tools: &mut tools, mix: painting_mix, recent: &recent, can_undo: true, can_redo: false });
+            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes });
             ui.update_textures(&frame.textures)?;
             primitives = frame.primitives;
         }

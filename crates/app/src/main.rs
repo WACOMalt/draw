@@ -6,9 +6,9 @@
 //!                               ~/.local/share/vdraw/painting.vdraw unless told otherwise
 //!   vdraw --import in.bdraw [out.vdraw]
 //!                               bring a 2D app canvas in, as 3D strokes on a plane ahead
-//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap|flat|mix|near] [--orbit x y z yaw pitch distance]
+//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap|flat|mix|near|layers] [--orbit x y z yaw pitch distance]
 //!                               [--tip opacity hardness] [--size WxH] [--bench N] [--mix normal|pigment]
-//!                               [--panel [brush|eraser|stroke-eraser]] [--sweep radius] [--replay folder [right]]
+//!                               [--panel [brush|eraser|stroke-eraser|color|palettes|layers|settings]] [--sweep radius] [--replay folder [right]]
 //!                               render a painting to a PNG (no window, no headset); --replay:
 //!                               a debug snapshot's painting from its left (or right) eye
 //!                               render a demo painting to a PNG (no window, no headset)
@@ -17,6 +17,7 @@ mod camera;
 mod debug;
 mod demo;
 mod painter;
+mod palettes;
 mod panel;
 mod rig;
 mod snapshot;
@@ -25,7 +26,7 @@ mod xr;
 
 use anyhow::{Context, Result};
 
-/// The painting of `--demo shapes|soft|compare|dense|overlap|flat|mix|near` (shapes when not given), and a camera for it.
+/// The painting of `--demo shapes|soft|compare|dense|overlap|flat|mix|near|layers` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
     // --open file.vdraw: a saved painting, seen from where the viewer starts, toward its middle.
     if let Some(path) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
@@ -43,8 +44,9 @@ fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
         "overlap" => (demo::overlap(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
         "flat" => (demo::flat(), camera::Orbit { target: glam::Vec3::new(0.0, 1.35, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.0 }),
         "near" => (demo::near(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
+        "layers" => (demo::layers(), camera::Orbit { target: glam::Vec3::new(0.0, 1.33, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.0 }),
         "mix" => (demo::mix(), camera::Orbit { target: glam::Vec3::new(0.0, 1.35, 0.0), yaw: 0.0, pitch: 0.0, distance: 0.9 }),
-        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense, overlap, flat, mix or near"),
+        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense, overlap, flat, mix, near or layers"),
     })
 }
 
@@ -122,9 +124,13 @@ fn main() -> Result<()> {
             // --panel [tool]: the tool panel beside the view; --sweep r: the stroke eraser's
             // overlay, its ball (radius r) at the orbit target.
             let panel = args.iter().position(|a| a == "--panel").map(|i| match args.get(i + 1).map(String::as_str) {
-                Some("eraser") => tools::Tool::Eraser,
-                Some("stroke-eraser") => tools::Tool::StrokeEraser,
-                _ => tools::Tool::Brush,
+                Some("eraser") => (tools::Tool::Eraser, panel::Tab::Tool),
+                Some("stroke-eraser") => (tools::Tool::StrokeEraser, panel::Tab::Tool),
+                Some("color") => (tools::Tool::Brush, panel::Tab::Color),
+                Some("palettes") => (tools::Tool::Brush, panel::Tab::Color),
+                Some("layers") => (tools::Tool::Brush, panel::Tab::Layers),
+                Some("settings") => (tools::Tool::Brush, panel::Tab::Settings),
+                _ => (tools::Tool::Brush, panel::Tab::Tool),
             });
             let sweep = match args.iter().position(|a| a == "--sweep").and_then(|i| args.get(i + 1)) {
                 Some(r) => Some(r.parse()?),

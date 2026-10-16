@@ -275,6 +275,8 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     let mut press = [Press::Off; 2];
     let mut click = false; // the trigger is clicked down on the panel
     let mut panel = Panel::new(&painter.tools.brush);
+    // Your palettes, beside the painting (or the default place, for a demo).
+    let mut palettes = crate::palettes::Palettes::load(crate::palettes::path_beside(save_to.as_deref()).unwrap_or_else(|| crate::painting_path().with_file_name("palettes.json")));
     let mut panel_shown = true;
     let mut ui: Option<UiRenderer> = None;
     // A debug snapshot this frame (the panel's button), and the buffer it is copied into.
@@ -394,11 +396,11 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                     if click && !was {
                         tick(h, 0.3, 15)?;
                     }
-                    pointer = Pointer { at: placement.and_then(|p| p.project(from, dir)), pressed: click };
+                    pointer = Pointer { at: placement.and_then(|p| p.project(from, dir)), pressed: click, scroll: 0.0 };
                 } else {
                     click = false;
                     if press[h] == Press::Off {
-                        pointer = Pointer { at: on_panel.map(|(_, at)| at), pressed: false };
+                        pointer = Pointer { at: on_panel.map(|(_, at)| at), pressed: false, scroll: 0.0 };
                     }
                 }
                 if let (Some(p), Some(at)) = (placement, pointer.at) {
@@ -421,21 +423,21 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             let s = input.stick.state(&session, input.hands[h])?;
             Ok(if s.is_active { Vec2::new(s.current_state.x, s.current_state.y) } else { Vec2::ZERO })
         };
-        loco.update(&mut rig, head_pose, stick(0)?, stick(1)?, dt);
+        // While the painting hand points at the panel, its stick scrolls the panel instead.
+        let mut sticks = [stick(0)?, stick(1)?];
+        if pointer.at.is_some() {
+            pointer.scroll = sticks[painting_hand].y;
+            sticks[painting_hand] = Vec2::ZERO;
+        }
+        loco.update(&mut rig, head_pose, sticks[0], sticks[1], dt);
 
         // The panel: laid out with this frame's pointer.
-        let panel_frame = placement.map(|_| {
-            let (can_undo, can_redo) = (!painter.undo.is_empty(), !painter.redo.is_empty());
-            panel.run(pointer, Model { tools: &mut painter.tools, mix: painter.painting.mix, recent: &painter.recent, can_undo, can_redo })
-        });
+        let panel_frame = placement.map(|_| panel.run(pointer, Model { painter: &mut painter, palettes: &mut palettes }));
         if let Some(f) = &panel_frame {
             for action in &f.actions {
                 match action {
-                    Action::Undo => painter.undo(),
-                    Action::Redo => painter.redo(),
                     Action::Recenter => rig = Rig::default(),
                     Action::DebugSnapshot => capture = true,
-                    Action::Mix(mix) => painter.set_mix(*mix),
                 }
             }
         }

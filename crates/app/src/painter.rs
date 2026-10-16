@@ -75,6 +75,9 @@ pub struct Painter {
     /// The layer strokes go to (by id), and whether to its mask (the 2D app's mask target).
     pub active_layer: u32,
     pub mask_target: bool,
+    /// The last layer edit's key and when it was: edits of the same key within 2 s are one
+    /// step of undo (an opacity drag), as in the 2D app.
+    merge: Option<(&'static str, std::time::Instant)>,
     /// Colors used, newest first (sRGB), for the panel's swatches.
     pub recent: Vec<[u8; 3]>,
     /// The strokes changed since the last save.
@@ -98,6 +101,7 @@ impl Painter {
             tools: Tools::default(),
             active_layer,
             mask_target: false,
+            merge: None,
             recent: Vec::new(),
             changed: false,
         };
@@ -227,6 +231,19 @@ impl Painter {
     /// A layer edit: `f` changes the layers and returns what it took out and the layer to make
     /// active. One step of undo.
     pub fn edit_layers(&mut self, f: impl FnOnce(&mut Painting) -> (Option<usize>, Removed)) {
+        self.merge = None;
+        self.edit_layers_inner(f, true);
+    }
+
+    /// A layer edit that joins the last one of the same `key` within 2 s (one step of undo).
+    pub fn edit_layers_merged(&mut self, key: &'static str, f: impl FnOnce(&mut Painting) -> (Option<usize>, Removed)) {
+        let now = std::time::Instant::now();
+        let join = self.merge.is_some_and(|(k, t)| k == key && now - t < std::time::Duration::from_secs(2)) && matches!(self.undo.last(), Some(Edit::Layers { .. }));
+        self.merge = Some((key, now));
+        self.edit_layers_inner(f, !join);
+    }
+
+    fn edit_layers_inner(&mut self, f: impl FnOnce(&mut Painting) -> (Option<usize>, Removed), record: bool) {
         self.end_sweep();
         let before = layout(&self.painting);
         let was = self.active_layer;
@@ -237,10 +254,23 @@ impl Painter {
         if self.painting.index_of(self.active_layer).is_none() || self.painting.layers[self.active_index()].mask.is_none() {
             self.mask_target = false;
         }
-        self.undo.push(Edit::Layers { layout: before, kept: removed.layers, masks: removed.masks, active: was });
+        if record {
+            self.undo.push(Edit::Layers { layout: before, kept: removed.layers, masks: removed.masks, active: was });
+        } else if let Some(Edit::Layers { kept, masks, .. }) = self.undo.last_mut() {
+            kept.extend(removed.layers);
+            masks.extend(removed.masks);
+        }
         self.redo.clear();
         self.rebuild();
         self.changed = true;
+    }
+
+    /// Puts a color (sRGB) first among the recent ones (the 2D app keeps 18).
+    pub fn add_recent(&mut self, srgb: [f32; 3]) {
+        let c = srgb.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+        self.recent.retain(|&r| r != c);
+        self.recent.insert(0, c);
+        self.recent.truncate(panel::RECENT);
     }
 
     /// Sets the paint mixing, as an edit.
@@ -315,10 +345,7 @@ impl Painter {
                         let grey = panel::to_linear([0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; 3]);
                         brush.color = grey;
                     } else if !brush.erase {
-                        let c = panel::to_srgb(brush.color).map(|c| (c * 255.0).round() as u8);
-                        self.recent.retain(|&r| r != c);
-                        self.recent.insert(0, c);
-                        self.recent.truncate(panel::RECENT);
+                        self.add_recent(panel::to_srgb(brush.color));
                     }
                     let mut stroke = Stroke::new(brush);
                     stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
