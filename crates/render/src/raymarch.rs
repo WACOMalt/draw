@@ -38,7 +38,7 @@ struct EyeGpu {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ParamsGpu {
-    eyes: [EyeGpu; 2],
+    eyes: [EyeGpu; 3],
     seg_count: u32,
     width: u32,
     height: u32,
@@ -52,7 +52,7 @@ struct ParamsGpu {
     cluster_count: u32,
     line_count: u32,
     step_count: u32,
-    pad2: u32,
+    pick_layer: u32,
 }
 
 /// A compositing step as the shader reads it (vdraw_core::Step): what it is (`STEP_*`), the
@@ -130,6 +130,9 @@ pub struct Overlays<'a> {
     pub laser: Option<(Vec3, Vec3)>,
     /// Lines over everything (the stroke eraser's marks). At most `MAX_LINES` show per tile.
     pub lines: &'a [OverlayLine],
+    /// The eyedropper's view: drawn into the target's layer after the eyes', only its first
+    /// tile (see `Raymarcher::pick_layer`; the ray through its top-left pixel is the pick).
+    pub pick: Option<EyeView>,
 }
 
 /// A line drawn over the painting, as the 2D app draws stroke paths: from `a` to `b` (xyz), a
@@ -435,7 +438,9 @@ impl Raymarcher {
             let code = ash::util::read_spv(&mut std::io::Cursor::new(spirv))?;
             let module = unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }?;
             let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-            let pipeline = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None) }
+            // Dispatch base: the eyedropper's view is one workgroup at a layer of its own.
+            let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE);
+            let pipeline = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) }
                 .map_err(|(_, e)| e)?[0];
             unsafe { d.destroy_shader_module(module, None) };
             Ok(pipeline)
@@ -514,7 +519,9 @@ impl Raymarcher {
     pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, scene: &Scene, eyes: &[EyeView], overlays: &Overlays) -> Result<()> {
         let target = self.target.as_ref().expect("call target() first");
         let (view, image, w, h, layers) = (target.view, target.image, target.width, target.height, target.layers);
-        assert!(eyes.len() as u32 == layers && layers <= 2);
+        // The eyes, one per layer; with an eyedropper's view, a layer more.
+        let pick = overlays.pick.filter(|_| layers as usize == eyes.len() + 1);
+        assert!((eyes.len() as u32 == layers || eyes.len() as u32 + 1 == layers) && eyes.len() <= 2);
 
         // The finished strokes' chunks, made again only when they change.
         if self.static_version != Some(scene.version) {
@@ -584,6 +591,11 @@ impl Raymarcher {
         let (segment_count, chunk_count) = (n_segments as u32, n_chunks as u32);
         let f = &mut self.frames[frame];
         let mut p = ParamsGpu::zeroed();
+        p.pick_layer = u32::MAX;
+        if let Some(e) = pick {
+            p.pick_layer = eyes.len() as u32;
+            p.eyes[eyes.len()] = EyeGpu { inv_view_proj: e.view_proj.inverse().to_cols_array(), pos: [e.pos.x, e.pos.y, e.pos.z, 1.0] };
+        }
         for (i, e) in eyes.iter().enumerate() {
             p.eyes[i] = EyeGpu { inv_view_proj: e.view_proj.inverse().to_cols_array(), pos: [e.pos.x, e.pos.y, e.pos.z, 1.0] };
         }
@@ -620,7 +632,11 @@ impl Raymarcher {
                 vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE);
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, if scene.pigment { self.pigment } else { self.pipeline });
             d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &[self.frames[frame].set], &[]);
-            d.cmd_dispatch(cmd, w.div_ceil(TILE), h.div_ceil(TILE), layers);
+            d.cmd_dispatch(cmd, w.div_ceil(TILE), h.div_ceil(TILE), eyes.len() as u32);
+            if pick.is_some() {
+                // Only the eyedropper view's first tile.
+                d.cmd_dispatch_base(cmd, 0, 0, eyes.len() as u32, 1, 1, 1);
+            }
             barrier(d, cmd, image, layers, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 vk::PipelineStageFlags2::ALL_TRANSFER, vk::AccessFlags2::TRANSFER_READ);

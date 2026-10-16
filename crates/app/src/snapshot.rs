@@ -29,7 +29,9 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
     let mut rm = Raymarcher::new(gpu.clone())?;
-    let image = rm.target(width, height, 1)?.image;
+    // VDRAW_PICK: also the eyedropper, along the orbit camera's middle ray (logged).
+    let picking = std::env::var("VDRAW_PICK").is_ok() && matches!(view, View::Orbit(_));
+    let image = rm.target(width, height, if picking { 2 } else { 1 })?.image;
 
     let mut segs = Vec::new();
     let built = painting.build(&mut segs);
@@ -117,7 +119,14 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let t0 = std::time::Instant::now();
     unsafe {
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, lines: &lines, ..Default::default() })?;
+        let pick = cam.filter(|_| picking).map(|c| EyeView { view_proj: crate::camera::pick_projection(width, height, 0.02, 100.0) * c.view(), pos: c.eye() });
+        rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, lines: &lines, pick, ..Default::default() })?;
+        if pick.is_some() {
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_array_layer(1).layer_count(1))
+                .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 });
+            d.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, readback.buffer, &[region]);
+        }
         barrier(d, cmd, out.image, 1, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
@@ -142,6 +151,11 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         d.destroy_fence(fence, None);
     }
     log::info!("{} segments, rendered in {:.1} ms (with the upload)", segs.len(), t0.elapsed().as_secs_f64() * 1000.0);
+    if picking {
+        let px: [u16; 4] = bytemuck::pod_read_unaligned(&readback.bytes()[..8]);
+        let [r, g, b, a] = px.map(crate::xr::half_to_f32);
+        log::info!("eyedropper: linear {r:.3} {g:.3} {b:.3}, paint {a:.3}; sRGB {}", crate::palettes::to_hex(crate::panel::to_srgb([r, g, b])));
+    }
 
     // The sRGB bytes as they are; alpha opaque.
     let mut rgba = readback4.bytes()[..(width * height * 4) as usize].to_vec();

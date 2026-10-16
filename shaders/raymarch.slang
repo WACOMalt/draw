@@ -36,7 +36,7 @@ struct Eye
 
 struct Params
 {
-    Eye eyes[2];
+    Eye eyes[3]; // the eyes, and the eyedropper's view (pickLayer)
     uint segCount;
     uint width;
     uint height;
@@ -50,7 +50,7 @@ struct Params
     uint clusterCount;
     uint lineCount;
     uint stepCount;
-    uint pad2;
+    uint pickLayer; // the image layer of the eyedropper's view (0xffffffff: none)
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -932,7 +932,10 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     //    the pending base until the next shows whether it is clipped to it: clipped layers go
     //    onto the base, atop; then the base goes onto the canvas by its mode and opacity. Seen
     //    through a layer above, a layer below shows by the blend, not by depth.
-    float4 canvas = float4(srgbFromLinear(color), 1.0);
+    // The eyedropper's view starts clear: it picks the paint alone, and nothing where there is
+    // none (as the 2D app's, without its paper).
+    bool picking = id.z == params.pickLayer;
+    float4 canvas = picking ? float4(0.0) : float4(srgbFromLinear(color), 1.0);
     float4 base = 0.0;
     uint baseBlend = 0;
     float baseOpacity = 1.0;
@@ -1020,6 +1023,12 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     }
     if (hasBase)
         canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+    if (picking)
+    {
+        // Linear color, not premultiplied, and how much paint there is.
+        outImage[id] = canvas.a > 0.0 ? float4(linearFromSrgb(canvas.rgb / canvas.a), canvas.a) : float4(0.0);
+        return;
+    }
     color = linearFromSrgb(canvas.rgb);
 
     // 4. The brush tip, where the next stroke starts: a preview of its color, opacity and

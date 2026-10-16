@@ -333,6 +333,8 @@ impl Painter {
                     self.finish(stroke);
                 }
             }
+            // The eyedropper picks where the pen points (the frame loop renders that).
+            None if self.tools.tool == crate::tools::Tool::Eyedropper => {}
             None if down && self.sweep.is_none() => match self.tools.paint() {
                 Some(mut brush) => {
                     // Not on a hidden layer, a group, or a mask that is not there.

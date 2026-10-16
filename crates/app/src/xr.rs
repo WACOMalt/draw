@@ -21,6 +21,7 @@ use crate::debug;
 use crate::panel::{Action, Model, Panel, Placement, Pointer};
 use crate::rig::{Locomotion, Rig};
 use crate::painter::Painter;
+use crate::tools::Tool;
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk::{self, Handle};
 use glam::{Mat4, Quat, Vec2, Vec3};
@@ -282,6 +283,12 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     // A debug snapshot this frame (the panel's button), and the buffer it is copied into.
     let mut capture = false;
     let mut shot_buffer: Option<Buffer> = None;
+    // The eyedropper: per frame slot, the picked pixel copied out, and whether it waits there.
+    let mut pick_buffers = (0..FRAMES)
+        .map(|_| Buffer::new(&gpu, 256, vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu, "eyedropper"))
+        .collect::<Result<Vec<_>>>()?;
+    let mut pick_pending = [false; FRAMES];
+    let mut picking_was = false;
 
     'main: loop {
         if quit.swap(false, Ordering::Relaxed) {
@@ -446,7 +453,12 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
         // of the next stroke), the eraser's and the stroke eraser's (rings), and the stroke
         // eraser's overlay.
         let mut lines = Vec::new();
-        let tip = aims[painting_hand].filter(|_| pointer.at.is_none()).map(|aim| {
+        // The eyedropper: no tip, a laser along what it points at.
+        if let (Tool::Eyedropper, None, Some(aim)) = (painter.tools.tool, pointer.at, aims[painting_hand]) {
+            let from = aim.w_axis.truncate();
+            laser = Some((rig.point(from), rig.point(from + aim.transform_vector3(Vec3::NEG_Z) * 4.0)));
+        }
+        let tip = aims[painting_hand].filter(|_| pointer.at.is_none() && painter.tools.tool != Tool::Eyedropper).map(|aim| {
             let (pos, up) = (rig.point(tip_of(aim)), rig.dir(up_of(aim)));
             match painter.tools.paint() {
                 Some(b) => BrushTip {
@@ -484,6 +496,16 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
         unsafe {
             d.wait_for_fences(&[fences[frame]], true, u64::MAX)?;
             d.reset_fences(&[fences[frame]])?;
+            if pick_pending[frame] {
+                // The eyedropper's pixel (RGBA16F: linear color, and how much paint): where
+                // there is paint, it is the color.
+                pick_pending[frame] = false;
+                let px: [u16; 4] = bytemuck::pod_read_unaligned(&pick_buffers[frame].bytes()[..8]);
+                let [r, g, b, a] = px.map(half_to_f32);
+                if a > 0.01 {
+                    painter.tools.brush.color = [r, g, b].map(|c| c.clamp(0.0, 1.0));
+                }
+            }
             if queried[frame] {
                 let mut ts = [0u64; 2];
                 if d.get_query_pool_results(queries, 2 * frame as u32, &mut ts, vk::QueryResultFlags::TYPE_64).is_ok() {
@@ -507,13 +529,32 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
         let cmd = cmds[frame];
         let (w, h) = (sc.width, sc.height);
-        let target = rm.target(w, h, 2)?.image;
+        // The eyes, and a layer for the eyedropper's view.
+        let target = rm.target(w, h, 3)?.image;
+        // The eyedropper, while its trigger is held: a view along the controller's ray, whose
+        // first pixel is what it points at. Let go: the color goes to the recent ones.
+        let picking = painter.tools.tool == Tool::Eyedropper && press[painting_hand] == Press::Paint;
+        let pick = aims[painting_hand].filter(|_| picking).map(|aim| {
+            let world = rig.mat() * aim;
+            EyeView { view_proj: crate::camera::pick_projection(w, h, NEAR, FAR) * world.inverse(), pos: world.w_axis.truncate() }
+        });
+        if picking_was && !picking {
+            painter.add_recent(crate::panel::to_srgb(painter.tools.brush.color));
+        }
+        picking_was = picking;
         let dst = sc.images[image_index];
         unsafe {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
-            rm.record(cmd, frame, &painter.scene(&steps), &eyes, &Overlays { tip, laser, lines: &lines })?;
+            rm.record(cmd, frame, &painter.scene(&steps), &eyes, &Overlays { tip, laser, lines: &lines, pick })?;
+            if pick.is_some() {
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_array_layer(2).layer_count(1))
+                    .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 });
+                d.cmd_copy_image_to_buffer(cmd, target, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, pick_buffers[frame].buffer, &[region]);
+                pick_pending[frame] = true;
+            }
             barrier(d, cmd, dst, 2, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
@@ -655,6 +696,9 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     if let Some(mut b) = shot_buffer.take() {
         b.destroy(&gpu);
     }
+    for b in &mut pick_buffers {
+        b.destroy(&gpu);
+    }
     drop(ui);
     drop(swapchain);
     drop((input, head, stage, stream, waiter, session));
@@ -696,4 +740,16 @@ fn make_swapchain(instance: &xr::Instance, system: xr::SystemId, session: &xr::S
     })?;
     let images = handle.enumerate_images()?.into_iter().map(vk::Image::from_raw).collect();
     Ok(Swapchain { handle, images, format, width, height })
+}
+
+/// A half float (IEEE 754 binary16) as an f32.
+pub fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x3ff) as f32;
+    sign * match exp {
+        0 => mant * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        e => (1.0 + mant / 1024.0) * 2f32.powi(e - 15),
+    }
 }

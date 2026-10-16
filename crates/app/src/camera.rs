@@ -21,6 +21,15 @@ pub fn perspective_fov(left: f32, right: f32, up: f32, down: f32, near: f32, far
     )
 }
 
+/// A projection for picking: in an image `width` x `height` pixels, the ray through the middle
+/// of the top-left pixel goes straight ahead (-z), and a pixel spans 0.1 milliradian. (The
+/// eyedropper renders only that corner of a view along the controller's ray.)
+pub fn pick_projection(width: u32, height: u32, near: f32, far: f32) -> Mat4 {
+    let (sx, sy) = (width as f32 * 1e-4, height as f32 * 1e-4);
+    let (l, u) = (-sx / (2.0 * width as f32), sy / (2.0 * height as f32));
+    perspective_fov(l.atan(), (l + sx).atan(), u.atan(), (u - sy).atan(), near, far)
+}
+
 /// Turns around a target point: yaw and pitch in radians, distance in meters.
 #[derive(Clone, Copy, Debug)]
 pub struct Orbit {
@@ -59,6 +68,17 @@ impl Orbit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pick_ray_goes_straight_ahead() {
+        // The shader's ray through pixel (0.5, 0.5): the inverse projection of its NDC point.
+        let (w, h) = (1732, 1924);
+        let inv = pick_projection(w, h, 0.02, 100.0).inverse();
+        let ndc = glam::Vec2::new(0.5 / w as f32 * 2.0 - 1.0, 0.5 / h as f32 * 2.0 - 1.0);
+        let far = inv * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        let dir = (far.truncate() / far.w).normalize();
+        assert!(dir.abs_diff_eq(Vec3::NEG_Z, 1e-5), "{dir}");
+    }
 
     #[test]
     fn fov_matches_symmetric() {
