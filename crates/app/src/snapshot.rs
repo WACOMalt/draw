@@ -8,7 +8,7 @@ use gpu_allocator::MemoryLocation;
 use std::sync::Arc;
 use vdraw_render::raymarch::Buffer;
 use crate::panel::{Model, Panel, Placement, Pointer};
-use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, Target, UiRenderer, barrier};
+use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, Scene, Target, UiRenderer, barrier};
 
 const OUT_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
@@ -24,9 +24,10 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let image = rm.target(width, height, 1)?.image;
 
     let mut segs = Vec::new();
-    painting.segments(None, &mut segs);
-    let flat = painting.flat();
-    rm.set_flat(painting.canvas.as_ref(), &flat)?;
+    let runs = painting.segments(&mut segs);
+    let layers = crate::xr::scene_layers(&painting);
+    rm.set_canvas(painting.canvas.as_ref());
+    let scene = Scene { segments: &segs, runs: &runs, version: 0, active: &[], active_layer: 0, layers: &layers };
     let eye = EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() };
 
     let d = &gpu.device;
@@ -42,7 +43,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
                 d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
                 d.cmd_reset_query_pool(cmd, queries, 0, 2);
                 d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 0);
-                rm.record(cmd, 0, &segs, &[eye], &Overlays { tip, laser: None })?;
+                rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, laser: None })?;
                 d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::BOTTOM_OF_PIPE, queries, 1);
                 d.end_command_buffer(cmd)?;
                 let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
@@ -82,7 +83,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let t0 = std::time::Instant::now();
     unsafe {
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        rm.record(cmd, 0, &segs, &[eye], &Overlays { tip, laser: None })?;
+        rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, laser: None })?;
         barrier(d, cmd, out.image, 1, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);

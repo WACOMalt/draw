@@ -1,10 +1,9 @@
 //! From samples to round cones: filter, resample by arc length, connect.
 
 use crate::filter::OneEuro3;
-use crate::painting::Plane;
-use crate::stroke::{Brush, Dabs, Stroke};
+use crate::stroke::{Brush, Stroke};
 use bytemuck::{Pod, Zeroable};
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 
 /// One round cone, as the GPU reads it: four float4, so a port can also keep segments in a
 /// float texture (four texels each). `a.w` and `b.w` are the radii; `color` is linear RGB and
@@ -29,7 +28,8 @@ impl GpuSegment {
         Self {
             a: [a.x, a.y, a.z, ra],
             b: [b.x, b.y, b.z, rb],
-            color: [c[0], c[1], c[2], brush.opacity.clamp(0.0, 1.0)],
+            // An eraser's opacity is negative (it takes paint away).
+            color: [c[0], c[1], c[2], brush.opacity.clamp(0.0, 1.0) * if brush.erase { -1.0 } else { 1.0 }],
             style: [brush.hardness.clamp(0.0, 1.0), stroke as f32, 0.0, 0.0],
         }
     }
@@ -61,9 +61,13 @@ pub struct GpuChunk {
     pub sphere: [f32; 4],
     pub first: u32,
     pub count: u32,
-    /// 1 when the stroke is soft (drawn as a layer), 0 when solid.
-    pub soft: u32,
-    pub pad: u32,
+    /// Bit 0: the stroke is soft (density stamps); bit 1: it is an eraser. 0: solid.
+    pub flags: u32,
+    /// The layer (the renderer's layer table), set by the renderer.
+    pub layer: u32,
+    /// The stroke number (as the segments' style.y).
+    pub stroke: u32,
+    pub pad: [u32; 3],
 }
 
 /// The chunks of `segs` (segments of a stroke are next to each other, in order).
@@ -85,7 +89,69 @@ pub fn chunks(segs: &[GpuSegment], out: &mut Vec<GpuChunk>) {
         }
         let c = (lo + hi) * 0.5;
         let radius = ends().map(|(p, r)| (p - c).length() + r).fold(0.0, f32::max);
-        out.push(GpuChunk { sphere: [c.x, c.y, c.z, radius], first: i as u32, count: n as u32, soft: !run[0].solid() as u32, pad: 0 });
+        let flags = !run[0].solid() as u32 | ((run[0].color[3] < 0.0) as u32) << 1;
+        out.push(GpuChunk { sphere: [c.x, c.y, c.z, radius], first: i as u32, count: n as u32, flags, layer: 0, stroke: stroke as u32, pad: [0; 3] });
+        i += n;
+    }
+}
+
+/// The full-chord table: the falloff integrated along a whole line through a stamp, at
+/// distance q (radii) from its center, for CHORD_H hardnesses (0..1) x CHORD_Q distances (0..1),
+/// row by hardness. A stamp's optical depth along a ray it crosses whole is its strength times
+/// this.
+pub const CHORD_Q: usize = 65;
+pub const CHORD_H: usize = 17;
+
+pub fn chord_table() -> Vec<f32> {
+    let mut out = Vec::with_capacity(CHORD_Q * CHORD_H);
+    for hi in 0..CHORD_H {
+        let h = hi as f32 / (CHORD_H - 1) as f32;
+        for qi in 0..CHORD_Q {
+            let q = qi as f32 / (CHORD_Q - 1) as f32;
+            let half = (1.0 - q * q).max(0.0).sqrt();
+            const N: usize = 512;
+            let sum: f32 = (0..N).map(|i| {
+                let y = half * (i as f32 + 0.5) / N as f32;
+                falloff((q * q + y * y).sqrt(), h)
+            }).sum();
+            out.push(2.0 * sum * half / N as f32);
+        }
+    }
+    out
+}
+
+/// Chunks per cluster, at most.
+pub const CLUSTER: usize = 16;
+
+/// A run of up to `CLUSTER` consecutive chunks of one layer, in a sphere: the renderer's tiles
+/// test clusters before chunks (so a tile's cost grows with the clusters, not every chunk).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuCluster {
+    pub sphere: [f32; 4],
+    pub first: u32,
+    pub count: u32,
+    pub pad: [u32; 2],
+}
+
+/// The clusters of `chunks` (appended to `out`; chunk numbers start at `base`).
+pub fn clusters(chunks: &[GpuChunk], base: u32, out: &mut Vec<GpuCluster>) {
+    let mut i = 0;
+    while i < chunks.len() {
+        let mut n = 1;
+        while n < CLUSTER && i + n < chunks.len() && chunks[i + n].layer == chunks[i].layer {
+            n += 1;
+        }
+        let run = &chunks[i..i + n];
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for c in run {
+            let (p, r) = (Vec3::from_slice(&c.sphere[..3]), c.sphere[3]);
+            lo = lo.min(p - r);
+            hi = hi.max(p + r);
+        }
+        let center = (lo + hi) * 0.5;
+        let radius = run.iter().map(|c| (Vec3::from_slice(&c.sphere[..3]) - center).length() + c.sphere[3]).fold(0.0, f32::max);
+        out.push(GpuCluster { sphere: [center.x, center.y, center.z, radius], first: base + i as u32, count: n as u32, pad: [0; 2] });
         i += n;
     }
 }
@@ -128,11 +194,18 @@ fn depth_of(opacity: f32) -> f32 {
 /// spacing. A stamp's optical depth along a ray is its strength times the line integral of the
 /// falloff (in radii).
 fn stamp_strengths(pts: &[(Vec3, f32)], brush: &Brush) -> Vec<f32> {
-    let depth = depth_of(brush.opacity);
+    // A 2D app brush: the dabs' sum through a trail's middle, flow x (1 + hardness) / (2
+    // spacing) (its opacity caps the stroke where it is drawn, as in the 2D app). Else: the
+    // depth that covers by the opacity.
+    let depth = match brush.dabs {
+        Some(d) => d.flow * (1.0 + brush.hardness) / (2.0 * d.spacing.max(0.005)),
+        None => depth_of(brush.opacity),
+    };
     if pts.len() == 1 {
-        // One stamp: covered by `opacity` through its center (the line integral there is
-        // 1 + hardness radii).
-        return vec![depth / (1.0 + brush.hardness)];
+        // One stamp: covered by `opacity` (one dab: by its flow) through its center (the line
+        // integral there is 1 + hardness radii).
+        let one = brush.dabs.map_or(depth, |d| -(1.0 - d.flow.clamp(0.0, 0.999)).ln());
+        return vec![one / (1.0 + brush.hardness)];
     }
     let gap = |i: usize| (pts[i + 1].0 - pts[i].0).length();
     let area = falloff_area(brush.hardness);
@@ -163,52 +236,6 @@ pub fn to_linear(c: [f32; 3]) -> [f32; 3] {
 }
 
 impl Stroke {
-    /// A flat layer's stroke, as the 2D app's trail of dabs, in the plane's coordinates (meters,
-    /// z 0). No filter: the points are the 2D app's, only merged to steps of at least half the
-    /// radius (or 1 mm). Color is sRGB (the 2D app composites in sRGB); color.a is the opacity,
-    /// negative for an eraser; style is (hardness, stroke number, dab density at a, at b). The
-    /// dab density is flow / (2 spacing): summed along the trail, dabs give a covering of
-    /// density times the line integral of the falloff (in radii).
-    pub fn flat_segments(&self, plane: &Plane, id: u32, out: &mut Vec<GpuSegment>) {
-        let brush = &self.brush;
-        if self.samples.is_empty() {
-            return;
-        }
-        let dabs = brush.dabs.unwrap_or(Dabs { flow: 1.0, spacing: 0.1, pressure_flow: false });
-        let spacing = dabs.spacing.max(0.005);
-        let density = |p: f32| dabs.flow * if dabs.pressure_flow { p.clamp(0.0, 1.0).max(0.02) } else { 1.0 } / (2.0 * spacing);
-        let mut pts: Vec<(Vec2, f32)> = Vec::new();
-        let n = self.samples.len();
-        for (i, s) in self.samples.iter().enumerate() {
-            let q = plane.to_plane(s.pos);
-            if let Some(&(last, lp)) = pts.last() {
-                if i + 1 < n && (q - last).length() < (0.5 * brush.radius_at(lp)).max(0.001) {
-                    continue;
-                }
-            }
-            pts.push((q, s.pressure));
-        }
-        let color = to_srgb(brush.color);
-        let alpha = if brush.erase { -brush.opacity } else { brush.opacity };
-        let seg = |a: Vec2, ra: f32, ka: f32, b: Vec2, rb: f32, kb: f32| GpuSegment {
-            a: [a.x, a.y, 0.0, ra],
-            b: [b.x, b.y, 0.0, rb],
-            color: [color[0], color[1], color[2], alpha],
-            style: [brush.hardness, id as f32, ka, kb],
-        };
-        if pts.len() == 1 {
-            // One dab: a trail as long as one dab's share of it.
-            let (p, q) = pts[0];
-            let r = brush.radius_at(q);
-            out.push(seg(p, r, density(q), p + Vec2::X * (2.0 * spacing * r), r, density(q)));
-            return;
-        }
-        for w in pts.windows(2) {
-            let ((a, qa), (b, qb)) = (w[0], w[1]);
-            out.push(seg(a, brush.radius_at(qa), density(qa), b, brush.radius_at(qb), density(qb)));
-        }
-    }
-
     /// The stroke's round cones, appended to `out`. A single sample is a sphere. `id`: the
     /// stroke's number in the painting (exact in an f32 up to 2^24).
     pub fn segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
@@ -216,10 +243,12 @@ impl Stroke {
         if self.samples.is_empty() {
             return;
         }
-        // 1. Filter the positions (the pressure stays raw).
+        // 1. Filter the positions (the pressure stays raw). Strokes from the 2D app (with its
+        //    brush, `dabs`) keep their points: they were smoothed there already.
         let mut f = filter;
         f.reset();
-        let pts: Vec<(Vec3, f32)> = self.samples.iter().map(|s| (f.filter(s.time, s.pos), s.pressure)).collect();
+        let raw = brush.dabs.is_some();
+        let pts: Vec<(Vec3, f32)> = self.samples.iter().map(|s| (if raw { s.pos } else { f.filter(s.time, s.pos) }, s.pressure)).collect();
         // 2. Resample by arc length, pressure interpolated. The step follows the radius at the
         //    last point, so thin parts of a stroke get points as close (in radii) as thick ones.
         let step_at = |q: f32| spacing(brush.radius_at(q));
@@ -251,7 +280,13 @@ impl Stroke {
         }
         // 3. Connect them, with the stamp strengths of a soft stroke.
         let centers: Vec<(Vec3, f32)> = res.iter().map(|&(p, q)| (p, brush.radius_at(q))).collect();
-        let strengths = if brush.solid() { vec![0.0; centers.len()] } else { stamp_strengths(&centers, brush) };
+        let mut strengths = if brush.solid() { vec![0.0; centers.len()] } else { stamp_strengths(&centers, brush) };
+        // A 2D brush whose pressure scales the flow: each stamp's strength by its pressure.
+        if brush.dabs.is_some_and(|d| d.pressure_flow) {
+            for (s, &(_, q)) in strengths.iter_mut().zip(&res) {
+                *s *= q.clamp(0.0, 1.0).max(0.02);
+            }
+        }
         if centers.len() == 1 {
             let (p, r) = centers[0];
             let mut seg = GpuSegment::new(p, r, p, r, brush, id);
@@ -365,7 +400,7 @@ mod tests {
             assert_eq!(c.first, next);
             assert!(c.count as usize <= CHUNK);
             let run = &out[c.first as usize..(c.first + c.count) as usize];
-            assert!(run.iter().all(|s| s.style[1] == run[0].style[1] && s.solid() == (c.soft == 0)));
+            assert!(run.iter().all(|s| s.style[1] == run[0].style[1] && s.solid() == (c.flags == 0)));
             let center = Vec3::from_slice(&c.sphere[..3]);
             for s in run {
                 assert!((s.a() - center).length() + s.a[3] <= c.sphere[3] + 1e-5);

@@ -1,5 +1,5 @@
 //! Files: vdraw's own (.vdraw: gzip-compressed JSON of the painting), and the 2D app's
-//! (.bdraw), brought in as a canvas on a wall.
+//! (.bdraw), brought in as 3D strokes on a wall.
 
 use crate::painting::{Blend, Canvas, Layer, Painting, Plane};
 use crate::segments::to_linear;
@@ -80,12 +80,15 @@ fn hex(s: &str) -> [f32; 3] {
     if s.len() >= 6 { [c(0), c(2), c(4)] } else { [0.0; 3] }
 }
 
-/// Brings in a .bdraw (the 2D app's canvas) as a canvas on a wall: its layers become flat
-/// layers in their order (groups that pass through flattened; a group's opacity multiplies its
-/// layers'), its strokes become strokes on the canvas plane, with the 2D brush (dabs, flow,
-/// spacing, erasers). A volume layer goes on top for painting in VR. What it cannot carry yet:
-/// isolated groups (drawn as if they passed through), layer masks, clipping, adjustment and
-/// shape layers, and brush tip shapes (angle, roundness).
+/// Brings in a .bdraw (the 2D app's canvas) as 3D strokes on a wall: every stroke keeps its
+/// path and pressure and its 2D brush (flow, spacing, hardness, opacity, eraser), all its
+/// points at one depth (the wall's plane), on the paper. Its layers are ordered (strokes cover
+/// each other in their order, as in the 2D app). Seen square on with no perspective it matches
+/// the 2D drawing; in perspective the round strokes show their thickness. The layers come in
+/// order (groups that pass through flattened; a group's opacity multiplies its layers'), with
+/// their blend modes. A layer goes on top for painting in VR. What it cannot carry yet: isolated
+/// groups (drawn as if they passed through), layer masks, clipping, adjustment and shape
+/// layers, and brush tip shapes (angle, roundness).
 pub fn import_bdraw(path: &Path) -> Result<Painting> {
     let doc: Value = serde_json::from_slice(&read_maybe_gzip(path)?)?;
     if doc.get("format").and_then(Value::as_str) != Some("bdraw") {
@@ -148,7 +151,7 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
 
     let mut out: Vec<Layer> = ordered
         .iter()
-        .map(|(_, opacity, visible, blend, name)| Layer { name: name.clone(), blend: *blend, opacity: *opacity, visible: *visible, flat: true, strokes: Vec::new() })
+        .map(|(_, opacity, visible, blend, name)| Layer { name: name.clone(), blend: *blend, opacity: *opacity, visible: *visible, ordered: true, strokes: Vec::new() })
         .collect();
     let index: std::collections::HashMap<&str, usize> = ordered.iter().enumerate().map(|(i, l)| (l.0.as_str(), i)).collect();
     let mut sorted: Vec<&Value> = strokes.iter().filter(|s| !flag(s, "deleted", false) && s.get("mask").is_none()).collect();
@@ -156,15 +159,18 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
     for s in sorted {
         let Some(&li) = s.get("layerId").and_then(Value::as_str).and_then(|l| index.get(l)) else { continue };
         let b = &s["brush"];
+        // The 2D brush comes along whole: the stamps' strengths follow its dabs (flow and
+        // spacing), and its opacity caps each stroke (see stamp_strengths).
+        let (flow, spacing, hardness) = (num(b, "flow", 1.0), num(b, "spacing", 0.1).max(0.005), num(b, "hardness", 0.8));
         let brush = Brush {
             radius: num(b, "size", 1.0) * 0.5 * scale,
             color: to_linear(hex(b.get("color").and_then(Value::as_str).unwrap_or("#000000"))),
             pressure_size: flag(b, "pressureSize", true),
             min_ratio: 0.02,
             opacity: num(b, "opacity", 1.0),
-            hardness: num(b, "hardness", 0.8),
+            hardness,
             erase: b.get("tool").and_then(Value::as_str) == Some("erase"),
-            dabs: Some(Dabs { flow: num(b, "flow", 1.0), spacing: num(b, "spacing", 0.1), pressure_flow: flag(b, "pressureFlow", false) }),
+            dabs: Some(Dabs { flow, spacing, pressure_flow: flag(b, "pressureFlow", false) }),
         };
         let mut stroke = Stroke::new(brush);
         if let Some(pts) = s.get("pts").and_then(Value::as_array) {

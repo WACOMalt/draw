@@ -19,7 +19,7 @@ import sdf;
 import brush;
 
 static const uint TILE = 16;
-static const uint MAX_TILE = 1024;
+static const uint MAX_TILE = 2048;
 
 struct Eye
 {
@@ -39,12 +39,14 @@ struct Params
     float4 brushStyle; // x = opacity, y = hardness of the next stroke
     float4 laserA;     // the pointer's laser: from xyz (w = radius, 0: none)
     float4 laserB;     // to xyz
-    // The canvas on a wall (flat layers), if any.
+    // A paper on a wall, if any (behind strokes brought in from the 2D app).
     float4 canvasOrigin; // xyz; w: 1 with a canvas
     float4 canvasRight;  // xyz unit; w: the rectangle's min x (plane meters)
     float4 canvasUp;     // xyz unit; w: its min y
-    float4 canvasMax;    // xy: its max; z: flat layers; w: 1 with paper
+    float4 canvasMax;    // xy: its max; w: 1 with paper
     float4 paper;        // rgb: the paper color (sRGB)
+    uint clusterCount;
+    uint3 pad2;
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -58,26 +60,107 @@ struct Chunk
     float4 sphere; // center xyz, radius w
     uint first;
     uint count;
-    uint soft; // 1: the stroke is soft
-    uint pad;
+    uint flags; // bit 0: soft (density stamps); bit 1: an eraser; 0: solid
+    uint layer;
+    uint stroke;
+    uint pad0; // three scalars, not a uint3 (std430 would align that to 16 bytes)
+    uint pad1;
+    uint pad2;
 };
 [[vk::binding(3, 0)]] StructuredBuffer<Chunk> chunks;
 
-// The canvas, composited from the flat layers' strokes by shaders/bake.slang: sRGB,
-// premultiplied, row 0 at the top; with mipmaps.
-[[vk::binding(4, 0)]] Sampler2D canvasImage;
+// The layers: the 2D app's blend mode (its number) and the opacity.
+struct Layer
+{
+    uint blend;
+    float opacity;
+    uint ordered; // 1: strokes cover each other in their order (2D app strokes, in one plane)
+    uint pad;
+};
+[[vk::binding(4, 0)]] StructuredBuffer<Layer> layers;
 
-// Chunks that touch this tile's cone of view (shared by the workgroup), sorted near to far by
-// where their spheres start.
+// The falloff integrated along a whole line through a stamp (vdraw_core::chord_table):
+// CHORD_H hardnesses x CHORD_Q distances from the center (radii), row by hardness.
+static const uint CHORD_Q = 65;
+static const uint CHORD_H = 17;
+[[vk::binding(6, 0)]] StructuredBuffer<float> chordTable;
+
+float chord(float q, float hard)
+{
+    float fq = saturate(q) * float(CHORD_Q - 1);
+    float fh = saturate(hard) * float(CHORD_H - 1);
+    uint q0 = min(uint(fq), CHORD_Q - 2);
+    uint h0 = min(uint(fh), CHORD_H - 2);
+    float tq = fq - float(q0);
+    float th = fh - float(h0);
+    float a = lerp(chordTable[h0 * CHORD_Q + q0], chordTable[h0 * CHORD_Q + q0 + 1], tq);
+    float b = lerp(chordTable[(h0 + 1) * CHORD_Q + q0], chordTable[(h0 + 1) * CHORD_Q + q0 + 1], tq);
+    return lerp(a, b, th);
+}
+
+// A stamp's optical depth along a ray that crosses it whole (in front of the eye).
+float stampWhole(float3 c, float r, float strength, float hard, float3 o, float3 dir)
+{
+    float tc = dot(c - o, dir);
+    if (tc + r < 0.0 || strength <= 0.0)
+        return 0.0;
+    float q = length(o + dir * tc - c) / r;
+    return q < 1.0 ? strength * chord(q, hard) : 0.0;
+}
+
+// Up to 16 consecutive chunks of one layer, in a sphere: tiles test clusters before chunks.
+struct Cluster
+{
+    float4 sphere;
+    uint first; // chunk
+    uint count;
+    uint2 pad;
+};
+[[vk::binding(5, 0)]] StructuredBuffer<Cluster> clusters;
+
+// Chunks that touch this tile's cone of view (shared by the workgroup), sorted by layer, then
+// near to far by where their spheres start: the key is the layer (top 8 bits) and the depth
+// (24 bits, up to DEPTH_RANGE meters).
+static const float DEPTH_RANGE = 100.0;
 groupshared uint tileList[MAX_TILE];
-groupshared float tileKey[MAX_TILE];
+groupshared uint tileKey[MAX_TILE];
+// Which 4x4-pixel parts of the tile each listed chunk can touch (bit y * 4 + x).
+groupshared uint tileMask[MAX_TILE];
+groupshared float4 subAxis[16]; // xyz: a part's middle ray; w: cos of its half angle
+static uint sub; // this pixel's part
 groupshared uint tileCount;
 static bool tileAll; // more than fit: the tile uses every chunk
 
 uint tileN() { return tileAll ? params.chunkCount : min(tileCount, MAX_TILE); }
 uint tileSeg(uint i) { return tileAll ? i : tileList[i]; }
-// No chunk from list position i on starts nearer than this (the list is sorted).
-float tileNear(uint i) { return tileAll ? 0.0 : tileKey[i]; }
+// Whether list position i can touch this pixel's 4x4 part.
+bool inPart(uint i) { return tileAll || ((tileMask[i] >> sub) & 1) != 0; }
+uint tileLayer(uint i) { return tileAll ? chunks[i].layer : tileKey[i] >> 24; }
+// No chunk of the same layer from list position i on starts nearer than this (layers that are
+// not ordered).
+float tileNear(uint i) { return tileAll ? 0.0 : float(tileKey[i] & 0xffffff) * (DEPTH_RANGE / 16777215.0); }
+// The first list position past i's layer (the list is sorted by layer).
+uint runEnd(uint i)
+{
+    uint n = tileN();
+    uint layer = tileLayer(i);
+    if (tileAll)
+    {
+        while (i < n && chunks[i].layer == layer)
+            i++;
+        return i;
+    }
+    uint lo = i + 1, hi = n;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) / 2;
+        if ((tileKey[mid] >> 24) == layer)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
 
 // The world-space direction of the ray through pixel position `px` (pixels, may be fractional).
 float3 rayDir(Eye eye, float2 px)
@@ -88,15 +171,17 @@ float3 rayDir(Eye eye, float2 px)
 }
 
 // Whether a sphere (xyz, w = radius) touches the cone from `o` along `axis` with half angle
-// `angle`: the angle to its center, less its angular radius, is inside the cone.
-bool sphereInCone(float3 o, float3 axis, float angle, float4 sphere)
+// a (given as cos a, sin a; under 90 degrees): the angle to its center is at most a plus the
+// sphere's angular radius b, that is cos(angle) >= cos(a + b) = cos a cos b - sin a sin b.
+bool sphereInCone(float3 o, float3 axis, float cosA, float sinA, float4 sphere)
 {
     float3 v = sphere.xyz - o;
     float d = length(v);
     if (d <= sphere.w)
         return true;
-    float toCenter = acos(clamp(dot(v, axis) / d, -1.0, 1.0));
-    return toCenter <= angle + asin(sphere.w / d);
+    float sinB = sphere.w / d;
+    float cosB = sqrt(1.0 - sinB * sinB);
+    return dot(v, axis) >= d * (cosA * cosB - sinA * sinB);
 }
 
 static const float3 LIGHT = float3(0.39, 0.88, 0.29); // normalized (0.4, 0.9, 0.3)
@@ -123,7 +208,7 @@ float3 shadeSurface(float3 base, float3 n, float3 dir)
 // crosses, exactly (the line integral of the falloff); then the slices are blended front to
 // back. Within a slice the order does not count; between slices it does.
 
-static const uint BINS = 12;
+static const uint BINS = 10;
 // The slices of every pixel of the tile, in shared memory: each a pair of half floats (optical
 // depth, red) and (green, blue), the color weighted by the depth. Per-thread arrays indexed at
 // run time spill to local memory, which made the soft pass three times slower.
@@ -210,6 +295,77 @@ float3 linearFromSrgb(float3 c)
     return lerp(c / 12.92, pow((c + 0.055) / 1.055, float3(2.4)), step(0.04045, c));
 }
 
+// One stamp's optical depth along the ray, from the eye to tEnd (for erasers).
+float stampTau(float3 c, float r, float strength, float hard, float3 o, float3 dir, float tEnd)
+{
+    float tc = dot(c - o, dir);
+    float q = length(o + dir * tc - c) / r;
+    if (q >= 1.0 || strength <= 0.0)
+        return 0.0;
+    float half = r * sqrt(1.0 - q * q);
+    float a = max(tc - half, 0.0);
+    float b = min(tc + half, tEnd);
+    if (a >= b)
+        return 0.0;
+    return strength * (stampLine(q, (b - tc) / r, hard) - stampLine(q, (a - tc) / r, hard));
+}
+
+// The 2D app's layer blend modes (W3C Compositing and Blending), on sRGB colors: backdrop b,
+// source s (multiplayer-canvas src/client/engine/gl/programs.ts, BLEND_FS).
+float lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
+float3 clipColor(float3 c)
+{
+    float l = lum(c);
+    float n = min(c.r, min(c.g, c.b));
+    float x = max(c.r, max(c.g, c.b));
+    if (n < 0.0)
+        c = l + (c - l) * l / max(l - n, 1e-6);
+    if (x > 1.0)
+        c = l + (c - l) * (1.0 - l) / max(x - l, 1e-6);
+    return c;
+}
+float3 setLum(float3 c, float l) { return clipColor(c + (l - lum(c))); }
+float sat(float3 c) { return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)); }
+float3 setSat(float3 c, float s)
+{
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    return mx > mn ? (c - mn) * s / (mx - mn) : float3(0.0);
+}
+float dodge(float b, float s) { return b <= 0.0 ? 0.0 : (s >= 1.0 ? 1.0 : min(1.0, b / (1.0 - s))); }
+float burn(float b, float s) { return b >= 1.0 ? 1.0 : (s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / s)); }
+float hardLight(float b, float s) { return s <= 0.5 ? b * 2.0 * s : b + (2.0 * s - 1.0) - b * (2.0 * s - 1.0); }
+float softLight(float b, float s)
+{
+    if (s <= 0.5)
+        return b - (1.0 - 2.0 * s) * b * (1.0 - b);
+    float d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : sqrt(b);
+    return b + (2.0 * s - 1.0) * (d - b);
+}
+float3 blendMode(uint mode, float3 b, float3 s)
+{
+    switch (mode)
+    {
+    case 1: return b * s;
+    case 2: return b + s - b * s;
+    case 3: return float3(hardLight(s.r, b.r), hardLight(s.g, b.g), hardLight(s.b, b.b));
+    case 4: return min(b, s);
+    case 5: return max(b, s);
+    case 6: return float3(dodge(b.r, s.r), dodge(b.g, s.g), dodge(b.b, s.b));
+    case 7: return float3(burn(b.r, s.r), burn(b.g, s.g), burn(b.b, s.b));
+    case 8: return float3(hardLight(b.r, s.r), hardLight(b.g, s.g), hardLight(b.b, s.b));
+    case 9: return float3(softLight(b.r, s.r), softLight(b.g, s.g), softLight(b.b, s.b));
+    case 10: return abs(b - s);
+    case 11: return b + s - 2.0 * b * s;
+    case 12: return setLum(setSat(s, sat(b)), lum(b));
+    case 13: return setLum(setSat(b, sat(s)), lum(b));
+    case 14: return setLum(s, lum(b));
+    case 15: return setLum(b, lum(s));
+    case 16: return min(b + s, float3(1.0));
+    default: return s;
+    }
+}
+
 // ---- Background ----
 
 // Sky and a floor grid at y = 0 (for scale and orientation in VR). `pix`: the angle of one
@@ -254,29 +410,60 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         float3 axis = rayDir(eye, (lo + hi) * 0.5);
         float cosAngle = min(min(dot(axis, rayDir(eye, lo)), dot(axis, rayDir(eye, hi))),
                              min(dot(axis, rayDir(eye, float2(lo.x, hi.y))), dot(axis, rayDir(eye, float2(hi.x, lo.y)))));
-        float angle = acos(clamp(cosAngle, -1.0, 1.0));
+        float sinAngle = sqrt(saturate(1.0 - cosAngle * cosAngle));
+        // The 4x4-pixel parts' cones.
+        if (gi < 16)
+        {
+            float2 slo = lo + float2(gi % 4, gi / 4) * 4.0;
+            float2 shi = min(slo + 4.0, float2(params.width, params.height));
+            float3 sax = rayDir(eye, (slo + shi) * 0.5);
+            float c = min(min(dot(sax, rayDir(eye, slo)), dot(sax, rayDir(eye, shi))),
+                          min(dot(sax, rayDir(eye, float2(slo.x, shi.y))), dot(sax, rayDir(eye, float2(shi.x, slo.y)))));
+            subAxis[gi] = float4(sax, c);
+        }
         if (gi == 0)
             tileCount = 0;
         GroupMemoryBarrierWithGroupSync();
-        for (uint c = gi; c < params.chunkCount; c += TILE * TILE)
+        // Clusters first: each thread takes clusters, and the chunks of those in the cone.
+        for (uint cl = gi; cl < params.clusterCount; cl += TILE * TILE)
         {
-            float4 b = chunks[c].sphere;
-            if (sphereInCone(o, axis, angle, b))
+            Cluster cluster = clusters[cl];
+            if (!sphereInCone(o, axis, cosAngle, sinAngle, cluster.sphere))
+                continue;
+            for (uint c = cluster.first; c < cluster.first + cluster.count; c++)
             {
+                float4 b = chunks[c].sphere;
+                if (!sphereInCone(o, axis, cosAngle, sinAngle, b))
+                    continue;
+                uint mask = 0;
+                for (uint p = 0; p < 16; p++)
+                {
+                    float4 sa = subAxis[p];
+                    if (sphereInCone(o, sa.xyz, sa.w, sqrt(saturate(1.0 - sa.w * sa.w)), b))
+                        mask |= 1u << p;
+                }
+                if (mask == 0)
+                    continue;
                 uint k;
                 InterlockedAdd(tileCount, 1, k);
                 if (k < MAX_TILE)
                 {
+                    // Ordered layers keep their stroke order (the chunk number); the others go
+                    // near to far.
+                    uint layer = chunks[c].layer;
+                    float near = saturate(max(length(b.xyz - o) - b.w, 0.0) / DEPTH_RANGE);
+                    uint order = layers[layer].ordered != 0 ? (c & 0xffffff) : uint(near * 16777215.0);
                     tileList[k] = c;
-                    tileKey[k] = max(length(b.xyz - o) - b.w, 0.0);
+                    tileKey[k] = (min(layer, 255u) << 24) | order;
+                    tileMask[k] = mask;
                 }
             }
         }
         GroupMemoryBarrierWithGroupSync();
         tileAll = tileCount > MAX_TILE;
 
-        // Sort near to far (bitonic, in place). When the list overflowed, the tile uses every
-        // chunk in stored order instead.
+        // Sort by the key (bitonic, in place). When the list overflowed, the tile uses every
+        // chunk in stored order instead (which is in layer order too).
         if (!tileAll && tileCount > 1)
         {
             uint n = tileCount;
@@ -284,7 +471,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             while (size < n)
                 size <<= 1;
             for (uint i = n + gi; i < size; i += TILE * TILE)
-                tileKey[i] = 1e30;
+                tileKey[i] = 0xffffffff;
             GroupMemoryBarrierWithGroupSync();
             for (uint k = 2; k <= size; k <<= 1)
             {
@@ -295,12 +482,15 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                         uint l = i ^ j;
                         if (l > i && (tileKey[i] > tileKey[l]) == ((i & k) == 0))
                         {
-                            float key = tileKey[i];
+                            uint key = tileKey[i];
                             tileKey[i] = tileKey[l];
                             tileKey[l] = key;
                             uint seg = tileList[i];
                             tileList[i] = tileList[l];
                             tileList[l] = seg;
+                            uint m = tileMask[i];
+                            tileMask[i] = tileMask[l];
+                            tileMask[l] = m;
                         }
                     }
                     GroupMemoryBarrierWithGroupSync();
@@ -312,14 +502,14 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     if (id.x >= params.width || id.y >= params.height)
         return;
     float3 dir = rayDir(eye, float2(id.xy) + 0.5);
+    sub = ((id.y % TILE) / 4) * 4 + (id.x % TILE) / 4;
     // The ray of the next pixel to the right: the angle of one pixel.
     float pix = length(rayDir(eye, float2(id.xy) + float2(1.5, 0.5)) - dir);
 
     float tFloor;
     float3 color = background(o, dir, pix, tFloor);
-    // The canvas on its wall, in front of the floor; where it is opaque (the paper), it hides
-    // what is behind it.
-    if (params.canvasOrigin.w > 0.0)
+    // The paper on its wall, in front of the floor: it hides what is behind it.
+    if (params.canvasOrigin.w > 0.0 && params.canvasMax.w > 0.0)
     {
         float3 n = cross(params.canvasRight.xyz, params.canvasUp.xyz);
         float den = dot(dir, n);
@@ -328,78 +518,188 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             float t = dot(params.canvasOrigin.xyz - o, n) / den;
             float3 at = o + dir * t - params.canvasOrigin.xyz;
             float2 p = float2(dot(at, params.canvasRight.xyz), dot(at, params.canvasUp.xyz));
-            float2 lo = float2(params.canvasRight.w, params.canvasUp.w);
-            float2 hi = params.canvasMax.xy;
-            if (t > 0.0 && t < tFloor && all(p >= lo) && all(p <= hi))
+            if (t > 0.0 && t < tFloor && all(p >= float2(params.canvasRight.w, params.canvasUp.w)) && all(p <= params.canvasMax.xy))
             {
-                float2 uv = float2((p.x - lo.x) / (hi.x - lo.x), (hi.y - p.y) / (hi.y - lo.y));
-                // The mip level: one pixel on the canvas (longer at a slant) over one texel.
-                uint w, h, levels;
-                canvasImage.GetDimensions(0, w, h, levels);
-                float texel = (hi.x - lo.x) / float(w);
-                float footprint = pix * t / max(abs(den), 0.05);
-                float4 c = canvasImage.SampleLevel(uv, max(log2(footprint / texel), 0.0));
-                color = linearFromSrgb(c.rgb + (1.0 - c.a) * srgbFromLinear(color));
-                if (c.a > 0.99)
-                    tFloor = t;
+                color = linearFromSrgb(params.paper.rgb);
+                tFloor = t;
             }
         }
     }
 
-    // 2. Solid: the nearest exact hit among the tile's solid segments.
-    float tBehind = tFloor;
-    bool anySoft = false;
-    for (uint j = 0; j < tileN() && tileNear(j) < tBehind; j++)
+    // 2. The layers, bottom to top. Each is drawn on its own: its solid strokes (the nearest
+    //    hit), its soft strokes' density in front of that (in depth slices), its erasers
+    //    taking paint away; then it is blended onto what is below by its mode and opacity, in
+    //    sRGB, as the 2D app composites (multiplayer-canvas BLEND_FS). Seen through a layer
+    //    above, a layer below shows by the blend, not by depth.
+    float3 below = srgbFromLinear(color); // opaque
+    lane = gi;
+    uint n = tileN();
+    for (uint j = 0; j < n;)
     {
-        Chunk ch = chunks[tileSeg(j)];
-        float2 tc = raySphere(o, dir, ch.sphere);
-        if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
-            continue;
-        if (ch.soft != 0)
+        uint end = runEnd(j);
+        Layer ly = layers[tileLayer(j)];
+        if (ly.ordered != 0)
         {
-            anySoft = true;
-            continue;
-        }
-        for (uint s = ch.first; s < ch.first + ch.count; s++)
-        {
-            Segment g = segments[s];
-            float2 tt = raySphere(o, dir, segmentBounds(g));
-            if (tt.x > tt.y || tt.y < 0.0 || tt.x >= tBehind)
-                continue;
-            float4 hit = raySegment(o, dir, g);
-            if (hit.x >= 0.0 && hit.x < tBehind)
+            // An ordered layer, as the 2D app draws: each stroke's dabs along the ray (its
+            // stamps, whole: the strokes lie in the paper's plane, so the paper does not cut
+            // them), covering 1 - exp(-dabs), capped by its opacity, over the strokes before
+            // it, or taking from them (an eraser). Unlit, in sRGB.
+            float3 lc = 0.0; // premultiplied sRGB
+            float la = 0.0;
+            float stroke = -1.0;
+            float dabs = 0.0;
+            float4 strokeColor = 0.0;
+            for (uint k = j; k <= end; k++)
             {
-                tBehind = hit.x;
-                color = shadeSurface(g.color.rgb, hit.yzw, dir);
+                // Past the last chunk: one more round, to put the last stroke down.
+                bool more = k < end;
+                Chunk ch;
+                if (more)
+                {
+                    if (!inPart(k))
+                        continue;
+                    ch = chunks[tileSeg(k)];
+                    float2 tc = raySphere(o, dir, ch.sphere);
+                    if (tc.x > tc.y || tc.y < 0.0)
+                        continue;
+                }
+                float id = more ? float(ch.stroke) : -2.0;
+                if (id != stroke)
+                {
+                    if (stroke >= 0.0 && dabs > 0.0)
+                    {
+                        float alpha = abs(strokeColor.a) * (1.0 - exp(-dabs));
+                        lc *= 1.0 - alpha;
+                        la *= 1.0 - alpha;
+                        if (strokeColor.a > 0.0)
+                        {
+                            lc += srgbFromLinear(strokeColor.rgb) * alpha;
+                            la += alpha;
+                        }
+                    }
+                    stroke = id;
+                    dabs = 0.0;
+                    if (more)
+                        strokeColor = segments[ch.first].color;
+                }
+                if (more)
+                {
+                    for (uint s = ch.first; s < ch.first + ch.count; s++)
+                    {
+                        Segment g = segments[s];
+                        dabs += stampWhole(g.a.xyz, g.a.w, g.style.z, g.style.x, o, dir);
+                        if (g.style.w > 0.0)
+                            dabs += stampWhole(g.b.xyz, g.b.w, g.style.w, g.style.x, o, dir);
+                    }
+                }
             }
+            float sa = la * ly.opacity;
+            if (sa > 0.0)
+            {
+                float3 cs = saturate(lc / la);
+                below = below * (1.0 - sa) + sa * saturate(blendMode(ly.blend, below, cs));
+            }
+            j = end;
+            continue;
         }
-    }
-
-    // 3. Soft: the stamps' density through the volume in front of whatever is behind.
-    if (anySoft)
-    {
-        // The span the soft chunks cover along the ray.
-        float t0 = tBehind, t1 = 0.0;
-        for (uint j = 0; j < tileN() && tileNear(j) < tBehind; j++)
+        float tBehind = tFloor;
+        float3 solidColor = 0.0;
+        bool solid = false, anySoft = false, anyErase = false;
+        for (uint k = j; k < end && tileNear(k) < tBehind; k++)
         {
-            Chunk ch = chunks[tileSeg(j)];
-            if (ch.soft == 0)
+            if (!inPart(k))
                 continue;
+            Chunk ch = chunks[tileSeg(k)];
             float2 tc = raySphere(o, dir, ch.sphere);
             if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
                 continue;
-            t0 = min(t0, max(tc.x, 0.0));
-            t1 = max(t1, min(tc.y, tBehind));
-        }
-        if (t1 > t0)
-        {
-            lane = gi;
-            for (uint k = 0; k < BINS; k++)
-                bins[k * TILE * TILE + gi] = uint2(0, 0);
-            for (uint j = 0; j < tileN() && tileNear(j) < tBehind; j++)
+            if (ch.flags != 0)
             {
-                Chunk ch = chunks[tileSeg(j)];
-                if (ch.soft == 0)
+                anySoft = anySoft || (ch.flags & 2) == 0;
+                anyErase = anyErase || (ch.flags & 2) != 0;
+                continue;
+            }
+            for (uint s = ch.first; s < ch.first + ch.count; s++)
+            {
+                Segment g = segments[s];
+                float2 tt = raySphere(o, dir, segmentBounds(g));
+                if (tt.x > tt.y || tt.y < 0.0 || tt.x >= tBehind)
+                    continue;
+                float4 hit = raySegment(o, dir, g);
+                if (hit.x >= 0.0 && hit.x < tBehind)
+                {
+                    tBehind = hit.x;
+                    solidColor = shadeSurface(g.color.rgb, hit.yzw, dir);
+                    solid = true;
+                }
+            }
+        }
+        // The layer, premultiplied (linear): the solid hit, then the soft density over it.
+        float3 lc = solid ? solidColor : float3(0.0);
+        float la = solid ? 1.0 : 0.0;
+        if (anySoft)
+        {
+            // The span the soft chunks cover along the ray.
+            float t0 = tBehind, t1 = 0.0;
+            for (uint k = j; k < end && tileNear(k) < tBehind; k++)
+            {
+                if (!inPart(k))
+                    continue;
+                Chunk ch = chunks[tileSeg(k)];
+                if (ch.flags != 1)
+                    continue;
+                float2 tc = raySphere(o, dir, ch.sphere);
+                if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
+                    continue;
+                t0 = min(t0, max(tc.x, 0.0));
+                t1 = max(t1, min(tc.y, tBehind));
+            }
+            if (t1 > t0)
+            {
+                for (uint b = 0; b < BINS; b++)
+                    bins[b * TILE * TILE + gi] = uint2(0, 0);
+                for (uint k = j; k < end && tileNear(k) < tBehind; k++)
+                {
+                    if (!inPart(k))
+                        continue;
+                    Chunk ch = chunks[tileSeg(k)];
+                    if (ch.flags != 1)
+                        continue;
+                    float2 tc = raySphere(o, dir, ch.sphere);
+                    if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
+                        continue;
+                    for (uint s = ch.first; s < ch.first + ch.count; s++)
+                    {
+                        Segment g = segments[s];
+                        addStamp(g, g.a.xyz, g.a.w, g.style.z, o, dir, t0, t1);
+                        if (g.style.w > 0.0)
+                            addStamp(g, g.b.xyz, g.b.w, g.style.w, o, dir, t0, t1);
+                    }
+                }
+                // Back to front, over the solid hit.
+                for (uint b = BINS; b-- > 0;)
+                {
+                    uint2 v = bins[b * TILE * TILE + gi];
+                    float tau = f16tof32(v.x);
+                    if (tau <= 0.0)
+                        continue;
+                    float3 c = float3(f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+                    float alpha = 1.0 - exp(-tau);
+                    lc = lc * (1.0 - alpha) + alpha * c / tau;
+                    la = la * (1.0 - alpha) + alpha;
+                }
+            }
+        }
+        // Erasers: their density along the ray (in front of the solid hit) takes paint away.
+        if (anyErase && la > 0.0)
+        {
+            float erased = 0.0;
+            for (uint k = j; k < end && tileNear(k) < tBehind; k++)
+            {
+                if (!inPart(k))
+                    continue;
+                Chunk ch = chunks[tileSeg(k)];
+                if ((ch.flags & 2) == 0)
                     continue;
                 float2 tc = raySphere(o, dir, ch.sphere);
                 if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
@@ -407,28 +707,25 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                 for (uint s = ch.first; s < ch.first + ch.count; s++)
                 {
                     Segment g = segments[s];
-                    addStamp(g, g.a.xyz, g.a.w, g.style.z, o, dir, t0, t1);
+                    erased += stampTau(g.a.xyz, g.a.w, g.style.z, g.style.x, o, dir, tBehind);
                     if (g.style.w > 0.0)
-                        addStamp(g, g.b.xyz, g.b.w, g.style.w, o, dir, t0, t1);
+                        erased += stampTau(g.b.xyz, g.b.w, g.style.w, g.style.x, o, dir, tBehind);
                 }
             }
-            // Front to back.
-            float T = 1.0; // what still shows through
-            float3 sum = 0.0;
-            for (uint k = 0; k < BINS; k++)
-            {
-                uint2 v = bins[k * TILE * TILE + gi];
-                float tau = f16tof32(v.x);
-                if (tau <= 0.0)
-                    continue;
-                float3 c = float3(f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
-                float alpha = 1.0 - exp(-tau);
-                sum += T * alpha * c / tau;
-                T *= 1.0 - alpha;
-            }
-            color = sum + T * color;
+            float keep = exp(-erased);
+            lc *= keep;
+            la *= keep;
         }
+        // Onto what is below.
+        float sa = la * ly.opacity;
+        if (sa > 0.0)
+        {
+            float3 cs = srgbFromLinear(lc / max(la, 1e-6));
+            below = below * (1.0 - sa) + sa * saturate(blendMode(ly.blend, below, cs));
+        }
+        j = end;
     }
+    color = linearFromSrgb(below);
 
     // 4. The brush tip, where the next stroke starts: a preview of its color, opacity and
     //    hardness (drawn over everything), with a thin outline so it shows at any opacity.

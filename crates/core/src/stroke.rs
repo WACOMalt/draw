@@ -11,8 +11,7 @@ pub struct Sample {
     pub time: f64,
 }
 
-/// A brush of the 2D app: a trail of dabs. Strokes brought in from a .bdraw keep it, and are
-/// drawn as the 2D app draws them (on a flat layer).
+/// A brush of the 2D app: a trail of dabs. Strokes brought in from a .bdraw keep it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Dabs {
     /// Alpha of one dab (it builds up where dabs overlap).
@@ -38,9 +37,10 @@ pub struct Brush {
     /// Where the density starts to fall off, as a part of the radius: 1 is a hard edge, 0
     /// falls off from the center (an airbrush).
     pub hardness: f32,
-    /// Takes paint away (on a flat layer, from the strokes before it).
+    /// Takes paint away from its layer.
     pub erase: bool,
-    /// A 2D app brush.
+    /// A 2D app brush (a stroke brought in from a .bdraw): its points are kept as they are, and
+    /// pressure scales the radius (and maybe the flow) as the 2D app does.
     pub dabs: Option<Dabs>,
 }
 
@@ -51,9 +51,10 @@ impl Default for Brush {
 }
 
 impl Brush {
-    /// Opaque with a hard edge: drawn as a surface. Else drawn as density stamps.
+    /// Opaque with a hard edge, and not an eraser: drawn as a surface. Else drawn as density
+    /// stamps.
     pub fn solid(&self) -> bool {
-        self.opacity >= 0.999 && self.hardness >= 0.999
+        self.opacity >= 0.999 && self.hardness >= 0.999 && !self.erase && self.dabs.is_none()
     }
 
     /// The radius at a pressure. A 2D app brush scales it as the 2D app does (by the pressure,

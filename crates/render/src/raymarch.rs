@@ -2,7 +2,6 @@
 //! every eye into a layer of an RGBA16F image array (the target). Whoever presents (a window,
 //! an OpenXR swapchain, a snapshot) copies from the target afterwards.
 
-use crate::canvas::{self, CanvasImage};
 use crate::gpu::Gpu;
 use anyhow::Result;
 use ash::vk;
@@ -11,7 +10,7 @@ use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use std::sync::Arc;
-use vdraw_core::{Canvas, FlatData, GpuChunk, GpuSegment};
+use vdraw_core::{Canvas, GpuChunk, GpuCluster, GpuSegment, LayerRun};
 
 /// Frames in flight: each has its own parameter and segment buffers.
 pub const FRAMES: usize = 2;
@@ -52,6 +51,32 @@ struct ParamsGpu {
     canvas_up: [f32; 4],
     canvas_max: [f32; 4],
     paper: [f32; 4],
+    cluster_count: u32,
+    pad2: [u32; 3],
+}
+
+/// A layer as the shader reads it: the 2D app's blend mode (its number) and the opacity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct SceneLayer {
+    pub blend: u32,
+    pub opacity: f32,
+    /// 1: the strokes cover each other in their order, as in the 2D app.
+    pub ordered: u32,
+    pub pad: u32,
+}
+
+/// What to draw: the finished strokes' segments in layer runs (they change rarely: `version`
+/// says when, and only then are they uploaded again), the stroke being drawn, and the layers.
+pub struct Scene<'a> {
+    pub segments: &'a [GpuSegment],
+    pub runs: &'a [LayerRun],
+    pub version: u64,
+    pub active: &'a [GpuSegment],
+    /// The layer the stroke being drawn goes to (its place in `layers`).
+    pub active_layer: usize,
+    /// Every layer of the painting, by its place (`LayerRun::layer`).
+    pub layers: &'a [SceneLayer],
 }
 
 /// What is drawn over the painting: the brush tip, and the pointer's laser.
@@ -181,6 +206,12 @@ struct Frame {
     params: Buffer,
     segments: Buffer,
     chunks: Buffer,
+    /// The layers' blend modes and opacities (binding 4).
+    layers: Buffer,
+    /// The chunks' clusters (binding 5).
+    clusters: Buffer,
+    /// The version of the finished strokes in these buffers (None: none yet).
+    version: Option<u64>,
     set: vk::DescriptorSet,
     /// The target view the set points at (rewritten when the target changes).
     bound_view: vk::ImageView,
@@ -194,11 +225,12 @@ pub struct Raymarcher {
     pool: vk::DescriptorPool,
     frames: Vec<Frame>,
     target: Option<Target>,
-    /// This frame's chunks (kept to reuse the allocation).
-    chunks: Vec<GpuChunk>,
-    /// The canvas image (binding 4), set by `set_flat`, shared by the frames.
-    canvas_image: CanvasImage,
-    sampler: vk::Sampler,
+    /// The chunks and clusters of the finished strokes, and the version they are of.
+    static_chunks: Vec<GpuChunk>,
+    static_clusters: Vec<GpuCluster>,
+    static_version: Option<u64>,
+    /// The full-chord table (binding 6), the same for every frame.
+    chord: Buffer,
     /// The canvas's part of the parameters.
     canvas: [[f32; 4]; 5],
 }
@@ -212,8 +244,10 @@ impl Raymarcher {
             vk::DescriptorSetLayoutBinding::default().binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default().binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let canvas_binding = vk::DescriptorSetLayoutBinding::default().binding(4).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
-        let bindings: Vec<_> = bindings.into_iter().chain([canvas_binding]).collect();
+        let layers_binding = vk::DescriptorSetLayoutBinding::default().binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let clusters_binding = vk::DescriptorSetLayoutBinding::default().binding(5).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let chord_binding = vk::DescriptorSetLayoutBinding::default().binding(6).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let bindings: Vec<_> = bindings.into_iter().chain([layers_binding, clusters_binding, chord_binding]).collect();
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }?;
         let layout = unsafe { d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]), None) }?;
         let code = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV))?;
@@ -225,8 +259,7 @@ impl Raymarcher {
 
         let sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: FRAMES as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * FRAMES as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: FRAMES as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5 * FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: FRAMES as u32 },
         ];
         let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES as u32).pool_sizes(&sizes), None) }?;
@@ -237,41 +270,22 @@ impl Raymarcher {
             let params = Buffer::new(&gpu, size_of::<ParamsGpu>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "params")?;
             let segments = Buffer::new(&gpu, 1024 * size_of::<GpuSegment>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "segments")?;
             let chunks = Buffer::new(&gpu, 256 * size_of::<GpuChunk>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
-            frames.push(Frame { params, segments, chunks, set, bound_view: vk::ImageView::null() });
+            let layers = Buffer::new(&gpu, 64 * size_of::<SceneLayer>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "layers")?;
+            let clusters = Buffer::new(&gpu, 64 * size_of::<GpuCluster>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "clusters")?;
+            frames.push(Frame { params, segments, chunks, layers, clusters, version: None, set, bound_view: vk::ImageView::null() });
         }
-        let canvas_image = canvas::empty(&gpu)?;
-        let sampler = unsafe {
-            d.create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                    .max_lod(vk::LOD_CLAMP_NONE)
-                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                None,
-            )
-        }?;
-        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, chunks: Vec::new(), canvas_image, sampler, canvas: [[0.0; 4]; 5] };
+        let table = vdraw_core::chord_table();
+        let mut chord = Buffer::new(&gpu, (table.len() * 4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chord table")?;
+        chord.bytes()[..table.len() * 4].copy_from_slice(bytemuck::cast_slice(&table));
+        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord, canvas: [[0.0; 4]; 5] };
         for i in 0..FRAMES {
             r.write_buffers(i);
         }
         Ok(r)
     }
 
-    /// The canvas on a wall and its flat layers (from `Painting::flat`), until set again: they
-    /// are composited into the canvas image here. Waits for the GPU: call it when they change,
-    /// not every frame.
-    pub fn set_flat(&mut self, canvas: Option<&Canvas>, data: &FlatData) -> Result<()> {
-        unsafe { self.gpu.device.device_wait_idle() }?;
-        let gpu = self.gpu.clone();
-        let image = match canvas {
-            Some(c) if !data.layers.is_empty() || c.paper.is_some() => canvas::bake(&gpu, c, data)?,
-            _ => canvas::empty(&gpu)?,
-        };
-        let mut old = std::mem::replace(&mut self.canvas_image, image);
-        old.destroy(&gpu);
+    /// The paper on a wall behind the strokes, if any, until set again.
+    pub fn set_canvas(&mut self, canvas: Option<&Canvas>) {
         self.canvas = match canvas {
             Some(c) => {
                 let (o, r, u) = (c.plane.origin, c.plane.right, c.plane.up);
@@ -280,16 +294,12 @@ impl Raymarcher {
                     [o.x, o.y, o.z, 1.0],
                     [r.x, r.y, r.z, c.min.x],
                     [u.x, u.y, u.z, c.min.y],
-                    [c.max.x, c.max.y, data.layers.len() as f32, c.paper.is_some() as u32 as f32],
+                    [c.max.x, c.max.y, 0.0, c.paper.is_some() as u32 as f32],
                     [paper[0], paper[1], paper[2], 0.0],
                 ]
             }
             None => [[0.0; 4]; 5],
         };
-        for i in 0..FRAMES {
-            self.write_buffers(i);
-        }
-        Ok(())
     }
 
     fn write_buffers(&self, i: usize) {
@@ -297,9 +307,13 @@ impl Raymarcher {
         let seg = [vk::DescriptorBufferInfo::default().buffer(f.segments.buffer).range(vk::WHOLE_SIZE)];
         let chk = [vk::DescriptorBufferInfo::default().buffer(f.chunks.buffer).range(vk::WHOLE_SIZE)];
         let par = [vk::DescriptorBufferInfo::default().buffer(f.params.buffer).range(vk::WHOLE_SIZE)];
-        let canvas = [vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(self.canvas_image.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let lay = [vk::DescriptorBufferInfo::default().buffer(f.layers.buffer).range(vk::WHOLE_SIZE)];
+        let clu = [vk::DescriptorBufferInfo::default().buffer(f.clusters.buffer).range(vk::WHOLE_SIZE)];
+        let cho = [vk::DescriptorBufferInfo::default().buffer(self.chord.buffer).range(vk::WHOLE_SIZE)];
         let writes = [
-            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(4).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&canvas),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(6).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&cho),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(5).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&clu),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lay),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&seg),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&chk),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&par),
@@ -322,41 +336,81 @@ impl Raymarcher {
 
     /// Records the raymarch of `eyes` (one per target layer) into `cmd`, for frame slot `frame`
     /// (its previous use must be finished). Leaves the target in TRANSFER_SRC_OPTIMAL.
-    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], overlays: &Overlays) -> Result<()> {
+    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, scene: &Scene, eyes: &[EyeView], overlays: &Overlays) -> Result<()> {
         let target = self.target.as_ref().expect("call target() first");
         let (view, image, w, h, layers) = (target.view, target.image, target.width, target.height, target.layers);
         assert!(eyes.len() as u32 == layers && layers <= 2);
 
-        // Segments: grow the buffer when needed.
-        let mut chunks = std::mem::take(&mut self.chunks);
-        vdraw_core::chunks(segments, &mut chunks);
-        let need = (segments.len().max(1) * size_of::<GpuSegment>()) as u64;
-        let need_chunks = (chunks.len().max(1) * size_of::<GpuChunk>()) as u64;
-        if self.frames[frame].segments.size < need || self.frames[frame].chunks.size < need_chunks {
+        // The finished strokes' chunks, made again only when they change.
+        if self.static_version != Some(scene.version) {
+            self.static_chunks.clear();
+            let mut run_chunks = Vec::new();
+            for run in scene.runs {
+                vdraw_core::chunks(&scene.segments[run.first..run.first + run.count], &mut run_chunks);
+                self.static_chunks.extend(run_chunks.iter().map(|c| GpuChunk { first: c.first + run.first as u32, layer: run.layer as u32, ..*c }));
+            }
+            self.static_clusters.clear();
+            vdraw_core::clusters(&self.static_chunks, 0, &mut self.static_clusters);
+            self.static_version = Some(scene.version);
+        }
+        let mut active_chunks = Vec::new();
+        vdraw_core::chunks(scene.active, &mut active_chunks);
+        let (n_static, n_static_chunks) = (scene.segments.len(), self.static_chunks.len());
+        for c in &mut active_chunks {
+            c.first += n_static as u32;
+            c.layer = scene.active_layer as u32;
+        }
+        let n_segments = n_static + scene.active.len();
+        let n_chunks = n_static_chunks + active_chunks.len();
+        let mut active_clusters = Vec::new();
+        vdraw_core::clusters(&active_chunks, n_static_chunks as u32, &mut active_clusters);
+        let n_static_clusters = self.static_clusters.len();
+        let n_clusters = n_static_clusters + active_clusters.len();
+
+        // Buffers: grow when needed (and then fill the finished strokes in again).
+        let need = (n_segments.max(1) * size_of::<GpuSegment>()) as u64;
+        let need_chunks = (n_chunks.max(1) * size_of::<GpuChunk>()) as u64;
+        let need_layers = (scene.layers.len().max(1) * size_of::<SceneLayer>()) as u64;
+        let need_clusters = (n_clusters.max(1) * size_of::<GpuCluster>()) as u64;
+        {
             let gpu = self.gpu.clone();
             let f = &mut self.frames[frame];
-            if f.segments.size < need {
-                f.segments.destroy(&gpu);
-                f.segments = Buffer::new(&gpu, need.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "segments")?;
+            let mut rebind = false;
+            for (buffer, need, name) in [(&mut f.segments, need, "segments"), (&mut f.chunks, need_chunks, "chunks"), (&mut f.layers, need_layers, "layers"), (&mut f.clusters, need_clusters, "clusters")] {
+                if buffer.size < need {
+                    buffer.destroy(&gpu);
+                    *buffer = Buffer::new(&gpu, need.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, name)?;
+                    rebind = true;
+                }
             }
-            if f.chunks.size < need_chunks {
-                f.chunks.destroy(&gpu);
-                f.chunks = Buffer::new(&gpu, need_chunks.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
+            if rebind {
+                f.version = None;
+                self.write_buffers(frame);
             }
-            self.write_buffers(frame);
         }
         let f = &mut self.frames[frame];
-        f.segments.bytes()[..segments.len() * size_of::<GpuSegment>()].copy_from_slice(bytemuck::cast_slice(segments));
-        f.chunks.bytes()[..chunks.len() * size_of::<GpuChunk>()].copy_from_slice(bytemuck::cast_slice(&chunks));
-        let chunk_count = chunks.len() as u32;
-        self.chunks = chunks;
+        let seg = size_of::<GpuSegment>();
+        let chk = size_of::<GpuChunk>();
+        if f.version != Some(scene.version) {
+            f.segments.bytes()[..n_static * seg].copy_from_slice(bytemuck::cast_slice(scene.segments));
+            f.chunks.bytes()[..n_static_chunks * chk].copy_from_slice(bytemuck::cast_slice(&self.static_chunks));
+            f.clusters.bytes()[..n_static_clusters * size_of::<GpuCluster>()].copy_from_slice(bytemuck::cast_slice(&self.static_clusters));
+            f.version = Some(scene.version);
+        }
+        f.segments.bytes()[n_static * seg..n_segments * seg].copy_from_slice(bytemuck::cast_slice(scene.active));
+        f.chunks.bytes()[n_static_chunks * chk..n_chunks * chk].copy_from_slice(bytemuck::cast_slice(&active_chunks));
+        let clu = size_of::<GpuCluster>();
+        f.clusters.bytes()[n_static_clusters * clu..n_clusters * clu].copy_from_slice(bytemuck::cast_slice(&active_clusters));
+        f.layers.bytes()[..scene.layers.len() * size_of::<SceneLayer>()].copy_from_slice(bytemuck::cast_slice(scene.layers));
+        let (segment_count, chunk_count) = (n_segments as u32, n_chunks as u32);
         let f = &mut self.frames[frame];
         let mut p = ParamsGpu::zeroed();
         for (i, e) in eyes.iter().enumerate() {
             p.eyes[i] = EyeGpu { inv_view_proj: e.view_proj.inverse().to_cols_array(), pos: [e.pos.x, e.pos.y, e.pos.z, 1.0] };
         }
-        p.seg_count = segments.len() as u32;
+        p.seg_count = segment_count;
         p.chunk_count = chunk_count;
+        p.cluster_count = n_clusters as u32;
         [p.canvas_origin, p.canvas_right, p.canvas_up, p.canvas_max, p.paper] = self.canvas;
         p.width = w;
         p.height = h;
@@ -429,12 +483,14 @@ impl Drop for Raymarcher {
                 f.params.destroy(&gpu);
                 f.segments.destroy(&gpu);
                 f.chunks.destroy(&gpu);
+                f.layers.destroy(&gpu);
+                f.clusters.destroy(&gpu);
             }
-            self.canvas_image.destroy(&gpu);
-            gpu.device.destroy_sampler(self.sampler, None);
+
             if let Some(mut t) = self.target.take() {
                 t.destroy(&gpu);
             }
+            self.chord.destroy(&gpu);
             gpu.device.destroy_descriptor_pool(self.pool, None);
             gpu.device.destroy_pipeline(self.pipeline, None);
             gpu.device.destroy_pipeline_layout(self.layout, None);

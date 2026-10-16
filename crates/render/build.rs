@@ -11,7 +11,6 @@ fn main() {
     // (file, entry point, stage, output)
     let jobs = [
         ("raymarch", "main", "compute", "raymarch"),
-        ("bake", "main", "compute", "bake"),
         ("ui", "vsMain", "vertex", "ui.vert"),
         ("ui", "fsMain", "fragment", "ui.frag"),
     ];

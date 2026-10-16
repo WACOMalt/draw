@@ -54,11 +54,12 @@ fn import(args: &[String]) -> Result<()> {
     let from = args.get(1).context("usage: vdraw --import in.bdraw [out.vdraw]")?;
     let to = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(painting_path);
     let painting = vdraw_core::file::import_bdraw(std::path::Path::new(from))?;
-    let flat = painting.flat();
     for l in &painting.layers {
-        log::info!("layer {:?}: {} strokes, {:?}, opacity {:.2}{}{}", l.name, l.strokes.len(), l.blend, l.opacity, if l.flat { ", flat" } else { "" }, if l.visible { "" } else { ", hidden" });
+        log::info!("layer {:?}: {} strokes, {:?}, opacity {:.2}{}", l.name, l.strokes.len(), l.blend, l.opacity, if l.visible { "" } else { ", hidden" });
     }
-    log::info!("{} flat segments, {} chunks, {} cell entries", flat.segments.len(), flat.chunks.len(), flat.items.len());
+    let mut segs = Vec::new();
+    painting.segments(&mut segs);
+    log::info!("{} segments", segs.len());
     vdraw_core::file::save(&to, &painting)?;
     log::info!("saved {}", to.display());
     Ok(())

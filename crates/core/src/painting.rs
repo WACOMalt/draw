@@ -1,17 +1,9 @@
-//! A painting: layers of strokes, maybe a canvas on a wall, and what the renderer draws.
-//!
-//! Two kinds of layer:
-//!   - Volume layers hold strokes painted in VR, in 3D. The renderer draws them as surfaces or
-//!     density stamps, in depth order.
-//!   - Flat layers lie on the painting's canvas, a plane (a canvas on a wall). Strokes brought
-//!     in from the 2D app (.bdraw) go there, still as strokes. The renderer draws them on the
-//!     plane as the 2D app does: each stroke a trail of dabs, the strokes in order (erasers
-//!     included), then the layers in order with their blend modes, over the paper.
+//! A painting: layers of strokes (each with a blend mode and opacity, as in the 2D app), maybe
+//! a paper on a wall behind them, and the segments the renderer draws.
 
 use crate::filter::OneEuro3;
-use crate::segments::{GpuChunk, GpuSegment, chunks};
+use crate::segments::GpuSegment;
 use crate::stroke::Stroke;
-use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -53,14 +45,16 @@ pub struct Layer {
     pub blend: Blend,
     pub opacity: f32,
     pub visible: bool,
-    /// On the painting's canvas (drawn as the 2D app draws), not in the volume.
-    pub flat: bool,
+    /// The strokes cover each other in their order, as in the 2D app (each over the ones
+    /// before, an eraser taking from those before it), not by depth. For strokes brought in from
+    /// the 2D app, which lie in one plane.
+    pub ordered: bool,
     pub strokes: Vec<Stroke>,
 }
 
 impl Default for Layer {
     fn default() -> Self {
-        Self { name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, flat: false, strokes: Vec::new() }
+        Self { name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, strokes: Vec::new() }
     }
 }
 
@@ -84,8 +78,8 @@ impl Plane {
     }
 }
 
-/// A canvas on a wall: the plane its flat layers lie on, the rectangle it covers (in plane
-/// meters), and its paper.
+/// A canvas on a wall: a plane, a rectangle on it (plane meters), and its paper, behind the
+/// strokes brought in from the 2D app (which lie on the plane).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Canvas {
     pub plane: Plane,
@@ -112,30 +106,13 @@ impl Default for Painting {
     }
 }
 
-/// Cells across each side of a flat layer's grid.
-pub const GRID: u32 = 64;
-
-/// A flat layer as the GPU reads it.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
-pub struct GpuFlatLayer {
-    pub blend: u32,
-    pub opacity: f32,
-    pub visible: u32,
-    /// Where this layer's cells start in `FlatData::cells`.
-    pub cell_base: u32,
-}
-
-/// The flat layers, ready for the GPU: their segments in plane coordinates (meters; z 0), the
-/// chunks, and a grid over the canvas. Each cell lists the chunks that touch it, in stroke
-/// order, as ranges in `items`: cell c of a layer is items[cells[base + c] .. cells[base + c + 1]].
-#[derive(Clone, Debug, Default)]
-pub struct FlatData {
-    pub segments: Vec<GpuSegment>,
-    pub chunks: Vec<GpuChunk>,
-    pub layers: Vec<GpuFlatLayer>,
-    pub cells: Vec<u32>,
-    pub items: Vec<u32>,
+/// A run of segments of one layer, as `Painting::segments` lays them out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerRun {
+    /// The layer's place in `Painting::layers`.
+    pub layer: usize,
+    pub first: usize,
+    pub count: usize,
 }
 
 impl Painting {
@@ -146,12 +123,11 @@ impl Painting {
         p
     }
 
-    /// The layer new VR strokes go to: the top volume layer (made when there is none).
+    /// The layer new VR strokes go to: the top layer (made when there is none).
     pub fn active_layer(&mut self) -> usize {
-        if let Some(i) = self.layers.iter().rposition(|l| !l.flat) {
-            return i;
+        if self.layers.is_empty() {
+            self.layers.push(Layer { name: "VR".into(), ..Default::default() });
         }
-        self.layers.push(Layer { name: "VR".into(), ..Default::default() });
         self.layers.len() - 1
     }
 
@@ -161,66 +137,34 @@ impl Painting {
         &mut self.layers[i].strokes
     }
 
-    /// The visible volume layers' strokes as round cones, in stroke order, with `active` (the
-    /// stroke being drawn) last. Stroke numbers count on across layers.
-    pub fn segments(&self, active: Option<&Stroke>, out: &mut Vec<GpuSegment>) {
+    /// The visible layers' finished strokes as round cones, bottom layer first, each layer's
+    /// strokes in order, and where each layer's run is. Stroke numbers count on across layers;
+    /// the next one (for a stroke being drawn) is `next_stroke`.
+    pub fn segments(&self, out: &mut Vec<GpuSegment>) -> Vec<LayerRun> {
         out.clear();
-        let strokes = self.layers.iter().filter(|l| !l.flat && l.visible).flat_map(|l| &l.strokes);
-        for (i, s) in strokes.chain(active).enumerate() {
-            s.segments(self.filter, i as u32, out);
-        }
-    }
-
-    /// The flat layers for the GPU. Empty without a canvas.
-    pub fn flat(&self) -> FlatData {
-        let mut data = FlatData::default();
-        let Some(canvas) = self.canvas else { return data };
-        let size = (canvas.max - canvas.min).max(Vec2::splat(1e-6));
-        let cell = size / GRID as f32;
+        let mut runs = Vec::new();
         let mut id = 0u32;
-        for layer in self.layers.iter().filter(|l| l.flat) {
-            let first_seg = data.segments.len();
-            for s in &layer.strokes {
-                s.flat_segments(&canvas.plane, id, &mut data.segments);
+        for (layer, l) in self.layers.iter().enumerate().filter(|(_, l)| l.visible) {
+            let first = out.len();
+            for s in &l.strokes {
+                s.segments(self.filter, id, out);
                 id += 1;
             }
-            let mut layer_chunks = Vec::new();
-            chunks(&data.segments[first_seg..], &mut layer_chunks);
-            let chunk_base = data.chunks.len() as u32;
-            // Each chunk into the cells its circle touches, in order.
-            let mut lists: Vec<Vec<u32>> = vec![Vec::new(); (GRID * GRID) as usize];
-            for (i, c) in layer_chunks.iter_mut().enumerate() {
-                c.first += first_seg as u32;
-                let center = Vec2::new(c.sphere[0], c.sphere[1]);
-                let r = c.sphere[3];
-                let lo = ((center - r - canvas.min) / cell).floor().max(Vec2::ZERO);
-                let hi = ((center + r - canvas.min) / cell).floor().min(Vec2::splat(GRID as f32 - 1.0));
-                if lo.x > hi.x || lo.y > hi.y {
-                    continue;
-                }
-                for y in lo.y as u32..=hi.y as u32 {
-                    for x in lo.x as u32..=hi.x as u32 {
-                        lists[(y * GRID + x) as usize].push(chunk_base + i as u32);
-                    }
-                }
-            }
-            data.chunks.extend(layer_chunks);
-            let cell_base = data.cells.len() as u32;
-            for list in &lists {
-                data.cells.push(data.items.len() as u32);
-                data.items.extend(list);
-            }
-            data.cells.push(data.items.len() as u32);
-            data.layers.push(GpuFlatLayer { blend: layer.blend as u32, opacity: layer.opacity, visible: layer.visible as u32, cell_base });
+            runs.push(LayerRun { layer, first, count: out.len() - first });
         }
-        data
+        runs
+    }
+
+    /// The stroke number after every visible stroke.
+    pub fn next_stroke(&self) -> u32 {
+        self.layers.iter().filter(|l| l.visible).map(|l| l.strokes.len() as u32).sum()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stroke::{Brush, Dabs, Sample};
+    use crate::stroke::{Brush, Sample};
 
     #[test]
     fn blend_names_are_the_2d_apps() {
@@ -230,28 +174,24 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_stroke_is_listed_in_the_cells_it_crosses() {
-        let plane = Plane { origin: Vec3::new(0.0, 1.0, -1.0), right: Vec3::X, up: Vec3::Y };
-        let brush = Brush { radius: 0.01, dabs: Some(Dabs { flow: 0.5, spacing: 0.1, pressure_flow: false }), ..Default::default() };
-        let mut stroke = Stroke::new(brush);
-        for i in 0..=20 {
-            stroke.push(Sample { pos: plane.to_room(Vec2::new(-0.4 + i as f32 * 0.04, 0.0)), pressure: 1.0, time: i as f64 });
-        }
-        let layer = Layer { flat: true, strokes: vec![stroke], ..Default::default() };
-        let painting = Painting { layers: vec![layer], canvas: Some(Canvas { plane, min: Vec2::splat(-0.5), max: Vec2::splat(0.5), paper: None }), ..Default::default() };
-        let flat = painting.flat();
-        assert_eq!(flat.layers.len(), 1);
-        assert_eq!(flat.cells.len(), (GRID * GRID + 1) as usize);
-        // The cell at the stroke's middle (plane 0, 0) lists a chunk; one far above, none.
-        let cell = |p: Vec2| {
-            let c = ((p + 0.5) * GRID as f32).floor();
-            (c.y as u32 * GRID + c.x as u32) as usize
+    fn segments_come_in_layer_runs() {
+        let stroke = |x: f32| {
+            let mut s = Stroke::new(Brush::default());
+            s.push(Sample { pos: Vec3::new(x, 1.0, 0.0), pressure: 1.0, time: 0.0 });
+            s.push(Sample { pos: Vec3::new(x + 0.1, 1.0, 0.0), pressure: 1.0, time: 0.1 });
+            s
         };
-        let count = |c: usize| flat.cells[c + 1] - flat.cells[c];
-        assert!(count(cell(Vec2::ZERO)) > 0);
-        assert_eq!(count(cell(Vec2::new(0.0, 0.4))), 0);
-        // Segments are on the plane, in plane meters.
-        assert!(flat.segments.iter().all(|s| s.a[2] == 0.0 && s.a[1].abs() < 1e-5));
+        let mut p = Painting::default();
+        p.layers[0].strokes = vec![stroke(0.0), stroke(1.0)];
+        p.layers.push(Layer { visible: false, strokes: vec![stroke(2.0)], ..Default::default() });
+        p.layers.push(Layer { strokes: vec![stroke(3.0)], ..Default::default() });
+        let mut out = Vec::new();
+        let runs = p.segments(&mut out);
+        assert_eq!(runs.len(), 2, "the hidden layer is left out");
+        assert_eq!((runs[0].layer, runs[0].first), (0, 0));
+        assert_eq!((runs[1].layer, runs[1].first + runs[1].count), (2, out.len()));
+        assert!(out[runs[1].first].a[0] >= 3.0);
+        assert_eq!(p.next_stroke(), 3);
     }
 
     #[test]

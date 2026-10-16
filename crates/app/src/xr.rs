@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use vdraw_core::{Brush, GpuSegment, Painting, Sample, Stroke};
+use vdraw_core::{Brush, GpuSegment, LayerRun, Painting, Sample, Stroke};
 use vdraw_render::raymarch::FRAMES;
-use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, UiRenderer, barrier};
+use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, Scene, SceneLayer, UiRenderer, barrier};
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 const NEAR: f32 = 0.02;
@@ -179,8 +179,13 @@ impl Input {
 /// What the hands do to the painting, frame to frame.
 struct Painter {
     painting: Painting,
-    /// Segments of the finished strokes (made again only when the strokes change).
+    /// Segments of the finished strokes in layer runs (made again only when the strokes
+    /// change), and their version (counts up at each change).
     done: Vec<GpuSegment>,
+    runs: Vec<LayerRun>,
+    version: u64,
+    /// The stroke being drawn, as segments (made every frame).
+    drawing: Vec<GpuSegment>,
     redo: Vec<Stroke>,
     active: Option<(usize, Stroke)>,
     brush: Brush,
@@ -192,18 +197,25 @@ struct Painter {
 
 impl Painter {
     fn new(painting: Painting) -> Self {
-        let mut p = Self { painting, done: Vec::new(), redo: Vec::new(), active: None, brush: Brush::default(), recent: Vec::new(), changed: false };
+        let mut p = Self {
+            painting,
+            done: Vec::new(),
+            runs: Vec::new(),
+            version: 0,
+            drawing: Vec::new(),
+            redo: Vec::new(),
+            active: None,
+            brush: Brush::default(),
+            recent: Vec::new(),
+            changed: false,
+        };
         p.rebuild();
         p
     }
 
-    /// The stroke number the next volume stroke gets (after every visible volume stroke).
-    fn next_id(&self) -> u32 {
-        self.painting.layers.iter().filter(|l| !l.flat && l.visible).map(|l| l.strokes.len() as u32).sum()
-    }
-
     fn rebuild(&mut self) {
-        self.painting.segments(None, &mut self.done);
+        self.runs = self.painting.segments(&mut self.done);
+        self.version += 1;
     }
 
     fn undo(&mut self) {
@@ -222,6 +234,28 @@ impl Painter {
         }
     }
 
+    /// Puts a finished stroke into the active layer. When that layer's run is the last one (the
+    /// usual case: VR strokes go to the top layer), its segments are appended; else all are
+    /// made again.
+    fn finish(&mut self, stroke: Stroke) {
+        let layer = self.painting.active_layer();
+        let id = self.painting.next_stroke();
+        match self.runs.last_mut() {
+            Some(run) if run.layer == layer => {
+                stroke.segments(self.painting.filter, id, &mut self.done);
+                run.count = self.done.len() - run.first;
+                self.painting.layers[layer].strokes.push(stroke);
+                self.version += 1;
+            }
+            _ => {
+                self.painting.layers[layer].strokes.push(stroke);
+                self.rebuild();
+            }
+        }
+        self.changed = true;
+        self.redo.clear();
+    }
+
     /// One hand's trigger at time `t` (seconds), the tip at `tip`.
     fn hand(&mut self, hand: usize, t: f64, tip: Vec3, pull: f32) {
         let painting = pull > TRIGGER_DEAD;
@@ -231,10 +265,7 @@ impl Painter {
                     stroke.push(Sample { pos: tip, pressure: pull, time: t });
                 } else {
                     let (_, stroke) = self.active.take().unwrap();
-                    stroke.segments(self.painting.filter, self.next_id(), &mut self.done);
-                    self.painting.active().push(stroke);
-                    self.changed = true;
-                    self.redo.clear();
+                    self.finish(stroke);
                 }
             }
             None if painting => {
@@ -250,13 +281,23 @@ impl Painter {
         }
     }
 
-    fn segments(&self, out: &mut Vec<GpuSegment>) {
-        out.clear();
-        out.extend_from_slice(&self.done);
+    /// The stroke being drawn, as segments, into `drawing`.
+    fn update_drawing(&mut self) {
+        self.drawing.clear();
         if let Some((_, s)) = &self.active {
-            s.segments(self.painting.filter, self.next_id(), out);
+            s.segments(self.painting.filter, self.painting.next_stroke(), &mut self.drawing);
         }
     }
+
+    /// What the renderer draws this frame.
+    fn scene<'a>(&'a self, layers: &'a [SceneLayer]) -> Scene<'a> {
+        Scene { segments: &self.done, runs: &self.runs, version: self.version, active: &self.drawing, active_layer: self.painting.layers.len().saturating_sub(1), layers }
+    }
+}
+
+/// The layers as the renderer reads them.
+pub fn scene_layers(painting: &Painting) -> Vec<SceneLayer> {
+    painting.layers.iter().map(|l| SceneLayer { blend: l.blend as u32, opacity: l.opacity, ordered: l.ordered as u32, pad: 0 }).collect()
 }
 
 /// Paints in VR. `save_to`: where the painting is saved, after changes (every half minute, in
@@ -341,11 +382,10 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
     let scale: f32 = std::env::var("VDRAW_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let mut swapchain: Option<Swapchain> = None;
-    rm.set_flat(painting.canvas.as_ref(), &painting.flat())?;
+    rm.set_canvas(painting.canvas.as_ref());
     let mut painter = Painter::new(painting);
     let mut saving: Option<std::thread::JoinHandle<()>> = None;
     let mut saved_at = Instant::now();
-    let mut segs = Vec::new();
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
     let mut frame = 0usize;
@@ -523,7 +563,8 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             opacity: painter.brush.opacity,
             hardness: painter.brush.hardness,
         });
-        painter.segments(&mut segs);
+        painter.update_drawing();
+        let layers = scene_layers(&painter.painting);
 
         let sc = match &mut swapchain {
             Some(s) => s,
@@ -550,7 +591,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             }
         }
         stats.frame(dt, state.predicted_display_period.as_nanos() as f32 * 1e-9);
-        stats.log(segs.len(), sc.width, sc.height);
+        stats.log(painter.done.len() + painter.drawing.len(), sc.width, sc.height);
 
         // Views as late as possible, for the least latency.
         let (_, views) = session.locate_views(VIEW_TYPE, state.predicted_display_time, &stage)?;
@@ -571,7 +612,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
-            rm.record(cmd, frame, &segs, &eyes, &Overlays { tip, laser })?;
+            rm.record(cmd, frame, &painter.scene(&layers), &eyes, &Overlays { tip, laser })?;
             barrier(d, cmd, dst, 2, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
