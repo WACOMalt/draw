@@ -1,0 +1,10 @@
+[package]
+name = "vdraw-core"
+description = "The painting model of vdraw: strokes, filtering, segments and their distance functions. No GPU code, so a port (a VRChat world, a tool) can share it."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true

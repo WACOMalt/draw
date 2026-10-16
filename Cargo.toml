@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/render", "crates/app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+vdraw-core = { path = "crates/core" }
+vdraw-render = { path = "crates/render" }
+ash = "0.38"
+ash-window = "0.13"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
+openxr = { version = "0.21", features = ["loaded"] }
+winit = "0.30"
+raw-window-handle = "0.6"
+glam = { version = "0.30", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+png = "0.17"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
