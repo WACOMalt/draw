@@ -10,7 +10,7 @@ use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use std::sync::Arc;
-use vdraw_core::{Canvas, GpuChunk, GpuCluster, GpuSegment, LayerRun};
+use vdraw_core::{GpuChunk, GpuCluster, GpuSegment, LayerRun};
 
 /// Frames in flight: each has its own parameter and segment buffers.
 pub const FRAMES: usize = 2;
@@ -46,11 +46,6 @@ struct ParamsGpu {
     brush_style: [f32; 4],
     laser_a: [f32; 4],
     laser_b: [f32; 4],
-    canvas_origin: [f32; 4],
-    canvas_right: [f32; 4],
-    canvas_up: [f32; 4],
-    canvas_max: [f32; 4],
-    paper: [f32; 4],
     cluster_count: u32,
     pad2: [u32; 3],
 }
@@ -231,8 +226,6 @@ pub struct Raymarcher {
     static_version: Option<u64>,
     /// The full-chord table (binding 6), the same for every frame.
     chord: Buffer,
-    /// The canvas's part of the parameters.
-    canvas: [[f32; 4]; 5],
 }
 
 impl Raymarcher {
@@ -277,29 +270,11 @@ impl Raymarcher {
         let table = vdraw_core::chord_table();
         let mut chord = Buffer::new(&gpu, (table.len() * 4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chord table")?;
         chord.bytes()[..table.len() * 4].copy_from_slice(bytemuck::cast_slice(&table));
-        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord, canvas: [[0.0; 4]; 5] };
+        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord };
         for i in 0..FRAMES {
             r.write_buffers(i);
         }
         Ok(r)
-    }
-
-    /// The paper on a wall behind the strokes, if any, until set again.
-    pub fn set_canvas(&mut self, canvas: Option<&Canvas>) {
-        self.canvas = match canvas {
-            Some(c) => {
-                let (o, r, u) = (c.plane.origin, c.plane.right, c.plane.up);
-                let paper = c.paper.unwrap_or([0.0; 3]);
-                [
-                    [o.x, o.y, o.z, 1.0],
-                    [r.x, r.y, r.z, c.min.x],
-                    [u.x, u.y, u.z, c.min.y],
-                    [c.max.x, c.max.y, 0.0, c.paper.is_some() as u32 as f32],
-                    [paper[0], paper[1], paper[2], 0.0],
-                ]
-            }
-            None => [[0.0; 4]; 5],
-        };
     }
 
     fn write_buffers(&self, i: usize) {
@@ -411,7 +386,6 @@ impl Raymarcher {
         p.seg_count = segment_count;
         p.chunk_count = chunk_count;
         p.cluster_count = n_clusters as u32;
-        [p.canvas_origin, p.canvas_right, p.canvas_up, p.canvas_max, p.paper] = self.canvas;
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {

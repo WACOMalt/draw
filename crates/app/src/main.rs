@@ -5,7 +5,7 @@
 //!                               paint in VR (OpenXR: SteamVR, Monado, WiVRn); opens and saves
 //!                               ~/.local/share/vdraw/painting.vdraw unless told otherwise
 //!   vdraw --import in.bdraw [out.vdraw]
-//!                               bring a 2D app canvas in, as a canvas on a wall
+//!                               bring a 2D app canvas in, as 3D strokes on a plane ahead
 //!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap] [--orbit x y z yaw pitch distance]
 //!                               [--tip opacity hardness] [--size WxH] [--bench N] [--panel]
 //!                               render a demo painting to a PNG (no window, no headset)
@@ -21,10 +21,10 @@ use anyhow::{Context, Result};
 
 /// The painting of `--demo shapes|soft|compare|dense|overlap` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
-    // --open file.vdraw: a saved painting, seen from where the viewer starts (its canvas ahead).
+    // --open file.vdraw: a saved painting, seen from where the viewer starts, toward its middle.
     if let Some(path) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
         let painting = vdraw_core::file::load(std::path::Path::new(path))?;
-        let target = painting.canvas.map_or(glam::Vec3::new(0.0, 1.3, -1.0), |c| c.plane.to_room((c.min + c.max) * 0.5));
+        let target = painting.bounds().map_or(glam::Vec3::new(0.0, 1.3, -1.0), |(lo, hi)| (lo + hi) * 0.5);
         let cam = camera::Orbit { target, yaw: 0.0, pitch: 0.0, distance: target.z.abs().max(0.5) };
         return Ok((painting, cam));
     }
@@ -49,7 +49,7 @@ fn painting_path() -> std::path::PathBuf {
     data.join("vdraw/painting.vdraw")
 }
 
-/// `--import in.bdraw [out.vdraw]`: brings a 2D app canvas in as a canvas on a wall.
+/// `--import in.bdraw [out.vdraw]`: brings a 2D app canvas in as 3D strokes on a plane ahead.
 fn import(args: &[String]) -> Result<()> {
     let from = args.get(1).context("usage: vdraw --import in.bdraw [out.vdraw]")?;
     let to = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(painting_path);

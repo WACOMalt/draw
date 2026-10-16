@@ -1,10 +1,10 @@
-//! A painting: layers of strokes (each with a blend mode and opacity, as in the 2D app), maybe
-//! a paper on a wall behind them, and the segments the renderer draws.
+//! A painting: layers of strokes (each with a blend mode and opacity, as in the 2D app), and
+//! the segments the renderer draws.
 
 use crate::filter::OneEuro3;
 use crate::segments::GpuSegment;
 use crate::stroke::Stroke;
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 /// The 2D app's blend modes, in its order (the shader's mode numbers).
@@ -60,43 +60,11 @@ impl Default for Layer {
     }
 }
 
-/// A plane in the room: an origin and the unit directions of its x (right) and y (up).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Plane {
-    pub origin: Vec3,
-    pub right: Vec3,
-    pub up: Vec3,
-}
-
-impl Plane {
-    /// A room point's place on the plane (meters).
-    pub fn to_plane(&self, p: Vec3) -> Vec2 {
-        let d = p - self.origin;
-        Vec2::new(d.dot(self.right), d.dot(self.up))
-    }
-
-    pub fn to_room(&self, p: Vec2) -> Vec3 {
-        self.origin + self.right * p.x + self.up * p.y
-    }
-}
-
-/// A canvas on a wall: a plane, a rectangle on it (plane meters), and its paper, behind the
-/// strokes brought in from the 2D app (which lie on the plane).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Canvas {
-    pub plane: Plane,
-    pub min: Vec2,
-    pub max: Vec2,
-    /// The paper color (sRGB), or none (the room shows through).
-    pub paper: Option<[f32; 3]>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Painting {
     /// Bottom to top.
     pub layers: Vec<Layer>,
-    pub canvas: Option<Canvas>,
     /// The filter for every VR stroke's path.
     #[serde(skip)]
     pub filter: OneEuro3,
@@ -104,7 +72,7 @@ pub struct Painting {
 
 impl Default for Painting {
     fn default() -> Self {
-        Self { layers: vec![Layer { name: "Layer 1".into(), ..Default::default() }], canvas: None, filter: OneEuro3::default() }
+        Self { layers: vec![Layer { name: "Layer 1".into(), ..Default::default() }], filter: OneEuro3::default() }
     }
 }
 
@@ -155,6 +123,13 @@ impl Painting {
             runs.push(LayerRun { layer, first, count: out.len() - first });
         }
         runs
+    }
+
+    /// The box around every sample (None when there are none).
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        let mut points = self.layers.iter().flat_map(|l| &l.strokes).flat_map(|s| &s.samples).map(|s| s.pos);
+        let first = points.next()?;
+        Some(points.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p))))
     }
 
     /// The stroke number after every visible stroke.

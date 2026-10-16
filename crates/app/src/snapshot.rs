@@ -26,7 +26,6 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut segs = Vec::new();
     let runs = painting.segments(&mut segs);
     let layers = crate::xr::scene_layers(&painting);
-    rm.set_canvas(painting.canvas.as_ref());
     let scene = Scene { segments: &segs, runs: &runs, version: 0, active: &[], active_layer: 0, layers: &layers };
     let eye = EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() };
 

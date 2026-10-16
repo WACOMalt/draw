@@ -382,7 +382,6 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
     let scale: f32 = std::env::var("VDRAW_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let mut swapchain: Option<Swapchain> = None;
-    rm.set_canvas(painting.canvas.as_ref());
     let mut painter = Painter::new(painting);
     let mut saving: Option<std::thread::JoinHandle<()>> = None;
     let mut saved_at = Instant::now();

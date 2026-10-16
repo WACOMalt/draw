@@ -39,12 +39,6 @@ struct Params
     float4 brushStyle; // x = opacity, y = hardness of the next stroke
     float4 laserA;     // the pointer's laser: from xyz (w = radius, 0: none)
     float4 laserB;     // to xyz
-    // A paper on a wall, if any (behind strokes brought in from the 2D app).
-    float4 canvasOrigin; // xyz; w: 1 with a canvas
-    float4 canvasRight;  // xyz unit; w: the rectangle's min x (plane meters)
-    float4 canvasUp;     // xyz unit; w: its min y
-    float4 canvasMax;    // xy: its max; w: 1 with paper
-    float4 paper;        // rgb: the paper color (sRGB)
     uint clusterCount;
     uint3 pad2;
 };
@@ -282,7 +276,7 @@ float3 rayToSegment(float3 o, float3 dir, float3 a, float3 b, out float t, out f
     return w + dir * t - ba * s;
 }
 
-// ---- The canvas on a wall ----
+// ---- Colors ----
 
 float3 srgbFromLinear(float3 c)
 {
@@ -508,24 +502,6 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
 
     float tFloor;
     float3 color = background(o, dir, pix, tFloor);
-    // The paper on its wall, in front of the floor: it hides what is behind it.
-    if (params.canvasOrigin.w > 0.0 && params.canvasMax.w > 0.0)
-    {
-        float3 n = cross(params.canvasRight.xyz, params.canvasUp.xyz);
-        float den = dot(dir, n);
-        if (abs(den) > 1e-6)
-        {
-            float t = dot(params.canvasOrigin.xyz - o, n) / den;
-            float3 at = o + dir * t - params.canvasOrigin.xyz;
-            float2 p = float2(dot(at, params.canvasRight.xyz), dot(at, params.canvasUp.xyz));
-            if (t > 0.0 && t < tFloor && all(p >= float2(params.canvasRight.w, params.canvasUp.w)) && all(p <= params.canvasMax.xy))
-            {
-                color = linearFromSrgb(params.paper.rgb);
-                tFloor = t;
-            }
-        }
-    }
-
     // 2. The layers, bottom to top. Each is drawn on its own: its solid strokes (the nearest
     //    hit), its soft strokes' density in front of that (in depth slices), its erasers
     //    taking paint away; then it is blended onto what is below by its mode and opacity, in
@@ -541,9 +517,8 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         if (ly.ordered != 0)
         {
             // An ordered layer, as the 2D app draws: each stroke's dabs along the ray (its
-            // stamps, whole: the strokes lie in the paper's plane, so the paper does not cut
-            // them), covering 1 - exp(-dabs), capped by its opacity, over the strokes before
-            // it, or taking from them (an eraser). Unlit, in sRGB.
+            // stamps, whole), covering 1 - exp(-dabs), capped by its opacity, over the strokes
+            // before it, or taking from them (an eraser). Unlit, in sRGB.
             float3 lc = 0.0; // premultiplied sRGB
             float la = 0.0;
             float stroke = -1.0;

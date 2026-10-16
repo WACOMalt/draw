@@ -1,7 +1,7 @@
 //! Files: vdraw's own (.vdraw: gzip-compressed JSON of the painting), and the 2D app's
 //! (.bdraw), brought in as 3D strokes on a wall.
 
-use crate::painting::{Blend, Canvas, Layer, Painting, Plane};
+use crate::painting::{Blend, Layer, Painting};
 use crate::segments::to_linear;
 use crate::stroke::{Brush, Dabs, Sample, Stroke};
 use anyhow::{Result, bail};
@@ -60,10 +60,10 @@ pub fn load(path: &Path) -> Result<Painting> {
     Ok(file.painting)
 }
 
-/// Where the canvas of a .bdraw hangs: a wall in front of the viewer, its center at this point
-/// (the viewer stands at the origin and looks toward -z), facing them.
+/// Where the strokes of a .bdraw go: on a vertical plane in front of the viewer, centered at
+/// this point (the viewer stands at the origin and looks toward -z).
 pub const WALL_CENTER: Vec3 = Vec3::new(0.0, 1.45, -1.3);
-/// The canvas's longer side, meters.
+/// The drawing's longer side, meters.
 pub const WALL_SIZE: f32 = 1.1;
 
 fn num(v: &Value, key: &str, default: f32) -> f32 {
@@ -82,7 +82,7 @@ fn hex(s: &str) -> [f32; 3] {
 
 /// Brings in a .bdraw (the 2D app's canvas) as 3D strokes on a wall: every stroke keeps its
 /// path and pressure and its 2D brush (flow, spacing, hardness, opacity, eraser), all its
-/// points at one depth (the wall's plane), on the paper. Its layers are ordered (strokes cover
+/// points at one depth (a vertical plane in front of the viewer). No paper. Its layers are ordered (strokes cover
 /// each other in their order, as in the 2D app). Seen square on with no perspective it matches
 /// the 2D drawing; in perspective the round strokes show their thickness. The layers come in
 /// order (groups that pass through flattened; a group's opacity multiplies its layers'), with
@@ -121,7 +121,7 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
     }
     walk(&live, None, 1.0, true, &mut ordered);
 
-    // The canvas: the strokes' extent, with a margin, scaled to the wall.
+    // The drawing's extent, with a margin, scaled to the wall.
     let mut lo = Vec2::splat(f32::MAX);
     let mut hi = Vec2::splat(f32::MIN);
     for s in strokes {
@@ -142,12 +142,8 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
     let (lo, hi) = (lo - margin, hi + margin);
     let scale = WALL_SIZE / (hi - lo).max_element(); // meters per 2D unit
     let center2d = (lo + hi) * 0.5;
-    let plane = Plane { origin: WALL_CENTER, right: Vec3::X, up: Vec3::Y };
     // 2D y runs down; the wall's runs up.
-    let to_wall = |x: f32, y: f32| plane.to_room(Vec2::new(x - center2d.x, center2d.y - y) * scale);
-    let half = (hi - lo) * 0.5 * scale;
-    let paper = doc.get("paper").and_then(|p| p.get("color")).and_then(Value::as_str).map(hex).unwrap_or([1.0, 1.0, 1.0]);
-    let canvas = Canvas { plane, min: -half, max: half, paper: Some(paper) };
+    let to_wall = |x: f32, y: f32| WALL_CENTER + Vec3::new(x - center2d.x, center2d.y - y, 0.0) * scale;
 
     let mut out: Vec<Layer> = ordered
         .iter()
@@ -184,5 +180,5 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
         }
     }
     out.push(Layer { name: "VR".into(), ..Default::default() });
-    Ok(Painting { layers: out, canvas: Some(canvas), ..Default::default() })
+    Ok(Painting { layers: out, ..Default::default() })
 }
