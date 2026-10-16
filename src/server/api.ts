@@ -10,7 +10,7 @@ import http from 'node:http';
 import zlib from 'node:zlib';
 import { BDRAW_VERSION, isGzip } from '../shared/bdraw';
 import { newId, newSessionCode } from '../shared/ids';
-import { LIMITS, normalizeName, parseKey, candidateKeys, type BrushPreset, type BrushSettings } from '../shared/types';
+import { LIMITS, normalizeName, parseKey, candidateKeys, type BrushPreset, type BrushSettings, type Palette, type PaletteColor } from '../shared/types';
 import { canClaim, isAdmin, isTemporary, TEMP_TTL_MS } from './access';
 import {
   clearSessionCookie,
@@ -24,8 +24,8 @@ import {
   userFromToken,
   verifyPassword,
 } from './auth';
-import { linkToken, sha256, type CanvasRow, type MemberRole, type PresetRow, type Store, type UserRow } from './db';
-import { validateBrushSettings } from '../shared/validate';
+import { linkToken, sha256, type CanvasRow, type MemberRole, type PaletteRow, type PresetRow, type Store, type UserRow } from './db';
+import { validateBrushSettings, validatePaletteColors } from '../shared/validate';
 import { actionMail, type Mailer } from './mailer';
 import type { Captcha } from './captcha';
 
@@ -86,11 +86,18 @@ const limits = {
   device: new Limiter(10, 15 * 60_000),
   share: new Limiter(60, 60_000),
   presets: new Limiter(30, 3600_000),
+  palettes: new Limiter(30, 3600_000),
+  /** Palette edits: one for each color added or removed. */
+  paletteEdits: new Limiter(600, 3600_000),
 };
 
 /** Caps for shared brush presets. */
 const MAX_PRESETS = 5000;
 const MAX_PRESETS_PER_CREATOR = 300;
+
+/** Caps for shared color palettes. */
+const MAX_PALETTES = 5000;
+const MAX_PALETTES_PER_CREATOR = 100;
 
 function publicUser(u: UserRow, admins: Set<string>) {
   return { id: u.id, email: u.email, name: u.name, admin: admins.has(u.email) };
@@ -439,6 +446,94 @@ const deletePreset: Handler = async (ctx, req) => {
   return ok({ deleted: p.id });
 };
 
+// --- color palettes -------------------------------------------------------------------------------
+
+function publicPalette(p: PaletteRow): Palette {
+  return {
+    id: p.id,
+    name: p.name,
+    colors: JSON.parse(p.colors),
+    creator: presetCreator(p),
+    creatorName: p.display_name,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+}
+
+function paletteName(v: unknown): string {
+  return typeof v === 'string' ? v.replace(/[\u0000-\u001f]/g, '').trim().slice(0, LIMITS.maxPaletteName) : '';
+}
+
+/** The creator of a palette: the same account, or the same browser (its anonymous secret). */
+function isPaletteCreator(p: PaletteRow, req: { user?: UserRow | null; body: Record<string, unknown> }): boolean {
+  if (p.owner_id) return req.user?.id === p.owner_id;
+  return !!p.creator_anon && typeof req.body.anon === 'string' && sha256(req.body.anon) === p.creator_anon;
+}
+
+const listPalettes: Handler = async (ctx) => ok({ palettes: ctx.store.palettes().map(publicPalette) });
+
+/** Saves a palette for everyone, under the account name, or else under the display name. */
+const savePalette: Handler = async (ctx, req) => {
+  if (!limits.palettes.allow(req.ip)) return err(429, 'rate_limited');
+  const name = paletteName(req.body.name);
+  if (!name) return err(400, 'bad_name');
+  let colors: PaletteColor[];
+  try {
+    colors = validatePaletteColors(req.body.colors ?? []);
+  } catch {
+    return err(400, 'bad_colors');
+  }
+  const anon = !req.user && typeof req.body.anon === 'string' && req.body.anon.length >= 16 && req.body.anon.length <= 100 ? sha256(req.body.anon) : null;
+  if (!req.user && !anon) return err(400, 'bad_request');
+  const counts = ctx.store.paletteCounts(req.user?.id ?? null, anon);
+  if (counts.total >= MAX_PALETTES) return err(507, 'too_many_palettes');
+  if (counts.mine >= MAX_PALETTES_PER_CREATOR) return err(429, 'too_many_palettes');
+  const given = typeof req.body.creatorName === 'string' ? req.body.creatorName.replace(/[\u0000-\u001f]/g, '').trim().slice(0, LIMITS.maxPeerName) : '';
+  const now = Date.now();
+  const row = {
+    id: newId(),
+    name,
+    colors: JSON.stringify(colors),
+    owner_id: req.user?.id ?? null,
+    creator_anon: anon,
+    creator_name: req.user?.name ?? (given || 'Anonymous'),
+    created_at: now,
+    updated_at: now,
+  };
+  ctx.store.addPalette(row);
+  return ok({ palette: publicPalette(ctx.store.palette(row.id)!) }, 201);
+};
+
+/** Only the creator changes a palette: its name, its colors, or both. */
+const updatePalette: Handler = async (ctx, req) => {
+  const p = ctx.store.palette(req.params[0]);
+  if (!p) return err(404, 'not_found');
+  if (!isPaletteCreator(p, req)) return err(403, 'not_yours');
+  if (!limits.paletteEdits.allow(req.ip)) return err(429, 'rate_limited');
+  const name = req.body.name === undefined ? p.name : paletteName(req.body.name);
+  if (!name) return err(400, 'bad_name');
+  let colors = p.colors;
+  if (req.body.colors !== undefined) {
+    try {
+      colors = JSON.stringify(validatePaletteColors(req.body.colors));
+    } catch {
+      return err(400, 'bad_colors');
+    }
+  }
+  ctx.store.updatePalette(p.id, name, colors);
+  return ok({ palette: publicPalette(ctx.store.palette(p.id)!) });
+};
+
+/** The creator or an admin may delete a palette. */
+const deletePalette: Handler = async (ctx, req) => {
+  const p = ctx.store.palette(req.params[0]);
+  if (!p) return err(404, 'not_found');
+  const admin = !!req.user && ctx.adminEmails.has(req.user.email);
+  if (!admin && !isPaletteCreator(p, req)) return err(403, 'not_yours');
+  ctx.store.deletePalette(p.id);
+  return ok({ deleted: p.id });
+};
+
 const resolveCanvas: Handler = async (ctx, req) => {
   const key = candidateKeys(req.params[0]).find((k) => ctx.store.sessionExists(k)) ?? null;
   return ok({ exists: key !== null, key });
@@ -651,6 +746,10 @@ const ROUTES: [string, RegExp, Handler][] = [
   ['GET', /^\/api\/presets$/, listPresets],
   ['POST', /^\/api\/presets$/, savePreset],
   ['POST', /^\/api\/presets\/([A-Za-z0-9_-]{6,40})\/delete$/, deletePreset],
+  ['GET', /^\/api\/palettes$/, listPalettes],
+  ['POST', /^\/api\/palettes$/, savePalette],
+  ['POST', /^\/api\/palettes\/([A-Za-z0-9_-]{6,40})$/, updatePalette],
+  ['POST', /^\/api\/palettes\/([A-Za-z0-9_-]{6,40})\/delete$/, deletePalette],
   ['GET', /^\/api\/sessions\/([^/]+)$/, resolveCanvas],
   ['GET', /^\/api\/canvases$/, myCanvases],
   ['GET', /^\/api\/canvases\/([^/]+)\/sharing$/, getSharing],

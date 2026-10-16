@@ -495,6 +495,22 @@ Shortcuts: `Ctrl+S` saves a `.bdraw` file, `Ctrl+O` opens one, `Ctrl+0` fits all
 - Apply: a click sets the brush (or the eraser, while it is the tool). Settings that the preset does not hold go back to their defaults.
 - API: `GET /api/presets`, `POST /api/presets` (`name`, `settings`, `anon`, `creatorName`), `POST /api/presets/<id>/delete` (`anon`). Limits: 30 saves per hour per IP address, 300 presets per creator, 5000 in total.
 
+### 9.3.1 Color palettes
+
+- The color panel has two tabs: Color (the picker and the recent colors) and Palettes. The device keeps the open tab.
+- A palette is a name and 0 to 128 colors (`#rrggbb`, each with an optional name). Palettes are shared like brush presets (§9.3): every person sees every palette, under the account name, or the display name at save time without an account. The creator is stored and shown the same way (`owner_id`, or the sha256 of the anonymous secret).
+- Change (name, colors): only the creator. Delete: the creator or an admin. The server makes the check.
+- Tab, from the top: the current color, "Add current color", "New palette", and a line with the name and hex of the swatch picked last (or the palette that "Add current color" adds to). Then three sections:
+  - Yours: your palettes. The target of "Add current color" is highlighted: the palette you added to or made last (kept on the device), or else your newest. Without a palette, "Add current color" makes one ("My colors"). The + tile at the end of a palette adds the current color to that palette. A color that is in the palette already is not added again. Edit: rename, remove colors (×), delete the palette.
+  - Paint: the built-in palettes (`src/shared/paints.ts`, generated).
+  - Shared: the palettes of other people, grouped by creator, by name.
+- A tap on a swatch makes it the foreground color and a recent color. Each palette and group can collapse (kept on the device).
+- Built-in palettes:
+  - Golden Heavy Body acrylics: 78 paints, measured. Golden Artist Colors gave the spectral reflectance (drawdowns over a white card, 400 to 700 nm by 10 nm) to Andrew Glassner and Eric Haines, with permission to share it (https://www.realtimerendering.com/golden.html). The color is the spectrum under D65 with the CIE 1931 2° observer, in sRGB, with the gloss of the surface taken out (Saunderson, k1 = 0.04, k2 = 0.6): the paint straight from the tube, without glare. Sorted by hue (yellow to red to violet to blue to green), then the earths, then the neutrals.
+  - Limited palettes from those paints: Zorn (plus a white that is not measured), Split primary, Earth.
+  - Not included: tints. The drawdowns are masstones: most paints absorb some band almost fully, and without the gloss that band is measurement noise, so a tint made from it (Kubelka-Munk with white) gets a wrong hue (phthalo blue became violet). In Pigment mode (§6.7) a masstone mixed with white on the canvas gives the tints. Watercolor and oil data: artistpigments.org (via palette-builder) has CIELAB of about 1100 watercolors and 1460 oils with pigment codes, but it is CC BY-NC 4.0, so it is not included.
+- API: `GET /api/palettes`, `POST /api/palettes` (`name`, `colors`, `anon`, `creatorName`), `POST /api/palettes/<id>` (`name` and/or `colors`, `anon`), `POST /api/palettes/<id>/delete` (`anon`). Limits: 30 new palettes and 600 changes per hour per IP address, 100 palettes per creator, 5000 in total. Table `palettes` (schema 6). A server from before palettes answers 404: the tab shows the built-in palettes and "This server does not keep palettes yet".
+
 ### 9.4 Image export
 
 One "Export image" button in the top bar (on phones, in the ⋮ menu) opens the export dialog. It keeps its settings for next time (in the browser).

@@ -26,6 +26,7 @@ import {
   type LayerBlend,
   type LayerEffect,
   type LayerMask,
+  type PaletteColor,
   type LayerProps,
   type Op,
   type PathContour,
@@ -79,6 +80,19 @@ export function validateColor(v: unknown): string {
   const c = v.toLowerCase();
   if (!COLOR_RE.test(c)) fail('bad color');
   return c;
+}
+
+/** Palette colors: 0 to maxPaletteColors of { hex, name? }, names trimmed, empty names dropped. */
+export function validatePaletteColors(v: unknown): PaletteColor[] {
+  if (!Array.isArray(v) || v.length > LIMITS.maxPaletteColors) fail('bad colors');
+  return v.map((c) => {
+    const o = obj(c, 'color');
+    const hex = validateColor(o.hex);
+    if (o.name === undefined) return { hex };
+    if (typeof o.name !== 'string') fail('bad color name');
+    const name = o.name.replace(/[\u0000-\u001f]/g, '').trim().slice(0, LIMITS.maxPaletteName);
+    return name ? { hex, name } : { hex };
+  });
 }
 
 function oneOf<T extends string>(v: unknown, list: readonly T[], what: string): T {

@@ -397,6 +397,31 @@ try {
   check((await anonP.api('POST', `/api/presets/${vSaved.data.preset.id}/delete`, { anon: anonP.anon })).status === 403, 'an anonymous browser cannot delete an account preset');
   check((await admin.api('POST', `/api/presets/${vSaved.data.preset.id}/delete`, {})).status === 200, 'the admin deletes any preset');
 
+  // --- color palettes ----------------------------------------------------------------------------
+  const anonC = new Browser();
+  const cSaved = await anonC.api('POST', '/api/palettes', { name: 'Sky', colors: [{ hex: '#3366FF', name: ' Blue ' }, { hex: '#ffffff' }], anon: anonC.anon, creatorName: 'Busy Mongoose' });
+  check(cSaved.status === 201 && cSaved.data.palette.creatorName === 'Busy Mongoose' && /^a:[0-9a-f]{16}$/.test(cSaved.data.palette.creator), 'save a palette without an account');
+  check(cSaved.data.palette.colors[0].hex === '#3366ff' && cSaved.data.palette.colors[0].name === 'Blue' && !('name' in cSaved.data.palette.colors[1]), 'palette colors are lowercase hex with trimmed names');
+  check((await anonC.api('POST', '/api/palettes', { name: 'x', colors: [{ hex: 'blue' }], anon: anonC.anon })).status === 400, 'palette colors must be #rrggbb');
+  check((await anonC.api('POST', '/api/palettes', { name: 'x', colors: Array.from({ length: 129 }, () => ({ hex: '#000000' })), anon: anonC.anon })).status === 400, 'a palette holds at most 128 colors');
+  check((await anonC.api('POST', '/api/palettes', { name: ' ', colors: [], anon: anonC.anon })).status === 400, 'palette needs a name');
+  const cId = cSaved.data.palette.id;
+  const cAdd = await anonC.api('POST', `/api/palettes/${cId}`, { colors: [...cSaved.data.palette.colors, { hex: '#ff0000' }], anon: anonC.anon });
+  check(cAdd.status === 200 && cAdd.data.palette.colors.length === 3 && cAdd.data.palette.name === 'Sky', 'the creator adds a color');
+  const cRen = await anonC.api('POST', `/api/palettes/${cId}`, { name: 'Sky 2', anon: anonC.anon });
+  check(cRen.status === 200 && cRen.data.palette.name === 'Sky 2' && cRen.data.palette.colors.length === 3, 'the creator renames it and the colors stay');
+  const stranger3 = new Browser();
+  check((await stranger3.api('POST', `/api/palettes/${cId}`, { colors: [], anon: stranger3.anon })).status === 403, 'someone else cannot change it');
+  check((await admin.api('POST', `/api/palettes/${cId}`, { colors: [] })).status === 403, 'an admin cannot change it either');
+  const cList = (await new Browser().api('GET', '/api/palettes')).data.palettes;
+  check(cList.some((x) => x.id === cId && x.name === 'Sky 2' && x.colors.length === 3), 'everyone sees the palette');
+  check((await stranger3.api('POST', `/api/palettes/${cId}/delete`, { anon: stranger3.anon })).status === 403, 'someone else cannot delete it');
+  check((await anonC.api('POST', `/api/palettes/${cId}/delete`, { anon: anonC.anon })).status === 200, 'the same browser deletes its palette');
+  const vPal = await funky.api('POST', '/api/palettes', { name: 'Earth', colors: [], creatorName: 'Spoofed Name' });
+  check(vPal.status === 201 && vPal.data.palette.creatorName === 'Funky Otter' && vPal.data.palette.creator.startsWith('u:'), 'an account saves a palette under its account name');
+  check((await anonC.api('POST', `/api/palettes/${vPal.data.palette.id}`, { colors: [], anon: anonC.anon })).status === 403, 'an anonymous browser cannot change an account palette');
+  check((await admin.api('POST', `/api/palettes/${vPal.data.palette.id}/delete`, {})).status === 200, 'the admin deletes any palette');
+
   // --- embeds -------------------------------------------------------------------------------------
   const emb = (await funky.api('POST', '/api/sessions', { name: 'embed-test' })).data.key;
   await funky.api('POST', `/api/canvases/${emb}/links`, { kind: 'code', role: 'editor' });

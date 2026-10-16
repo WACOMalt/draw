@@ -71,6 +71,23 @@ export interface BrushPreset {
   createdAt: number;
 }
 
+/** A color of a palette: sRGB hex (#rrggbb) and an optional name. */
+export interface PaletteColor {
+  hex: string;
+  name?: string;
+}
+
+/** A shared color palette. The creator key works as for brush presets. */
+export interface Palette {
+  id: string;
+  name: string;
+  colors: PaletteColor[];
+  creator: string;
+  creatorName: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export const ADJUST_TYPES = ['levels', 'curves', 'hueSat', 'brightContrast', 'blur'] as const;
 export type AdjustType = (typeof ADJUST_TYPES)[number];
 
@@ -572,6 +589,9 @@ export const LIMITS = {
   /** Numbers in a dash pattern, and the longest dash or gap (stroke widths). */
   maxDash: 8,
   maxDashLength: 1000,
+  /** Colors in one palette, and the length of a palette or color name. */
+  maxPaletteColors: 128,
+  maxPaletteName: 40,
 } as const;
 
 /** Unambiguous alphabet for session codes: no 0/O, 1/I/L. */
