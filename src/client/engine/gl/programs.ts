@@ -432,7 +432,7 @@ float overshoot(vec3 c) { return max(max(max(c.r, c.g), c.b) - 1.0, -min(min(c.r
  * (Björn Ottosson's adaptive L0 projection, alpha 0.05), by bisection. Near the corners of the
  * gamut (pure blue, green) a hue 1 or 2 degrees off the corner can hold much less chroma, so the
  * projection alone would band where a mix grazes the edge. Thus a small overshoot clamps (its
- * hue error is small), and the projection takes over by an overshoot of 0.05.
+ * hue error is small), and the projection takes over by an overshoot of 0.02.
  */
 vec3 srgb(vec3 lab) {
   vec3 c = linear(lab);
@@ -447,7 +447,7 @@ vec3 srgb(vec3 lab) {
   }
   vec3 kept = oklab(clamp(linear(g + (lab - g) * lo), 0.0, 1.0));
   vec3 clamped = oklab(clamp(c, 0.0, 1.0));
-  return spectral_linear_to_srgb(linear(mix(clamped, kept, smoothstep(0.0, 0.05, over))));
+  return spectral_linear_to_srgb(linear(mix(clamped, kept, smoothstep(0.0, 0.02, over))));
 }
 /**
  * Paint d (amount wd) and paint s (amount ws).
