@@ -1365,7 +1365,7 @@ export class GLRenderer implements Renderer {
       const uv: [number, number, number, number] = [x0 / sw, y0 / sh, x1 / sw, y1 / sh];
       if (this.pigmentFor(b)) {
         this.pigmentOnto(target, this.strokeT.tex, [x0, y0, bw, bh], uv, b.opacity, this.mixT);
-        work += 40 * bw * bh; // the spectral mix costs far more than a copy
+        work += 120 * bw * bh; // the spectral mix (7 Kubelka-Munk passes) costs far more than a copy
       } else {
         this.bindTarget(target);
         this.blendFor(erase);

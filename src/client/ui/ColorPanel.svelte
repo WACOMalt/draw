@@ -2,8 +2,27 @@
   import type { Engine } from '../engine/engine';
   import { hexToHsv, hexToRgb, hsvToHex, parseHex, type HSV } from '../color';
   import { ed } from '../state.svelte';
+  import PalettesTab from './PalettesTab.svelte';
 
   let { engine }: { engine: Engine | null } = $props();
+
+  const TAB_KEY = 'draw.colorTab';
+  let tab = $state<'picker' | 'palettes'>(readTab());
+  function readTab(): 'picker' | 'palettes' {
+    try {
+      return localStorage.getItem(TAB_KEY) === 'palettes' ? 'palettes' : 'picker';
+    } catch {
+      return 'picker';
+    }
+  }
+  function setTab(t: 'picker' | 'palettes') {
+    tab = t;
+    try {
+      localStorage.setItem(TAB_KEY, t);
+    } catch {
+      // storage may be unavailable
+    }
+  }
 
   // Local HSV keeps the hue when saturation or value reach 0.
   let hsv = $state<HSV>(hexToHsv(ed.fg));
@@ -72,26 +91,33 @@
 </script>
 
 <section>
-  <h2>Color</h2>
-  <div class="sv" style:background-color={hsvToHex({ h: hsv.h, s: 1, v: 1 })} use:svArea>
-    <div class="knob" style:left="{hsv.s * 100}%" style:top="{(1 - hsv.v) * 100}%"></div>
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected={tab === 'picker'} class:on={tab === 'picker'} onclick={() => setTab('picker')}>Color</button>
+    <button role="tab" aria-selected={tab === 'palettes'} class:on={tab === 'palettes'} onclick={() => setTab('palettes')}>Palettes</button>
   </div>
-  <div class="hue" use:hueArea>
-    <div class="hknob" style:left="{(hsv.h / 360) * 100}%"></div>
-  </div>
-  <div class="fields">
-    <span class="preview" style:background={ed.fg}></span>
-    <label>#<input type="text" class="hex" maxlength="7" bind:value={hexInput} onchange={onHex} /></label>
-    {#each ['R', 'G', 'B'] as ch, i}
-      <label>{ch}<input type="number" min="0" max="255" value={rgb[i]} onchange={(e) => onRgb(i, e.currentTarget.value)} /></label>
-    {/each}
-  </div>
-  {#if ed.swatches.length}
-    <div class="swatches">
-      {#each ed.swatches as c (c)}
-        <button style:background={c} title={c} aria-label={c} onclick={() => (ed.fg = c)}></button>
+  {#if tab === 'picker'}
+    <div class="sv" style:background-color={hsvToHex({ h: hsv.h, s: 1, v: 1 })} use:svArea>
+      <div class="knob" style:left="{hsv.s * 100}%" style:top="{(1 - hsv.v) * 100}%"></div>
+    </div>
+    <div class="hue" use:hueArea>
+      <div class="hknob" style:left="{(hsv.h / 360) * 100}%"></div>
+    </div>
+    <div class="fields">
+      <span class="preview" style:background={ed.fg}></span>
+      <label>#<input type="text" class="hex" maxlength="7" bind:value={hexInput} onchange={onHex} /></label>
+      {#each ['R', 'G', 'B'] as ch, i}
+        <label>{ch}<input type="number" min="0" max="255" value={rgb[i]} onchange={(e) => onRgb(i, e.currentTarget.value)} /></label>
       {/each}
     </div>
+    {#if ed.swatches.length}
+      <div class="swatches">
+        {#each ed.swatches as c (c)}
+          <button style:background={c} title={c} aria-label={c} onclick={() => (ed.fg = c)}></button>
+        {/each}
+      </div>
+    {/if}
+  {:else}
+    <PalettesTab {engine} />
   {/if}
 </section>
 
@@ -100,13 +126,27 @@
     padding: 8px 10px 10px;
     border-bottom: 1px solid var(--border);
   }
-  h2 {
+  .tabs {
+    display: flex;
+    gap: 12px;
     margin: 0 0 8px;
+  }
+  .tabs button {
+    padding: 0 0 2px;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.6px;
     color: var(--text-dim);
+    cursor: pointer;
+  }
+  .tabs button.on {
+    color: var(--text);
+    border-bottom-color: var(--accent);
   }
   .sv {
     position: relative;

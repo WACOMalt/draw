@@ -94,7 +94,7 @@ void spectral_linear_to_reflectance(vec3 lrgb, inout float R[SPECTRAL_SIZE]) {
   R[37] = max(SPECTRAL_EPSILON, w * 1.0005449969930000 + c * 0.0145038009464639 + m * 0.9722813248265600 + y * 0.9847028681227950 + r * 0.9856965214637620 + g * 0.0281260133612096 + b * 0.0157648801149616);
 }
 
-vec3 spectral_xyz_to_srgb(vec3 xyz) {
+vec3 spectral_xyz_to_linear(vec3 xyz) {
   mat3 XYZ_RGB;
 
   XYZ_RGB[0] = vec3( 3.2409699419045200, -1.537383177570090, -0.4986107602930030);
@@ -105,7 +105,11 @@ vec3 spectral_xyz_to_srgb(vec3 xyz) {
   float g = dot(XYZ_RGB[1], xyz);
   float b = dot(XYZ_RGB[2], xyz);
 
-  return spectral_linear_to_srgb(vec3(r, g, b));
+  return vec3(r, g, b);
+}
+
+vec3 spectral_xyz_to_srgb(vec3 xyz) {
+  return spectral_linear_to_srgb(spectral_xyz_to_linear(xyz));
 }
 
 vec3 spectral_reflectance_to_xyz(float R[SPECTRAL_SIZE]) {
@@ -157,22 +161,18 @@ float KS(float R) {
 	return pow(1.0 - R, 2.0) / (2.0 * R);
 }
 
+// 1 + KS - sqrt(KS^2 + 2 KS), in the form without cancellation: a strong absorber has KS up to
+// 1e15, and the difference of two such numbers in 32-bit floats is noise.
 float KM(float KS) {
-  return 1.0 + KS - sqrt(pow(KS, 2.0) + 2.0 * KS);
+  return 1.0 / (1.0 + KS + sqrt(KS * (KS + 2.0)));
 }
 
-// Two paints by amount (spectral.js spectral_mix with tinting strength 1, the concentrations
-// computed once instead of per wavelength).
-vec3 spectral_mix2(vec3 color1, float factor1, vec3 color2, float factor2) {
-  float R1[SPECTRAL_SIZE];
-  float R2[SPECTRAL_SIZE];
-  spectral_linear_to_reflectance(spectral_srgb_to_linear(color1), R1);
-  spectral_linear_to_reflectance(spectral_srgb_to_linear(color2), R2);
-  float c1 = factor1 * factor1 * spectral_reflectance_to_xyz(R1)[1];
-  float c2 = factor2 * factor2 * spectral_reflectance_to_xyz(R2)[1];
+// Two paints by their K/S curves and concentrations (spectral.js spectral_mix with tinting
+// strength 1): linear sRGB, not clamped.
+vec3 spectral_km(float K1[SPECTRAL_SIZE], float K2[SPECTRAL_SIZE], float c1, float c2) {
   float total = max(c1 + c2, SPECTRAL_EPSILON);
   float R[SPECTRAL_SIZE];
-  for (int i = 0; i < SPECTRAL_SIZE; i++) R[i] = KM((KS(R1[i]) * c1 + KS(R2[i]) * c2) / total);
-  return spectral_xyz_to_srgb(spectral_reflectance_to_xyz(R));
+  for (int i = 0; i < SPECTRAL_SIZE; i++) R[i] = KM((K1[i] * c1 + K2[i] * c2) / total);
+  return spectral_xyz_to_linear(spectral_reflectance_to_xyz(R));
 }
 `;

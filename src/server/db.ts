@@ -53,6 +53,19 @@ export interface PresetRow {
   display_name: string;
 }
 
+export interface PaletteRow {
+  id: string;
+  name: string;
+  colors: string; // JSON of PaletteColor[]
+  owner_id: string | null;
+  creator_anon: string | null; // sha256 hex of the anonymous secret
+  creator_name: string;
+  created_at: number;
+  updated_at: number;
+  /** COALESCE(account name, creator_name), from the queries. */
+  display_name: string;
+}
+
 export interface UserRow {
   id: string;
   email: string;
@@ -220,6 +233,26 @@ export class Store {
         this.setSetting('schema', '5');
       })();
     }
+    if (version < 6) {
+      // Shared color palettes. The creator works as for brush presets.
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE palettes (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            colors TEXT NOT NULL,
+            owner_id TEXT REFERENCES users (id) ON DELETE CASCADE,
+            creator_anon TEXT,
+            creator_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE INDEX palettes_owner ON palettes (owner_id);
+          CREATE INDEX palettes_anon ON palettes (creator_anon);
+        `);
+        this.setSetting('schema', '6');
+      })();
+    }
   }
 
   setting(key: string): string | undefined {
@@ -336,6 +369,49 @@ export class Store {
     const total = this.db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM presets').get()!.n;
     const mine = this.db
       .prepare<[string | null, string | null], { n: number }>('SELECT COUNT(*) AS n FROM presets WHERE (owner_id IS NOT NULL AND owner_id = ?) OR (creator_anon IS NOT NULL AND creator_anon = ?)')
+      .get(ownerId, anonHash)!.n;
+    return { total, mine };
+  }
+
+  // --- color palettes -----------------------------------------------------------------------
+
+  /** All palettes, oldest first, with the account name for palettes of an account. */
+  palettes(): PaletteRow[] {
+    return this.db
+      .prepare<[], PaletteRow>(
+        `SELECT p.*, COALESCE(u.name, p.creator_name) AS display_name
+         FROM palettes p LEFT JOIN users u ON u.id = p.owner_id ORDER BY p.created_at, p.id`,
+      )
+      .all();
+  }
+
+  palette(id: string): PaletteRow | undefined {
+    return this.db
+      .prepare<[string], PaletteRow>(
+        'SELECT p.*, COALESCE(u.name, p.creator_name) AS display_name FROM palettes p LEFT JOIN users u ON u.id = p.owner_id WHERE p.id = ?',
+      )
+      .get(id);
+  }
+
+  addPalette(p: Omit<PaletteRow, 'display_name'>): void {
+    this.db
+      .prepare('INSERT INTO palettes (id, name, colors, owner_id, creator_anon, creator_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(p.id, p.name, p.colors, p.owner_id, p.creator_anon, p.creator_name, p.created_at, p.updated_at);
+  }
+
+  updatePalette(id: string, name: string, colors: string): void {
+    this.db.prepare('UPDATE palettes SET name = ?, colors = ?, updated_at = ? WHERE id = ?').run(name, colors, Date.now(), id);
+  }
+
+  deletePalette(id: string): void {
+    this.db.prepare('DELETE FROM palettes WHERE id = ?').run(id);
+  }
+
+  /** Number of palettes in total, and of one creator. */
+  paletteCounts(ownerId: string | null, anonHash: string | null): { total: number; mine: number } {
+    const total = this.db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM palettes').get()!.n;
+    const mine = this.db
+      .prepare<[string | null, string | null], { n: number }>('SELECT COUNT(*) AS n FROM palettes WHERE (owner_id IS NOT NULL AND owner_id = ?) OR (creator_anon IS NOT NULL AND creator_anon = ?)')
       .get(ownerId, anonHash)!.n;
     return { total, mine };
   }
