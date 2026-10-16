@@ -402,7 +402,7 @@ uniform sampler2D uPaint;
 uniform float uOpacity;
 out vec4 o;
 ${SPECTRAL_GLSL}
-// OKLab (Björn Ottosson), from linear sRGB and to sRGB.
+// OKLab (Björn Ottosson), from linear sRGB.
 vec3 oklab(vec3 c) {
   vec3 lms = vec3(
     dot(vec3(0.4122214708, 0.5363325363, 0.0514459929), c),
@@ -414,16 +414,40 @@ vec3 oklab(vec3 c) {
     dot(vec3(1.9779984951, -2.4285922050, 0.4505937099), lms),
     dot(vec3(0.0259040371, 0.7827717662, -0.8086757660), lms));
 }
-vec3 srgb(vec3 lab) {
+// Linear sRGB of an OKLab color, not clamped.
+vec3 linear(vec3 lab) {
   vec3 l = vec3(
     dot(vec3(1.0, 0.3963377774, 0.2158037573), lab),
     dot(vec3(1.0, -0.1055613458, -0.0638541728), lab),
     dot(vec3(1.0, -0.0894841775, -1.2914855480), lab));
   l = l * l * l;
-  return spectral_linear_to_srgb(vec3(
+  return vec3(
     dot(vec3(4.0767416621, -3.3077115913, 0.2309699292), l),
     dot(vec3(-1.2684380046, 2.6097574011, -0.3413193965), l),
-    dot(vec3(-0.0041960863, -0.7034186147, 1.7076147010), l)));
+    dot(vec3(-0.0041960863, -0.7034186147, 1.7076147010), l));
+}
+float overshoot(vec3 c) { return max(max(max(c.r, c.g), c.b) - 1.0, -min(min(c.r, c.g), c.b)); }
+/**
+ * sRGB of an OKLab color, into the gamut with its hue kept: along the line to a grey (L0, 0, 0)
+ * (Björn Ottosson's adaptive L0 projection, alpha 0.05), by bisection. Near the corners of the
+ * gamut (pure blue, green) a hue 1 or 2 degrees off the corner can hold much less chroma, so the
+ * projection alone would band where a mix grazes the edge. Thus a small overshoot clamps (its
+ * hue error is small), and the projection takes over by an overshoot of 0.05.
+ */
+vec3 srgb(vec3 lab) {
+  vec3 c = linear(lab);
+  float over = overshoot(c);
+  if (over <= 0.0) return spectral_linear_to_srgb(c);
+  float C = length(lab.yz), Ld = lab.x - 0.5, e1 = 0.5 + abs(Ld) + 0.05 * C;
+  vec3 g = vec3(0.5 * (1.0 + sign(Ld) * (e1 - sqrt(max(e1 * e1 - 2.0 * abs(Ld), 0.0)))), 0.0, 0.0);
+  float lo = 0.0, hi = 1.0;
+  for (int n = 0; n < 12; n++) {
+    float m = 0.5 * (lo + hi);
+    if (overshoot(linear(g + (lab - g) * m)) <= 1e-5) lo = m; else hi = m;
+  }
+  vec3 kept = oklab(clamp(linear(g + (lab - g) * lo), 0.0, 1.0));
+  vec3 clamped = oklab(clamp(c, 0.0, 1.0));
+  return spectral_linear_to_srgb(linear(mix(clamped, kept, smoothstep(0.0, 0.05, over))));
 }
 /**
  * Paint d (amount wd) and paint s (amount ws).
