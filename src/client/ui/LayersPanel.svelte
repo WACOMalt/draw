@@ -508,6 +508,21 @@
       onopacity={(a, done) => engine?.setPaper({ ...ed.paper, alpha: a }, !done)}
     />
   </div>
+  <!-- How paint mixes on this canvas: a canvas setting, for everyone on it. -->
+  <div
+    class="paper"
+    title={ed.pigmentOk
+      ? 'Paint mixing for the whole canvas. Pigment: strokes mix with the paint below as real paint does (blue and yellow make green). Normal: they cover it.'
+      : 'Pigment mixing needs a newer server. Canvases on this device have it.'}
+  >
+    <span class="lbl">Paint mixing</span>
+    <div class="seg">
+      <button class="small" class:on={ed.mix === 'normal'} disabled={!ed.canEdit} onclick={() => engine?.setMix('normal')}>Normal</button>
+      <button class="small" class:on={ed.mix === 'pigment'} disabled={!ed.canEdit || (!ed.pigmentOk && ed.mix !== 'pigment')} onclick={() => engine?.setMix('pigment')}
+        >Pigment</button
+      >
+    </div>
+  </div>
 
   {#if active && (active.kind === 'adjust' || active.mask)}
     <div class="props">
@@ -966,6 +981,18 @@
   .paper .pct {
     color: #999;
     font-size: 12px;
+  }
+  .paper + .paper {
+    border-top: none;
+  }
+  .seg {
+    display: flex;
+    gap: 4px;
+  }
+  .seg button.on {
+    color: var(--text);
+    border-color: var(--accent-dim);
+    background: #24394c;
   }
   .footer {
     display: flex;

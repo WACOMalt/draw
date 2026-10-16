@@ -93,7 +93,7 @@ const api: ApiContext = {
   allowedOrigins: CORS_ORIGINS,
   refreshCanvas,
   moveCanvas,
-  importDoc: (row, layers, strokes, shapes, paper) => Session.importDoc(store, row, layers, strokes, shapes, paper),
+  importDoc: (row, layers, strokes, shapes, paper, mix) => Session.importDoc(store, row, layers, strokes, shapes, paper, mix),
 };
 
 setInterval(() => {

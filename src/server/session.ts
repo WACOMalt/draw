@@ -104,11 +104,12 @@ export class Session {
     strokes: unknown[],
     shapes: unknown[] = [],
     paper?: unknown,
+    mix?: unknown,
   ): { layers: number; strokes: number; shapes: number; skipped: number } {
     const s = new Session(row.code, store, row);
     let n = { layers: 0, strokes: 0, shapes: 0, skipped: 0 };
     store.transaction(() => {
-      n = importOps(s.doc, layers, strokes, shapes, (op, by) => s.commit(op, by), paper);
+      n = importOps(s.doc, layers, strokes, shapes, (op, by) => s.commit(op, by), paper, mix);
     });
     return n;
   }
@@ -297,11 +298,12 @@ export class Session {
         strokes: [...this.doc.strokes.values()].filter((s) => !s.deleted),
         shapes: [...this.doc.shapes.values()].filter((s) => !s.deleted),
         paper: this.doc.paper,
+        ...(this.doc.mix !== 'normal' ? { mix: this.doc.mix } : {}),
         peers,
         role: client.role,
         canvas: this.info(client),
         grant: access.grant,
-        features: docFeatures(this.doc.layers.values(), this.doc.strokes.values(), this.doc.shapes.values(), this.doc.paper),
+        features: docFeatures(this.doc.layers.values(), this.doc.strokes.values(), this.doc.shapes.values(), this.doc.paper, this.doc.mix),
         supports: [...DOC_FEATURES],
         previewSeq: this.store.previewInfo(this.code)?.seq ?? null,
       });

@@ -14,6 +14,7 @@ import {
   type Layer,
   type LayerEffect,
   type LayerProps,
+  type MixMode,
   type Op,
   type Paper,
   type ServerMsg,
@@ -515,9 +516,10 @@ export class Engine {
   }
 
   /** Confirmed document state for an off-screen render (exports, previews). */
-  snapshot(): { layers: Layer[]; strokes: Stroke[]; shapes: Shape[]; seq: number; paper: Paper } {
+  snapshot(): { layers: Layer[]; strokes: Stroke[]; shapes: Shape[]; seq: number; paper: Paper; mix: MixMode } {
     return {
       paper: this.doc.paperView(),
+      mix: this.doc.mixView(),
       layers: this.doc.displayLayers(),
       strokes: [...this.doc.strokes.values()].filter((st) => !st.deleted),
       shapes: [...this.doc.shapes.values()].filter((sh) => !sh.deleted),
@@ -1236,7 +1238,7 @@ export class Engine {
     const opId = newId();
     this.doc.addPending(opId, op);
     this.net.send({ t: 'op', opId, op });
-    if (op.type.startsWith('layer.') || op.type === 'paper.set') this.refreshLayers();
+    if (op.type.startsWith('layer.') || op.type === 'paper.set' || op.type === 'mix.set') this.refreshLayers();
     else if (op.type.startsWith('shape.')) this.shapes.docChanged();
   }
 
@@ -1287,6 +1289,8 @@ export class Engine {
     this.comp.setLayers(layers);
     ed.paper = this.doc.paperView();
     this.comp.setPaper(ed.paper);
+    ed.mix = this.doc.mixView();
+    this.comp.setMix(ed.mix);
     if (!layers.some((l) => l.id === ed.activeLayerId)) ed.activeLayerId = layers.at(-1)?.id ?? null;
     if (ed.maskTarget && !layers.find((l) => l.id === ed.activeLayerId)?.mask) this.setMaskTarget(false);
     this.shapes.docChanged();
@@ -1493,6 +1497,16 @@ export class Engine {
       return;
     }
     this.pushUndo({ undo: [{ type: 'paper.set', paper: { ...old } }], redo: [op], key: live ? 'paper' : undefined });
+  }
+
+  /** Sets how paint mixes on this canvas (pigment: as real paint). One undo step. */
+  setMix(mix: MixMode): void {
+    if (!ed.canEdit) return;
+    const old = this.doc.mixView();
+    if (old === mix) return;
+    const op: Op = { type: 'mix.set', mix };
+    this.sendOp(op);
+    this.pushUndo({ undo: [{ type: 'mix.set', mix: old }], redo: [op] });
   }
 
   /** dir +1 moves the layer up (toward the top) among the layers of its group, -1 down. */
@@ -1947,8 +1961,9 @@ export class Engine {
         if (m.grant) grants.set(this.code, m.grant);
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
         // A server from before effects sends no list: it refuses effects and blur layers.
-        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur');
-        this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper);
+        // A server from before `supports` takes none of the features that came with it or later.
+        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment');
+        this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper, m.mix);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);
         ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
@@ -2223,8 +2238,8 @@ export class Engine {
     const seq = this.doc.seq;
     this.previewAt = Date.now();
     try {
-      const { layers, strokes, shapes, paper } = this.snapshot();
-      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes, paper);
+      const { layers, strokes, shapes, paper, mix } = this.snapshot();
+      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes, paper, mix);
       if (!png || png.size > maxBytes) return;
       const bmp = await createImageBitmap(png);
       const ok = bmp.width === W && bmp.height === H;
@@ -2269,15 +2284,15 @@ export class Engine {
     const all = this.contentBounds();
     if (all) {
       try {
-        const { layers, strokes, shapes, seq, paper } = this.snapshot();
-        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512, shapes, paper);
+        const { layers, strokes, shapes, seq, paper, mix } = this.snapshot();
+        const png = await renderPng(layers, strokes, seq, padded(all, 0.04), 512, 512, shapes, paper, mix);
         if (png) preview = await blobToDataUrl(png);
       } catch (e) {
         console.warn('bdraw preview', e);
       }
     }
     const source = this.onDevice ? undefined : { key: this.code, url: `${PUBLIC_ORIGIN}/s/${this.code}` };
-    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview, this.doc.shapes.values(), this.doc.paper);
+    const file = makeBdraw(this.doc.layers.values(), this.doc.strokes.values(), __APP_VERSION__, source, preview, this.doc.shapes.values(), this.doc.paper, this.doc.mix);
     return encodeBdraw(file);
   }
 }

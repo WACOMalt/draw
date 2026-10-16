@@ -7,7 +7,7 @@
 // checks as live ops.
 
 import { docFeatures } from './features';
-import { isDefaultPaper, type Layer, type Paper, type Shape, type Stroke } from './types';
+import { isDefaultPaper, type Layer, type MixMode, type Paper, type Shape, type Stroke } from './types';
 
 export const BDRAW_EXT = 'bdraw';
 export const BDRAW_MIME = 'application/x-bdraw';
@@ -16,11 +16,11 @@ export const BDRAW_MIME = 'application/x-bdraw';
  * 3: shape layers and `shapes`. 4: paths (kind 'path') and vector strokes (`vector`). 5: spline
  * paths (`curve: 'spline'`). 6: compound shapes (kind 'compound', `parts`). 7: ellipse arcs and
  * holes, custom shapes, dashes and arrowheads. 8: see-through shape fill and stroke
- * (`fillOpacity`, `strokeOpacity`) and the paper (`paper`). 9: layer effects (`effects`) and blur
+ * (`fillOpacity`, `strokeOpacity`) and the paper (`paper`). 10: the canvas mix mode (`mix`). 9: layer effects (`effects`) and blur
  * adjustment layers. A file is written with the lowest
  * version that holds it, so older servers accept what they can read.
  */
-export const BDRAW_VERSION = 9;
+export const BDRAW_VERSION = 10;
 
 export interface BdrawFile {
   format: 'bdraw';
@@ -44,6 +44,8 @@ export interface BdrawFile {
   shapes?: Shape[];
   /** The paper (absent: white). */
   paper?: Paper;
+  /** Version 10: how paint mixes (absent: 'normal'). */
+  mix?: MixMode;
 }
 
 export function makeBdraw(
@@ -54,6 +56,7 @@ export function makeBdraw(
   preview?: string,
   shapes: Iterable<Shape> = [],
   paper?: Paper,
+  mix: MixMode = 'normal',
 ): BdrawFile {
   const live = [...layers].filter((l) => !l.deleted).sort((a, b) => a.order - b.order);
   const ids = new Set(live.map((l) => l.id));
@@ -61,7 +64,7 @@ export function makeBdraw(
   const liveStrokes = [...strokes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.seq - b.seq);
   return {
     format: 'bdraw',
-    version: fileVersion(live, liveStrokes, liveShapes, paper),
+    version: fileVersion(live, liveStrokes, liveShapes, paper, mix),
     app,
     savedAt: new Date().toISOString(),
     ...(preview ? { preview } : {}),
@@ -70,12 +73,14 @@ export function makeBdraw(
     strokes: liveStrokes,
     ...(liveShapes.length ? { shapes: liveShapes } : {}),
     ...(paper && !isDefaultPaper(paper) ? { paper } : {}),
+    ...(mix !== 'normal' ? { mix } : {}),
   };
 }
 
 /** The lowest version that holds these layers, strokes and shapes. */
-function fileVersion(layers: Layer[], strokes: Stroke[], shapes: Shape[], paper?: Paper): number {
-  const f = docFeatures(layers, strokes, shapes, paper);
+function fileVersion(layers: Layer[], strokes: Stroke[], shapes: Shape[], paper?: Paper, mix?: MixMode): number {
+  const f = docFeatures(layers, strokes, shapes, paper, mix);
+  if (f.includes('pigment')) return 10;
   if (f.some((x) => x === 'effects' || x === 'blur')) return 9;
   if (f.some((x) => x === 'shapeAlpha' || x === 'paper')) return 8;
   if (f.some((x) => x === 'arcs' || x === 'custom' || x === 'dashes' || x === 'arrows')) return 7;
