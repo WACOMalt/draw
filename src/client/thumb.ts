@@ -28,7 +28,7 @@ async function renderBdraw(fileB64: string, size: number): Promise<string | null
   const visible = new Set(file.layers.filter((l) => !effectivelyDeleted(byId, l) && effectivelyVisible(byId, l)).map((l) => l.id));
   const all = unionAll(doc, visible);
   if (!all) return null;
-  const png = await renderPng(doc.displayLayers(), file.strokes, seq, padded(all, 0.04), size, size, shapes, file.paper);
+  const png = await renderPng(doc.displayLayers(), file.strokes, seq, padded(all, 0.04), size, size, shapes, file.paper, file.mix);
   if (!png) return null;
   const buf = new Uint8Array(await png.arrayBuffer());
   let bin = '';

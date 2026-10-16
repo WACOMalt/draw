@@ -3,7 +3,7 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, lowFlow, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, LIMITS, type Affine, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
+import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, LIMITS, type Affine, type Brush, type Layer, type LayerBlend, type LayerEffect, type MixMode, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
 import { kaleidoscopeStep, takesEffects } from '../../../shared/effects';
 import { MARGIN, blurLevel, kernel } from '../blur';
 import { byZ } from '../../../shared/shapes';
@@ -235,6 +235,10 @@ export class GLRenderer implements Renderer {
   private compA!: Target;
   private compB!: Target;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
+  /** Tile-sized buffer for a pigment mix (pigmentOnto). */
+  private mixT!: Target;
+  /** How paint strokes mix with the paint below (setMix). */
+  private mix: MixMode = 'normal';
   private pickT!: Target;
   /** Screen buffers made only when a frame needs them: layer masks and clipping groups. */
   /** Screen-sized buffers some frames need (masks, clipping and group buffers per depth). */
@@ -393,6 +397,7 @@ export class GLRenderer implements Renderer {
     this.luts.clear();
 
     this.strokeT = this.makeTarget(TILE, TILE);
+    this.mixT = this.makeTarget(TILE, TILE);
     this.pickT = this.makeTarget(1, 1, true);
     this.shapeTex = this.makeTexture();
     this.hot.clear();
@@ -1228,7 +1233,51 @@ export class GLRenderer implements Renderer {
    * stroke draws as one dot here (stageStroke), which cannot build up.
    */
   private viaBuffer(b: Brush, dot: boolean): boolean {
-    return b.opacity < 1 || (!dot && this.precision === 8 && lowFlow(b));
+    return this.pigmentFor(b) || b.opacity < 1 || (!dot && this.precision === 8 && lowFlow(b));
+  }
+
+  /** The stroke mixes as pigment with the paint below (the canvas mix mode; not an eraser). */
+  private pigmentFor(b: Brush): boolean {
+    return this.mix === 'pigment' && b.tool !== 'erase';
+  }
+
+  /**
+   * How paint strokes mix with the paint below them. A change draws every tile again: the paint
+   * already there mixes the new way too.
+   */
+  setMix(mix: MixMode): void {
+    if (mix === this.mix) return;
+    this.mix = mix;
+    for (const t of this.tiles.values()) {
+      if (t.job) this.dropJob(t);
+      t.stale = true;
+    }
+    this.invalidate();
+  }
+
+  /**
+   * Pigment mix (PIGMENT_FS) of `src` into `dst` inside `rect` (dst px), with `uv` the same area
+   * in `src`: through `tmp` (the size of `dst`), since a pass cannot read the target it writes.
+   */
+  private pigmentOnto(dst: Target, src: WebGLTexture, rect: [number, number, number, number], uv: [number, number, number, number], opacity: number, tmp: Target): void {
+    const gl = this.gl;
+    this.bindTarget(tmp);
+    gl.disable(gl.BLEND);
+    const p = this.progs.pigment;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, dst.tex);
+    gl.uniform1i(p.u.uBack, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, src);
+    gl.uniform1i(p.u.uPaint, 1);
+    gl.uniform1f(p.u.uOpacity, opacity);
+    this.quad(p, tmp, rect, uv);
+    gl.activeTexture(gl.TEXTURE0);
+    // Back into dst: only the rectangle.
+    this.bindTarget(dst);
+    gl.disable(gl.BLEND);
+    this.copy(tmp.tex, dst, rect, 1, [rect[0] / tmp.w, rect[1] / tmp.h, (rect[0] + rect[2]) / tmp.w, (rect[1] + rect[3]) / tmp.h]);
   }
 
   /**
@@ -1312,10 +1361,16 @@ export class GLRenderer implements Renderer {
       gl.disable(gl.SCISSOR_TEST);
       this.blendFor(false);
       this.drawDabs(n, brush, w, h, grain, true);
-      this.bindTarget(target);
-      this.blendFor(erase);
       const sw = this.strokeT.w, sh = this.strokeT.h;
-      this.copy(this.strokeT.tex, target, [x0, y0, bw, bh], b.opacity, [x0 / sw, y0 / sh, x1 / sw, y1 / sh]);
+      const uv: [number, number, number, number] = [x0 / sw, y0 / sh, x1 / sw, y1 / sh];
+      if (this.pigmentFor(b)) {
+        this.pigmentOnto(target, this.strokeT.tex, [x0, y0, bw, bh], uv, b.opacity, this.mixT);
+        work += 40 * bw * bh; // the spectral mix costs far more than a copy
+      } else {
+        this.bindTarget(target);
+        this.blendFor(erase);
+        this.copy(this.strokeT.tex, target, [x0, y0, bw, bh], b.opacity, uv);
+      }
       work += 3 * bw * bh; // clear, copy
     }
     return work;
@@ -1333,6 +1388,10 @@ export class GLRenderer implements Renderer {
     ctx.clearRect(0, 0, c.width, c.height);
     drawShapes(ctx, [vectorShape(rec.stroke)], wx0, wy0, scale, w, h);
     this.uploadCanvas(this.shapeTex, c);
+    if (this.mix === 'pigment') {
+      this.pigmentOnto(target, this.shapeTex, [0, 0, w, h], [0, 0, 1, 1], 1, this.mixT);
+      return 2000 + 43 * w * h;
+    }
     this.bindTarget(target);
     this.blendFor(false);
     this.copy(this.shapeTex, target, [0, 0, w, h]);
@@ -1709,6 +1768,28 @@ export class GLRenderer implements Renderer {
     return p.a;
   }
 
+  /**
+   * Where a stroke in progress is in frame g (px, from its dabs, on screen), and the same area
+   * in its screen buffer (texture coordinates). Null: nothing on screen.
+   */
+  private liveRect(l: Live, g: Grid): { rect: [number, number, number, number]; uv: [number, number, number, number] } | null {
+    const W = this.canvas.width || 1, H = this.canvas.height || 1, ds = this.view.zoom * this.dpr;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let i = 0; i + 2 < l.dabs.length; i += DAB_STRIDE) {
+      const r = l.dabs[i + 2];
+      x0 = Math.min(x0, l.dabs[i] - r);
+      y0 = Math.min(y0, l.dabs[i + 1] - r);
+      x1 = Math.max(x1, l.dabs[i] + r);
+      y1 = Math.max(y1, l.dabs[i + 1] + r);
+    }
+    // Screen px, a pixel of margin for the edge, inside the screen.
+    const sx0 = Math.max(0, Math.floor((x0 - this.view.x) * ds) - 1), sy0 = Math.max(0, Math.floor((y0 - this.view.y) * ds) - 1);
+    const sx1 = Math.min(W, Math.ceil((x1 - this.view.x) * ds) + 1), sy1 = Math.min(H, Math.ceil((y1 - this.view.y) * ds) + 1);
+    if (!(sx1 > sx0 && sy1 > sy0)) return null;
+    const [ox, oy, sw] = this.screenRect(g), f = sw / W;
+    return { rect: [ox + sx0 * f, oy + sy0 * f, (sx1 - sx0) * f, (sy1 - sy0) * f], uv: [sx0 / W, sy0 / H, sx1 / W, sy1 / H] };
+  }
+
   /** A layer's or group's own pixels with its effects, before its blend and opacity. */
   private nodePixels(node: LayerNode, g: Grid, depth: number): Target {
     if (node.layer.kind === 'group') return this.groupPixels(node, g, depth);
@@ -1916,6 +1997,13 @@ export class GLRenderer implements Renderer {
     this.drawLayerContent(layer.id, g, t, 1);
     const scr = this.screenRect(g);
     for (const l of this.livesFor(layer.id)) {
+      if (this.pigmentFor(l.brush)) {
+        // Only where the stroke is: the mix is a heavy shader.
+        const r = this.liveRect(l, g);
+        if (r) this.pigmentOnto(t, l.target!.tex, r.rect, r.uv, l.brush.opacity, this.buf(g, 'pigment'));
+        this.bindTarget(t);
+        continue;
+      }
       this.blendFor(l.brush.tool === 'erase');
       this.copy(l.target!.tex, t, scr, l.brush.opacity);
     }

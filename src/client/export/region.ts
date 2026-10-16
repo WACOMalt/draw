@@ -3,7 +3,7 @@
 // .bdraw preview, and the link preview image.
 
 import { FULL_PROFILE } from '../engine/perf';
-import { DEFAULT_PAPER, type Layer, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, type Layer, type MixMode, type Paper, type Shape, type Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { GLRenderer } from '../engine/gl/glRenderer';
 
@@ -27,6 +27,7 @@ export class RegionRenderer {
     shapes: Shape[] = [],
     transparent = false,
     paper: Paper = DEFAULT_PAPER,
+    mix: MixMode = 'normal',
   ) {
     this.alpha = transparent || paper.alpha < 1;
     const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false });
@@ -34,6 +35,7 @@ export class RegionRenderer {
     this.r = new GLRenderer(this.canvas, gl, true, FULL_PROFILE);
     this.r.transparent = transparent;
     this.r.setPaper(paper);
+    this.r.setMix(mix);
     this.r.setLayers(layers);
     this.r.resetStrokes(strokes, seq);
     this.r.resetShapes(shapes);
@@ -78,13 +80,13 @@ export function flatPaper(p: unknown): Paper {
  * A PNG of `b` fitted into at most maxW × maxH pixels (aspect kept), on the paper (see flatPaper:
  * link previews and thumbnails are opaque).
  */
-export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number, shapes: Shape[] = [], paper?: unknown): Promise<Blob | null> {
+export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number, shapes: Shape[] = [], paper?: unknown, mix?: unknown): Promise<Blob | null> {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
   if (!(bw > 0 && bh > 0)) return null;
   const scale = Math.min(maxW / bw, maxH / bh);
   const w = Math.max(1, Math.min(PIECE, Math.round(bw * scale)));
   const h = Math.max(1, Math.min(PIECE, Math.round(bh * scale)));
-  const rr = new RegionRenderer(layers, strokes, seq, shapes, false, flatPaper(paper));
+  const rr = new RegionRenderer(layers, strokes, seq, shapes, false, flatPaper(paper), mix === 'pigment' ? 'pigment' : 'normal');
   try {
     const px = rr.render(b.x0, b.y0, scale, w, h);
     const c = new OffscreenCanvas(w, h);

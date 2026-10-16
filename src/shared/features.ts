@@ -1,7 +1,7 @@
 // Which newer document features a canvas uses. The server lists them in `welcome`; a client
 // that does not know one of them asks for an update instead of drawing the canvas wrong.
 
-import { isDefaultPaper, type Brush, type DocFeature, type Layer, type Paper, type Shape, type Stroke } from './types';
+import { isDefaultPaper, type Brush, type DocFeature, type Layer, type MixMode, type Paper, type Shape, type Stroke } from './types';
 
 /** True when the brush draws differently from the plain round brush of older clients. */
 export function brushHasDynamics(b: Brush): boolean {
@@ -27,9 +27,10 @@ function shapeFeatures(s: Partial<Pick<Shape, 'kind' | 'arc' | 'hole' | 'dash' |
   if ((s.fillOpacity ?? 1) < 1 || (s.strokeOpacity ?? 1) < 1) f.add('shapeAlpha');
 }
 
-export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, shapes: Iterable<Shape> = [], paper?: Paper): DocFeature[] {
+export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, shapes: Iterable<Shape> = [], paper?: Paper, mix?: MixMode): DocFeature[] {
   const f = new Set<DocFeature>();
   if (paper && !isDefaultPaper(paper)) f.add('paper');
+  if (mix === 'pigment') f.add('pigment');
   for (const l of layers) {
     if (l.deleted) continue;
     if (l.kind === 'adjust') f.add('adjust');

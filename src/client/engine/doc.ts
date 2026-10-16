@@ -5,7 +5,7 @@ import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shar
 import { transformLayerLengths } from '../../shared/effects';
 import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
 import { planFromPaint, planToPaint, vectorShape } from '../../shared/flatten';
-import { DEFAULT_PAPER, LIMITS, type AppliedOp, type Layer, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, LIMITS, type AppliedOp, type Layer, type MixMode, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
 
 export interface PendingOp {
   opId: string;
@@ -101,8 +101,11 @@ export class Doc {
   pending: PendingOp[] = [];
   /** The confirmed paper. */
   paper: Paper = { ...DEFAULT_PAPER };
+  /** The confirmed mix mode. */
+  mix: MixMode = 'normal';
 
-  reset(seq: number, layers: Layer[], strokes: Stroke[], shapes: Shape[] = [], paper: Paper = DEFAULT_PAPER): void {
+  reset(seq: number, layers: Layer[], strokes: Stroke[], shapes: Shape[] = [], paper: Paper = DEFAULT_PAPER, mix: MixMode = 'normal'): void {
+    this.mix = mix;
     this.seq = seq;
     this.paper = { ...paper };
     this.layers = new Map(layers.map((l) => [l.id, l]));
@@ -239,6 +242,9 @@ export class Doc {
         this.bounds.delete(op.id);
         this.version++;
         break;
+      case 'mix.set':
+        this.mix = op.mix;
+        break;
       case 'paper.set':
         this.paper = { ...op.paper };
         break;
@@ -254,6 +260,15 @@ export class Doc {
    */
   displayLayers(): Layer[] {
     return paintOrder(this.layerView().values());
+  }
+
+  /** The mix mode as the user sees it: the last pending change, else the confirmed one. */
+  mixView(): MixMode {
+    for (let i = this.pending.length - 1; i >= 0; i--) {
+      const op = this.pending[i].op;
+      if (op.type === 'mix.set') return op.mix;
+    }
+    return this.mix;
   }
 
   /** The paper as the user sees it: the last pending paper change, else the confirmed paper. */

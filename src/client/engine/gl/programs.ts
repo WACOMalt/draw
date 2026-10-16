@@ -4,6 +4,8 @@
 // and texture v = 0 is that top row. Only the present pass, which draws to the canvas, flips Y.
 // All colors are premultiplied by alpha.
 
+import { SPECTRAL_GLSL } from './spectral';
+
 const QUAD_VS = `#version 300 es
 precision highp float;
 layout(location = 0) in vec2 aCorner;   // 0..1
@@ -384,6 +386,35 @@ void main() {
   o = vec4(l.rgb * (1.0 - a) + uColor * a * l.a, l.a);
 }`;
 
+/**
+ * Pigment mixing (the canvas mix mode 'pigment'): a stroke's paint (uPaint, times uOpacity) into
+ * the paint below it (uBack, the same size as the target), as real paint mixes: Kubelka-Munk
+ * (spectral.ts). The amounts are the stroke's alpha and what shows of the paint below
+ * (alpha-over coverage), so an opaque stroke still covers and a thin one mixes in. Alpha
+ * composites as normal. Premultiplied in and out.
+ */
+const PIGMENT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in vec2 vScreen;
+uniform sampler2D uBack;
+uniform sampler2D uPaint;
+uniform float uOpacity;
+out vec4 o;
+${SPECTRAL_GLSL}
+void main() {
+  vec4 d = texture(uBack, vScreen);
+  vec4 s = texture(uPaint, vUv) * uOpacity;
+  if (s.a <= 1e-4) { o = d; return; }
+  if (d.a <= 1e-4) { o = s; return; }
+  float ws = s.a, wd = d.a * (1.0 - s.a);
+  float a = ws + wd;
+  // spectral.js weighs paints by the square of their factor: the square root keeps the weight
+  // in proportion to the coverage, so a thin glaze still tints.
+  vec3 c = spectral_mix2(clamp(d.rgb / d.a, 0.0, 1.0), sqrt(wd), clamp(s.rgb / s.a, 0.0, 1.0), sqrt(ws));
+  o = vec4(c * a, a);
+}`;
+
 export interface Program {
   prog: WebGLProgram;
   u: Record<string, WebGLUniformLocation | null>;
@@ -422,6 +453,7 @@ export function createPrograms(gl: WebGL2RenderingContext) {
     mask: link(gl, QUAD_VS, MASK_FS, [...quad, 'uMask']),
     adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity', 'uFxMap']),
     blur: link(gl, QUAD_VS, BLUR_FS, [...quad, 'uTex', 'uStep', 'uN', 'uOff', 'uW']),
+    pigment: link(gl, QUAD_VS, PIGMENT_FS, [...quad, 'uBack', 'uPaint', 'uOpacity']),
     fx: link(gl, QUAD_VS, FX_FS, [...quad, 'uLayer', 'uFx', 'uFxMap', 'uMode', 'uColor', 'uOpacity', 'uSpread']),
     dab: link(gl, DAB_VS, DAB_FS, [
       'uTarget',

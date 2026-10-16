@@ -1,7 +1,7 @@
 // Reactive editor state shared by the Svelte UI and the engine.
 
 import { DEFAULT_BRUSH } from '../shared/brush';
-import { DEFAULT_PAPER, type ArrowKind, type Brush, type CanvasInfo, type CustomShape, type DeniedReason, type Layer, type LineCap, type Paper, type Role, type Shape, type ShapeKind, type StrokeAlign } from '../shared/types';
+import { DEFAULT_PAPER, type ArrowKind, type Brush, type CanvasInfo, type CustomShape, type DeniedReason, type Layer, type LineCap, type MixMode, type Paper, type Role, type Shape, type ShapeKind, type StrokeAlign } from '../shared/types';
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
@@ -231,6 +231,12 @@ class EditorState {
   layers = $state<Layer[]>([]); // bottom to top
   /** The canvas paper (color and alpha), with pending changes. */
   paper = $state<Paper>({ ...DEFAULT_PAPER });
+  /** How paint mixes on this canvas, with pending changes. */
+  mix = $state<MixMode>('normal');
+  /** The server takes the pigment mix mode. */
+  get pigmentOk(): boolean {
+    return this.serverSupports.includes('pigment');
+  }
   activeLayerId = $state<string | null>(null);
   peers = $state<PeerView[]>([]);
   clientId = $state<string | null>(null);

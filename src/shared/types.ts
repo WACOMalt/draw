@@ -361,7 +361,15 @@ export interface Paper {
 export const DEFAULT_PAPER: Paper = { color: '#ffffff', alpha: 1 };
 export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p.alpha >= 1;
 
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur'] as const;
+/**
+ * How a paint stroke mixes with the paint below it on its layer. 'normal': over it (alpha
+ * compositing in RGB). 'pigment': as real paint (Kubelka-Munk spectral mixing): blue and yellow
+ * make green, not grey. A setting of the canvas; layers still blend with their blend modes.
+ */
+export const MIX_MODES = ['normal', 'pigment'] as const;
+export type MixMode = (typeof MIX_MODES)[number];
+
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
@@ -402,7 +410,9 @@ export type Op =
   /** The undo of shapes.toPaint (same key, ids, layerId): the strokes go, the shapes come back. */
   | { type: 'shapes.fromPaint'; key: string; ids: string[]; layerId: string }
   /** The paper under all layers: its color and opacity (0: transparent, as a transparent export). */
-  | { type: 'paper.set'; paper: Paper };
+  | { type: 'paper.set'; paper: Paper }
+  /** How paint strokes mix with the paint below them on the canvas (MixMode). */
+  | { type: 'mix.set'; mix: MixMode };
 
 /** An op as the server broadcasts it: restore ops carry the full object so late joiners can apply them. */
 export type AppliedOp =
@@ -496,6 +506,8 @@ export type ServerMsg =
       shapes?: Shape[];
       /** The paper. Absent: DEFAULT_PAPER (and from servers before paper colors). */
       paper?: Paper;
+      /** Absent: 'normal'. */
+      mix?: MixMode;
       peers: Peer[];
       role: Role;
       canvas: CanvasInfo;

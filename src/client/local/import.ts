@@ -51,6 +51,7 @@ export async function createLocalFromFile(name: string, blob: Blob): Promise<{ i
       ops.push({ canvas: c.id, seq, by, op: applied });
     },
     file.paper,
+    file.mix,
   );
   try {
     await appendOps(c.id, ops);

@@ -3,6 +3,7 @@
 import {
   ADJUST_TYPES,
   BLEND_MODES,
+  MIX_MODES,
   EFFECT_TYPES,
   BRUSH_TIPS,
   GRAINS,
@@ -303,6 +304,8 @@ export function validateOp(v: unknown): Op {
     case 'shape.remove':
     case 'shape.restore':
       return { type: o.type, id: id(o.id) };
+    case 'mix.set':
+      return { type: 'mix.set', mix: oneOf(o.mix, MIX_MODES, 'mix') };
     case 'paper.set': {
       const p = obj(o.paper, 'paper');
       return { type: 'paper.set', paper: { color: validateColor(p.color), alpha: num(p.alpha, 0, 1, 'paper alpha') } };

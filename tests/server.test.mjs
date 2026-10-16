@@ -289,6 +289,10 @@ try {
   const roundTrip = { format: 'bdraw', version: 1, app: 'test', savedAt: '', layers: iw.layers, strokes: iw.strokes };
   const anonImp = await new Browser().upload(Buffer.from(JSON.stringify(roundTrip)), {});
   check(anonImp.status === 201 && /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(anonImp.data.key) && anonImp.data.strokes === 2 && anonImp.data.skipped === 0, 'plain JSON file imports as a temporary canvas (round trip)');
+  // Version 10: the mix mode.
+  const mixImp = await new Browser().upload(Buffer.from(JSON.stringify({ ...roundTrip, version: 10, mix: 'pigment' })), {});
+  const mixW = await first(await new Browser().join(mixImp.data.key));
+  check(mixImp.status === 201 && mixW.mix === 'pigment', 'a .bdraw v10 imports its mix mode');
   // Version 8: the paper (color and alpha). A bad paper is left out; the drawing still imports.
   const paperImp = await new Browser().upload(Buffer.from(JSON.stringify({ ...roundTrip, version: 8, paper: { color: '#203040', alpha: 0.25 } })), {});
   const paperW = await first(await new Browser().join(paperImp.data.key));
@@ -645,6 +649,17 @@ try {
     check(r?.t === 'reject', 'paper: alpha below 0 is refused');
     r = await tryOp({ type: 'paper.set', paper: { color: 'orange', alpha: 1 } });
     check(r?.t === 'reject', 'paper: colors are #rrggbb');
+
+    // Paint mixing: a canvas setting, synced and in the welcome.
+    r = await tryOp({ type: 'mix.set', mix: 'watercolor' });
+    check(r?.t === 'reject', 'mix: normal or pigment only');
+    r = await tryOp({ type: 'mix.set', mix: 'pigment' });
+    check(r?.t === 'op' && r.op.mix === 'pigment', 'mix: set pigment mixing');
+    const mw = await first(await sb.join(sc));
+    check(mw.mix === 'pigment' && mw.features.includes('pigment') && mw.supports?.includes('pigment'), 'mix: persists; welcome lists the pigment feature; the server supports it');
+    r = await tryOp({ type: 'mix.set', mix: 'normal' });
+    const nw = await first(await sb.join(sc));
+    check(r?.t === 'op' && nw.mix === undefined && !nw.features.includes('pigment'), 'mix: back to normal');
 
     // Partial updates: the result must still be a valid shape of its kind.
     r = await tryOp({ type: 'shape.update', id: 'shapeRECT01', props: { fill: null, stroke: '#112233', radii: [0, 8, 0, 8], sides: 7 } });

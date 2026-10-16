@@ -2,7 +2,7 @@
 // - GLRenderer: WebGL2, half-float buffers, shader blend modes (preferred)
 // - Canvas2DRenderer: Canvas 2D + tile worker, 8-bit (fallback without WebGL2)
 
-import type { Affine, Brush, Layer, Paper, Shape, Stroke } from '../../shared/types';
+import type { Affine, Brush, Layer, MixMode, Paper, Shape, Stroke } from '../../shared/types';
 import type { PerfProfile } from './perf';
 
 export interface ViewState {
@@ -71,6 +71,11 @@ export interface Renderer {
 
   /** The bottom of the stack. Where its alpha is below 1, the screen shows a checkerboard. */
   setPaper(p: Paper): void;
+  /**
+   * How paint strokes mix with the paint below them (pigment: Kubelka-Munk, spectral.ts). The
+   * Canvas 2D fallback mixes as normal.
+   */
+  setMix(mix: MixMode): void;
   /**
    * The color of the drawing under a CSS-pixel position, as #rrggbb: composited without the
    * paper, un-premultiplied. Null where nothing is drawn.

@@ -2,7 +2,7 @@
 // layer opacity and blend modes, onto the visible canvas.
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
-import { DEFAULT_PAPER, EFFECT_TYPES, LIMITS, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type LayerEffect, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, EFFECT_TYPES, LIMITS, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type LayerEffect, type MixMode, type Paper, type Shape, type Stroke } from '../../shared/types';
 import { kaleidoscopeStep, takesEffects } from '../../shared/effects';
 import { byZ } from '../../shared/shapes';
 import { ShapeIndex, shapeRec } from './shapeIndex';
@@ -948,6 +948,9 @@ export class Canvas2DRenderer implements Renderer {
   }
 
   // --- readback ---------------------------------------------------------------------------
+
+  /** The fallback mixes paint as normal (pigment mixing needs WebGL2). */
+  setMix(_mix: MixMode): void {}
 
   setPaper(p: Paper): void {
     if (p.color === this.paper.color && p.alpha === this.paper.alpha) return;

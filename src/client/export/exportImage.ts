@@ -1,7 +1,7 @@
 // The large image export: a world rectangle at a chosen pixel size, rendered in pieces by an
 // off-screen renderer and streamed into a PNG or a tiled (Big)TIFF file.
 
-import type { Layer, Paper, Shape, Stroke } from '../../shared/types';
+import type { Layer, MixMode, Paper, Shape, Stroke } from '../../shared/types';
 import type { Bounds } from '../engine/doc';
 import { PngWriter } from './png';
 import { PIECE, RegionRenderer } from './region';
@@ -23,6 +23,8 @@ export interface ExportJob {
   transparent: boolean;
   /** The canvas paper. A see-through paper also gives the file an alpha channel. */
   paper: Paper;
+  /** How paint mixes (pigment: as real paint). */
+  mix: MixMode;
   sink: Sink;
   /** done: 0..1; piece: pieces rendered so far, of `pieces`. */
   onProgress: (done: number, piece: number, pieces: number) => void;
@@ -43,7 +45,7 @@ export const hasAlpha = (transparent: boolean, paper: Paper) => transparent || p
 export async function exportImage(job: ExportJob): Promise<void> {
   const { bounds, width, height, sink, signal } = job;
   const scale = width / (bounds.x1 - bounds.x0);
-  const rr = new RegionRenderer(job.layers, job.strokes, job.seq, job.shapes, job.transparent, job.paper);
+  const rr = new RegionRenderer(job.layers, job.strokes, job.seq, job.shapes, job.transparent, job.paper, job.mix);
   const alpha = hasAlpha(job.transparent, job.paper);
   const at = (px: number, py: number): [number, number] => [bounds.x0 + px / scale, bounds.y0 + py / scale];
   let piece = 0;
