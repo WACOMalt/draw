@@ -47,7 +47,9 @@ pub struct Layer {
     pub visible: bool,
     /// The strokes cover each other in their order, as in the 2D app (each over the ones
     /// before, an eraser taking from those before it), not by depth. For strokes brought in from
-    /// the 2D app, which lie in one plane.
+    /// the 2D app, which lie in one plane. (Files from before 3D strokes called these layers
+    /// `flat`.)
+    #[serde(alias = "flat")]
     pub ordered: bool,
     pub strokes: Vec<Stroke>,
 }
