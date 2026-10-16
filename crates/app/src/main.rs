@@ -2,8 +2,8 @@
 //!
 //!   vdraw                       paint in a desktop window (mouse)
 //!   vdraw --xr [--demo ...]     paint in VR (OpenXR: SteamVR, Monado, WiVRn)
-//!   vdraw --snapshot out.png [--demo shapes|soft|compare] [--orbit x y z yaw pitch distance]
-//!                               [--tip opacity hardness]
+//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense] [--orbit x y z yaw pitch distance]
+//!                               [--tip opacity hardness] [--size WxH] [--bench N]
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
@@ -12,16 +12,17 @@ mod rig;
 mod snapshot;
 mod xr;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-/// The painting of `--demo shapes|soft|compare` (shapes when not given), and a camera for it.
+/// The painting of `--demo shapes|soft|compare|dense` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
     let name = args.iter().position(|a| a == "--demo").and_then(|i| args.get(i + 1)).map(String::as_str);
     Ok(match name.unwrap_or("shapes") {
         "shapes" => (demo::painting(), camera::Orbit::default()),
         "soft" => (demo::soft(), camera::Orbit::default()),
         "compare" => (demo::compare(), camera::Orbit { target: glam::Vec3::new(0.0, 1.22, 0.0), yaw: 0.0, pitch: 0.05, distance: 1.25 }),
-        other => anyhow::bail!("no demo {other:?}: shapes, soft or compare"),
+        "dense" => (demo::dense(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.3, pitch: 0.1, distance: 0.9 }),
+        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare or dense"),
     })
 }
 
@@ -50,7 +51,19 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
-            snapshot::run(path, 1280, 800, painting, cam, tip)
+            // --size WxH (1280x800), --bench N: time N renders on the GPU first.
+            let size = match args.iter().position(|a| a == "--size").and_then(|i| args.get(i + 1)) {
+                Some(s) => {
+                    let (w, h) = s.split_once('x').context("--size WxH")?;
+                    (w.parse()?, h.parse()?)
+                }
+                None => (1280, 800),
+            };
+            let bench = match args.iter().position(|a| a == "--bench").and_then(|i| args.get(i + 1)) {
+                Some(n) => n.parse()?,
+                None => 0,
+            };
+            snapshot::run(path, size.0, size.1, painting, cam, tip, bench)
         }
         Some("--xr") => xr::run(demo(&args)?.0),
         _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),

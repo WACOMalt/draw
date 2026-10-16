@@ -33,6 +33,60 @@ pub fn round_cone(p: Vec3, a: Vec3, ra: f32, b: Vec3, rb: f32) -> f32 {
     ((x2 * a2 * il2).sqrt() + y * rr) * il2 - ra
 }
 
+/// Where a ray (from `o`, unit `dir`) first enters a sphere, at `t >= 0` along it, and the
+/// normal there. None when it misses, or starts inside.
+pub fn ray_sphere(o: Vec3, dir: Vec3, c: Vec3, r: f32) -> Option<(f32, Vec3)> {
+    let oc = o - c;
+    let b = oc.dot(dir);
+    let h = b * b - (oc.dot(oc) - r * r);
+    if h < 0.0 {
+        return None;
+    }
+    let t = -b - h.sqrt();
+    (t >= 0.0).then(|| (t, (oc + dir * t) / r))
+}
+
+/// Where a ray (from `o`, unit `dir`) first enters a round cone, at `t >= 0` along it, and the
+/// normal there. Exact (Inigo Quilez, "rounded cone intersection"): the cone's side when the
+/// hit is between the two spheres, else the nearer sphere. None when it misses, or starts
+/// inside.
+pub fn ray_round_cone(o: Vec3, dir: Vec3, a: Vec3, ra: f32, b: Vec3, rb: f32) -> Option<(f32, Vec3)> {
+    let ba = b - a;
+    let m0 = ba.dot(ba);
+    let rr = ra - rb;
+    if rr * rr >= m0 {
+        // One sphere inside the other (also a == b).
+        return if ra >= rb { ray_sphere(o, dir, a, ra) } else { ray_sphere(o, dir, b, rb) };
+    }
+    let oa = o - a;
+    let ob = o - b;
+    let m1 = ba.dot(oa);
+    let m2 = ba.dot(dir);
+    let m3 = dir.dot(oa);
+    let m5 = oa.dot(oa);
+    let m6 = ob.dot(dir);
+    let m7 = ob.dot(ob);
+    // The side: a quadratic in t.
+    let d2 = m0 - rr * rr;
+    let k2 = d2 - m2 * m2;
+    let k1 = d2 * m3 - m1 * m2 + m2 * rr * ra;
+    let k0 = d2 * m5 - m1 * m1 + m1 * rr * ra * 2.0 - m0 * ra * ra;
+    let h = k1 * k1 - k0 * k2;
+    if h < 0.0 {
+        return None;
+    }
+    let t = (-h.sqrt() - k1) / k2;
+    let y = m1 - ra * rr + t * m2;
+    if y > 0.0 && y < d2 {
+        return (t >= 0.0).then(|| (t, (d2 * (oa + dir * t) - ba * y).normalize()));
+    }
+    // The ends: the first entry of either sphere.
+    match (ray_sphere(o, dir, a, ra), ray_sphere(o, dir, b, rb)) {
+        (Some(x), Some(y)) => Some(if x.0 <= y.0 { x } else { y }),
+        (x, y) => x.or(y),
+    }
+}
+
 /// Smooth minimum (polynomial, Inigo Quilez): blends two distances over `k`.
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     if k <= 0.0 {
@@ -61,6 +115,66 @@ mod tests {
         let d = round_cone(Vec3::new(0.5, 1.0, 0.0), Vec3::ZERO, 0.1, Vec3::X, 0.1);
         assert!((d - 0.9).abs() < 1e-5);
         assert!(round_cone(Vec3::new(0.5, 0.0, 0.0), Vec3::ZERO, 0.1, Vec3::X, 0.1) < 0.0);
+    }
+
+    /// A small random generator for the tests (no dependency).
+    struct Lcg(u64);
+    impl Lcg {
+        fn f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn v(&mut self) -> Vec3 {
+            Vec3::new(self.f(), self.f(), self.f()) * 2.0 - 1.0
+        }
+    }
+
+    #[test]
+    fn ray_matches_sphere_tracing() {
+        // The exact intersection agrees with sphere tracing the distance function.
+        let mut rng = Lcg(7);
+        let mut hits = 0;
+        for _ in 0..4000 {
+            let a = rng.v() * 0.3;
+            let b = if rng.f() < 0.1 { a } else { a + rng.v() * 0.3 };
+            let (ra, rb) = (0.01 + rng.f() * 0.1, 0.01 + rng.f() * 0.1);
+            let o = rng.v().normalize() * 1.5;
+            let dir = ((a + b) * 0.5 + rng.v() * 0.15 - o).normalize();
+            // Trace: the first t where the distance is ~0, and the closest approach.
+            let (mut t, mut traced, mut closest) = (0.0f32, None, f32::MAX);
+            for _ in 0..2000 {
+                let d = round_cone(o + dir * t, a, ra, b, rb);
+                closest = closest.min(d);
+                if d < 1e-6 {
+                    traced = Some(t);
+                    break;
+                }
+                t += d;
+                if t > 4.0 {
+                    break;
+                }
+            }
+            let exact = ray_round_cone(o, dir, a, ra, b, rb);
+            match (traced, exact) {
+                (Some(tt), Some((te, n))) => {
+                    hits += 1;
+                    assert!((tt - te).abs() < 1e-3, "t {tt} vs {te}");
+                    let p = o + dir * te;
+                    let e = 1e-4;
+                    let g = Vec3::new(
+                        round_cone(p + Vec3::X * e, a, ra, b, rb) - round_cone(p - Vec3::X * e, a, ra, b, rb),
+                        round_cone(p + Vec3::Y * e, a, ra, b, rb) - round_cone(p - Vec3::Y * e, a, ra, b, rb),
+                        round_cone(p + Vec3::Z * e, a, ra, b, rb) - round_cone(p - Vec3::Z * e, a, ra, b, rb),
+                    )
+                    .normalize();
+                    assert!(n.dot(g) > 0.99, "normal {n} vs {g}");
+                }
+                (None, None) => {}
+                // A ray that only grazes the surface can go either way.
+                _ => assert!(closest.abs() < 1e-3, "traced {traced:?} exact {exact:?} closest {closest}"),
+            }
+        }
+        assert!(hits > 1000, "{hits} hits: the test rays miss too often");
     }
 
     #[test]

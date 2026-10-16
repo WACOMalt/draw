@@ -74,3 +74,41 @@ pub fn compare() -> Painting {
     }
     p
 }
+
+/// A load test: 24 tangled strokes in a ball of about 0.4 m around standing height, half solid
+/// and half soft, about as dense as a few minutes of painting in one place. VDRAW_DENSE=solid
+/// or =soft makes them all one kind (to time each).
+pub fn dense() -> Painting {
+    let mut seed = 12345u64;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let mut p = Painting::default();
+    for i in 0..24 {
+        let phase: [f32; 6] = std::array::from_fn(|_| rnd() * TAU);
+        let freq: [f32; 3] = std::array::from_fn(|_| 1.0 + rnd());
+        let soft = match std::env::var("VDRAW_DENSE").as_deref() {
+            Ok("solid") => false,
+            Ok("soft") => true,
+            _ => i % 2 == 1,
+        };
+        let brush = Brush {
+            radius: 0.01 + rnd() * 0.025,
+            color: [0.2 + rnd() * 0.8, 0.2 + rnd() * 0.8, 0.2 + rnd() * 0.8],
+            hardness: if soft { rnd() * 0.5 } else { 1.0 },
+            opacity: if soft { 0.4 + rnd() * 0.6 } else { 1.0 },
+            ..Default::default()
+        };
+        p.strokes.push(stroke(brush, 200, move |t| {
+            let a = t * TAU;
+            let v = Vec3::new(
+                (a * freq[0] + phase[0]).sin() + 0.5 * (a * 2.0 * freq[1] + phase[3]).sin(),
+                (a * freq[1] + phase[1]).sin() + 0.5 * (a * 2.0 * freq[2] + phase[4]).sin(),
+                (a * freq[2] + phase[2]).sin() + 0.5 * (a * 2.0 * freq[0] + phase[5]).sin(),
+            );
+            (Vec3::new(0.0, 1.3, 0.0) + v * 0.13, 0.5 + 0.5 * (a * 3.0).sin().abs())
+        }));
+    }
+    p
+}

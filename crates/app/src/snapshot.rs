@@ -26,7 +26,10 @@ fn srgb(x: f32) -> u8 {
     (y * 255.0 + 0.5) as u8
 }
 
-pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit, tip: Option<BrushTip>) -> Result<()> {
+/// Renders and writes the PNG. `bench` > 0: first renders that many times and logs the GPU
+/// time of the raymarch (median and worst).
+#[allow(clippy::too_many_arguments)]
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit, tip: Option<BrushTip>, bench: u32) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
@@ -41,6 +44,31 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut readback = Buffer::new(&gpu, (width * height * 8) as u64, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "readback")?;
     let pool = unsafe { d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family), None) }?;
     let cmd = unsafe { d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)) }?[0];
+    if bench > 0 {
+        let queries = unsafe { d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None) }?;
+        let tick_ns = unsafe { gpu.instance.get_physical_device_properties(gpu.physical) }.limits.timestamp_period as f64;
+        let mut ms = Vec::new();
+        for _ in 0..bench {
+            unsafe {
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+                d.cmd_reset_query_pool(cmd, queries, 0, 2);
+                d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 0);
+                rm.record(cmd, 0, &segs, &[eye], tip)?;
+                d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::BOTTOM_OF_PIPE, queries, 1);
+                d.end_command_buffer(cmd)?;
+                let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+                d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)?;
+                d.wait_for_fences(&[fence], true, u64::MAX)?;
+                d.destroy_fence(fence, None);
+                let mut ts = [0u64; 2];
+                d.get_query_pool_results(queries, 0, &mut ts, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)?;
+                ms.push((ts[1] - ts[0]) as f64 * tick_ns * 1e-6);
+            }
+        }
+        ms.sort_by(f64::total_cmp);
+        log::info!("{} segments at {width}x{height}: GPU median {:.2} ms, worst {:.2} ms ({bench} runs)", segs.len(), ms[ms.len() / 2], ms[ms.len() - 1]);
+        unsafe { d.destroy_query_pool(queries, None) };
+    }
     let t0 = std::time::Instant::now();
     unsafe {
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;

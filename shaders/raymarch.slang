@@ -1,26 +1,23 @@
-// Raymarches the painting: the exact round cones of every stroke, no voxels.
+// Raytraces the painting: the exact round cones of every stroke, no voxels.
 //
 // Two kinds of stroke:
-//   - Solid (opaque, hard edge): a surface. Sphere-traced to the hit, lit with its normal.
-//   - Soft (opacity or hardness below 1): a volume of density. Marched in small steps, front
-//     to back, over whatever solid surface or background is behind it.
+//   - Solid (opaque, hard edge): a surface. Each ray takes the nearest exact ray/round-cone
+//     intersection, lit with its normal. No marching.
+//   - Soft (opacity or hardness below 1): a volume of density. The ray integrates each
+//     segment's density, and blends the segments front to back over whatever solid surface or
+//     background is behind them. No marching either.
 //
-// One thread per pixel, one image layer per eye (dispatch z = eye). Two culling steps keep the
-// work per pixel small:
+// One thread per pixel, one image layer per eye (dispatch z = eye). The work per pixel stays
+// small in two ways:
 //   1. Tile: a 16x16 workgroup first collects, together, the segments whose bounding spheres
-//      touch the cone of view of its tile (in shared memory, at most MAX_TILE), sorted by
-//      segment number when the tile has soft segments.
-//   2. Ray: each pixel then collects the tile segments its own ray crosses (solid and soft
-//      apart), and traces only those.
+//      touch the cone of view of its tile (in shared memory, at most MAX_TILE).
+//   2. Order: the tile sorts its list near to far once, so each pixel blends the soft
+//      segments front to back in one pass, with no sorting of its own.
 // Writes linear color (RGBA16F); the present step encodes sRGB.
 import sdf;
 
 static const uint TILE = 16;
-static const uint MAX_TILE = 1024;
-static const uint MAX_SOLID = 48;
-static const uint MAX_SOFT = 32;
-static const uint MAX_STEPS = 192;
-static const uint MAX_VSTEPS = 384;
+static const uint MAX_TILE = 2048;
 
 struct Eye
 {
@@ -44,24 +41,17 @@ struct Params
 [[vk::binding(1, 0)]] StructuredBuffer<Segment> segments;
 [[vk::binding(2, 0)]] ConstantBuffer<Params> params;
 
-// Segments that touch this tile's cone of view (shared by the workgroup).
+// Segments that touch this tile's cone of view (shared by the workgroup), sorted near to far
+// by where their bounding spheres start.
 groupshared uint tileList[MAX_TILE];
+groupshared float tileKey[MAX_TILE];
 groupshared uint tileCount;
-groupshared uint tileSoft; // 1 when any of them is soft
-static bool tileAll;       // more than fit: the tile uses every segment
+static bool tileAll; // more than fit: the tile uses every segment
 
 uint tileN() { return tileAll ? params.segCount : min(tileCount, MAX_TILE); }
 uint tileSeg(uint i) { return tileAll ? i : tileList[i]; }
-
-// Candidates of this ray. When there are more than fit, the ray uses every tile segment of
-// that kind instead (`solidAll`, `softAll`). Soft candidates stay in segment order, so the
-// segments of one stroke are next to each other.
-static uint solid[MAX_SOLID];
-static uint solidCount;
-static bool solidAll;
-static uint soft[MAX_SOFT];
-static uint softCount;
-static bool softAll;
+// No segment from list position i on starts nearer than this (the list is sorted).
+float tileNear(uint i) { return tileAll ? 0.0 : tileKey[i]; }
 
 // The world-space direction of the ray through pixel position `px` (pixels, may be fractional).
 float3 rayDir(Eye eye, float2 px)
@@ -83,44 +73,6 @@ bool sphereInCone(float3 o, float3 axis, float angle, float4 sphere)
     return toCenter <= angle + asin(sphere.w / d);
 }
 
-// ---- Solid strokes: surfaces ----
-
-// The distance to the nearest solid candidate, and which one it is.
-float scene(float3 p, out uint nearest)
-{
-    float d = 1e9;
-    nearest = 0;
-    uint n = solidAll ? tileN() : solidCount;
-    for (uint i = 0; i < n; i++)
-    {
-        uint s = solidAll ? tileSeg(i) : solid[i];
-        Segment g = segments[s];
-        if (solidAll && !isSolid(g))
-            continue;
-        float ds = sdSegment(p, g);
-        if (ds < d)
-        {
-            d = ds;
-            nearest = s;
-        }
-    }
-    return d;
-}
-
-float sceneD(float3 p)
-{
-    uint unused;
-    return scene(p, unused);
-}
-
-// Normal from four samples (tetrahedron), Inigo Quilez.
-float3 normalAt(float3 p, float eps)
-{
-    const float2 k = float2(1.0, -1.0);
-    return normalize(k.xyy * sceneD(p + k.xyy * eps) + k.yyx * sceneD(p + k.yyx * eps) +
-                     k.yxy * sceneD(p + k.yxy * eps) + k.xxx * sceneD(p + k.xxx * eps));
-}
-
 static const float3 LIGHT = float3(0.39, 0.88, 0.29); // normalized (0.4, 0.9, 0.3)
 
 float3 shadeSurface(float3 base, float3 n, float3 dir)
@@ -135,76 +87,174 @@ float3 shadeSurface(float3 base, float3 n, float3 dir)
 
 // ---- Soft strokes: volumes ----
 
-// Density of the soft candidates at p: `sigma` (absorption per meter) and its mean lit color.
-// Inside one stroke only the segment with the nearest axis counts (its segments overlap at the
-// joints, and in the full-density core they tie); strokes add up. `outside`: about the distance to the nearest soft volume (0 inside one), for skipping
-// empty space. `rMin`: the smallest radius around p, for the step size.
-void field(float3 p, out float sigma, out float3 color, out float outside, out float rMin)
+// Each soft segment owns the part of its stroke between the planes that halve the angles at
+// its two joints. An open end (the first or last segment) has a flat cut there instead, and a
+// half sphere beyond it: the round end. So the segments of a stroke share it out with no
+// overlap and no gap, and different strokes add up.
+//
+// The density falls off with the distance from the axis, as a part of the radius (rho): full
+// inside `hardness`, then ((1 - rho) / (1 - hardness))^3 to 0 at the edge. Along a straight
+// line, this profile has a closed-form integral, so each segment's optical depth along the ray
+// is exact, with no steps. The segments are then blended front to back, in order of entry.
+
+// Antiderivative in s of (1 - rho)^3, rho = sqrt(q^2 + s^2).
+float shellAnti(float q, float s)
 {
-    sigma = 0.0;
-    float3 sum = 0.0;
-    outside = 1e9;
-    rMin = 1e9;
-    float best = 0.0;     // density of this stroke's nearest segment
-    float bestU = 1.0;    // its distance from the axis, as a part of the radius
-    float3 bestColor = 0.0;
-    float stroke = -1.0;
-    uint n = softAll ? tileN() : softCount;
-    for (uint i = 0; i < n; i++)
-    {
-        Segment g = segments[softAll ? tileSeg(i) : soft[i]];
-        if (softAll && isSolid(g))
-            continue;
-        if (g.style.y != stroke)
-        {
-            sigma += best;
-            sum += best * bestColor;
-            best = 0.0;
-            bestU = 1.0;
-            stroke = g.style.y;
-        }
-        // The nearest point of the axis, and the radius there.
-        float3 ba = g.b.xyz - g.a.xyz;
-        float h = saturate(dot(p - g.a.xyz, ba) / max(dot(ba, ba), 1e-12));
-        float3 c = g.a.xyz + ba * h;
-        float r = lerp(g.a.w, g.b.w, h);
-        float3 pc = p - c;
-        float dist = length(pc);
-        outside = min(outside, dist - r);
-        float u = dist / r;
-        if (u >= bestU)
-            continue;
-        bestU = u;
-        rMin = min(rMin, r);
-        // Full density inside `hardness` of the radius, then a falloff to 0 at the edge
-        // (cubic: most of the density near the core, so the cover fades out gradually).
-        float hard = g.style.x;
-        float e = saturate((1.0 - u) / max(1.0 - hard, 1e-3));
-        float f = e * e * e;
-        // Scaled so a ray through the middle is covered by `opacity` (at most 98%: a soft
-        // edge needs a core that is not quite saturated), at any hardness. Across the stroke
-        // the profile integrates to 2r * (hard + (1 - hard) / 4).
-        float depth = -log(1.0 - min(g.color.a, 0.98));
-        float k = depth / (2.0 * r * (hard + (1.0 - hard) * 0.25));
-        best = f * k;
-        float3 nrm = dist > 1e-6 ? pc / dist : float3(0.0, 1.0, 0.0);
-        float diff = saturate(dot(nrm, LIGHT) * 0.5 + 0.5);
-        float hemi = lerp(0.5, 1.0, nrm.y * 0.5 + 0.5);
-        // Softer strokes get flatter light: a haze has no clear surface to shade.
-        float lit = 0.35 * hemi + 0.75 * diff;
-        bestColor = g.color.rgb * lerp(0.85, lit, 0.4 + 0.6 * hard);
-    }
-    sigma += best;
-    sum += best * bestColor;
-    color = sigma > 0.0 ? sum / sigma : 0.0;
-    outside = max(outside, 0.0);
+    float r = sqrt(q * q + s * s);
+    float L = q > 1e-6 ? q * q * log((s + r) / q) : 0.0; // q^2 asinh(s / q)
+    float i1 = 0.5 * (s * r + L);                         // integral of rho
+    float i2 = q * q * s + s * s * s / 3.0;               // of rho^2
+    float i3 = 0.25 * s * r * r * r + 0.375 * q * q * (s * r + L); // of rho^3
+    return s - 3.0 * i1 + 3.0 * i2 - i3;
 }
 
-// Interleaved gradient noise (Jimenez): a per-pixel offset for the volume steps, so the steps
-// show as fine noise, not as bands.
-float pixelNoise(float2 px)
+// The profile integrated along a line at distance q (in radii) from the axis, from the point
+// nearest the axis to y further on (in radii; negative y: backward).
+float profileIntegral(float q, float y, float hard)
 {
-    return frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
+    float sgn = y < 0.0 ? -1.0 : 1.0;
+    y = min(abs(y), sqrt(max(1.0 - q * q, 0.0)));
+    if (y <= 0.0)
+        return 0.0;
+    if (hard > 0.98)
+    {
+        // A hard edge: a step at the radius that holds the same amount.
+        float rc = hard + (1.0 - hard) * 0.25;
+        return sgn * min(y, sqrt(max(rc * rc - q * q, 0.0)));
+    }
+    float yc = sqrt(max(hard * hard - q * q, 0.0)); // where the full-density core ends
+    float core = min(y, yc);
+    float shell = 0.0;
+    if (y > yc)
+    {
+        float w = 1.0 - hard;
+        shell = (shellAnti(q, y) - shellAnti(q, yc)) / (w * w * w);
+    }
+    return sgn * (core + shell);
+}
+
+// The profile's value at rho (for a ray along the axis).
+float profileAt(float rho, float hard)
+{
+    if (rho >= 1.0)
+        return 0.0;
+    float e = saturate((1.0 - rho) / max(1.0 - hard, 1e-3));
+    return e * e * e;
+}
+
+// Clips the ray interval `span` to the side of a plane (through q, normal n) that n points to.
+float2 clipPlane(float2 span, float3 o, float3 dir, float3 q, float3 n)
+{
+    float dn = dot(dir, n);
+    float dist = dot(q - o, n); // t * dn >= dist
+    if (abs(dn) < 1e-8)
+        return dist <= 0.0 ? span : float2(1.0, 0.0);
+    float t = dist / dn;
+    return dn > 0.0 ? float2(max(span.x, t), span.y) : float2(span.x, min(span.y, t));
+}
+
+// The light of a soft segment along a ray. `n`: the mean normal along the ray's path through
+// it, which is about the offset of the path from the axis, in radii (0 through the middle, so
+// the light changes smoothly across the stroke; the light is linear in n).
+float3 softLit(Segment g, float3 n)
+{
+    float diff = saturate(dot(n, LIGHT) * 0.5 + 0.5);
+    float hemi = lerp(0.5, 1.0, n.y * 0.5 + 0.5);
+    // Softer strokes get flatter light: a haze has no clear surface to shade.
+    float lit = 0.35 * hemi + 0.75 * diff;
+    return g.color.rgb * lerp(0.85, lit, 0.4 + 0.6 * g.style.x);
+}
+
+// A round end: the half sphere at c (radius r) on the side of the plane through c that n
+// points to. Adds its optical depth within `span` (in units of the profile integral) and its
+// lit color, weighted.
+void softCap(Segment g, float3 c, float r, float3 n, float3 o, float3 dir, float2 span, inout float tau, inout float3 col)
+{
+    span = clipPlane(span, o, dir, c, n);
+    float tc = dot(c - o, dir);
+    float3 off = o + dir * tc - c;
+    float q = length(off) / r;
+    if (q >= 1.0 || span.x >= span.y)
+        return;
+    float d = profileIntegral(q, (span.y - tc) / r, g.style.x) - profileIntegral(q, (span.x - tc) / r, g.style.x);
+    tau += d;
+    col += d * softLit(g, off / r);
+}
+
+// The segment's optical depth along the ray within `span`, and its mean color.
+float softOptical(uint s, float3 o, float3 dir, float2 span, out float3 color)
+{
+    Segment g = segments[s];
+    color = 0.0;
+    float3 ba = g.b.xyz - g.a.xyz;
+    float len = length(ba);
+    float hard = g.style.x;
+    // Scaled so a ray through the middle is covered by `opacity` (at most 98%: a soft edge
+    // needs a core that is not quite saturated), at any hardness. Across the stroke the profile
+    // integrates to 2 * (hard + (1 - hard) / 4) radii.
+    float k = -log(1.0 - min(g.color.a, 0.98)) / (2.0 * (hard + (1.0 - hard) * 0.25));
+    float tau = 0.0; // in profile-integral units until the end
+    float3 col = 0.0;
+    if (len < 1e-7)
+    {
+        // A single point: a whole sphere.
+        softCap(g, g.a.xyz, max(g.a.w, g.b.w), -dir, o, dir, span, tau, col);
+        softCap(g, g.a.xyz, max(g.a.w, g.b.w), dir, o, dir, span, tau, col);
+    }
+    else
+    {
+        float3 u = ba / len;
+        // The cut at a: the plane halving the joint with the previous segment, or flat.
+        float2 body = span;
+        bool openA = !(s > 0 && segments[s - 1].style.y == g.style.y);
+        float3 na = u;
+        if (!openA)
+        {
+            float3 pd = segments[s - 1].b.xyz - segments[s - 1].a.xyz;
+            float3 n = (dot(pd, pd) > 1e-14 ? normalize(pd) : u) + u;
+            if (dot(n, n) > 1e-8)
+                na = normalize(n);
+        }
+        body = clipPlane(body, o, dir, g.a.xyz, na);
+        bool openB = !(s + 1 < params.segCount && segments[s + 1].style.y == g.style.y);
+        float3 nb = u;
+        if (!openB)
+        {
+            float3 qd = segments[s + 1].b.xyz - segments[s + 1].a.xyz;
+            float3 n = (dot(qd, qd) > 1e-14 ? normalize(qd) : u) + u;
+            if (dot(n, n) > 1e-8)
+                nb = normalize(n);
+        }
+        body = clipPlane(body, o, dir, g.b.xyz, -nb);
+        // The body: the ray against the axis line. Its distance from the axis is
+        // sqrt(d0^2 + (sp * (t - tc))^2).
+        float3 oa = o - g.a.xyz;
+        float3 dp = dir - u * dot(dir, u);
+        float3 op = oa - u * dot(oa, u);
+        float sp2 = dot(dp, dp);
+        float tc = sp2 > 1e-12 ? -dot(op, dp) / sp2 : 0.0;
+        float3 off = op + dp * tc; // from the axis to the ray's nearest point
+        float hc = saturate(dot(o + dir * tc - g.a.xyz, u) / len);
+        float r = lerp(g.a.w, g.b.w, hc);
+        float q = length(off) / r;
+        if (body.x < body.y && q < 1.0)
+        {
+            float sp = sqrt(sp2);
+            float d;
+            if (sp < 1e-3)
+                d = profileAt(q, hard) * (body.y - body.x) / r; // along the axis
+            else
+                d = (profileIntegral(q, sp * (body.y - tc) / r, hard) - profileIntegral(q, sp * (body.x - tc) / r, hard)) / sp;
+            tau += d;
+            col += d * softLit(g, off / r);
+        }
+        if (openA)
+            softCap(g, g.a.xyz, g.a.w, -u, o, dir, span, tau, col);
+        if (openB)
+            softCap(g, g.b.xyz, g.b.w, u, o, dir, span, tau, col);
+    }
+    color = tau > 0.0 ? col / tau : 0.0;
+    return tau * k;
 }
 
 // ---- Background ----
@@ -253,37 +303,35 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                              min(dot(axis, rayDir(eye, float2(lo.x, hi.y))), dot(axis, rayDir(eye, float2(hi.x, lo.y)))));
         float angle = acos(clamp(cosAngle, -1.0, 1.0));
         if (gi == 0)
-        {
             tileCount = 0;
-            tileSoft = 0;
-        }
         GroupMemoryBarrierWithGroupSync();
         for (uint s = gi; s < params.segCount; s += TILE * TILE)
         {
-            Segment g = segments[s];
-            if (sphereInCone(o, axis, angle, segmentBounds(g)))
+            if (sphereInCone(o, axis, angle, segmentBounds(segments[s])))
             {
                 uint k;
                 InterlockedAdd(tileCount, 1, k);
                 if (k < MAX_TILE)
+                {
+                    float4 b = segmentBounds(segments[s]);
                     tileList[k] = s;
-                if (!isSolid(g))
-                    tileSoft = 1;
+                    tileKey[k] = max(length(b.xyz - o) - b.w, 0.0);
+                }
             }
         }
         GroupMemoryBarrierWithGroupSync();
         tileAll = tileCount > MAX_TILE;
 
-        // Soft segments of one stroke must come together: sort the list (bitonic, in place).
-        // When it overflowed, the tile uses every segment, which is in order already.
-        if (tileSoft != 0 && !tileAll && tileCount > 1)
+        // Sort near to far (bitonic, in place). When the list overflowed, the tile uses every
+        // segment in stored order instead.
+        if (!tileAll && tileCount > 1)
         {
             uint n = tileCount;
             uint size = 2;
             while (size < n)
                 size <<= 1;
             for (uint i = n + gi; i < size; i += TILE * TILE)
-                tileList[i] = 0xffffffff;
+                tileKey[i] = 1e30;
             GroupMemoryBarrierWithGroupSync();
             for (uint k = 2; k <= size; k <<= 1)
             {
@@ -292,15 +340,14 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                     for (uint i = gi; i < size; i += TILE * TILE)
                     {
                         uint l = i ^ j;
-                        if (l > i)
+                        if (l > i && (tileKey[i] > tileKey[l]) == ((i & k) == 0))
                         {
-                            uint a = tileList[i];
-                            uint b = tileList[l];
-                            if ((a > b) == ((i & k) == 0))
-                            {
-                                tileList[i] = b;
-                                tileList[l] = a;
-                            }
+                            float key = tileKey[i];
+                            tileKey[i] = tileKey[l];
+                            tileKey[l] = key;
+                            uint seg = tileList[i];
+                            tileList[i] = tileList[l];
+                            tileList[l] = seg;
                         }
                     }
                     GroupMemoryBarrierWithGroupSync();
@@ -315,101 +362,56 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     // The ray of the next pixel to the right: the angle of one pixel.
     float pix = length(rayDir(eye, float2(id.xy) + float2(1.5, 0.5)) - dir);
 
-    // 2. Candidates: tile segments whose bounding sphere the ray crosses in front of the eye.
-    solidCount = 0;
-    softCount = 0;
-    float2 solidSpan = float2(1e9, 0.0);
-    float2 softSpan = float2(1e9, 0.0);
-    for (uint j = 0; j < tileN(); j++)
-    {
-        uint s = tileSeg(j);
-        Segment g = segments[s];
-        float2 tt = raySphere(o, dir, segmentBounds(g));
-        if (tt.x > tt.y || tt.y < 0.0)
-            continue;
-        float2 span = float2(max(tt.x, 0.0), tt.y);
-        if (isSolid(g))
-        {
-            solidSpan = float2(min(solidSpan.x, span.x), max(solidSpan.y, span.y));
-            if (solidCount < MAX_SOLID)
-                solid[solidCount] = s;
-            solidCount++;
-        }
-        else
-        {
-            softSpan = float2(min(softSpan.x, span.x), max(softSpan.y, span.y));
-            if (softCount < MAX_SOFT)
-                soft[softCount] = s;
-            softCount++;
-        }
-    }
-    solidAll = solidCount > MAX_SOLID;
-    softAll = softCount > MAX_SOFT;
-
     float tFloor;
     float3 color = background(o, dir, pix, tFloor);
-    float tBehind = tFloor;
 
-    // 3. Solid: sphere trace from the first entry to the last exit.
-    if (solidCount > 0)
+    // 2. Solid: the nearest exact hit among the tile's solid segments.
+    float tBehind = tFloor;
+    bool anySoft = false;
+    for (uint j = 0; j < tileN() && tileNear(j) < tBehind; j++)
     {
-        float t = solidSpan.x;
-        float tMax = min(solidSpan.y, tFloor);
-        for (uint i = 0; i < MAX_STEPS && t < tMax; i++)
+        Segment g = segments[tileSeg(j)];
+        float2 tt = raySphere(o, dir, segmentBounds(g));
+        if (tt.x > tt.y || tt.y < 0.0 || tt.x >= tBehind)
+            continue;
+        if (!isSolid(g))
         {
-            float3 p = o + dir * t;
-            uint nearest;
-            float d = scene(p, nearest);
-            float hit = 0.0001 + t * 0.0004; // about a pixel
-            if (d < hit)
-            {
-                float3 n = normalAt(p, max(hit, 0.0002));
-                color = shadeSurface(segments[nearest].color.rgb, n, dir);
-                tBehind = t;
-                break;
-            }
-            t += d;
+            anySoft = true;
+            continue;
+        }
+        float4 hit = raySegment(o, dir, g);
+        if (hit.x >= 0.0 && hit.x < tBehind)
+        {
+            tBehind = hit.x;
+            color = shadeSurface(g.color.rgb, hit.yzw, dir);
         }
     }
 
-    // 4. Soft: march the volume in front of whatever is behind, front to back.
-    if (softCount > 0)
+    // 3. Soft: the volumes in front of whatever is behind, blended front to back in the
+    //    tile's order.
+    if (anySoft)
     {
-        float t = softSpan.x;
-        float tMax = min(softSpan.y, tBehind);
-        float jitter = pixelNoise(float2(id.xy) + float2(id.z * 37, 0));
         float T = 1.0; // what still shows through
         float3 sum = 0.0;
-        bool inside = false;
-        for (uint i = 0; i < MAX_VSTEPS && t < tMax && T > 0.004; i++)
+        for (uint j = 0; j < tileN() && tileNear(j) < tBehind && T > 0.004; j++)
         {
-            float sigma, outside, rMin;
+            uint s = tileSeg(j);
+            Segment g = segments[s];
+            if (isSolid(g))
+                continue;
+            float2 tt = raySphere(o, dir, segmentBounds(g));
+            if (tt.x > tt.y || tt.y < 0.0 || tt.x >= tBehind)
+                continue;
             float3 c;
-            field(o + dir * t, sigma, c, outside, rMin);
-            if (sigma <= 0.0)
-            {
-                // Empty: skip toward the next volume.
-                inside = false;
-                t += max(outside * 0.9, 0.0003);
-                continue;
-            }
-            float dt = clamp(rMin * 0.07, 0.0002, 0.01);
-            if (!inside)
-            {
-                // Just entered: start a random part of a step in.
-                inside = true;
-                t += jitter * dt;
-                continue;
-            }
-            float alpha = 1.0 - exp(-sigma * dt);
+            float tau = softOptical(s, o, dir, float2(max(tt.x, 0.0), min(tt.y, tBehind)), c);
+            float alpha = 1.0 - exp(-tau);
             sum += T * alpha * c;
             T *= 1.0 - alpha;
-            t += dt;
         }
         color = sum + T * color;
     }
 
-    // 5. The brush tip, where the next stroke starts: a preview of its color, opacity and
+    // 4. The brush tip, where the next stroke starts: a preview of its color, opacity and
     //    hardness (drawn over everything), with a thin outline so it shows at any opacity.
     if (params.brushTip.w > 0.0)
     {

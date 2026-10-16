@@ -30,6 +30,56 @@ public float sdRoundCone(float3 p, float3 a, float ra, float3 b, float rb)
     return (sqrt(x2 * a2 * il2) + y * rr) * il2 - ra;
 }
 
+// Where a ray (from o, unit dir) first enters a sphere: x = t (negative: a miss, or the ray
+// starts inside), yzw = the normal there.
+public float4 rayEnterSphere(float3 o, float3 dir, float3 c, float r)
+{
+    float3 oc = o - c;
+    float b = dot(oc, dir);
+    float h = b * b - (dot(oc, oc) - r * r);
+    if (h < 0.0)
+        return float4(-1.0, 0.0, 0.0, 0.0);
+    float t = -b - sqrt(h);
+    return float4(t, (oc + dir * t) / r);
+}
+
+// Where a ray (from o, unit dir) first enters a round cone: x = t (negative: a miss, or the
+// ray starts inside), yzw = the normal there. Exact (Inigo Quilez, "rounded cone
+// intersection"). The same as ray_round_cone in crates/core/src/sdf.rs, which is tested.
+public float4 rayRoundCone(float3 o, float3 dir, float3 a, float ra, float3 b, float rb)
+{
+    float3 ba = b - a;
+    float m0 = dot(ba, ba);
+    float rr = ra - rb;
+    if (rr * rr >= m0)
+        return ra >= rb ? rayEnterSphere(o, dir, a, ra) : rayEnterSphere(o, dir, b, rb);
+    float3 oa = o - a;
+    float m1 = dot(ba, oa);
+    float m2 = dot(ba, dir);
+    float m3 = dot(dir, oa);
+    float m5 = dot(oa, oa);
+    // The side: a quadratic in t.
+    float d2 = m0 - rr * rr;
+    float k2 = d2 - m2 * m2;
+    float k1 = d2 * m3 - m1 * m2 + m2 * rr * ra;
+    float k0 = d2 * m5 - m1 * m1 + m1 * rr * ra * 2.0 - m0 * ra * ra;
+    float h = k1 * k1 - k0 * k2;
+    if (h < 0.0)
+        return float4(-1.0, 0.0, 0.0, 0.0);
+    float t = (-sqrt(h) - k1) / k2;
+    float y = m1 - ra * rr + t * m2;
+    if (y > 0.0 && y < d2)
+        return float4(t, normalize(d2 * (oa + dir * t) - ba * y));
+    // The ends: the first entry of either sphere.
+    float4 ea = rayEnterSphere(o, dir, a, ra);
+    float4 eb = rayEnterSphere(o, dir, b, rb);
+    if (ea.x < 0.0)
+        return eb;
+    if (eb.x < 0.0)
+        return ea;
+    return ea.x <= eb.x ? ea : eb;
+}
+
 // Smooth minimum (polynomial): blends two distances over k.
 public float smin(float a, float b, float k)
 {
@@ -54,6 +104,11 @@ public struct Segment
 public bool isSolid(Segment s)
 {
     return s.color.a >= 0.999 && s.style.x >= 0.999;
+}
+
+public float4 raySegment(float3 o, float3 dir, Segment s)
+{
+    return rayRoundCone(o, dir, s.a.xyz, s.a.w, s.b.xyz, s.b.w);
 }
 
 public float sdSegment(float3 p, Segment s)
