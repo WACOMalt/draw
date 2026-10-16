@@ -258,16 +258,6 @@ Tests in headless Chromium with SwiftShader compare 2D and WebGL2 screenshots on
 - Edits: while a shape changes (a drag, a slider), the change is a draft. A layer with drafts draws straight to the screen each frame, from all its shapes, in place of its tiles. When the drafts end, this continues until the tiles of the layer in view are current. Thus a drag shows at once, and the layer does not flash back.
 - Far zoom-out is not optimized yet: each tile draws every shape that touches it.
 
-### 6.7 Pigment mixing
-
-Kubelka-Munk spectral mixing, from spectral.js by Ronald van Wijnen (MIT License, `src/client/engine/gl/spectral.ts` keeps the notice). Rebelle and Mixbox mix paint with the same physics; their exact models are not published, so this is the open equivalent.
-
-- **Model:** a color becomes a reflectance curve at 38 wavelengths (380 to 750 nm), as a sum of 7 base curves (white, cyan, magenta, yellow, red, green, blue). Each paint's absorption over scattering, K/S = (1 − R)² / 2R, mixes by weight; the mix goes back to reflectance (R = 1 + K/S − √((K/S)² + 2 K/S)), then to sRGB through the CIE 1931 observer.
-- **Weights:** the stroke's coverage (its alpha times its opacity) and what shows of the paint below it (its alpha times 1 − the stroke's coverage), each times the paint's luminance (spectral.js). spectral.js weighs by the square of a factor; the factors are the square roots of the coverages, so the weight stays in proportion to the coverage and a thin glaze still tints. An opaque stroke covers. Alpha composites as normal.
-- **Where:** in the WebGL2 renderer, a paint stroke builds up in the stroke buffer (strokeT), as below full opacity, and the pigment pass (`PIGMENT_FS`) mixes it into the tile, inside the stroke's box, through a tile-sized buffer (a pass cannot read the target it writes). Vector strokes mix the same way. A stroke in progress mixes into the layer's screen buffer, inside the box of its dabs on screen. Thus the stroke shows the same while drawn and after. A change of the mode draws every tile again.
-- **Cost:** the pass is heavy (two reflectance curves and three CIE sums for each pixel), so the tile budget counts it as about 40 copies of the box. Strokes no longer share draw calls on a pigment canvas.
-- The Canvas 2D fallback mixes as normal.
-
 ### 6.5 Effects: blur, shadow and glows
 
 The blur follows glsl-fast-gaussian-blur (Experience Monks): a separable Gaussian (one pass across, one down), with each tap between two texels so that the bilinear filter reads both with their weights (linear sampling). `src/client/engine/blur.ts` computes the kernel for any standard deviation up to 4 px: at most 7 taps per side and the center.
@@ -285,6 +275,20 @@ The blur follows glsl-fast-gaussian-blur (Experience Monks): a separable Gaussia
 - The local stroke draws at once. The input uses `getCoalescedEvents()` for full pen rate.
 - Remote strokes in progress arrive as `live` messages every 40 ms. Each one draws into its own buffer.
 - At pointer up, the client sends `stroke.add`. The buffer stays on screen until the tiles show the stroke. Then the client removes the buffer.
+
+### 6.7 Pigment mixing
+
+Kubelka-Munk spectral mixing, from spectral.js by Ronald van Wijnen (MIT License, `src/client/engine/gl/spectral.ts` keeps the notice). Rebelle and Mixbox mix paint with the same physics; their exact models are not published, so this is the open equivalent.
+
+- **Model:** a color becomes a reflectance curve at 38 wavelengths (380 to 750 nm), as a sum of 7 base curves (white, cyan, magenta, yellow, red, green, blue). Each paint's absorption over scattering, K/S = (1 − R)² / 2R, mixes by weight; the mix goes back to reflectance (R = 1 / (1 + K/S + √(K/S (K/S + 2))), the same as 1 + K/S − √((K/S)² + 2 K/S) without the cancellation that 32-bit floats cannot hold), then to sRGB through the CIE 1931 observer.
+- **Amounts:** t is the stroke's coverage (its alpha times its opacity) over the sum of the coverage and what shows of the paint below it (its alpha times 1 − the stroke's coverage). The KM concentrations are the amounts times each paint's luminance (spectral.js). An opaque stroke covers. Alpha composites as normal.
+- **Even rate:** where one paint absorbs a band of wavelengths almost fully, a trace of it overrules the other paint. A plain KM mix by amount thus stays at the strong paint for most of the way and jumps to the weak one in the last percent: a hard edge at each end of a gradient, and a glaze that does nothing until it is opaque. Six bisection steps on the KM amount, in logit space (amount = 1 / (1 + e^−z), z from −12 to 12), find the mix that sits the fraction t of the OKLab way from the paint below to the stroke (distance to the one over the sum of the distances to both).
+- **Hue mix:** KM alone mixes sRGB red and blue into a grey brown (their reflectance curves share almost no wavelength). A second mix in OKLab takes the lightness and the hue (along the short way round) at t, and the chroma at t times 1 − (1 − √|cos(Δh/2)|) · 4t(1 − t), so the ends stay exact. The two mixes blend in OKLab, weighted by chroma⁴: the more colorful one wins. Thus blue and yellow stay the KM green, red and blue make purple, and the ends of every mix are the two paints. Out-of-gamut results clamp per channel (chroma reduction at constant lightness made larger steps near the gamut cusps).
+- **Check:** gradient loops (pure red, yellow, blue; paint red #d0201b, yellow #f2d21b, blue #1f4fd1; cyan, magenta, yellow; red, green, blue), 341 pixels for each pair: the largest OKLab step is at most 2.5 times the mean step of its pair, and the step across each stop at most 1.4 times. Normal compositing measures 1.5 to 2.6. Plain KM measured up to 36 and 49.
+- **Lorentz Pigment Mixing** (Ivković et al., 2025, code GPL-3.0) was examined and not used. It shapes an RGB interpolation with a curve and a damped differential equation, for each channel apart. Any mix that treats R, G and B alike gives R = G for yellow (1, 1, 0) and blue (0, 0, 1), so it cannot make green. Its code is a filter for a whole image (channel cross-talk weighted by a Lorentzian of the image position, then 1.4× brighter), not a mix of two paints by amount.
+- **Where:** in the WebGL2 renderer, a paint stroke builds up in the stroke buffer (strokeT), as below full opacity, and the pigment pass (`PIGMENT_FS`) mixes it into the tile, inside the stroke's box, through a tile-sized buffer (a pass cannot read the target it writes). Vector strokes mix the same way. A stroke in progress mixes into the layer's screen buffer, inside the box of its dabs on screen. Thus the stroke shows the same while drawn and after. A change of the mode draws every tile again.
+- **Cost:** the pass is heavy (two reflectance curves, then seven KM mixes of 38 wavelengths with their CIE sums, for each pixel; about 3 times one KM mix on the GPU), so the tile budget counts it as about 120 copies of the box. Strokes no longer share draw calls on a pigment canvas.
+- The Canvas 2D fallback mixes as normal.
 
 ## 7. Sync protocol
 
