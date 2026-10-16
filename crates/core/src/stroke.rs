@@ -33,6 +33,11 @@ impl Default for Brush {
 }
 
 impl Brush {
+    /// Opaque with a hard edge: drawn as a surface. Else drawn as density stamps.
+    pub fn solid(&self) -> bool {
+        self.opacity >= 0.999 && self.hardness >= 0.999
+    }
+
     /// The radius at a pressure.
     pub fn radius_at(&self, pressure: f32) -> f32 {
         if !self.pressure_size {

@@ -112,3 +112,22 @@ pub fn dense() -> Painting {
     }
     p
 }
+
+/// Big soft strokes that overlap themselves: a loop that crosses itself across the view, and
+/// one that folds back in depth. Where a stroke overlaps itself, its density adds up.
+pub fn overlap() -> Painting {
+    let mut p = Painting::default();
+    let soft = |color| Brush { radius: 0.06, color, hardness: 0.0, opacity: 0.45, pressure_size: false, ..Default::default() };
+    // A figure-eight in the plane facing the viewer.
+    p.strokes.push(stroke(soft([0.95, 0.35, 0.2]), 300, |t| {
+        let a = t * TAU;
+        (Vec3::new(-0.3 + (a).sin() * 0.22, 1.3 + (2.0 * a).sin() * 0.12, 0.0), 1.0)
+    }));
+    // A hairpin that folds back toward the viewer: its two halves line up along the view.
+    p.strokes.push(stroke(soft([0.2, 0.55, 0.95]), 300, |t| {
+        // Out toward the viewer and back, a little lower: from the front, the halves overlap.
+        let a = t * std::f32::consts::PI;
+        (Vec3::new(0.3 + (t - 0.5) * 0.06, 1.3 - t * 0.06, a.sin() * 0.3), 1.0)
+    }));
+    p
+}

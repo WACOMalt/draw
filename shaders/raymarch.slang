@@ -3,9 +3,9 @@
 // Two kinds of stroke:
 //   - Solid (opaque, hard edge): a surface. Each ray takes the nearest exact ray/round-cone
 //     intersection, lit with its normal. No marching.
-//   - Soft (opacity or hardness below 1): a layer per stroke, as in the 2D app. Its cover
-//     comes from how near the ray passes to the stroke's center line. The layers are blended
-//     front to back over whatever solid surface or background is behind them.
+//   - Soft (opacity or hardness below 1): a row of density stamps (spheres with the 2D app's
+//     brush falloff), all adding up. The ray takes each stamp's exact optical depth into depth
+//     slices, then blends the slices front to back over whatever is behind them.
 //
 // One thread per pixel, one image layer per eye (dispatch z = eye). The work per pixel stays
 // small in two ways:
@@ -18,7 +18,7 @@
 import sdf;
 
 static const uint TILE = 16;
-static const uint MAX_TILE = 2048;
+static const uint MAX_TILE = 1024;
 
 struct Eye
 {
@@ -100,18 +100,36 @@ float3 shadeSurface(float3 base, float3 n, float3 dir)
     return base * (0.25 * hemi + 0.85 * diff * diff) + spec + rim;
 }
 
-// ---- Soft strokes: layers ----
+// ---- Soft strokes: density stamps ----
 
-// A soft stroke works like a stroke of the 2D app, seen from where the ray is: its cover along
-// a ray comes from how near the ray passes to the stroke's center line (as a part of the
-// radius there), through the brush falloff, times its opacity. Each stroke is one layer: where
-// it folds or crosses itself it does not build up, the nearest pass counts. The layers are
-// blended front to back by the depth of that nearest pass.
+// A soft stroke is a row of density stamps, one at each resampled point (a segment's `a`, and
+// the last segment's `b`): spheres whose density falls off from the center by the 2D app's
+// brush falloff, scaled by the stamp's strength (style.z, style.w). All stamps add up: along a
+// stroke, where it crosses itself, and between strokes.
+//
+// The ray samples this density through the volume in BINS depth slices over the part of the
+// ray that soft chunks cover. Each stamp's optical depth goes into the slices its chord
+// crosses, exactly (the line integral of the falloff); then the slices are blended front to
+// back. Within a slice the order does not count; between slices it does.
 
-static const uint MAX_LAYERS = 8;
+static const uint BINS = 12;
+// The slices of every pixel of the tile, in shared memory: each a pair of half floats (optical
+// depth, red) and (green, blue), the color weighted by the depth. Per-thread arrays indexed at
+// run time spill to local memory, which made the soft pass three times slower.
+groupshared uint2 bins[BINS * TILE * TILE];
+static uint lane; // this thread's place in the tile
 
-// The brush falloff of the 2D app: cover at distance u (a part of the radius) from the center
-// line. Full inside `hard`, then a raised cosine down to 0 at the edge.
+void binAdd(uint k, float tau, float3 c)
+{
+    uint i = k * TILE * TILE + lane;
+    uint2 v = bins[i];
+    float2 a = float2(f16tof32(v.x), f16tof32(v.x >> 16)) + float2(tau, c.r);
+    float2 b = float2(f16tof32(v.y), f16tof32(v.y >> 16)) + c.gb;
+    bins[i] = uint2(f32tof16(a.x) | (f32tof16(a.y) << 16), f32tof16(b.x) | (f32tof16(b.y) << 16));
+}
+
+// The brush falloff of the 2D app: 1 inside `hard` of the radius, then a raised cosine down
+// to 0 at the edge. `u`: the distance from the center, in radii. (vdraw_core::segments::falloff)
 float brushFalloff(float u, float hard)
 {
     if (u >= 1.0)
@@ -122,9 +140,37 @@ float brushFalloff(float u, float hard)
     return 0.5 + 0.5 * cos(3.14159265 * x);
 }
 
-// The light of a soft stroke. `n`: the offset of the ray's nearest pass from the center line,
-// in radii (0 through the middle, so the light changes smoothly across the stroke; the light
-// is linear in n).
+// The falloff integrated along a line at distance q (radii) from a stamp's center, from the
+// line's nearest point to y further on (radii; negative: backward). The full-density core is
+// exact; the falloff shell, which is smooth, by 4-point Gauss.
+float stampLine(float q, float y, float hard)
+{
+    float sgn = y < 0.0 ? -1.0 : 1.0;
+    y = min(abs(y), sqrt(max(1.0 - q * q, 0.0)));
+    if (y <= 0.0)
+        return 0.0;
+    float yc = sqrt(max(hard * hard - q * q, 0.0)); // where the core ends
+    float core = min(y, yc);
+    float shell = 0.0;
+    if (y > yc)
+    {
+        const float X[2] = { 0.3399810436, 0.8611363116 };
+        const float W[2] = { 0.6521451549, 0.3478548451 };
+        float mid = 0.5 * (y + yc);
+        float half = 0.5 * (y - yc);
+        for (uint k = 0; k < 2; k++)
+        {
+            float s0 = mid - X[k] * half;
+            float s1 = mid + X[k] * half;
+            shell += W[k] * (brushFalloff(sqrt(q * q + s0 * s0), hard) + brushFalloff(sqrt(q * q + s1 * s1), hard));
+        }
+        shell *= half;
+    }
+    return sgn * (core + shell);
+}
+
+// The light of a soft stamp. `n`: the offset of the ray's nearest point from the center, in
+// radii (0 through the middle, so the light changes smoothly; the light is linear in n).
 float3 softLit(Segment g, float3 n)
 {
     float diff = saturate(dot(n, LIGHT) * 0.5 + 0.5);
@@ -134,8 +180,37 @@ float3 softLit(Segment g, float3 n)
     return g.color.rgb * lerp(0.85, lit, 0.4 + 0.6 * g.style.x);
 }
 
+// One stamp (center c, radius r, strength) into the slices: its optical depth along the ray,
+// between t0 and t1 (the slices' span), split where the slice edges cut its chord.
+void addStamp(Segment g, float3 c, float r, float strength, float3 o, float3 dir, float t0, float t1)
+{
+    float tc = dot(c - o, dir);
+    float3 off = o + dir * tc - c;
+    float q = length(off) / r;
+    if (q >= 1.0 || strength <= 0.0)
+        return;
+    float half = r * sqrt(1.0 - q * q);
+    float a = max(tc - half, t0);
+    float b = min(tc + half, t1);
+    if (a >= b)
+        return;
+    float3 lit = softLit(g, off / r);
+    float perBin = (t1 - t0) / float(BINS);
+    uint k0 = min(uint((a - t0) / perBin), BINS - 1);
+    uint k1 = min(uint((b - t0) / perBin), BINS - 1);
+    float before = stampLine(q, (a - tc) / r, g.style.x);
+    for (uint k = k0; k <= k1; k++)
+    {
+        float edge = min(b, t0 + perBin * float(k + 1));
+        float upto = stampLine(q, (edge - tc) / r, g.style.x);
+        float tau = strength * (upto - before);
+        binAdd(k, tau, tau * lit);
+        before = upto;
+    }
+}
+
 // The nearest points of a ray (o + t dir, t >= 0) and a segment (a + s (b - a), s in 0..1).
-// Returns the offset from the segment's point to the ray's.
+// Returns the offset from the segment's point to the ray's. (For the laser.)
 float3 rayToSegment(float3 o, float3 dir, float3 a, float3 b, out float t, out float s)
 {
     float3 ba = b - a;
@@ -150,22 +225,6 @@ float3 rayToSegment(float3 o, float3 dir, float3 a, float3 b, out float t, out f
     s = bb > 1e-12 ? saturate((ob + t * bd) / bb) : 0.0;
     t = max(s * bd - od, 0.0);
     return w + dir * t - ba * s;
-}
-
-// One soft segment along the ray: its cover (0 when the ray passes outside it), the depth of
-// the nearest pass, and the lit color there. `tBehind`: a solid surface or the floor; a pass
-// beyond it fades out within half a radius.
-float softCover(Segment g, float3 o, float3 dir, float tBehind, out float t, out float3 color, out float r)
-{
-    float s;
-    float3 off = rayToSegment(o, dir, g.a.xyz, g.b.xyz, t, s);
-    r = lerp(g.a.w, g.b.w, s);
-    float u = length(off) / r;
-    color = 0.0;
-    float cover = g.color.a * brushFalloff(u, g.style.x) * saturate((tBehind - t) / (0.5 * r));
-    if (cover > 0.0)
-        color = softLit(g, off / r);
-    return cover;
 }
 
 // ---- Background ----
@@ -305,23 +364,11 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         }
     }
 
-    // 3. Soft: one layer per stroke, then the layers front to back.
-    //    A layer's cover is the stroke's best cover along the ray (it does not build up where
-    //    the stroke folds); its color, depth and radius are means over the stroke's segments,
-    //    weighted by cover^4, so they change smoothly where segments tie.
+    // 3. Soft: the stamps' density through the volume in front of whatever is behind.
     if (anySoft)
     {
-        float layerId[MAX_LAYERS];
-        float layerCover[MAX_LAYERS];
-        float layerW[MAX_LAYERS];      // sum of weights
-        float layerT[MAX_LAYERS];      // weighted sums, then means
-        float layerR[MAX_LAYERS];
-        float3 layerColor[MAX_LAYERS];
-        uint layers = 0;
-        // Strokes past MAX_LAYERS: one rest layer behind the others, in no order.
-        float restT = 1.0;
-        float3 restSum = 0.0;
-        float restCover = 0.0;
+        // The span the soft chunks cover along the ray.
+        float t0 = tBehind, t1 = 0.0;
         for (uint j = 0; j < tileN() && tileNear(j) < tBehind; j++)
         {
             Chunk ch = chunks[tileSeg(j)];
@@ -330,92 +377,46 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             float2 tc = raySphere(o, dir, ch.sphere);
             if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
                 continue;
-            // The chunk's part (a chunk is all one stroke).
-            float cover = 0.0, w = 0.0, wt = 0.0, wr = 0.0;
-            float3 wc = 0.0;
-            for (uint s = ch.first; s < ch.first + ch.count; s++)
+            t0 = min(t0, max(tc.x, 0.0));
+            t1 = max(t1, min(tc.y, tBehind));
+        }
+        if (t1 > t0)
+        {
+            lane = gi;
+            for (uint k = 0; k < BINS; k++)
+                bins[k * TILE * TILE + gi] = uint2(0, 0);
+            for (uint j = 0; j < tileN() && tileNear(j) < tBehind; j++)
             {
-                float ts, rs;
-                float3 cs;
-                float cv = softCover(segments[s], o, dir, tBehind, ts, cs, rs);
-                if (cv <= 0.0)
+                Chunk ch = chunks[tileSeg(j)];
+                if (ch.soft == 0)
                     continue;
-                float ws = cv * cv * cv * cv;
-                cover = max(cover, cv);
-                w += ws;
-                wt += ws * ts;
-                wr += ws * rs;
-                wc += ws * cs;
-            }
-            if (cover <= 0.0)
-                continue;
-            float id = segments[ch.first].style.y;
-            uint k = 0;
-            while (k < layers && layerId[k] != id)
-                k++;
-            if (k == layers)
-            {
-                if (layers < MAX_LAYERS)
-                    layers++;
-                else
+                float2 tc = raySphere(o, dir, ch.sphere);
+                if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
+                    continue;
+                for (uint s = ch.first; s < ch.first + ch.count; s++)
                 {
-                    // Full: the farthest of the layers and this one goes to the rest.
-                    k = 0;
-                    for (uint i = 1; i < MAX_LAYERS; i++)
-                        if (layerT[i] / layerW[i] > layerT[k] / layerW[k])
-                            k = i;
-                    if (wt / w >= layerT[k] / layerW[k])
-                    {
-                        restSum += cover * wc / w;
-                        restCover += cover;
-                        restT *= 1.0 - cover;
-                        continue;
-                    }
-                    restSum += layerCover[k] * layerColor[k] / layerW[k];
-                    restCover += layerCover[k];
-                    restT *= 1.0 - layerCover[k];
+                    Segment g = segments[s];
+                    addStamp(g, g.a.xyz, g.a.w, g.style.z, o, dir, t0, t1);
+                    if (g.style.w > 0.0)
+                        addStamp(g, g.b.xyz, g.b.w, g.style.w, o, dir, t0, t1);
                 }
-                layerId[k] = id;
-                layerCover[k] = 0.0;
-                layerW[k] = 0.0;
-                layerT[k] = 0.0;
-                layerR[k] = 0.0;
-                layerColor[k] = 0.0;
             }
-            layerCover[k] = max(layerCover[k], cover);
-            layerW[k] += w;
-            layerT[k] += wt;
-            layerR[k] += wr;
-            layerColor[k] += wc;
-        }
-        for (uint i = 0; i < layers; i++)
-        {
-            layerT[i] /= layerW[i];
-            layerR[i] /= layerW[i];
-            layerColor[i] /= layerW[i];
-        }
-        // Front to back. A layer is in front of another by how much nearer its pass is,
-        // eased over their radii: strokes that cross mix smoothly instead of cutting along the
-        // crossing (where their order flips).
-        float T = 1.0; // what still shows through all layers
-        float3 sum = 0.0;
-        for (uint i = 0; i < layers; i++)
-        {
-            float shown = 1.0; // what of layer i the others let through
-            for (uint m = 0; m < layers; m++)
+            // Front to back.
+            float T = 1.0; // what still shows through
+            float3 sum = 0.0;
+            for (uint k = 0; k < BINS; k++)
             {
-                if (m == i)
+                uint2 v = bins[k * TILE * TILE + gi];
+                float tau = f16tof32(v.x);
+                if (tau <= 0.0)
                     continue;
-                float front = smoothstep(-1.0, 1.0, (layerT[i] - layerT[m]) / (0.5 * (layerR[i] + layerR[m])));
-                shown *= 1.0 - layerCover[m] * front;
+                float3 c = float3(f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+                float alpha = 1.0 - exp(-tau);
+                sum += T * alpha * c / tau;
+                T *= 1.0 - alpha;
             }
-            sum += shown * layerCover[i] * layerColor[i];
-            T *= 1.0 - layerCover[i];
+            color = sum + T * color;
         }
-        // The rest, behind all layers: its cover, in its mean color.
-        if (restCover > 0.0)
-            sum += T * (1.0 - restT) * restSum / restCover;
-        color = sum + T * restT * color;
     }
 
     // 4. The brush tip, where the next stroke starts: a preview of its color, opacity and

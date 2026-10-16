@@ -2,7 +2,7 @@
 //!
 //!   vdraw                       paint in a desktop window (mouse)
 //!   vdraw --xr [--demo ...]     paint in VR (OpenXR: SteamVR, Monado, WiVRn)
-//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense] [--orbit x y z yaw pitch distance]
+//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap] [--orbit x y z yaw pitch distance]
 //!                               [--tip opacity hardness] [--size WxH] [--bench N] [--panel]
 //!                               render a demo painting to a PNG (no window, no headset)
 
@@ -15,7 +15,7 @@ mod xr;
 
 use anyhow::{Context, Result};
 
-/// The painting of `--demo shapes|soft|compare|dense` (shapes when not given), and a camera for it.
+/// The painting of `--demo shapes|soft|compare|dense|overlap` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
     let name = args.iter().position(|a| a == "--demo").and_then(|i| args.get(i + 1)).map(String::as_str);
     Ok(match name.unwrap_or("shapes") {
@@ -23,7 +23,8 @@ fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
         "soft" => (demo::soft(), camera::Orbit::default()),
         "compare" => (demo::compare(), camera::Orbit { target: glam::Vec3::new(0.0, 1.22, 0.0), yaw: 0.0, pitch: 0.05, distance: 1.25 }),
         "dense" => (demo::dense(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.3, pitch: 0.1, distance: 0.9 }),
-        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare or dense"),
+        "overlap" => (demo::overlap(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
+        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense or overlap"),
     })
 }
 
