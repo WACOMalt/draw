@@ -5,7 +5,7 @@
 //! and turned into round cones (`GpuSegment`). The renderer raymarches the round cones exactly
 //! (no voxels). World units are meters.
 //!
-//! Portability: a segment is three `[f32; 4]`, so a port can keep segments in a float texture
+//! Portability: a segment is four `[f32; 4]`, so a port can keep segments in a float texture
 //! (a VRChat world has no structured buffers), and `sdf` mirrors `shaders/sdf.slang` one to one.
 
 pub mod filter;
@@ -16,5 +16,5 @@ pub mod stroke;
 
 pub use filter::OneEuro3;
 pub use painting::Painting;
-pub use segments::GpuSegment;
+pub use segments::{GpuChunk, GpuSegment, chunks};
 pub use stroke::{Brush, Sample, Stroke};

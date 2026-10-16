@@ -43,6 +43,48 @@ impl GpuSegment {
     }
 }
 
+/// Segments per chunk, at most.
+pub const CHUNK: usize = 4;
+
+/// A run of up to `CHUNK` consecutive segments of one stroke, with a sphere around them all.
+/// The renderer culls chunks first, and looks at the segments of a chunk only when a ray
+/// crosses its sphere.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuChunk {
+    /// Center xyz, radius w.
+    pub sphere: [f32; 4],
+    pub first: u32,
+    pub count: u32,
+    /// 1 when the stroke is soft (drawn as a layer), 0 when solid.
+    pub soft: u32,
+    pub pad: u32,
+}
+
+/// The chunks of `segs` (segments of a stroke are next to each other, in order).
+pub fn chunks(segs: &[GpuSegment], out: &mut Vec<GpuChunk>) {
+    out.clear();
+    let mut i = 0;
+    while i < segs.len() {
+        let stroke = segs[i].style[1];
+        let mut n = 1;
+        while n < CHUNK && i + n < segs.len() && segs[i + n].style[1] == stroke {
+            n += 1;
+        }
+        let run = &segs[i..i + n];
+        let ends = || run.iter().flat_map(|s| [(s.a(), s.a[3]), (s.b(), s.b[3])]);
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for (p, r) in ends() {
+            lo = lo.min(p - r);
+            hi = hi.max(p + r);
+        }
+        let c = (lo + hi) * 0.5;
+        let radius = ends().map(|(p, r)| (p - c).length() + r).fold(0.0, f32::max);
+        out.push(GpuChunk { sphere: [c.x, c.y, c.z, radius], first: i as u32, count: n as u32, soft: !run[0].solid() as u32, pad: 0 });
+        i += n;
+    }
+}
+
 /// How far apart the resampled points are: a third of the radius (round cones then overlap
 /// enough to look smooth), but at least 0.5 mm.
 fn spacing(radius: f32) -> f32 {
@@ -100,7 +142,7 @@ impl Stroke {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stroke::Sample;
+    use crate::stroke::{Brush, Sample};
 
     #[test]
     fn straight_line_is_evenly_resampled() {
@@ -116,6 +158,35 @@ mod tests {
             assert!(((seg.b() - seg.a()).length() - step).abs() < 1e-4);
         }
         assert!((out.last().unwrap().b().x - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn chunks_hold_their_segments() {
+        let mut out = Vec::new();
+        for id in 0..3u32 {
+            let mut s = Stroke::new(Brush { hardness: if id == 1 { 0.0 } else { 1.0 }, ..Default::default() });
+            for i in 0..=40 {
+                let t = i as f32 / 40.0;
+                s.push(Sample { pos: Vec3::new(t.cos(), t * 0.3, (t * 3.0).sin()) * 0.4, pressure: t, time: i as f64 / 90.0 });
+            }
+            s.segments(OneEuro3::default(), id, &mut out);
+        }
+        let mut ch = Vec::new();
+        chunks(&out, &mut ch);
+        let mut next = 0;
+        for c in &ch {
+            assert_eq!(c.first, next);
+            assert!(c.count as usize <= CHUNK);
+            let run = &out[c.first as usize..(c.first + c.count) as usize];
+            assert!(run.iter().all(|s| s.style[1] == run[0].style[1] && s.solid() == (c.soft == 0)));
+            let center = Vec3::from_slice(&c.sphere[..3]);
+            for s in run {
+                assert!((s.a() - center).length() + s.a[3] <= c.sphere[3] + 1e-5);
+                assert!((s.b() - center).length() + s.b[3] <= c.sphere[3] + 1e-5);
+            }
+            next += c.count;
+        }
+        assert_eq!(next as usize, out.len());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use std::sync::Arc;
-use vdraw_core::GpuSegment;
+use vdraw_core::{GpuChunk, GpuSegment};
 
 /// Frames in flight: each has its own parameter and segment buffers.
 pub const FRAMES: usize = 2;
@@ -40,7 +40,7 @@ struct ParamsGpu {
     seg_count: u32,
     width: u32,
     height: u32,
-    pad: u32,
+    chunk_count: u32,
     brush_tip: [f32; 4],
     brush_color: [f32; 4],
     brush_style: [f32; 4],
@@ -158,6 +158,7 @@ pub fn color_range(layers: u32) -> vk::ImageSubresourceRange {
 struct Frame {
     params: Buffer,
     segments: Buffer,
+    chunks: Buffer,
     set: vk::DescriptorSet,
     /// The target view the set points at (rewritten when the target changes).
     bound_view: vk::ImageView,
@@ -171,6 +172,8 @@ pub struct Raymarcher {
     pool: vk::DescriptorPool,
     frames: Vec<Frame>,
     target: Option<Target>,
+    /// This frame's chunks (kept to reuse the allocation).
+    chunks: Vec<GpuChunk>,
 }
 
 impl Raymarcher {
@@ -179,6 +182,7 @@ impl Raymarcher {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default().binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default().binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }?;
@@ -192,7 +196,7 @@ impl Raymarcher {
 
         let sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: FRAMES as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: FRAMES as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: FRAMES as u32 },
         ];
         let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES as u32).pool_sizes(&sizes), None) }?;
@@ -202,9 +206,10 @@ impl Raymarcher {
         for set in sets {
             let params = Buffer::new(&gpu, size_of::<ParamsGpu>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "params")?;
             let segments = Buffer::new(&gpu, 1024 * size_of::<GpuSegment>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "segments")?;
-            frames.push(Frame { params, segments, set, bound_view: vk::ImageView::null() });
+            let chunks = Buffer::new(&gpu, 256 * size_of::<GpuChunk>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
+            frames.push(Frame { params, segments, chunks, set, bound_view: vk::ImageView::null() });
         }
-        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None };
+        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, chunks: Vec::new() };
         for i in 0..FRAMES {
             r.write_buffers(i);
         }
@@ -214,9 +219,11 @@ impl Raymarcher {
     fn write_buffers(&self, i: usize) {
         let f = &self.frames[i];
         let seg = [vk::DescriptorBufferInfo::default().buffer(f.segments.buffer).range(vk::WHOLE_SIZE)];
+        let chk = [vk::DescriptorBufferInfo::default().buffer(f.chunks.buffer).range(vk::WHOLE_SIZE)];
         let par = [vk::DescriptorBufferInfo::default().buffer(f.params.buffer).range(vk::WHOLE_SIZE)];
         let writes = [
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&seg),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&chk),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&par),
         ];
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
@@ -243,20 +250,35 @@ impl Raymarcher {
         assert!(eyes.len() as u32 == layers && layers <= 2);
 
         // Segments: grow the buffer when needed.
+        let mut chunks = std::mem::take(&mut self.chunks);
+        vdraw_core::chunks(segments, &mut chunks);
         let need = (segments.len().max(1) * size_of::<GpuSegment>()) as u64;
-        if self.frames[frame].segments.size < need {
+        let need_chunks = (chunks.len().max(1) * size_of::<GpuChunk>()) as u64;
+        if self.frames[frame].segments.size < need || self.frames[frame].chunks.size < need_chunks {
             let gpu = self.gpu.clone();
-            self.frames[frame].segments.destroy(&gpu);
-            self.frames[frame].segments = Buffer::new(&gpu, need.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "segments")?;
+            let f = &mut self.frames[frame];
+            if f.segments.size < need {
+                f.segments.destroy(&gpu);
+                f.segments = Buffer::new(&gpu, need.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "segments")?;
+            }
+            if f.chunks.size < need_chunks {
+                f.chunks.destroy(&gpu);
+                f.chunks = Buffer::new(&gpu, need_chunks.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
+            }
             self.write_buffers(frame);
         }
         let f = &mut self.frames[frame];
         f.segments.bytes()[..segments.len() * size_of::<GpuSegment>()].copy_from_slice(bytemuck::cast_slice(segments));
+        f.chunks.bytes()[..chunks.len() * size_of::<GpuChunk>()].copy_from_slice(bytemuck::cast_slice(&chunks));
+        let chunk_count = chunks.len() as u32;
+        self.chunks = chunks;
+        let f = &mut self.frames[frame];
         let mut p = ParamsGpu::zeroed();
         for (i, e) in eyes.iter().enumerate() {
             p.eyes[i] = EyeGpu { inv_view_proj: e.view_proj.inverse().to_cols_array(), pos: [e.pos.x, e.pos.y, e.pos.z, 1.0] };
         }
         p.seg_count = segments.len() as u32;
+        p.chunk_count = chunk_count;
         p.width = w;
         p.height = h;
         if let Some(b) = brush_tip {
@@ -323,6 +345,7 @@ impl Drop for Raymarcher {
             for f in &mut self.frames {
                 f.params.destroy(&gpu);
                 f.segments.destroy(&gpu);
+                f.chunks.destroy(&gpu);
             }
             if let Some(mut t) = self.target.take() {
                 t.destroy(&gpu);
