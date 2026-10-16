@@ -102,6 +102,60 @@ float stampWhole(float3 c, float r, float strength, float hard, float3 o, float3
     return q < 1.0 ? strength * chord(q, hard) : 0.0;
 }
 
+// The trail table (vdraw_core::trail_table) in a 3D texture: the chord value integrated
+// along a tube's axis direction from the nearest point to v (radii), x: KV lengths (0..1),
+// y: KQ distances, z: KH hardnesses.
+static const float KH = 17.0;
+static const float KQ = 33.0;
+static const float KV = 33.0;
+[[vk::binding(7, 0)]] Sampler3D<float> trailTable;
+
+float trail(float q, float v, float hard)
+{
+    float3 at = float3(min(abs(v), 1.0), saturate(q), saturate(hard));
+    float3 n = float3(KV, KQ, KH);
+    return sign(v) * trailTable.SampleLevel((at * (n - 1.0) + 0.5) / n, 0.0);
+}
+
+// A tube's optical depth along a ray: its dabs spread evenly from a to b (density per meter
+// at a and b in style.z and style.w), the radius and density taken at the point nearest the
+// ray. A segment with a == b is one stamp (its strength in style.z).
+float tubeWhole(Segment g, float3 o, float3 dir)
+{
+    float3 ab = g.b.xyz - g.a.xyz;
+    // Rays that pass outside the segment's bounding sphere (most that reach it through its
+    // chunk's sphere): out before the work. (x + y)^2 <= 2 (x^2 + y^2) keeps it a bound.
+    float rmax = max(g.a.w, g.b.w);
+    float3 m = (g.a.xyz + g.b.xyz) * 0.5 - o;
+    float md = dot(m, dir);
+    if (dot(m, m) - md * md > 2.0 * (0.25 * dot(ab, ab) + rmax * rmax))
+        return 0.0;
+    float len = length(ab);
+    if (len < 1e-6)
+        return stampWhole(g.a.xyz, g.a.w, g.style.z, g.style.x, o, dir);
+    float3 u = ab / len;
+    float3 w0 = g.a.xyz - o;
+    float ud = dot(u, dir);
+    float s2 = max(1.0 - ud * ud, 0.0);
+    if (max(dot(w0, dir), dot(g.b.xyz - o, dir)) + rmax < 0.0)
+        return 0.0; // behind the eye
+    // The axis point nearest the ray (x0 along the axis), and the distance there.
+    float x0 = s2 > 1e-8 ? (ud * dot(w0, dir) - dot(w0, u)) / s2 : len * 0.5;
+    float3 p = g.a.xyz + u * x0 - o;
+    float d0 = length(p - dir * dot(p, dir));
+    float f = saturate(x0 / len);
+    float r = lerp(g.a.w, g.b.w, f);
+    float lambda = lerp(g.style.z, g.style.w, f);
+    float q0 = d0 / r;
+    if (q0 >= 1.0 || lambda <= 0.0)
+        return 0.0;
+    float sn = sqrt(s2);
+    if (sn * len < 1e-3 * r)
+        return lambda * len * chord(q0, g.style.x); // along the axis
+    float k = sn / r;
+    return lambda / k * (trail(q0, (len - x0) * k, g.style.x) - trail(q0, -x0 * k, g.style.x));
+}
+
 // Up to 16 consecutive chunks of one layer, in a sphere: tiles test clusters before chunks.
 struct Cluster
 {
@@ -517,17 +571,21 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         if (ly.ordered != 0)
         {
             // An ordered layer, as the 2D app draws: each stroke's dabs along the ray (its
-            // stamps, whole), covering 1 - exp(-dabs), capped by its opacity, over the strokes
-            // before it, or taking from them (an eraser). Unlit, in sRGB.
+            // tubes, whole), covering 1 - exp(-dabs), capped by its opacity, over the strokes
+            // before it, or taking from them (an eraser). Unlit, in sRGB. Taken top stroke
+            // first (each stroke's paint shows through the strokes after it), so a pixel stops
+            // once the strokes over it cover it.
             float3 lc = 0.0; // premultiplied sRGB
             float la = 0.0;
+            float through = 1.0; // what shows through the strokes taken so far
             float stroke = -1.0;
             float dabs = 0.0;
             float4 strokeColor = 0.0;
-            for (uint k = j; k <= end; k++)
+            for (int ki = int(end) - 1; ki >= int(j) - 1; ki--)
             {
-                // Past the last chunk: one more round, to put the last stroke down.
-                bool more = k < end;
+                // Past the first chunk: one more round, to put the last stroke taken down.
+                bool more = ki >= int(j);
+                uint k = uint(max(ki, 0));
                 Chunk ch;
                 if (more)
                 {
@@ -544,13 +602,14 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                     if (stroke >= 0.0 && dabs > 0.0)
                     {
                         float alpha = abs(strokeColor.a) * (1.0 - exp(-dabs));
-                        lc *= 1.0 - alpha;
-                        la *= 1.0 - alpha;
                         if (strokeColor.a > 0.0)
                         {
-                            lc += srgbFromLinear(strokeColor.rgb) * alpha;
-                            la += alpha;
+                            lc += through * alpha * srgbFromLinear(strokeColor.rgb);
+                            la += through * alpha;
                         }
+                        through *= 1.0 - alpha;
+                        if (through < 1.0 / 512.0)
+                            break;
                     }
                     stroke = id;
                     dabs = 0.0;
@@ -560,12 +619,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                 if (more)
                 {
                     for (uint s = ch.first; s < ch.first + ch.count; s++)
-                    {
-                        Segment g = segments[s];
-                        dabs += stampWhole(g.a.xyz, g.a.w, g.style.z, g.style.x, o, dir);
-                        if (g.style.w > 0.0)
-                            dabs += stampWhole(g.b.xyz, g.b.w, g.style.w, g.style.x, o, dir);
-                    }
+                        dabs += tubeWhole(segments[s], o, dir);
                 }
             }
             float sa = la * ly.opacity;

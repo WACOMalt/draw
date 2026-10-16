@@ -17,5 +17,5 @@ pub mod stroke;
 
 pub use filter::OneEuro3;
 pub use painting::{Blend, Layer, LayerRun, Painting};
-pub use segments::{CHORD_H, CHORD_Q, GpuChunk, GpuCluster, GpuSegment, chord_table, chunks, clusters};
+pub use segments::{CHORD_H, CHORD_Q, GpuChunk, GpuCluster, GpuSegment, KH, KQ, KV, chord_table, chunks, clusters, trail_table};
 pub use stroke::{Brush, Dabs, Sample, Stroke};

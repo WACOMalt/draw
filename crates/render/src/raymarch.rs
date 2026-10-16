@@ -226,6 +226,120 @@ pub struct Raymarcher {
     static_version: Option<u64>,
     /// The full-chord table (binding 6), the same for every frame.
     chord: Buffer,
+    /// The trail table as a 3D texture (binding 7), filtered by the sampler.
+    trail: TrailTexture,
+}
+
+/// vdraw_core::trail_table in a 3D texture (x: length, y: distance, z: hardness), so a lookup
+/// is one filtered sample.
+struct TrailTexture {
+    image: vk::Image,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    alloc: Option<Allocation>,
+}
+
+/// To half floats (the table's values are small and positive).
+fn half(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    if exp <= 0 {
+        if exp < -10 { sign } else { sign | (((mant | 0x80_0000) >> (14 - exp)) as u16) }
+    } else if exp >= 31 {
+        sign | 0x7c00
+    } else {
+        sign | (((exp as u32) << 10 | mant >> 13) + ((mant >> 12) & 1)) as u16
+    }
+}
+
+impl TrailTexture {
+    fn new(gpu: &Gpu) -> Result<Self> {
+        use vdraw_core::{KH, KQ, KV};
+        let d = &gpu.device;
+        let format = vk::Format::R16_SFLOAT;
+        let extent = vk::Extent3D { width: KV as u32, height: KQ as u32, depth: KH as u32 };
+        let image = unsafe {
+            d.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_3D)
+                    .format(format)
+                    .extent(extent)
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+                None,
+            )
+        }?;
+        let req = unsafe { d.get_image_memory_requirements(image) };
+        let alloc = gpu.allocator.lock().unwrap().allocate(&AllocationCreateDesc {
+            name: "trail table",
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { d.bind_image_memory(image, alloc.memory(), alloc.offset()) }?;
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let view = unsafe { d.create_image_view(&vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_3D).format(format).subresource_range(range), None) }?;
+        let sampler = unsafe {
+            d.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+        }?;
+        // Upload through a staging buffer, and wait.
+        let data: Vec<u16> = vdraw_core::trail_table().into_iter().map(half).collect();
+        let mut staging = Buffer::new(gpu, (data.len() * 2) as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "trail staging")?;
+        staging.bytes()[..data.len() * 2].copy_from_slice(bytemuck::cast_slice(&data));
+        unsafe {
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family).flags(vk::CommandPoolCreateFlags::TRANSIENT), None)?;
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1))?[0];
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
+            let barrier = |old, new, src_stage, src_access, dst_stage, dst_access| {
+                let b = [vk::ImageMemoryBarrier2::default()
+                    .image(image)
+                    .old_layout(old)
+                    .new_layout(new)
+                    .src_stage_mask(src_stage)
+                    .src_access_mask(src_access)
+                    .dst_stage_mask(dst_stage)
+                    .dst_access_mask(dst_access)
+                    .subresource_range(range)];
+                d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            };
+            barrier(L::UNDEFINED, L::TRANSFER_DST_OPTIMAL, S::NONE, A::NONE, S::ALL_TRANSFER, A::TRANSFER_WRITE);
+            let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+            d.cmd_copy_buffer_to_image(cmd, staging.buffer, image, L::TRANSFER_DST_OPTIMAL, &[vk::BufferImageCopy::default().image_subresource(layers).image_extent(extent)]);
+            barrier(L::TRANSFER_DST_OPTIMAL, L::SHADER_READ_ONLY_OPTIMAL, S::ALL_TRANSFER, A::TRANSFER_WRITE, S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ);
+            d.end_command_buffer(cmd)?;
+            d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null())?;
+            d.queue_wait_idle(gpu.queue)?;
+            d.destroy_command_pool(pool, None);
+        }
+        staging.destroy(gpu);
+        Ok(Self { image, view, sampler, alloc: Some(alloc) })
+    }
+
+    fn destroy(&mut self, gpu: &Gpu) {
+        if let Some(a) = self.alloc.take() {
+            unsafe {
+                gpu.device.destroy_sampler(self.sampler, None);
+                gpu.device.destroy_image_view(self.view, None);
+                gpu.device.destroy_image(self.image, None);
+            }
+            let _ = gpu.allocator.lock().unwrap().free(a);
+        }
+    }
 }
 
 impl Raymarcher {
@@ -240,7 +354,8 @@ impl Raymarcher {
         let layers_binding = vk::DescriptorSetLayoutBinding::default().binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
         let clusters_binding = vk::DescriptorSetLayoutBinding::default().binding(5).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
         let chord_binding = vk::DescriptorSetLayoutBinding::default().binding(6).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
-        let bindings: Vec<_> = bindings.into_iter().chain([layers_binding, clusters_binding, chord_binding]).collect();
+        let trail_binding = vk::DescriptorSetLayoutBinding::default().binding(7).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let bindings: Vec<_> = bindings.into_iter().chain([layers_binding, clusters_binding, chord_binding, trail_binding]).collect();
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }?;
         let layout = unsafe { d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]), None) }?;
         let code = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV))?;
@@ -254,6 +369,7 @@ impl Raymarcher {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5 * FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: FRAMES as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: FRAMES as u32 },
         ];
         let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES as u32).pool_sizes(&sizes), None) }?;
         let layouts = [set_layout; FRAMES];
@@ -270,7 +386,8 @@ impl Raymarcher {
         let table = vdraw_core::chord_table();
         let mut chord = Buffer::new(&gpu, (table.len() * 4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chord table")?;
         chord.bytes()[..table.len() * 4].copy_from_slice(bytemuck::cast_slice(&table));
-        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord };
+        let trail = TrailTexture::new(&gpu)?;
+        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord, trail };
         for i in 0..FRAMES {
             r.write_buffers(i);
         }
@@ -285,7 +402,9 @@ impl Raymarcher {
         let lay = [vk::DescriptorBufferInfo::default().buffer(f.layers.buffer).range(vk::WHOLE_SIZE)];
         let clu = [vk::DescriptorBufferInfo::default().buffer(f.clusters.buffer).range(vk::WHOLE_SIZE)];
         let cho = [vk::DescriptorBufferInfo::default().buffer(self.chord.buffer).range(vk::WHOLE_SIZE)];
+        let tra = [vk::DescriptorImageInfo::default().sampler(self.trail.sampler).image_view(self.trail.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(7).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&tra),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(6).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&cho),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(5).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&clu),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lay),
@@ -465,6 +584,7 @@ impl Drop for Raymarcher {
                 t.destroy(&gpu);
             }
             self.chord.destroy(&gpu);
+            self.trail.destroy(&gpu);
             gpu.device.destroy_descriptor_pool(self.pool, None);
             gpu.device.destroy_pipeline(self.pipeline, None);
             gpu.device.destroy_pipeline_layout(self.layout, None);
