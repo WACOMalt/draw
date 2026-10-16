@@ -17,6 +17,7 @@
 //!   panel hand: stick click  hide or show the panel
 
 use crate::camera::perspective_fov;
+use crate::debug;
 use crate::panel::{self, Action, Model, Panel, Placement, Pointer};
 use crate::rig::{Locomotion, Rig};
 use crate::tools::{self, Tools};
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use vdraw_core::{GpuSegment, LayerRun, Mix, Painting, Sample, Stroke};
-use vdraw_render::raymarch::FRAMES;
+use vdraw_render::raymarch::{Buffer, FRAMES};
 use vdraw_render::{BrushTip, EyeView, Gpu, OverlayLine, Overlays, PanelDraw, Raymarcher, Scene, SceneLayer, UiRenderer, barrier};
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
@@ -85,11 +86,13 @@ struct Stats {
     late: u32,
     gpu_frames: u32,
     gpu_ms: f64,
+    /// The last logged: GPU ms per frame, frames per second, late frames.
+    last: (f64, f32, u32),
 }
 
 impl Stats {
     fn new() -> Self {
-        Self { since: Instant::now(), frames: 0, late: 0, gpu_frames: 0, gpu_ms: 0.0 }
+        Self { since: Instant::now(), frames: 0, late: 0, gpu_frames: 0, gpu_ms: 0.0, last: (0.0, 0.0, 0) }
     }
 
     fn gpu(&mut self, ms: f64) {
@@ -110,13 +113,9 @@ impl Stats {
             return;
         }
         let secs = self.since.elapsed().as_secs_f32();
-        log::info!(
-            "{segments} segments, GPU {:.2} ms/frame at {width}x{height} per eye, {:.0} fps, {} late frames",
-            self.gpu_ms / self.gpu_frames as f64,
-            self.frames as f32 / secs,
-            self.late
-        );
-        *self = Self::new();
+        let last = (self.gpu_ms / self.gpu_frames as f64, self.frames as f32 / secs, self.late);
+        log::info!("{segments} segments, GPU {:.2} ms/frame at {width}x{height} per eye, {:.0} fps, {} late frames", last.0, last.1, last.2);
+        *self = Self { last, ..Self::new() };
     }
 }
 
@@ -551,6 +550,9 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     let mut panel = Panel::new(&painter.tools.brush);
     let mut panel_shown = true;
     let mut ui: Option<UiRenderer> = None;
+    // A debug snapshot this frame (the panel's button), and the buffer it is copied into.
+    let mut capture = false;
+    let mut shot_buffer: Option<Buffer> = None;
 
     'main: loop {
         if quit.swap(false, Ordering::Relaxed) {
@@ -705,6 +707,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                     Action::Undo => painter.undo(),
                     Action::Redo => painter.redo(),
                     Action::Recenter => rig = Rig::default(),
+                    Action::DebugSnapshot => capture = true,
                     Action::Mix(mix) => painter.set_mix(*mix),
                 }
             }
@@ -803,12 +806,86 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                 let draw = PanelDraw { clip_from_point: [eyes[0].view_proj * model, eyes[1].view_proj * model], primitives: &f.primitives };
                 ui.record(cmd, frame, dst, w, h, 2, &[draw])?;
             }
+            // A debug snapshot: both eyes as shown, copied out.
+            if capture {
+                let size = (2 * w * h * 4) as u64;
+                if shot_buffer.as_ref().is_none_or(|b: &Buffer| b.size < size) {
+                    if let Some(mut b) = shot_buffer.take() {
+                        b.destroy(&gpu);
+                    }
+                    shot_buffer = Some(Buffer::new(&gpu, size, vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu, "debug snapshot")?);
+                }
+                let buf = shot_buffer.as_ref().unwrap().buffer;
+                barrier(d, cmd, dst, 2, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags2::ALL_TRANSFER, vk::AccessFlags2::TRANSFER_READ);
+                let regions: Vec<_> = (0..2u32)
+                    .map(|i| {
+                        vk::BufferImageCopy::default()
+                            .buffer_offset((i * w * h * 4) as u64)
+                            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_array_layer(i).layer_count(1))
+                            .image_extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                    })
+                    .collect();
+                d.cmd_copy_image_to_buffer(cmd, dst, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &regions);
+                barrier(d, cmd, dst, 2, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::PipelineStageFlags2::ALL_TRANSFER, vk::AccessFlags2::TRANSFER_READ,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+            }
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::BOTTOM_OF_PIPE, queries, 2 * frame as u32 + 1);
             d.end_command_buffer(cmd)?;
         }
         sc.handle.wait_image(xr::Duration::INFINITE)?;
         unsafe { d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fences[frame]) }?;
         queried[frame] = true;
+        if capture {
+            // Wait for the copy (a short hitch), then write the files in the background.
+            capture = false;
+            unsafe { d.wait_for_fences(&[fences[frame]], true, u64::MAX) }?;
+            let pixels = shot_buffer.as_mut().unwrap().bytes()[..(2 * w * h * 4) as usize].to_vec();
+            let info = debug::Info {
+                time: debug::now(),
+                runtime: format!("{} {}", props.runtime_name, props.runtime_version),
+                size: [w, h],
+                eyes: views
+                    .iter()
+                    .zip(&eyes)
+                    .map(|(v, e)| debug::Eye {
+                        stage: debug::Pose::of(pose_mat(v.pose)),
+                        world: debug::Pose::of(rig.mat() * pose_mat(v.pose)),
+                        fov: [v.fov.angle_left, v.fov.angle_right, v.fov.angle_up, v.fov.angle_down],
+                        view_proj: e.view_proj,
+                    })
+                    .collect(),
+                head: debug::Pose::of(head_pose),
+                hands: aims.map(|a| a.map(debug::Pose::of)),
+                painting_hand,
+                rig_pos: rig.pos,
+                rig_yaw: rig.yaw,
+                tools: format!("{:#?}", painter.tools),
+                panel_shown,
+                gpu_ms: stats.last.0,
+                fps: stats.last.1,
+                late: stats.last.2,
+                segments: painter.done.len() + painter.drawing.len(),
+                layers: painter
+                    .painting
+                    .layers
+                    .iter()
+                    .map(|l| debug::LayerInfo { name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, ordered: l.ordered, strokes: l.strokes.len() })
+                    .collect(),
+                active_layer: painter.active_layer(),
+                mix: painter.painting.mix,
+                undo: painter.undo.len(),
+                redo: painter.redo.len(),
+            };
+            let (dir, painting) = (debug::folder(save_to.as_deref()), painter.painting.clone());
+            let bgra = sc.format == vk::Format::B8G8R8A8_SRGB;
+            std::thread::spawn(move || match debug::write(&dir, &info, &pixels, bgra, &painting) {
+                Ok(()) => log::info!("debug snapshot: {}", dir.display()),
+                Err(e) => log::error!("debug snapshot {}: {e:#}", dir.display()),
+            });
+        }
         sc.handle.release_image()?;
 
         let rect = xr::Rect2Di { offset: xr::Offset2Di { x: 0, y: 0 }, extent: xr::Extent2Di { width: w as i32, height: h as i32 } };
@@ -846,6 +923,9 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
     // OpenXR lets go of the swapchain images before Vulkan objects go away.
     unsafe { d.device_wait_idle() }?;
+    if let Some(mut b) = shot_buffer.take() {
+        b.destroy(&gpu);
+    }
     drop(ui);
     drop(swapchain);
     drop((input, head, stage, stream, waiter, session));
@@ -875,7 +955,8 @@ fn make_swapchain(instance: &xr::Instance, system: xr::SystemId, session: &xr::S
     log::info!("swapchain {width}x{height} per eye ({}x{} recommended), {format:?}", views[0].recommended_image_rect_width, views[0].recommended_image_rect_height);
     let handle = session.create_swapchain(&xr::SwapchainCreateInfo {
         create_flags: xr::SwapchainCreateFlags::EMPTY,
-        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT | xr::SwapchainUsageFlags::TRANSFER_DST,
+        // Transfer source too: a debug snapshot copies what was shown.
+        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT | xr::SwapchainUsageFlags::TRANSFER_DST | xr::SwapchainUsageFlags::TRANSFER_SRC,
         format: format.as_raw() as u32,
         sample_count: 1,
         width,

@@ -27,6 +27,10 @@ pub struct GpuSegment {
     pub shape: [f32; 4],
 }
 
+/// A VR brush in an ordered layer, as a 2D brush: flow 1, spacing 0.1 (dense dabs, so the
+/// stroke's core is covered by its opacity, its edge by its hardness).
+pub const VR_DABS: crate::stroke::Dabs = crate::stroke::Dabs { flow: 1.0, spacing: 0.1, pressure_flow: false };
+
 /// The flattest a tip gets (roundness), so stretching by its inverse stays finite.
 pub const MIN_ROUNDNESS: f32 = 0.02;
 
@@ -320,14 +324,21 @@ impl Stroke {
     /// smooth: a segment ends where the points stray from it by over a tenth of the radius (a
     /// corner, fine detail), where the radius or the flow changes by over 15%, or at six radii.
     /// A stroke of one point is one stamp: a == b, its strength in style.z.
-    pub fn tube_segments(&self, id: u32, out: &mut Vec<GpuSegment>) {
+    ///
+    /// A VR stroke (no `dabs`) in an ordered layer is drawn the same way, as a 2D brush of flow
+    /// 1 and spacing 0.1 (`VR_DABS`: its core covered by its opacity), its path filtered by
+    /// `filter` first.
+    pub fn tube_segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
         let brush = &self.brush;
-        let Some(dabs) = brush.dabs else { return };
+        let dabs = brush.dabs.unwrap_or(VR_DABS);
+        let mut f = filter;
+        f.reset();
         let mut pts: Vec<(Vec3, f32)> = Vec::with_capacity(self.samples.len());
         let mut ups: Vec<Vec3> = Vec::with_capacity(self.samples.len());
         for s in &self.samples {
-            if pts.last().is_none_or(|&(p, _)| (s.pos - p).length() > 1e-4) {
-                pts.push((s.pos, s.pressure));
+            let pos = if brush.dabs.is_some() { s.pos } else { f.filter(s.time, s.pos) };
+            if pts.last().is_none_or(|&(p, _)| (pos - p).length() > 1e-4) {
+                pts.push((pos, s.pressure));
                 ups.push(align(s.up, ups.last().copied()));
             }
         }
@@ -387,6 +398,16 @@ impl Stroke {
         }
     }
 
+    /// The stroke's segments for a layer: tubes in an ordered layer (strokes covering each
+    /// other in order, as in the 2D app), else as `segments` makes them.
+    pub fn segments_in(&self, filter: OneEuro3, id: u32, ordered: bool, out: &mut Vec<GpuSegment>) {
+        if ordered {
+            self.tube_segments(filter, id, out);
+        } else {
+            self.segments(filter, id, out);
+        }
+    }
+
     /// The stroke's round cones, appended to `out`. A single sample is a sphere. `id`: the
     /// stroke's number in the painting (exact in an f32 up to 2^24).
     pub fn segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
@@ -396,7 +417,7 @@ impl Stroke {
         }
         // Strokes from the 2D app (with its brush, `dabs`) are tubes.
         if brush.dabs.is_some() {
-            self.tube_segments(id, out);
+            self.tube_segments(filter, id, out);
             return;
         }
         // 1. Filter the positions (the pressure and the pen's up direction stay raw).
@@ -537,7 +558,7 @@ mod tests {
             s.push(Sample::new(Vec3::new(i as f32 * 0.001, 0.0, 0.0), 1.0, i as f64));
         }
         let mut out = Vec::new();
-        s.tube_segments(0, &mut out);
+        s.tube_segments(OneEuro3::default(), 0, &mut out);
         assert!(out.len() <= 3, "{} segments", out.len());
         assert!(out.iter().all(|g| g.style[2] > 0.0 && g.style[3] == g.style[2]));
         // A zigzag with 4 mm teeth: every corner is an end.
@@ -547,13 +568,13 @@ mod tests {
             z.push(Sample::new(Vec3::new(i as f32 * 0.001, y * 0.001, 0.0), 1.0, i as f64));
         }
         out.clear();
-        z.tube_segments(0, &mut out);
+        z.tube_segments(OneEuro3::default(), 0, &mut out);
         assert_eq!(out.len(), 10);
         // One point: one stamp.
         let mut one = Stroke::new(brush);
         one.push(Sample::new(Vec3::ZERO, 1.0, 0.0));
         out.clear();
-        one.tube_segments(0, &mut out);
+        one.tube_segments(OneEuro3::default(), 0, &mut out);
         assert!(out.len() == 1 && out[0].a() == out[0].b());
     }
 

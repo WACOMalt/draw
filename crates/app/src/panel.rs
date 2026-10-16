@@ -134,6 +134,8 @@ pub enum Action {
     Recenter,
     /// Paint mixing (the painting's, an edit that undo takes back).
     Mix(Mix),
+    /// Write a debug snapshot: both eyes as shown, the view, and the state (debug.rs).
+    DebugSnapshot,
 }
 
 /// One frame of the panel: what to draw, egui's texture changes, and what was asked.
@@ -320,6 +322,9 @@ fn content(ui: &mut egui::Ui, tools: &mut Tools, mix: Mix, hsv: &mut [f32; 3], r
         ui.horizontal(|ui| {
             if ui.button("Recenter").clicked() {
                 actions.push(Action::Recenter);
+            }
+            if ui.button("Debug snapshot").clicked() {
+                actions.push(Action::DebugSnapshot);
             }
             ui.label(RichText::new("Left stick: fly · Right stick: turn, rise").color(TEXT_DIM).size(13.0));
         });

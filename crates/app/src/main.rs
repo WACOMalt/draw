@@ -8,10 +8,13 @@
 //!                               bring a 2D app canvas in, as 3D strokes on a plane ahead
 //!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap|flat|mix|near] [--orbit x y z yaw pitch distance]
 //!                               [--tip opacity hardness] [--size WxH] [--bench N] [--mix normal|pigment]
-//!                               [--panel [brush|eraser|stroke-eraser]] [--sweep radius]
+//!                               [--panel [brush|eraser|stroke-eraser]] [--sweep radius] [--replay folder [right]]
+//!                               render a painting to a PNG (no window, no headset); --replay:
+//!                               a debug snapshot's painting from its left (or right) eye
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
+mod debug;
 mod demo;
 mod panel;
 mod rig;
@@ -126,7 +129,17 @@ fn main() -> Result<()> {
                 Some(r) => Some(r.parse()?),
                 None => None,
             };
-            snapshot::run(path, size.0, size.1, painting, cam, tip, bench, panel, sweep)
+            // --replay folder [right]: a debug snapshot's painting, from its eye, at its size.
+            if let Some(dir) = args.iter().position(|a| a == "--replay").and_then(|i| args.get(i + 1)) {
+                let (info, painting) = debug::read(std::path::Path::new(dir))?;
+                let i = if args.iter().any(|a| a == "right") { 1 } else { 0 };
+                let e = &info.eyes[i];
+                let eye = vdraw_render::EyeView { view_proj: e.view_proj, pos: e.world.pos };
+                let size = args.iter().any(|a| a == "--size").then_some(size).unwrap_or((info.size[0], info.size[1]));
+                log::info!("replay: {} eye, {}x{}; it took {:.2} ms per frame (both eyes) in VR", ["left", "right"][i], size.0, size.1, info.gpu_ms);
+                return snapshot::run(path, size.0, size.1, painting, snapshot::View::Eye(eye), tip, bench, None, None);
+            }
+            snapshot::run(path, size.0, size.1, painting, snapshot::View::Orbit(cam), tip, bench, panel, sweep)
         }
         Some("--import") => import(&args),
         Some("--xr") => {

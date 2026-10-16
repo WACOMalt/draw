@@ -12,11 +12,19 @@ use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, Scen
 
 const OUT_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
+/// Where a snapshot looks from: an orbit camera, or an eye as VR drew it (a debug snapshot's,
+/// see debug.rs).
+pub enum View {
+    Orbit(Orbit),
+    Eye(EyeView),
+}
+
 /// Renders and writes the PNG. `bench` > 0: first renders that many times and logs the GPU
-/// time of the raymarch (median and worst). `panel`: the brush panel in front of the camera,
-/// the pointer on its Size slider, as VR draws it.
+/// time of the raymarch (median and worst). `panel`: the tool panel in front of the camera, as
+/// VR draws it (orbit views only). `sweep`: the stroke eraser's overlay, its ball (that radius)
+/// at the orbit target.
 #[allow(clippy::too_many_arguments)]
-pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit, tip: Option<BrushTip>, bench: u32, panel: Option<crate::tools::Tool>, sweep: Option<f32>) -> Result<()> {
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, view: View, tip: Option<BrushTip>, bench: u32, panel: Option<crate::tools::Tool>, sweep: Option<f32>) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
@@ -27,11 +35,14 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let runs = painting.segments(&mut segs);
     let layers = crate::xr::scene_layers(&painting);
     let scene = Scene { segments: &segs, runs: &runs, version: 0, active: &[], active_layer: 0, layers: &layers, pigment: painting.mix == vdraw_core::Mix::Pigment };
-    let eye = EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() };
+    let (eye, cam) = match view {
+        View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
+        View::Eye(eye) => (eye, None),
+    };
     let painting_mix = painting.mix;
     // The stroke eraser's overlay, its ball (radius `sweep`) at the orbit target.
     let mut lines = Vec::new();
-    if let Some(r) = sweep {
+    if let (Some(r), Some(cam)) = (sweep, cam) {
         let active = painting.layers.len().saturating_sub(1);
         let hot = crate::tools::swept(&segs, &runs, true, active, cam.target, cam.target, r, &[]);
         crate::tools::overlay(&segs, &runs, true, active, cam.target, (r * 4.0).max(0.05), &hot, &[], &mut lines);
@@ -72,7 +83,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut ui = UiRenderer::new(gpu.clone(), OUT_FORMAT)?;
     let mut primitives = Vec::new();
     let mut placement = None;
-    if let Some(tool) = panel {
+    if let (Some(tool), Some(cam)) = (panel, cam) {
         let mut tools = crate::tools::Tools { tool, ..Default::default() };
         tools.brush.hardness = 0.8;
         tools.brush.roundness = 0.4;

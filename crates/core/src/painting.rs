@@ -129,7 +129,7 @@ impl Painting {
         for (layer, l) in self.layers.iter().enumerate().filter(|(_, l)| l.visible) {
             let first = out.len();
             for s in &l.strokes {
-                s.segments(self.filter, id, out);
+                s.segments_in(self.filter, id, l.ordered, out);
                 id += 1;
             }
             runs.push(LayerRun { layer, first, count: out.len() - first });
