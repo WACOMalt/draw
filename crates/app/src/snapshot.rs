@@ -32,9 +32,10 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let image = rm.target(width, height, 1)?.image;
 
     let mut segs = Vec::new();
-    let runs = painting.segments(&mut segs);
-    let layers = crate::xr::scene_layers(&painting);
-    let scene = Scene { segments: &segs, runs: &runs, version: 0, active: &[], active_layer: 0, layers: &layers, pigment: painting.mix == vdraw_core::Mix::Pigment };
+    let built = painting.build(&mut segs);
+    let runs = &built.runs;
+    let steps = vdraw_render::scene_steps(&painting, &built.steps);
+    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_step: None, steps: &steps, pigment: painting.mix == vdraw_core::Mix::Pigment };
     let (eye, cam) = match view {
         View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
         View::Eye(eye) => (eye, None),
@@ -43,9 +44,8 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     // The stroke eraser's overlay, its ball (radius `sweep`) at the orbit target.
     let mut lines = Vec::new();
     if let (Some(r), Some(cam)) = (sweep, cam) {
-        let active = painting.layers.len().saturating_sub(1);
-        let hot = crate::tools::swept(&segs, &runs, true, active, cam.target, cam.target, r, &[]);
-        crate::tools::overlay(&segs, &runs, true, active, cam.target, (r * 4.0).max(0.05), &hot, &[], &mut lines);
+        let hot = crate::tools::swept(&segs, runs, None, cam.target, cam.target, r, &[]);
+        crate::tools::overlay(&segs, runs, None, cam.target, (r * 4.0).max(0.05), &hot, &[], &mut lines);
         log::info!("stroke eraser: {} strokes under the ball, {} lines", hot.len(), lines.len());
     }
 

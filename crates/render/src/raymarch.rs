@@ -51,18 +51,60 @@ struct ParamsGpu {
     laser_b: [f32; 4],
     cluster_count: u32,
     line_count: u32,
-    pad2: [u32; 2],
+    step_count: u32,
+    pad2: u32,
 }
 
-/// A layer as the shader reads it: the 2D app's blend mode (its number) and the opacity.
+/// A compositing step as the shader reads it (vdraw_core::Step): what it is (`STEP_*`), the
+/// 2D app's blend mode (its number), the opacity, and flags (`STEP_ORDERED`, ...).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-pub struct SceneLayer {
+pub struct SceneStep {
+    pub kind: u32,
     pub blend: u32,
     pub opacity: f32,
-    /// 1: the strokes cover each other in their order, as in the 2D app.
-    pub ordered: u32,
-    pub pad: u32,
+    pub flags: u32,
+}
+
+pub const STEP_LAYER: u32 = 0;
+pub const STEP_MASK: u32 = 1;
+pub const STEP_OPEN: u32 = 2;
+pub const STEP_CLOSE: u32 = 3;
+/// The strokes cover each other in their order, as in the 2D app.
+pub const STEP_ORDERED: u32 = 1;
+/// Clipped to the layer below in its group.
+pub const STEP_CLIP: u32 = 2;
+/// A group that is not pass through: its layers make one picture, which blends.
+pub const STEP_ISOLATED: u32 = 4;
+
+/// The steps of a painting as the shader reads them.
+pub fn scene_steps(painting: &vdraw_core::Painting, steps: &[vdraw_core::Step]) -> Vec<SceneStep> {
+    use vdraw_core::{Blend, Step};
+    steps
+        .iter()
+        .map(|&s| {
+            let (kind, i) = match s {
+                Step::Layer(i) => (STEP_LAYER, i),
+                Step::Mask(i) => (STEP_MASK, i),
+                Step::Open(i) => (STEP_OPEN, i),
+                Step::Close(i) => (STEP_CLOSE, i),
+            };
+            let l = &painting.layers[i];
+            let mut flags = 0;
+            if l.ordered {
+                flags |= STEP_ORDERED;
+            }
+            if l.clip && kind == STEP_LAYER {
+                flags |= STEP_CLIP;
+            }
+            if l.group && l.blend != Blend::Pass {
+                flags |= STEP_ISOLATED;
+            }
+            // A mask is drawn plainly (its luminance is what counts).
+            let (blend, opacity) = if kind == STEP_MASK { (0, 1.0) } else { (if l.blend == Blend::Pass { 0 } else { l.blend as u32 }, l.opacity) };
+            SceneStep { kind, blend, opacity, flags }
+        })
+        .collect()
 }
 
 /// What to draw: the finished strokes' segments in layer runs (they change rarely: `version`
@@ -72,10 +114,10 @@ pub struct Scene<'a> {
     pub runs: &'a [LayerRun],
     pub version: u64,
     pub active: &'a [GpuSegment],
-    /// The layer the stroke being drawn goes to (its place in `layers`).
-    pub active_layer: usize,
-    /// Every layer of the painting, by its place (`LayerRun::layer`).
-    pub layers: &'a [SceneLayer],
+    /// The step the stroke being drawn goes to (None: it is not drawn).
+    pub active_step: Option<usize>,
+    /// The compositing steps (`LayerRun::step` is a place here).
+    pub steps: &'a [SceneStep],
     /// Paint mixes as paint (vdraw_core::Mix::Pigment), not as light.
     pub pigment: bool,
 }
@@ -227,7 +269,7 @@ struct Frame {
     params: Buffer,
     segments: Buffer,
     chunks: Buffer,
-    /// The layers' blend modes and opacities (binding 4).
+    /// The compositing steps (binding 4).
     layers: Buffer,
     /// The chunks' clusters (binding 5).
     clusters: Buffer,
@@ -415,7 +457,7 @@ impl Raymarcher {
             let params = Buffer::new(&gpu, size_of::<ParamsGpu>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "params")?;
             let segments = Buffer::new(&gpu, 1024 * size_of::<GpuSegment>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "segments")?;
             let chunks = Buffer::new(&gpu, 256 * size_of::<GpuChunk>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
-            let layers = Buffer::new(&gpu, 64 * size_of::<SceneLayer>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "layers")?;
+            let layers = Buffer::new(&gpu, 64 * size_of::<SceneStep>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "steps")?;
             let clusters = Buffer::new(&gpu, 64 * size_of::<GpuCluster>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "clusters")?;
             let lines = Buffer::new(&gpu, 64 * size_of::<OverlayLine>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "overlay lines")?;
             frames.push(Frame { params, segments, chunks, layers, clusters, lines, version: None, set, bound_view: vk::ImageView::null() });
@@ -480,18 +522,20 @@ impl Raymarcher {
             let mut run_chunks = Vec::new();
             for run in scene.runs {
                 vdraw_core::chunks(&scene.segments[run.first..run.first + run.count], &mut run_chunks);
-                self.static_chunks.extend(run_chunks.iter().map(|c| GpuChunk { first: c.first + run.first as u32, layer: run.layer as u32, ..*c }));
+                self.static_chunks.extend(run_chunks.iter().map(|c| GpuChunk { first: c.first + run.first as u32, layer: run.step as u32, ..*c }));
             }
             self.static_clusters.clear();
             vdraw_core::clusters(&self.static_chunks, 0, &mut self.static_clusters);
             self.static_version = Some(scene.version);
         }
         let mut active_chunks = Vec::new();
-        vdraw_core::chunks(scene.active, &mut active_chunks);
+        if scene.active_step.is_some() {
+            vdraw_core::chunks(scene.active, &mut active_chunks);
+        }
         let (n_static, n_static_chunks) = (scene.segments.len(), self.static_chunks.len());
         for c in &mut active_chunks {
             c.first += n_static as u32;
-            c.layer = scene.active_layer as u32;
+            c.layer = scene.active_step.unwrap_or(0) as u32;
         }
         let n_segments = n_static + scene.active.len();
         let n_chunks = n_static_chunks + active_chunks.len();
@@ -503,14 +547,14 @@ impl Raymarcher {
         // Buffers: grow when needed (and then fill the finished strokes in again).
         let need = (n_segments.max(1) * size_of::<GpuSegment>()) as u64;
         let need_chunks = (n_chunks.max(1) * size_of::<GpuChunk>()) as u64;
-        let need_layers = (scene.layers.len().max(1) * size_of::<SceneLayer>()) as u64;
+        let need_layers = (scene.steps.len().max(1) * size_of::<SceneStep>()) as u64;
         let need_clusters = (n_clusters.max(1) * size_of::<GpuCluster>()) as u64;
         let need_lines = (overlays.lines.len().max(1) * size_of::<OverlayLine>()) as u64;
         {
             let gpu = self.gpu.clone();
             let f = &mut self.frames[frame];
             let mut rebind = false;
-            for (buffer, need, name) in [(&mut f.segments, need, "segments"), (&mut f.chunks, need_chunks, "chunks"), (&mut f.layers, need_layers, "layers"), (&mut f.clusters, need_clusters, "clusters"), (&mut f.lines, need_lines, "overlay lines")] {
+            for (buffer, need, name) in [(&mut f.segments, need, "segments"), (&mut f.chunks, need_chunks, "chunks"), (&mut f.layers, need_layers, "steps"), (&mut f.clusters, need_clusters, "clusters"), (&mut f.lines, need_lines, "overlay lines")] {
                 if buffer.size < need {
                     buffer.destroy(&gpu);
                     *buffer = Buffer::new(&gpu, need.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, name)?;
@@ -535,7 +579,7 @@ impl Raymarcher {
         f.chunks.bytes()[n_static_chunks * chk..n_chunks * chk].copy_from_slice(bytemuck::cast_slice(&active_chunks));
         let clu = size_of::<GpuCluster>();
         f.clusters.bytes()[n_static_clusters * clu..n_clusters * clu].copy_from_slice(bytemuck::cast_slice(&active_clusters));
-        f.layers.bytes()[..scene.layers.len() * size_of::<SceneLayer>()].copy_from_slice(bytemuck::cast_slice(scene.layers));
+        f.layers.bytes()[..scene.steps.len() * size_of::<SceneStep>()].copy_from_slice(bytemuck::cast_slice(scene.steps));
         f.lines.bytes()[..overlays.lines.len() * size_of::<OverlayLine>()].copy_from_slice(bytemuck::cast_slice(overlays.lines));
         let (segment_count, chunk_count) = (n_segments as u32, n_chunks as u32);
         let f = &mut self.frames[frame];
@@ -547,6 +591,7 @@ impl Raymarcher {
         p.chunk_count = chunk_count;
         p.cluster_count = n_clusters as u32;
         p.line_count = overlays.lines.len() as u32;
+        p.step_count = scene.steps.len() as u32;
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {

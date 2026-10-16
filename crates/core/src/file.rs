@@ -1,7 +1,7 @@
 //! Files: vdraw's own (.vdraw: gzip-compressed JSON of the painting), and the 2D app's
 //! (.bdraw), brought in as 3D strokes on a wall.
 
-use crate::painting::{Blend, Layer, Mix, Painting};
+use crate::painting::{Blend, Layer, Mask, Mix, Painting};
 use crate::segments::to_linear;
 use crate::stroke::{Brush, Dabs, Sample, Stroke};
 use anyhow::{Result, bail};
@@ -57,7 +57,9 @@ pub fn load(path: &Path) -> Result<Painting> {
     if file.version > VERSION {
         bail!("{}: version {} is newer than this vdraw reads ({VERSION})", path.display(), file.version);
     }
-    Ok(file.painting)
+    let mut painting = file.painting;
+    painting.normalize();
+    Ok(painting)
 }
 
 /// Where the strokes of a .bdraw go: on a vertical plane in front of the viewer, centered at
@@ -85,11 +87,11 @@ fn hex(s: &str) -> [f32; 3] {
 /// roundness and angle), all its points at one depth (a vertical plane in front of the
 /// viewer). No paper. Its layers are ordered (strokes cover each other in their order, as in
 /// the 2D app). Seen square on with no perspective it matches the 2D drawing; in perspective the
-/// strokes show their thickness. The layers come in order (groups that pass through flattened;
-/// a group's opacity multiplies its layers'), with their blend modes, and the canvas's paint
-/// mixing. A layer goes on top for painting in VR. What it cannot carry yet: isolated groups
-/// (drawn as if they passed through), layer masks, clipping, adjustment and shape layers, brush
-/// tips other than round (square, chalk, ...), and jitter, scatter and grain.
+/// strokes show their thickness. The layers come as they are: their order, groups (passing
+/// through or isolated), blend modes, opacity, visibility, clipping and masks, and the canvas's
+/// paint mixing. A layer goes on top for painting in VR. What it cannot carry yet: adjustment
+/// and shape layers, layer effects, brush tips other than round (square, chalk, ...), and
+/// jitter, scatter and grain.
 pub fn import_bdraw(path: &Path) -> Result<Painting> {
     let doc: Value = serde_json::from_slice(&read_maybe_gzip(path)?)?;
     if doc.get("format").and_then(Value::as_str) != Some("bdraw") {
@@ -99,28 +101,47 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
     let layers = doc.get("layers").and_then(Value::as_array).unwrap_or(&empty);
     let strokes = doc.get("strokes").and_then(Value::as_array).unwrap_or(&empty);
 
-    // The layer order: top-level items by `order`, a group's children in its place by theirs.
+    // The layers in paint order (top-level items by `order`, a group's layers right before
+    // it, by theirs), with their groups, clipping and masks. Adjustment and shape layers are
+    // left out.
     let live: Vec<&Value> = layers.iter().filter(|l| !flag(l, "deleted", false)).collect();
-    let mut ordered: Vec<(String, f32, bool, Blend, String)> = Vec::new(); // id, opacity, visible, blend, name
-    fn walk(live: &[&Value], under: Option<&str>, opacity: f32, visible: bool, out: &mut Vec<(String, f32, bool, Blend, String)>) {
+    let mut out: Vec<Layer> = Vec::new();
+    // The 2D app's layer id, and its mask's id, by place in `out`.
+    let mut ids: Vec<(String, Option<String>)> = Vec::new();
+    fn walk(live: &[&Value], under: Option<&str>, parent: Option<u32>, next: &mut u32, out: &mut Vec<Layer>, ids: &mut Vec<(String, Option<String>)>) {
         let mut items: Vec<&&Value> = live.iter().filter(|l| l.get("parent").and_then(Value::as_str) == under).collect();
         items.sort_by(|a, b| num(a, "order", 0.0).total_cmp(&num(b, "order", 0.0)));
         for l in items {
-            let op = opacity * num(l, "opacity", 1.0);
-            let vis = visible && flag(l, "visible", true);
             let lid = l.get("id").and_then(Value::as_str).unwrap_or("");
-            match l.get("kind").and_then(Value::as_str) {
-                Some("group") => walk(live, Some(lid), op, vis, out),
-                Some("adjust") | Some("shape") => {}
-                _ => {
-                    let blend = Blend::from_name(l.get("blend").and_then(Value::as_str).unwrap_or("normal"));
-                    let name = l.get("name").and_then(Value::as_str).unwrap_or("Layer").to_string();
-                    out.push((lid.to_string(), op, vis, blend, name));
-                }
+            let kind = l.get("kind").and_then(Value::as_str).unwrap_or("paint");
+            if kind != "group" && kind != "paint" {
+                continue;
             }
+            // The id first: a group's layers (before it in paint order) name it as parent.
+            *next += 1;
+            let id = *next;
+            let group = kind == "group";
+            if group {
+                walk(live, Some(lid), Some(id), next, out, ids);
+            }
+            let mask = l.get("mask").filter(|m| m.is_object());
+            out.push(Layer {
+                id,
+                name: l.get("name").and_then(Value::as_str).unwrap_or("Layer").to_string(),
+                blend: Blend::from_name(l.get("blend").and_then(Value::as_str).unwrap_or(if group { "pass" } else { "normal" })),
+                opacity: num(l, "opacity", 1.0),
+                visible: flag(l, "visible", true),
+                ordered: !group,
+                group,
+                parent,
+                clip: flag(l, "clip", false),
+                mask: mask.map(|m| Mask { enabled: flag(m, "enabled", true), strokes: Vec::new() }),
+                strokes: Vec::new(),
+            });
+            ids.push((lid.to_string(), mask.and_then(|m| m.get("id")).and_then(Value::as_str).map(str::to_string)));
         }
     }
-    walk(&live, None, 1.0, true, &mut ordered);
+    walk(&live, None, None, &mut 0, &mut out, &mut ids);
 
     // The drawing's extent, with a margin, scaled to the wall.
     let mut lo = Vec2::splat(f32::MAX);
@@ -146,15 +167,16 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
     // 2D y runs down; the wall's runs up.
     let to_wall = |x: f32, y: f32| WALL_CENTER + Vec3::new(x - center2d.x, center2d.y - y, 0.0) * scale;
 
-    let mut out: Vec<Layer> = ordered
-        .iter()
-        .map(|(_, opacity, visible, blend, name)| Layer { name: name.clone(), blend: *blend, opacity: *opacity, visible: *visible, ordered: true, strokes: Vec::new() })
-        .collect();
-    let index: std::collections::HashMap<&str, usize> = ordered.iter().enumerate().map(|(i, l)| (l.0.as_str(), i)).collect();
-    let mut sorted: Vec<&Value> = strokes.iter().filter(|s| !flag(s, "deleted", false) && s.get("mask").is_none()).collect();
+    let index: std::collections::HashMap<&str, usize> = ids.iter().enumerate().filter(|(i, _)| !out[*i].group).map(|(i, l)| (l.0.as_str(), i)).collect();
+    let mut sorted: Vec<&Value> = strokes.iter().filter(|s| !flag(s, "deleted", false)).collect();
     sorted.sort_by(|a, b| num(a, "seq", 0.0).total_cmp(&num(b, "seq", 0.0)));
     for s in sorted {
         let Some(&li) = s.get("layerId").and_then(Value::as_str).and_then(|l| index.get(l)) else { continue };
+        // A mask stroke (its mask's id) goes to the layer's mask, if it is that mask's.
+        let mask = s.get("mask").and_then(Value::as_str);
+        if mask.is_some() && mask != ids[li].1.as_deref() {
+            continue;
+        }
         let b = &s["brush"];
         // The 2D brush comes along whole: the stamps' strengths follow its dabs (flow and
         // spacing), and its opacity caps each stroke (see stamp_strengths).
@@ -193,11 +215,17 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
             }
         }
         if !stroke.samples.is_empty() {
-            out[li].strokes.push(stroke);
+            match (mask, &mut out[li].mask) {
+                (Some(_), Some(m)) => m.strokes.push(stroke),
+                _ => out[li].strokes.push(stroke),
+            }
         }
     }
-    out.push(Layer { name: "VR".into(), ..Default::default() });
+    let id = out.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+    out.push(Layer { id, name: "VR".into(), ..Default::default() });
     // The canvas's paint mixing (version 10 on; older files mix as normal).
     let mix = if doc.get("mix").and_then(Value::as_str) == Some("pigment") { Mix::Pigment } else { Mix::Normal };
-    Ok(Painting { layers: out, mix, ..Default::default() })
+    let mut painting = Painting { layers: out, mix, ..Default::default() };
+    painting.normalize();
+    Ok(painting)
 }

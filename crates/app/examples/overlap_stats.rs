@@ -10,7 +10,7 @@ fn main() {
     let min = lo3.truncate();
     let size = (hi3 - lo3).truncate().max(Vec2::splat(1e-6));
     let mut segs = Vec::new();
-    p.segments(&mut segs);
+    p.build(&mut segs);
     let mut chunks = Vec::new();
     vdraw_core::chunks(&segs, &mut chunks);
     const N: usize = 160;

@@ -16,6 +16,7 @@
 mod camera;
 mod debug;
 mod demo;
+mod painter;
 mod panel;
 mod rig;
 mod snapshot;
@@ -66,7 +67,7 @@ fn import(args: &[String]) -> Result<()> {
         log::info!("layer {:?}: {} strokes, {:?}, opacity {:.2}{}", l.name, l.strokes.len(), l.blend, l.opacity, if l.visible { "" } else { ", hidden" });
     }
     let mut segs = Vec::new();
-    painting.segments(&mut segs);
+    painting.build(&mut segs);
     log::info!("{} segments", segs.len());
     vdraw_core::file::save(&to, &painting)?;
     log::info!("saved {}", to.display());

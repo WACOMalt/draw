@@ -81,21 +81,20 @@ impl Tools {
     }
 }
 
-/// The segments the stroke eraser can take, as ranges of `segs`: every visible layer's, or the
-/// active layer's only (the last run, when it is that layer's).
-fn eligible<'a>(segs: &'a [GpuSegment], runs: &[LayerRun], all: bool, active: usize) -> impl Iterator<Item = &'a GpuSegment> {
+/// The segments the stroke eraser can take: every shown layer's (`only` None), or one step's.
+fn eligible<'a>(segs: &'a [GpuSegment], runs: &[LayerRun], only: Option<usize>) -> impl Iterator<Item = &'a GpuSegment> {
     runs.iter()
-        .filter(move |r| all || r.layer == active)
+        .filter(move |r| only.is_none_or(|s| r.step == s))
         .flat_map(move |r| &segs[r.first..r.first + r.count])
 }
 
 /// Strokes (by number) whose center line comes within `r` of the path `from`..`to` (the
 /// ball's sweep this frame; the 2D app's strokesNear), but not those in `skip` (sorted).
 #[allow(clippy::too_many_arguments)]
-pub fn swept(segs: &[GpuSegment], runs: &[LayerRun], all: bool, active: usize, from: Vec3, to: Vec3, r: f32, skip: &[u32]) -> Vec<u32> {
+pub fn swept(segs: &[GpuSegment], runs: &[LayerRun], only: Option<usize>, from: Vec3, to: Vec3, r: f32, skip: &[u32]) -> Vec<u32> {
     let mut hit: Vec<u32> = Vec::new();
     let (lo, hi) = (from.min(to) - r, from.max(to) + r);
-    for g in eligible(segs, runs, all, active) {
+    for g in eligible(segs, runs, only) {
         let id = g.style[1] as u32;
         if hit.last() == Some(&id) || skip.binary_search(&id).is_ok() {
             continue;
@@ -127,7 +126,7 @@ pub const MAX_OVERLAY: usize = 4096;
 /// `tip`) in blue. Strokes in `skip` (sorted: taken this sweep) are left out. (The 2D app shows
 /// every stroke's path; in VR the whole painting's would be a thicket around the hand.)
 #[allow(clippy::too_many_arguments)]
-pub fn overlay(segs: &[GpuSegment], runs: &[LayerRun], all: bool, active: usize, tip: Vec3, reach: f32, hot: &[u32], skip: &[u32], out: &mut Vec<OverlayLine>) {
+pub fn overlay(segs: &[GpuSegment], runs: &[LayerRun], only: Option<usize>, tip: Vec3, reach: f32, hot: &[u32], skip: &[u32], out: &mut Vec<OverlayLine>) {
     let line = |g: &GpuSegment, (color, alpha, width, halo_width): ([f32; 3], f32, f32, f32), halo: f32| {
         let c = vdraw_core::segments::to_linear(color);
         OverlayLine { a: [g.a[0], g.a[1], g.a[2], width], b: [g.b[0], g.b[1], g.b[2], halo_width], color: [c[0], c[1], c[2], alpha], halo: [0.0, 0.0, 0.0, halo] }
@@ -139,7 +138,7 @@ pub fn overlay(segs: &[GpuSegment], runs: &[LayerRun], all: bool, active: usize,
             out.push(line(g, HOT, HOT_HALO));
         }
     }
-    for g in eligible(segs, runs, all, active) {
+    for g in eligible(segs, runs, only) {
         if out.len() >= MAX_OVERLAY {
             break;
         }
@@ -170,17 +169,17 @@ mod tests {
     fn the_sweep_takes_strokes_whose_center_line_it_touches() {
         let mut segs = line(0, 0.0);
         segs.extend(line(1, 0.05));
-        let runs = [LayerRun { layer: 0, first: 0, count: segs.len() }];
+        let runs = [LayerRun { step: 0, first: 0, count: segs.len() }];
         // A sweep down across both lines, 1 cm ball: both.
-        let both = swept(&segs, &runs, true, 0, Vec3::new(0.05, 0.1, 0.0), Vec3::new(0.05, -0.1, 0.0), 0.01, &[]);
+        let both = swept(&segs, &runs, None, Vec3::new(0.05, 0.1, 0.0), Vec3::new(0.05, -0.1, 0.0), 0.01, &[]);
         assert_eq!(both, vec![0, 1]);
         // Within the second stroke's radius (1 cm) but not near its center line: nothing, as in
         // the 2D app (the ball must touch the path).
-        let near = swept(&segs, &runs, true, 0, Vec3::new(0.05, 0.035, 0.0), Vec3::new(0.05, 0.035, 0.0), 0.005, &[]);
+        let near = swept(&segs, &runs, None, Vec3::new(0.05, 0.035, 0.0), Vec3::new(0.05, 0.035, 0.0), 0.005, &[]);
         assert!(near.is_empty(), "{near:?}");
-        // Taken already: skipped. The active layer only: a layer not in the runs takes none.
-        assert_eq!(swept(&segs, &runs, true, 0, Vec3::new(0.05, 0.1, 0.0), Vec3::new(0.05, -0.1, 0.0), 0.01, &[0]), vec![1]);
-        assert!(swept(&segs, &runs, false, 1, Vec3::new(0.05, 0.1, 0.0), Vec3::new(0.05, -0.1, 0.0), 0.01, &[]).is_empty());
+        // Taken already: skipped. One step only: a step not in the runs takes none.
+        assert_eq!(swept(&segs, &runs, None, Vec3::new(0.05, 0.1, 0.0), Vec3::new(0.05, -0.1, 0.0), 0.01, &[0]), vec![1]);
+        assert!(swept(&segs, &runs, Some(1), Vec3::new(0.05, 0.1, 0.0), Vec3::new(0.05, -0.1, 0.0), 0.01, &[]).is_empty());
     }
 
     #[test]
