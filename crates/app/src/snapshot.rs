@@ -90,6 +90,9 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         painter.tools.brush.hardness = 0.8;
         painter.tools.brush.roundness = 0.4;
         painter.tools.angle[0] = 30.0;
+        let mut presets = crate::presets::Presets::default();
+        presets.list.push(crate::presets::Preset { name: "Soft round".into(), eraser: false, brush: vdraw_core::Brush { radius: 0.03, hardness: 0.0, opacity: 0.6, ..Default::default() }, angle: 0.0 });
+        presets.list.push(crate::presets::Preset { name: "Ink".into(), eraser: false, brush: vdraw_core::Brush { radius: 0.004, ..Default::default() }, angle: 0.0 });
         let mut palettes = crate::palettes::Palettes::default();
         palettes.create("My colors");
         for hex in ["#e64a2e", "#31a8ff", "#f2c94c", "#5cb85c"] {
@@ -108,7 +111,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         let place = Placement::centered(cam.eye() + forward * 0.5, right, -up, -forward);
         // Twice: egui lays out sizes it measured in the frame before.
         for _ in 0..2 {
-            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes });
+            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets });
             ui.update_textures(&frame.textures)?;
             primitives = frame.primitives;
         }

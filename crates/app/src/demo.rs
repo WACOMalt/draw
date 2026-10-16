@@ -236,3 +236,25 @@ pub fn layers() -> Painting {
     p.normalize();
     p
 }
+
+/// The brush's options, top to bottom: flow 0.25 (it builds up where the stroke crosses
+/// itself), spacing one diameter (dabs show), size jitter and scatter, angle jitter on a flat
+/// tip, and the same soft stroke in an ordered layer (as the 2D app draws it, capped by its
+/// opacity) with flow jitter.
+pub fn brushes() -> Painting {
+    use vdraw_core::Layer;
+    let soft = |color| Brush { radius: 0.025, color, hardness: 0.3, opacity: 0.9, pressure_size: false, seed: 3, ..Default::default() };
+    let wave = |b: Brush, y: f32| stroke(b, 160, move |t| (Vec3::new(-0.45 + t * 0.9, y + (t * TAU * 1.5).sin() * 0.03, 0.0), 1.0));
+    let mut p = Painting::default();
+    // Flow: a loop over itself.
+    p.active().push(stroke(Brush { flow: 0.25, ..soft([0.9, 0.3, 0.2]) }, 200, |t| {
+        let a = t * TAU * 1.3;
+        (Vec3::new(-0.3 + t * 0.6 + a.cos() * 0.05, 1.62 + a.sin() * 0.05, 0.0), 1.0)
+    }));
+    p.active().push(wave(Brush { spacing: 1.0, ..soft([0.2, 0.6, 0.9]) }, 1.5));
+    p.active().push(wave(Brush { size_jitter: 0.8, scatter: 1.0, ..soft([0.3, 0.8, 0.4]) }, 1.38));
+    p.active().push(wave(Brush { roundness: 0.2, angle_jitter: 0.5, spacing: 0.5, hardness: 0.9, ..soft([0.9, 0.8, 0.2]) }, 1.26));
+    let ordered = Layer { id: 2, name: "Ordered".into(), ordered: true, strokes: vec![wave(Brush { flow_jitter: 0.8, flow: 0.6, spacing: 0.15, ..soft([0.7, 0.3, 0.9]) }, 1.14)], ..Default::default() };
+    p.layers.push(ordered);
+    p
+}

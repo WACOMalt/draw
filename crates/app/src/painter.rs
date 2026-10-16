@@ -78,6 +78,10 @@ pub struct Painter {
     /// The last layer edit's key and when it was: edits of the same key within 2 s are one
     /// step of undo (an opacity drag), as in the 2D app.
     merge: Option<(&'static str, std::time::Instant)>,
+    /// The stroke being drawn: its smoothed tip (the 2D app's smoothing follows the pen), and
+    /// when a point was last added (airbrush: one every 30 ms while the pen holds still).
+    smoothed: Vec3,
+    last_point: f64,
     /// Colors used, newest first (sRGB), for the panel's swatches.
     pub recent: Vec<[u8; 3]>,
     /// The strokes changed since the last save.
@@ -102,6 +106,8 @@ impl Painter {
             active_layer,
             mask_target: false,
             merge: None,
+            smoothed: Vec3::ZERO,
+            last_point: 0.0,
             recent: Vec::new(),
             changed: false,
         };
@@ -324,10 +330,21 @@ impl Painter {
             }
             return;
         }
+        // The 2D app's smoothing: the point follows the pen by a part of the way.
+        let follow = 1.0 - self.tools.smoothing.min(0.95) * 0.9;
         match &mut self.active {
             Some((h, stroke)) if *h == hand => {
                 if down {
-                    stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
+                    let last = stroke.samples.last().map(|s| s.pos).unwrap_or(tip);
+                    self.smoothed += (tip - self.smoothed) * follow;
+                    if (self.smoothed - last).length() > 5e-4 {
+                        stroke.push(Sample { up, ..Sample::new(self.smoothed, pull, t) });
+                        self.last_point = t;
+                    } else if stroke.brush.buildup && t - self.last_point >= 0.03 {
+                        // Held still: the same point again, a dab more (airbrush).
+                        stroke.push(Sample { up, ..Sample::new(last, pull, t) });
+                        self.last_point = t;
+                    }
                 } else {
                     let (_, stroke) = self.active.take().unwrap();
                     self.finish(stroke);
@@ -349,8 +366,12 @@ impl Painter {
                     } else if !brush.erase {
                         self.add_recent(panel::to_srgb(brush.color));
                     }
+                    // The dynamics' random numbers: a seed of the stroke's own.
+                    brush.seed = (t * 1e6) as u64 as u32 ^ (tip.x.to_bits().rotate_left(13) ^ tip.z.to_bits());
                     let mut stroke = Stroke::new(brush);
                     stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
+                    self.smoothed = tip;
+                    self.last_point = t;
                     self.active = Some((hand, stroke));
                 }
                 None => {

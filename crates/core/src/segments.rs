@@ -27,10 +27,6 @@ pub struct GpuSegment {
     pub shape: [f32; 4],
 }
 
-/// A VR brush in an ordered layer, as a 2D brush: flow 1, spacing 0.1 (dense dabs, so the
-/// stroke's core is covered by its opacity, its edge by its hardness).
-pub const VR_DABS: crate::stroke::Dabs = crate::stroke::Dabs { flow: 1.0, spacing: 0.1, pressure_flow: false };
-
 /// The flattest a tip gets (roundness), so stretching by its inverse stays finite.
 pub const MIN_ROUNDNESS: f32 = 0.02;
 
@@ -316,7 +312,105 @@ pub fn to_linear(c: [f32; 3]) -> [f32; 3] {
     c.map(|c| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) })
 }
 
+/// One dab of a trail: where, its pressure, the pen's up direction, the direction of travel
+/// (unit; zero before the stroke moves), and its number (for the dynamics).
+struct Dab {
+    pos: Vec3,
+    pressure: f32,
+    up: Vec3,
+    dir: Vec3,
+    index: u32,
+}
+
+/// The 2D app's DabWalker (brush.ts): a dab at the start, then one each time the walked
+/// distance reaches the step at the last dab's pressure; with airbrush, also one where a point
+/// repeats (the pen held still).
+fn walk_dabs(pts: &[(Vec3, f32, Vec3)], step: impl Fn(f32) -> f32, buildup: bool) -> Vec<Dab> {
+    let mut out = Vec::new();
+    let Some(&(p0, q0, u0)) = pts.first() else { return out };
+    out.push(Dab { pos: p0, pressure: q0, up: u0, dir: Vec3::ZERO, index: 0 });
+    let (mut dab_q, mut carry, mut dir) = (q0, 0.0f32, Vec3::ZERO);
+    for w in pts.windows(2) {
+        let ((a, qa, ua), (b, qb, ub)) = (w[0], w[1]);
+        let len = (b - a).length();
+        if len == 0.0 {
+            if buildup {
+                dab_q = qb;
+                carry = 0.0;
+                out.push(Dab { pos: b, pressure: qb, up: ub, dir, index: out.len() as u32 });
+            }
+            continue;
+        }
+        dir = (b - a) / len;
+        let mut t = 0.0;
+        loop {
+            let need = step(dab_q) - carry;
+            if t + need > len {
+                carry += len - t;
+                break;
+            }
+            t += need;
+            carry = 0.0;
+            let f = t / len;
+            dab_q = qa + (qb - qa) * f;
+            out.push(Dab { pos: a.lerp(b, f), pressure: dab_q, up: ua.lerp(ub, f).normalize_or(ua), dir, index: out.len() as u32 });
+        }
+    }
+    out
+}
+
+/// The 2D app's dynamics of a dab of radius `r` (brush.ts DabWalker.dab): the tip turned (about
+/// the axis square to the pen's up and the travel: the pen's, when it moves square to it; the
+/// wall's, for a stroke from the 2D app), moved across the stroke, made smaller, and its paint
+/// made less. Returns where, the radius, the up direction, and the paint's factor.
+fn dynamics(brush: &Brush, d: &Dab, r: f32) -> (Vec3, f32, Vec3, f32) {
+    if !brush.jitters() {
+        return (d.pos, r, d.up, 1.0);
+    }
+    let rnd = |c: u32| crate::stroke::dab_random(brush.seed, d.index, c);
+    let axis = d.up.cross(d.dir).try_normalize().unwrap_or_else(|| d.up.any_orthogonal_vector().normalize());
+    let mut up = d.up;
+    if brush.angle_jitter > 0.0 {
+        let turn = (rnd(2) - 0.5) * std::f32::consts::TAU * brush.angle_jitter;
+        up = glam::Quat::from_axis_angle(axis, turn) * up;
+    }
+    let mut pos = d.pos;
+    if brush.scatter > 0.0 {
+        let across = axis.cross(d.dir).try_normalize().unwrap_or(Vec3::ZERO);
+        pos += across * (rnd(3) * 2.0 - 1.0) * brush.scatter * 2.0 * r;
+    }
+    let r = if brush.size_jitter > 0.0 { r * (1.0 - brush.size_jitter * rnd(0)) } else { r };
+    let paint = if brush.flow_jitter > 0.0 { 1.0 - brush.flow_jitter * rnd(1) } else { 1.0 };
+    (pos, r, up, paint)
+}
+
 impl Stroke {
+    /// A stroke as its single dabs, as the 2D app draws it (for an ordered layer, when the
+    /// brush has dynamics or airbrush, which tubes cannot carry): each a stamp (a == b) whose
+    /// strength covers by the dab's paint (flow, by the pressure when it scales it, by the
+    /// dynamics) through its middle.
+    pub fn dab_stamps(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
+        let brush = &self.brush;
+        let dabs = brush.dab_settings();
+        let mut f = filter;
+        f.reset();
+        let mut ups: Vec<Vec3> = Vec::with_capacity(self.samples.len());
+        for s in &self.samples {
+            ups.push(align(s.up, ups.last().copied()));
+        }
+        let pts: Vec<(Vec3, f32, Vec3)> =
+            self.samples.iter().zip(&ups).map(|(s, &up)| (if brush.dabs.is_some() { s.pos } else { f.filter(s.time, s.pos) }, s.pressure, up)).collect();
+        let step = |q: f32| dabs.spacing.max(0.005) * 2.0 * brush.radius_at(q);
+        for d in walk_dabs(&pts, step, brush.buildup) {
+            let (pos, r, up, paint) = dynamics(brush, &d, brush.radius_at(d.pressure));
+            let flow = dabs.flow * if dabs.pressure_flow { d.pressure.clamp(0.0, 1.0).max(0.02) } else { 1.0 };
+            let alpha = (flow * paint).clamp(0.0, 0.999);
+            let mut seg = GpuSegment::new(pos, r, pos, r, brush, id).with_up(up);
+            seg.style[2] = -(1.0 - alpha).ln() / (1.0 + brush.hardness);
+            out.push(seg);
+        }
+    }
+
     /// A 2D app stroke as tubes: its dabs spread evenly along each segment (the density per
     /// meter of trail, at a and b, in style.z and style.w), so a ray takes a segment's whole
     /// trail at once (the renderer integrates it from a table). Its points are kept as they are
@@ -325,12 +419,17 @@ impl Stroke {
     /// corner, fine detail), where the radius or the flow changes by over 15%, or at six radii.
     /// A stroke of one point is one stamp: a == b, its strength in style.z.
     ///
-    /// A VR stroke (no `dabs`) in an ordered layer is drawn the same way, as a 2D brush of flow
-    /// 1 and spacing 0.1 (`VR_DABS`: its core covered by its opacity), its path filtered by
-    /// `filter` first.
+    /// A VR stroke (no `dabs`) in an ordered layer is drawn the same way, as a 2D brush of its
+    /// flow and spacing (its core covered by its opacity when the flow builds up), its path
+    /// filtered by `filter` first.
     pub fn tube_segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
         let brush = &self.brush;
-        let dabs = brush.dabs.unwrap_or(VR_DABS);
+        // Dynamics and airbrush change each dab: single dabs.
+        if brush.jitters() || brush.buildup {
+            self.dab_stamps(filter, id, out);
+            return;
+        }
+        let dabs = brush.dab_settings();
         let mut f = filter;
         f.reset();
         let mut pts: Vec<(Vec3, f32)> = Vec::with_capacity(self.samples.len());
@@ -428,6 +527,9 @@ impl Stroke {
             ups.push(align(s.up, ups.last().copied()));
         }
         let pts: Vec<(Vec3, f32, Vec3)> = self.samples.iter().zip(&ups).map(|(s, &up)| (f.filter(s.time, s.pos), s.pressure, up)).collect();
+        // Airbrush: where the pen held still (a point repeats: the painter adds one every
+        // 30 ms then), a dab more.
+        let held: Vec<usize> = if brush.buildup && !brush.solid() { (1..self.samples.len()).filter(|&i| self.samples[i].pos == self.samples[i - 1].pos).collect() } else { Vec::new() };
         // 2. Resample by arc length, pressure and up direction interpolated. The step follows
         //    the radius at the last point, so thin parts of a stroke get points as close (in
         //    radii) as thick ones. A flat tip moving along its thin side: as close as it is thin
@@ -435,8 +537,10 @@ impl Stroke {
         let flat = 1.0 / brush.roundness.clamp(MIN_ROUNDNESS, 1.0) - 1.0;
         let step_at = |q: f32, along: Vec3, up: Vec3| {
             let k = along.dot(up);
-            spacing(brush.radius_at(q) / (1.0 + flat * (flat + 2.0) * k * k).sqrt())
+            // The brush's spacing, when it is wider (a soft stroke shows its dabs).
+            spacing(brush.radius_at(q) / (1.0 + flat * (flat + 2.0) * k * k).sqrt()).max(brush.spacing * 2.0 * brush.radius_at(q))
         };
+        let mut jitter_r: Vec<f32> = Vec::new();
         let mut res: Vec<(Vec3, f32, Vec3)> = vec![pts[0]];
         let mut carry = 0.0f32; // length walked since the last resampled point
         for w in pts.windows(2) {
@@ -465,9 +569,39 @@ impl Stroke {
         if res.len() == 1 || (res.last().unwrap().0 - last.0).length() > step_at(last.1, Vec3::ZERO, last.2) * 0.25 {
             res.push(last);
         }
-        // 3. Connect them, with the stamp strengths of a soft stroke.
-        let centers: Vec<(Vec3, f32)> = res.iter().map(|&(p, q, _)| (p, brush.radius_at(q))).collect();
-        let strengths = if brush.solid() { vec![0.0; centers.len()] } else { stamp_strengths(&centers, brush) };
+        // 3. The dynamics, per point (as the 2D app's per dab).
+        if brush.jitters() {
+            let n = res.len();
+            for k in 0..n {
+                let dir = (res[(k + 1).min(n - 1)].0 - res[k.saturating_sub(1)].0).normalize_or_zero();
+                let d = Dab { pos: res[k].0, pressure: res[k].1, up: res[k].2.normalize_or(Vec3::Y), dir, index: k as u32 };
+                let (pos, r, up, _) = dynamics(brush, &d, brush.radius_at(res[k].1));
+                // The radius comes back by the pressure that makes it.
+                let base = brush.radius_at(res[k].1).max(1e-9);
+                res[k] = (pos, res[k].1, up);
+                jitter_r.push(r / base);
+            }
+        }
+        // 4. Connect them, with the stamp strengths of a soft stroke: by the flow (and the
+        //    pressure, when it scales it, and the flow's jitter).
+        let centers: Vec<(Vec3, f32)> = res.iter().enumerate().map(|(k, &(p, q, _))| (p, brush.radius_at(q) * jitter_r.get(k).copied().unwrap_or(1.0))).collect();
+        let mut strengths = if brush.solid() { vec![0.0; centers.len()] } else { stamp_strengths(&centers, brush) };
+        if !brush.solid() {
+            for (k, s) in strengths.iter_mut().enumerate() {
+                let q = res[k].1;
+                let paint = if brush.flow_jitter > 0.0 { 1.0 - brush.flow_jitter * crate::stroke::dab_random(brush.seed, k as u32, 1) } else { 1.0 };
+                *s *= brush.flow * paint * if brush.pressure_flow { q.clamp(0.0, 1.0).max(0.02) } else { 1.0 };
+            }
+        }
+        // Airbrush dabs: each covers by the paint of one pass through its middle.
+        for &i in &held {
+            let (p, q, up) = pts[i];
+            let r = brush.radius_at(q);
+            let paint = (brush.opacity * brush.flow * if brush.pressure_flow { q.clamp(0.0, 1.0).max(0.02) } else { 1.0 }).clamp(0.0, 0.98);
+            let mut seg = GpuSegment::new(p, r, p, r, brush, id).with_up(up);
+            seg.style[2] = -(1.0 - paint).ln() / (1.0 + brush.hardness);
+            out.push(seg);
+        }
         if centers.len() == 1 {
             let (p, r) = centers[0];
             let mut seg = GpuSegment::new(p, r, p, r, brush, id).with_up(res[0].2);
@@ -615,6 +749,62 @@ mod tests {
                 .sum();
             assert!((tube - dabs).abs() < 0.03 * dabs, "tube {tube} vs dabs {dabs}");
         }
+    }
+
+    #[test]
+    fn dabs_walk_as_the_2d_app_walks() {
+        // A 2D brush of radius 1 cm, spacing 0.25 (a dab every 5 mm), along 10 cm: 21 dabs (the
+        // last may fall just past the end, as float steps add up); with
+        // dynamics, each a stamp; the size jitter makes them smaller, never larger.
+        let dabs = crate::stroke::Dabs { flow: 0.5, spacing: 0.25, pressure_flow: false };
+        let brush = Brush { radius: 0.01, pressure_size: false, hardness: 0.5, dabs: Some(dabs), size_jitter: 0.5, seed: 7, ..Default::default() };
+        let mut s = Stroke::new(brush);
+        for i in 0..=10 {
+            s.push(Sample::new(Vec3::new(i as f32 * 0.01, 0.0, 0.0), 1.0, i as f64));
+        }
+        let mut out = Vec::new();
+        s.tube_segments(OneEuro3::default(), 0, &mut out);
+        assert!((20..=21).contains(&out.len()), "{}", out.len());
+        assert!(out.iter().all(|g| g.a() == g.b() && g.a[3] <= 0.01 && g.a[3] >= 0.005));
+        assert!(out.iter().any(|g| g.a[3] < 0.009), "the sizes vary");
+        // One dab of flow 0.5 covers half through its middle.
+        let tau = out[0].style[2] * (1.0 + 0.5);
+        assert!((1.0 - (-tau).exp() - 0.5).abs() < 1e-4);
+        // The same stroke again: the same dabs (seeded).
+        let mut again = Vec::new();
+        s.tube_segments(OneEuro3::default(), 0, &mut again);
+        assert_eq!(out, again);
+    }
+
+    #[test]
+    fn flow_spacing_and_airbrush() {
+        let line = |brush: Brush, still: usize| {
+            let mut s = Stroke::new(brush);
+            for i in 0..=20 {
+                s.push(Sample::new(Vec3::new(i as f32 * 0.005, 0.0, 0.0), 1.0, i as f64 / 90.0));
+            }
+            // Held still at the end: the point repeats (as the painter adds it for airbrush).
+            for k in 0..still {
+                s.push(Sample::new(Vec3::new(0.1, 0.0, 0.0), 1.0, 1.0 + k as f64 * 0.03));
+            }
+            let mut out = Vec::new();
+            s.segments(OneEuro3::new(1e6, 0.0, 1.0), 0, &mut out);
+            out
+        };
+        let soft = Brush { radius: 0.01, hardness: 0.0, opacity: 0.6, pressure_size: false, ..Default::default() };
+        let full = line(soft, 0);
+        // Half the flow: half the strength.
+        let half = line(Brush { flow: 0.5, ..soft }, 0);
+        assert_eq!(full.len(), half.len());
+        assert!((half[3].style[2] - full[3].style[2] * 0.5).abs() < 1e-6);
+        // Wide spacing (a diameter): fewer points, as far apart as the diameter.
+        let wide = line(Brush { spacing: 1.0, ..soft }, 0);
+        assert!(wide.len() < full.len() / 2, "{} {}", wide.len(), full.len());
+        assert!(((wide[1].a() - wide[0].a()).length() - 0.02).abs() < 1e-3);
+        // Airbrush, held still for three ticks: three dabs more.
+        let air = line(Brush { buildup: true, ..soft }, 4);
+        let plain = line(soft, 4);
+        assert_eq!(air.len(), plain.len() + 3);
     }
 
     #[test]

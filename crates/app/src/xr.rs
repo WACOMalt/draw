@@ -278,6 +278,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     let mut panel = Panel::new(&painter.tools.brush);
     // Your palettes, beside the painting (or the default place, for a demo).
     let mut palettes = crate::palettes::Palettes::load(crate::palettes::path_beside(save_to.as_deref()).unwrap_or_else(|| crate::painting_path().with_file_name("palettes.json")));
+    let mut presets = crate::presets::Presets::load(crate::painting_path().with_file_name("presets.json"));
     let mut panel_shown = true;
     let mut ui: Option<UiRenderer> = None;
     // A debug snapshot this frame (the panel's button), and the buffer it is copied into.
@@ -439,7 +440,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
         loco.update(&mut rig, head_pose, sticks[0], sticks[1], dt);
 
         // The panel: laid out with this frame's pointer.
-        let panel_frame = placement.map(|_| panel.run(pointer, Model { painter: &mut painter, palettes: &mut palettes }));
+        let panel_frame = placement.map(|_| panel.run(pointer, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets }));
         if let Some(f) = &panel_frame {
             for action in &f.actions {
                 match action {

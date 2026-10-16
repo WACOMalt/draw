@@ -15,6 +15,8 @@ pub enum Target {
     PaletteName(Option<usize>),
     /// Search the paint library.
     Search,
+    /// A new brush preset's name.
+    PresetName,
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +35,7 @@ impl Typing {
             Target::Hex => 7,
             Target::PaletteName(_) => 40,
             Target::Search => 40,
+            Target::PresetName => 40,
         };
         Self { target, text: text.to_string(), shift: false, max }
     }
@@ -55,6 +58,7 @@ pub fn keyboard(ui: &mut egui::Ui, typing: &mut Typing) -> Option<Done> {
             Target::Hex => "Color (hex)",
             Target::PaletteName(_) => "Palette name",
             Target::Search => "Search paints and pigments, e.g. PB29",
+            Target::PresetName => "Name for the current brush",
         };
         ui.label(RichText::new(label).color(TEXT_DIM).size(13.0));
         // The text, with a caret.

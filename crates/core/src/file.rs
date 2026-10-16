@@ -91,7 +91,7 @@ fn hex(s: &str) -> [f32; 3] {
 /// through or isolated), blend modes, opacity, visibility, clipping and masks, and the canvas's
 /// paint mixing. A layer goes on top for painting in VR. What it cannot carry yet: adjustment
 /// and shape layers, layer effects, brush tips other than round (square, chalk, ...), and
-/// jitter, scatter and grain.
+/// grain.
 pub fn import_bdraw(path: &Path) -> Result<Painting> {
     let doc: Value = serde_json::from_slice(&read_maybe_gzip(path)?)?;
     if doc.get("format").and_then(Value::as_str) != Some("bdraw") {
@@ -191,6 +191,16 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
             roundness: num(b, "roundness", 1.0).clamp(0.05, 1.0),
             erase: b.get("tool").and_then(Value::as_str) == Some("erase"),
             dabs: Some(Dabs { flow, spacing, pressure_flow: flag(b, "pressureFlow", false) }),
+            flow,
+            spacing,
+            pressure_flow: flag(b, "pressureFlow", false),
+            buildup: flag(b, "buildup", false),
+            // The dynamics, with the 2D app's random numbers (seeded by the stroke's id).
+            size_jitter: num(b, "sizeJitter", 0.0).clamp(0.0, 1.0),
+            angle_jitter: num(b, "angleJitter", 0.0).clamp(0.0, 1.0),
+            scatter: num(b, "scatter", 0.0).clamp(0.0, 4.0),
+            flow_jitter: num(b, "opacityJitter", 0.0).clamp(0.0, 1.0),
+            seed: crate::stroke::stroke_seed(s.get("id").and_then(Value::as_str).unwrap_or("")),
         };
         // The tip's turn, as the 2D app's dabs (brush.ts DabWalker): its angle (degrees,
         // clockwise on the canvas, whose y runs down), plus the direction of travel when it

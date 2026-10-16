@@ -44,13 +44,15 @@ pub struct Tools {
     pub sweep_size: f32,
     /// The stroke eraser takes strokes from every visible layer; else from the active one.
     pub sweep_all: bool,
+    /// How much the pen's path is smoothed as it paints (0..0.95, the 2D app's smoothing).
+    pub smoothing: f32,
 }
 
 impl Default for Tools {
     fn default() -> Self {
         // The 2D app's eraser: hardness 0.6, no pressure to size.
         let eraser = Brush { radius: 0.02, hardness: 0.6, pressure_size: false, erase: true, ..Default::default() };
-        Self { tool: Tool::Brush, brush: Brush::default(), bg: [1.0; 3], eraser, angle: [0.0; 2], sweep_size: 0.03, sweep_all: true }
+        Self { tool: Tool::Brush, brush: Brush::default(), bg: [1.0; 3], eraser, angle: [0.0; 2], sweep_size: 0.03, sweep_all: true, smoothing: 0.25 }
     }
 }
 

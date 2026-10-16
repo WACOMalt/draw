@@ -18,6 +18,7 @@ pub use widgets::{RECENT, to_linear, to_srgb};
 
 use crate::painter::Painter;
 use crate::palettes::Palettes;
+use crate::presets::{Preset, Presets};
 use crate::tools::Tool;
 use egui::{Color32, Pos2, Rect, RichText, Sense, pos2, vec2};
 use glam::{Mat4, Vec3, Vec4};
@@ -141,6 +142,7 @@ pub struct Frame {
 pub struct Model<'a> {
     pub painter: &'a mut Painter,
     pub palettes: &'a mut Palettes,
+    pub presets: &'a mut Presets,
 }
 
 /// The panel's tabs.
@@ -161,6 +163,8 @@ pub struct Panel {
     color: color::ColorState,
     layers: layers::LayersState,
     typing: Option<Typing>,
+    /// The Tool tab's dynamics shown.
+    dynamics_open: bool,
 }
 
 impl Panel {
@@ -196,7 +200,7 @@ impl Panel {
             s.spacing.scroll = egui::style::ScrollStyle::solid();
             s.interaction.selectable_labels = false;
         });
-        Self { ctx, started: Instant::now(), was_pressed: false, was_on: false, tab: Tab::Tool, color: color::ColorState::new(brush.color), layers: layers::LayersState::default(), typing: None }
+        Self { ctx, started: Instant::now(), was_pressed: false, was_on: false, tab: Tab::Tool, color: color::ColorState::new(brush.color), layers: layers::LayersState::default(), typing: None, dynamics_open: false }
     }
 
     /// Opens the Color tab on its palettes.
@@ -242,10 +246,10 @@ impl Panel {
             ..Default::default()
         };
         let mut actions = Vec::new();
-        let Model { painter, palettes } = model;
+        let Model { painter, palettes, presets } = model;
         let output = self.ctx.clone().run(input, |ctx| {
             let frame = egui::Frame { inner_margin: egui::Margin::same(12.0), rounding: egui::Rounding::same(8.0), fill: BG_2, stroke: stroke(1.0, LINE), ..Default::default() };
-            egui::CentralPanel::default().frame(frame).show(ctx, |ui| self.content(ui, painter, palettes, &mut actions));
+            egui::CentralPanel::default().frame(frame).show(ctx, |ui| self.content(ui, painter, palettes, presets, &mut actions));
             // The pointer: a ring where the ray meets the panel.
             if let Some(at) = pointer.at {
                 let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pointer")));
@@ -257,7 +261,7 @@ impl Panel {
         Frame { primitives, textures: output.textures_delta, actions }
     }
 
-    fn content(&mut self, ui: &mut egui::Ui, painter: &mut Painter, palettes: &mut Palettes, actions: &mut Vec<Action>) {
+    fn content(&mut self, ui: &mut egui::Ui, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, actions: &mut Vec<Action>) {
         // The tabs, and undo and redo.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -298,7 +302,7 @@ impl Panel {
                     match done {
                         Some(Done::Commit(target, text)) => {
                             self.typing = None;
-                            self.commit(painter, palettes, &target, &text);
+                            self.commit(painter, palettes, presets, &target, &text);
                         }
                         Some(Done::Cancel) => self.typing = None,
                         None => {}
@@ -306,7 +310,7 @@ impl Panel {
                     return;
                 }
                 match self.tab {
-                    Tab::Tool => tool_tab(ui, painter),
+                    Tab::Tool => tool_tab(ui, painter, presets, &mut self.dynamics_open, &mut self.typing),
                     Tab::Color => color::color_tab(ui, painter, palettes, &mut self.color, &mut self.typing),
                     Tab::Layers => layers::layers_tab(ui, painter, &mut self.layers, &mut self.typing),
                     Tab::Settings => settings_tab(ui, actions),
@@ -316,8 +320,16 @@ impl Panel {
     }
 
     /// The keyboard's text, committed.
-    fn commit(&mut self, painter: &mut Painter, palettes: &mut Palettes, target: &Target, text: &str) {
+    fn commit(&mut self, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, target: &Target, text: &str) {
         match target {
+            Target::PresetName => {
+                let name: String = text.trim().chars().take(40).collect();
+                if let (false, Some((brush, angle))) = (name.is_empty(), painter.tools.current()) {
+                    let eraser = brush.erase;
+                    presets.list.push(Preset { name, eraser, brush: *brush, angle: *angle });
+                    presets.save();
+                }
+            }
             Target::LayerName(id) => {
                 let name: String = text.trim().chars().take(64).collect();
                 if let (false, Some(i)) = (name.is_empty(), painter.painting.index_of(*id)) {
@@ -383,53 +395,154 @@ impl Panel {
     }
 }
 
-/// The Tool tab: the tool's settings (the 2D app's options bar).
-fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter) {
-    let tools = &mut painter.tools;
-    match tools.tool {
-        Tool::Brush | Tool::Eraser => {
-            let (brush, angle) = tools.current().unwrap();
-            brush_settings(ui, brush, angle);
-        }
-        Tool::StrokeEraser => {
-            let mut diameter = tools.sweep_size;
-            if slider(ui, "Size", &mut diameter, SWEEP, true, length) {
-                tools.sweep_size = diameter;
+/// The Tool tab: the tool's settings (the 2D app's options bar), and the brush presets.
+fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, dynamics_open: &mut bool, typing: &mut Option<Typing>) {
+    let height = ui.available_height();
+    egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+        let tools = &mut painter.tools;
+        match tools.tool {
+            Tool::Brush | Tool::Eraser => {
+                let mut smoothing = tools.smoothing;
+                let (brush, angle) = tools.current().unwrap();
+                brush_settings(ui, brush, angle, &mut smoothing, dynamics_open);
+                painter.tools.smoothing = smoothing;
+                presets_section(ui, painter, presets, typing);
             }
-            ui.horizontal(|ui| {
-                ui.add_space(94.0);
-                if toggle(ui, "All layers", tools.sweep_all).clicked() {
-                    tools.sweep_all = true;
+            Tool::StrokeEraser => {
+                let mut diameter = tools.sweep_size;
+                if slider(ui, "Size", &mut diameter, SWEEP, true, length) {
+                    tools.sweep_size = diameter;
                 }
-                if toggle(ui, "Active layer", !tools.sweep_all).clicked() {
-                    tools.sweep_all = false;
-                }
-            });
-            ui.label(RichText::new("Removes every stroke whose path the ball touches. Undo brings them back.").color(TEXT_DIM).size(14.0));
+                ui.horizontal(|ui| {
+                    ui.add_space(94.0);
+                    if toggle(ui, "All layers", tools.sweep_all).clicked() {
+                        tools.sweep_all = true;
+                    }
+                    if toggle(ui, "Active layer", !tools.sweep_all).clicked() {
+                        tools.sweep_all = false;
+                    }
+                });
+                ui.label(RichText::new("Removes every stroke whose path the ball touches. Undo brings them back.").color(TEXT_DIM).size(14.0));
+            }
+            Tool::Eyedropper => {
+                ui.label(RichText::new("Point at the painting and pull the trigger to pick its color there, from all layers.").color(TEXT_DIM).size(14.0));
+            }
         }
-        Tool::Eyedropper => {
-            ui.label(RichText::new("Point at the painting and pull the trigger to pick its color there, from all layers.").color(TEXT_DIM).size(14.0));
-        }
-    }
+    });
 }
 
-/// The brush's or the eraser's settings: size (logarithmic), opacity, hardness, the tip's
-/// roundness and angle, and pressure to size.
-fn brush_settings(ui: &mut egui::Ui, brush: &mut Brush, angle: &mut f32) {
+/// The brush's or the eraser's settings, as the 2D app's options bar: size (logarithmic),
+/// opacity, flow (logarithmic), hardness, spacing (logarithmic), smoothing; pressure to size
+/// and to flow, airbrush; and the dynamics (the tip's angle and roundness, the jitters).
+fn brush_settings(ui: &mut egui::Ui, brush: &mut Brush, angle: &mut f32, smoothing: &mut f32, dynamics_open: &mut bool) {
     let mut diameter = brush.radius * 2.0;
     if slider(ui, "Size", &mut diameter, DIAMETER, true, length) {
         brush.radius = diameter * 0.5;
     }
     slider(ui, "Opacity", &mut brush.opacity, (0.01, 1.0), false, percent);
+    slider(ui, "Flow", &mut brush.flow, (0.005, 1.0), true, percent);
     slider(ui, "Hardness", &mut brush.hardness, (0.0, 1.0), false, percent);
-    slider(ui, "Roundness", &mut brush.roundness, (0.05, 1.0), false, percent);
-    slider(ui, "Angle", angle, (0.0, 360.0), false, |a| format!("{a:.0}°"));
+    slider(ui, "Spacing", &mut brush.spacing, (0.01, 2.0), true, percent);
+    slider(ui, "Smoothing", smoothing, (0.0, 0.95), false, percent);
     ui.horizontal(|ui| {
         ui.add_space(94.0);
         if toggle(ui, "P·size", brush.pressure_size).clicked() {
             brush.pressure_size = !brush.pressure_size;
         }
+        if toggle(ui, "P·flow", brush.pressure_flow).clicked() {
+            brush.pressure_flow = !brush.pressure_flow;
+        }
+        if toggle(ui, "Airbrush", brush.buildup).clicked() {
+            brush.buildup = !brush.buildup;
+        }
     });
+    // The dynamics, shown "on" when any is not its default (as the 2D app's button).
+    let on = brush.roundness < 1.0 || *angle != 0.0 || brush.jitters();
+    ui.horizontal(|ui| {
+        ui.add_space(94.0);
+        if toggle(ui, if *dynamics_open { "Dynamics: hide" } else { "Dynamics" }, on || *dynamics_open).clicked() {
+            *dynamics_open = !*dynamics_open;
+        }
+    });
+    if *dynamics_open {
+        slider(ui, "Angle", angle, (0.0, 360.0), false, |a| format!("{a:.0}°"));
+        slider(ui, "Roundness", &mut brush.roundness, (0.05, 1.0), false, percent);
+        slider(ui, "Size jit.", &mut brush.size_jitter, (0.0, 1.0), false, percent);
+        slider(ui, "Angle jit.", &mut brush.angle_jitter, (0.0, 1.0), false, percent);
+        slider(ui, "Scatter", &mut brush.scatter, (0.0, 4.0), false, percent);
+        slider(ui, "Flow jit.", &mut brush.flow_jitter, (0.0, 1.0), false, percent);
+    }
+}
+
+/// Brush presets: save the current brush (or eraser) under a name; press one to use it (its
+/// tool too); the cross deletes it.
+fn presets_section(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, typing: &mut Option<Typing>) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        section(ui, "PRESETS");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Save current").clicked() {
+                *typing = Some(Typing::new(Target::PresetName, ""));
+            }
+        });
+    });
+    if presets.list.is_empty() {
+        ui.label(RichText::new("None yet.").color(TEXT_FAINT).size(13.0));
+    }
+    let color = painter.tools.brush.color;
+    let mut apply = None;
+    let mut delete = None;
+    for (k, p) in presets.list.iter().enumerate() {
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 4.0, ROW_HOVER);
+        }
+        // A squiggle drawn with the brush: its width by a pressure swell, its paint by opacity
+        // and flow, its edge by hardness.
+        let thumb = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(120.0, 38.0));
+        ui.painter().rect_filled(thumb, 3.0, BG_1);
+        let c = if p.eraser { [0.85; 3] } else { color };
+        let b = to_srgb(c).map(|c| (c * 255.0).round() as u8);
+        let alpha = (p.brush.opacity * (0.3 + 0.7 * p.brush.flow)).clamp(0.05, 1.0);
+        let size = (p.brush.radius * 2.0 / DIAMETER.1).sqrt().clamp(0.08, 1.0) * 14.0;
+        for i in 0..40 {
+            let t = i as f32 / 39.0;
+            let pressure = if p.brush.pressure_size { (t * std::f32::consts::PI).sin().max(0.15) } else { 1.0 };
+            let at = pos2(thumb.left() + 10.0 + t * (thumb.width() - 20.0), thumb.center().y + (t * std::f32::consts::TAU).sin() * 8.0);
+            let r = (size * pressure).max(1.0);
+            let hard = p.brush.hardness;
+            ui.painter().circle_filled(at, r, Color32::from_rgba_unmultiplied(b[0], b[1], b[2], (alpha * 255.0 * (0.25 + 0.75 * hard)) as u8 / 2));
+            ui.painter().circle_filled(at, r * (0.4 + 0.6 * hard), Color32::from_rgba_unmultiplied(b[0], b[1], b[2], (alpha * 255.0) as u8 / 3));
+        }
+        ui.painter().text(pos2(thumb.right() + 10.0, rect.center().y), egui::Align2::LEFT_CENTER, format!("{}{}", p.name, if p.eraser { " (eraser)" } else { "" }), egui::FontId::proportional(15.0), TEXT);
+        let cross = Rect::from_center_size(pos2(rect.right() - 18.0, rect.center().y), vec2(30.0, 30.0));
+        let cross_r = ui.interact(cross, egui::Id::new(("preset delete", k)), Sense::click());
+        paint_icon(ui.painter(), "close", cross, 14.0, if cross_r.hovered() { TEXT } else { TEXT_FAINT });
+        if cross_r.clicked() {
+            delete = Some(k);
+        } else if response.clicked() {
+            apply = Some(k);
+        }
+    }
+    if let Some(k) = apply {
+        // The 2D app's apply: the eraser's settings when it is for the eraser, else the
+        // brush's (and the brush comes up); the color stays.
+        let p = presets.list[k].clone();
+        let tools = &mut painter.tools;
+        if p.eraser {
+            tools.eraser = Brush { erase: true, ..p.brush };
+            tools.angle[1] = p.angle;
+            tools.tool = Tool::Eraser;
+        } else {
+            tools.brush = Brush { color: tools.brush.color, erase: false, ..p.brush };
+            tools.angle[0] = p.angle;
+            tools.tool = Tool::Brush;
+        }
+    }
+    if let Some(k) = delete {
+        presets.list.remove(k);
+        presets.save();
+    }
 }
 
 /// The Settings tab: moving back to the start, the debug snapshot, and the controls.
