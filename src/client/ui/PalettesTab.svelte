@@ -9,6 +9,7 @@
   import { LIMITS } from '../../shared/types';
   import { deletePalette, loadPalettes, savePalette, updatePalette } from '../palettes';
   import { myCreators } from '../presets';
+  import { loadPaintLibrary, paintColor, paintDetail, type LibraryLine, type LibraryPaint, type PaintLibrary } from '../paintLibrary';
   import { ed, showToast } from '../state.svelte';
 
   let { engine }: { engine: Engine | null } = $props();
@@ -18,8 +19,10 @@
   let mine = $state<Set<string>>(new Set());
   let editing = $state<string | null>(null);
   let busy = $state(false);
-  /** The swatch picked last, for the line under the buttons. */
-  let picked = $state<PaletteColor | null>(null);
+  /** The swatch picked last: its color, and the text for the line under the buttons. */
+  let picked = $state<{ color: PaletteColor; detail: string } | null>(null);
+  let library = $state<PaintLibrary | null>(null);
+  let query = $state('');
 
   function readSet(key: string): Set<string> {
     try {
@@ -39,6 +42,16 @@
   const COLLAPSED_KEY = 'draw.paletteGroups';
   const ACTIVE_KEY = 'draw.activePalette';
   let collapsed = $state<Set<string>>(readSet(COLLAPSED_KEY));
+  /** Library media and lines start closed: the open ones. */
+  const OPEN_KEY = 'draw.paletteOpen';
+  let opened = $state<Set<string>>(readSet(OPEN_KEY));
+  function toggleOpen(key: string) {
+    const next = new Set(opened);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    opened = next;
+    store(OPEN_KEY, [...next]);
+  }
   let active = $state<string | null>(readActive());
   function readActive(): string | null {
     try {
@@ -68,7 +81,29 @@
       error = '';
     }
   }
-  onMount(() => void refresh());
+  onMount(() => {
+    void refresh();
+    loadPaintLibrary().then((l) => (library = l), () => {});
+  });
+
+  /** Paints whose name, line or pigment codes hold every word of the search. */
+  const results = $derived.by(() => {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length || !library) return null;
+    const found: { paint: LibraryPaint; line: LibraryLine; rank: number }[] = [];
+    for (const m of library.media)
+      for (const line of m.brands)
+        for (const paint of line.paints) {
+          const text = `${paint[0]} ${line.name} ${m.name} ${paint[2]}`.toLowerCase();
+          if (!words.every((w) => text.includes(w))) continue;
+          // First the paints of only the searched pigments, then those that contain them
+          const pigments = paint[2].toLowerCase().split(' ').filter(Boolean);
+          const rank = pigments.length && pigments.every((p) => words.includes(p)) ? 0 : words.some((w) => pigments.includes(w)) ? 1 : 2;
+          found.push({ paint, line, rank });
+        }
+    return found.sort((a, b) => a.rank - b.rank);
+  });
+  const SHOWN = 180;
 
   const own = $derived((palettes ?? []).filter((p) => mine.has(p.creator)));
   /** The palette "Add current color" adds to: the active one, or else the newest of mine. */
@@ -86,10 +121,13 @@
     return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
   });
 
-  function pick(c: PaletteColor) {
+  function pick(c: PaletteColor, detail = c.name ? `${c.name} · ${c.hex}` : c.hex) {
     ed.fg = c.hex;
     engine?.addSwatch(c.hex);
-    picked = c;
+    picked = { color: c, detail };
+  }
+  function pickPaint(p: LibraryPaint, line: LibraryLine) {
+    pick(paintColor(p, line), `${paintDetail(p, line)} · ${p[1]}`);
   }
 
   function replace(p: Palette) {
@@ -107,7 +145,9 @@
   }
 
   async function addTo(p: Palette | null) {
-    const color: PaletteColor = { hex: ed.fg };
+    // The name of the swatch picked last stays with it.
+    const name = picked?.color.hex === ed.fg ? picked.color.name?.slice(0, LIMITS.maxPaletteName) : undefined;
+    const color: PaletteColor = name ? { hex: ed.fg, name } : { hex: ed.fg };
     if (!p) {
       busy = true;
       const r = await savePalette('My colors', [color]);
@@ -162,7 +202,7 @@
     <button disabled={busy || !!error} onclick={newPalette} title="Make a new palette, shared with everyone under your name">New palette</button>
   </div>
   <p class="status">
-    {#if picked}{picked.name ? `${picked.name} · ` : ''}{picked.hex}{:else if target}Adds to <b>{target.name}</b>{:else}&nbsp;{/if}
+    {#if picked}{picked.detail}{:else if target}Adds to <b>{target.name}</b>{:else}&nbsp;{/if}
   </p>
 
   <div class="scroll">
@@ -208,7 +248,20 @@
     {/if}
 
     <h3>Paint</h3>
-    {#each BUILTIN_PALETTES as p (p.id)}
+    <input class="search" type="search" placeholder="Search paints and pigments, e.g. PB29" bind:value={query} aria-label="Search paints" />
+    {#if results}
+      {#if results.length === 0}
+        <p class="msg">No paint matches.</p>
+      {:else}
+        <p class="note">{results.length} paints{results.length > SHOWN ? `, the first ${SHOWN} shown` : ''}</p>
+        <div class="grid">
+          {#each results.slice(0, SHOWN) as r, i (i)}
+            <button class="sw" style:background={r.paint[1]} title={paintDetail(r.paint, r.line)} aria-label={paintDetail(r.paint, r.line)} onclick={() => pickPaint(r.paint, r.line)}></button>
+          {/each}
+        </div>
+      {/if}
+    {/if}
+    {#each results ? [] : BUILTIN_PALETTES as p (p.id)}
       <section>
         <button class="group" aria-expanded={!collapsed.has(p.id)} onclick={() => toggle(p.id)}>
           <span class="chev" class:open={!collapsed.has(p.id)}>›</span>
@@ -225,6 +278,36 @@
         {/if}
       </section>
     {/each}
+
+    {#if library && !results}
+      {#each library.media as m (m.id)}
+        <section>
+          <button class="group" aria-expanded={opened.has(m.id)} onclick={() => toggleOpen(m.id)}>
+            <span class="chev" class:open={opened.has(m.id)}>›</span>
+            <span class="title">{m.name}</span>
+            <span class="count">{m.brands.length} lines</span>
+          </button>
+          {#if opened.has(m.id)}
+            <p class="note">Masstones measured by <a href="https://artistpigments.org" target="_blank" rel="noreferrer">artistpigments.org</a> (CC BY-NC 4.0).</p>
+            {#each m.brands as line (line.id)}
+              {@const key = `${m.id}/${line.id}`}
+              <button class="group line" aria-expanded={opened.has(key)} onclick={() => toggleOpen(key)}>
+                <span class="chev" class:open={opened.has(key)}>›</span>
+                <span class="title">{line.name}</span>
+                <span class="count">{line.paints.length}</span>
+              </button>
+              {#if opened.has(key)}
+                <div class="grid">
+                  {#each line.paints as paint, i (i)}
+                    <button class="sw" class:disc={paint[3]} style:background={paint[1]} title={paintDetail(paint, line)} aria-label={paintDetail(paint, line)} onclick={() => pickPaint(paint, line)}></button>
+                  {/each}
+                </div>
+              {/if}
+            {/each}
+          {/if}
+        </section>
+      {/each}
+    {/if}
 
     {#if others.length}
       <h3>Shared</h3>
@@ -371,6 +454,22 @@
     margin: 0 0 4px 18px;
     font-size: 11px;
     color: var(--text-dim);
+  }
+  .search {
+    width: 100%;
+    margin: 2px 0 6px;
+    padding: 4px 6px;
+    font-size: 12px;
+  }
+  .note a {
+    color: var(--accent);
+  }
+  .group.line {
+    padding-left: 16px;
+    font-weight: 500;
+  }
+  .sw.disc {
+    opacity: 0.55;
   }
   .sub {
     display: flex;

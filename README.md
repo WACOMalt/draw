@@ -119,3 +119,11 @@ src-tauri/    desktop app for Windows and macOS (Tauri v2)
 electron/     desktop app for Linux (Electron)
 deploy/       nginx server block
 ```
+
+## Credits and data
+
+Draw is a non-commercial project. Some of the data in it allows only non-commercial use.
+
+- Pigment mixing: Kubelka-Munk spectral mixing from [spectral.js](https://github.com/rvanwijnen/spectral.js) by Ronald van Wijnen (MIT; the notice is in `src/client/engine/gl/spectral.ts`).
+- Golden Heavy Body palette: spectral reflectance of 78 Golden acrylics, given by Golden Artist Colors to Andrew Glassner and Eric Haines with permission to share ([realtimerendering.com/golden.html](https://www.realtimerendering.com/golden.html)). `scripts/golden-paints.py` makes `src/shared/paints.ts`.
+- Watercolor, gouache, oil and acrylic palettes: masstone colors and pigment codes from [artistpigments.org](https://artistpigments.org), licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (no commercial use), as collected by [palette-builder](https://github.com/colleen-love/palette-builder). `scripts/artistpigments-paints.py` makes `src/client/paint-library.json`.
