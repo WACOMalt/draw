@@ -26,17 +26,15 @@ fn srgb(x: f32) -> u8 {
     (y * 255.0 + 0.5) as u8
 }
 
-pub fn run(path: &str, width: u32, height: u32) -> Result<()> {
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
     let mut rm = Raymarcher::new(gpu.clone())?;
     let image = rm.target(width, height, 1)?.image;
 
-    let painting = crate::demo::painting();
     let mut segs = Vec::new();
     painting.segments(None, &mut segs);
-    let cam = Orbit::default();
     let eye = EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() };
 
     let d = &gpu.device;

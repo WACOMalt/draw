@@ -138,10 +138,10 @@ struct Painter {
 }
 
 impl Painter {
-    fn new() -> Self {
+    fn new(painting: Painting) -> Self {
         let hue = 0.02;
         let brush = Brush { color: hsv(hue, 0.75, 0.9), ..Default::default() };
-        let mut p = Self { painting: crate::demo::painting(), done: Vec::new(), redo: Vec::new(), active: None, brush, hue };
+        let mut p = Self { painting, done: Vec::new(), redo: Vec::new(), active: None, brush, hue };
         p.rebuild();
         p
     }
@@ -173,13 +173,13 @@ impl Painter {
                     stroke.push(Sample { pos: tip, pressure: pull, time: t });
                 } else {
                     let (_, stroke) = self.active.take().unwrap();
-                    stroke.segments(self.painting.filter, &mut self.done);
+                    stroke.segments(self.painting.filter, self.painting.strokes.len() as u32, &mut self.done);
                     self.painting.strokes.push(stroke);
                     self.redo.clear();
                 }
             }
             None if painting => {
-                let mut stroke = Stroke::new(self.brush.clone());
+                let mut stroke = Stroke::new(self.brush);
                 stroke.push(Sample { pos: tip, pressure: pull, time: t });
                 self.active = Some((hand, stroke));
             }
@@ -200,12 +200,12 @@ impl Painter {
         out.clear();
         out.extend_from_slice(&self.done);
         if let Some((_, s)) = &self.active {
-            s.segments(self.painting.filter, out);
+            s.segments(self.painting.filter, self.painting.strokes.len() as u32, out);
         }
     }
 }
 
-pub fn run() -> Result<()> {
+pub fn run(painting: Painting) -> Result<()> {
     // Ctrl-C asks the runtime to end the session, so it can leave the headset cleanly.
     let quit = Arc::new(AtomicBool::new(false));
     let q = quit.clone();
@@ -283,7 +283,7 @@ pub fn run() -> Result<()> {
 
     let scale: f32 = std::env::var("VDRAW_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let mut swapchain: Option<Swapchain> = None;
-    let mut painter = Painter::new();
+    let mut painter = Painter::new(painting);
     let mut segs = Vec::new();
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;

@@ -19,11 +19,16 @@ pub struct Brush {
     /// Pressure scales the radius, down to `min_ratio` of it at zero pressure.
     pub pressure_size: bool,
     pub min_ratio: f32,
+    /// How much a ray through the middle of the stroke is covered: 1 is opaque.
+    pub opacity: f32,
+    /// Where the density starts to fall off, as a part of the radius: 1 is a hard edge, 0
+    /// falls off from the center (an airbrush).
+    pub hardness: f32,
 }
 
 impl Default for Brush {
     fn default() -> Self {
-        Self { radius: 0.01, color: [0.9, 0.3, 0.2], pressure_size: true, min_ratio: 0.2 }
+        Self { radius: 0.01, color: [0.9, 0.3, 0.2], pressure_size: true, min_ratio: 0.2, opacity: 1.0, hardness: 1.0 }
     }
 }
 

@@ -1,24 +1,37 @@
 //! From samples to round cones: filter, resample by arc length, connect.
 
 use crate::filter::OneEuro3;
-use crate::stroke::Stroke;
+use crate::stroke::{Brush, Stroke};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
-/// One round cone, as the GPU reads it: three float4, so a port can also keep segments in a
-/// float texture (three texels each). `a.w` and `b.w` are the radii; `color` is linear RGB and
-/// alpha (1 for now).
+/// One round cone, as the GPU reads it: four float4, so a port can also keep segments in a
+/// float texture (four texels each). `a.w` and `b.w` are the radii; `color` is linear RGB and
+/// the opacity; `style` is the hardness and the stroke number (segments of one stroke do not
+/// add up where they overlap).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct GpuSegment {
     pub a: [f32; 4],
     pub b: [f32; 4],
     pub color: [f32; 4],
+    pub style: [f32; 4],
 }
 
 impl GpuSegment {
-    pub fn new(a: Vec3, ra: f32, b: Vec3, rb: f32, color: [f32; 3]) -> Self {
-        Self { a: [a.x, a.y, a.z, ra], b: [b.x, b.y, b.z, rb], color: [color[0], color[1], color[2], 1.0] }
+    pub fn new(a: Vec3, ra: f32, b: Vec3, rb: f32, brush: &Brush, stroke: u32) -> Self {
+        let c = brush.color;
+        Self {
+            a: [a.x, a.y, a.z, ra],
+            b: [b.x, b.y, b.z, rb],
+            color: [c[0], c[1], c[2], brush.opacity.clamp(0.0, 1.0)],
+            style: [brush.hardness.clamp(0.0, 1.0), stroke as f32, 0.0, 0.0],
+        }
+    }
+
+    /// Opaque with a hard edge: drawn as a surface. Else drawn as a volume.
+    pub fn solid(&self) -> bool {
+        self.color[3] >= 0.999 && self.style[0] >= 0.999
     }
 
     pub fn a(&self) -> Vec3 {
@@ -37,8 +50,9 @@ fn spacing(radius: f32) -> f32 {
 }
 
 impl Stroke {
-    /// The stroke's round cones, appended to `out`. A single sample is a sphere.
-    pub fn segments(&self, filter: OneEuro3, out: &mut Vec<GpuSegment>) {
+    /// The stroke's round cones, appended to `out`. A single sample is a sphere. `id`: the
+    /// stroke's number in the painting (exact in an f32 up to 2^24).
+    pub fn segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
         let brush = &self.brush;
         if self.samples.is_empty() {
             return;
@@ -74,11 +88,11 @@ impl Stroke {
         if res.len() == 1 {
             let (p, q) = res[0];
             let r = brush.radius_at(q);
-            out.push(GpuSegment::new(p, r, p, r, brush.color));
+            out.push(GpuSegment::new(p, r, p, r, brush, id));
             return;
         }
         for w in res.windows(2) {
-            out.push(GpuSegment::new(w[0].0, brush.radius_at(w[0].1), w[1].0, brush.radius_at(w[1].1), brush.color));
+            out.push(GpuSegment::new(w[0].0, brush.radius_at(w[0].1), w[1].0, brush.radius_at(w[1].1), brush, id));
         }
     }
 }
@@ -86,7 +100,7 @@ impl Stroke {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stroke::{Brush, Sample};
+    use crate::stroke::Sample;
 
     #[test]
     fn straight_line_is_evenly_resampled() {
@@ -96,7 +110,7 @@ mod tests {
         }
         let mut out = Vec::new();
         // No smoothing: a very high cutoff.
-        s.segments(OneEuro3::new(1e6, 0.0, 1.0), &mut out);
+        s.segments(OneEuro3::new(1e6, 0.0, 1.0), 0, &mut out);
         let step = spacing(0.01);
         for seg in &out[..out.len() - 1] {
             assert!(((seg.b() - seg.a()).length() - step).abs() < 1e-4);
@@ -109,7 +123,7 @@ mod tests {
         let mut s = Stroke::new(Brush::default());
         s.push(Sample { pos: Vec3::ONE, pressure: 1.0, time: 0.0 });
         let mut out = Vec::new();
-        s.segments(OneEuro3::default(), &mut out);
+        s.segments(OneEuro3::default(), 0, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].a(), out[0].b());
     }

@@ -15,8 +15,8 @@ impl Painting {
     /// All strokes as round cones, in stroke order (`active`, the stroke being drawn, last).
     pub fn segments(&self, active: Option<&Stroke>, out: &mut Vec<GpuSegment>) {
         out.clear();
-        for s in self.strokes.iter().chain(active) {
-            s.segments(self.filter, out);
+        for (i, s) in self.strokes.iter().chain(active).enumerate() {
+            s.segments(self.filter, i as u32, out);
         }
     }
 }

@@ -39,13 +39,21 @@ public float smin(float a, float b, float k)
     return min(a, b) - h * h * k * 0.25;
 }
 
-// A segment as stored: a.xyz, a.w = radius at a; b.xyz, b.w = radius at b; color = linear RGBA.
-// Three float4, so a port can read it from a float texture (three texels).
+// A segment as stored: a.xyz, a.w = radius at a; b.xyz, b.w = radius at b; color = linear RGB
+// and opacity; style.x = hardness, style.y = stroke number. Four float4, so a port can read it
+// from a float texture (four texels).
 public struct Segment
 {
     public float4 a;
     public float4 b;
     public float4 color;
+    public float4 style;
+}
+
+// Opaque with a hard edge: a surface. Else a volume.
+public bool isSolid(Segment s)
+{
+    return s.color.a >= 0.999 && s.style.x >= 0.999;
 }
 
 public float sdSegment(float3 p, Segment s)
