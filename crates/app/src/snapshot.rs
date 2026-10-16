@@ -16,7 +16,7 @@ const OUT_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 /// time of the raymarch (median and worst). `panel`: the brush panel in front of the camera,
 /// the pointer on its Size slider, as VR draws it.
 #[allow(clippy::too_many_arguments)]
-pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit, tip: Option<BrushTip>, bench: u32, panel: bool) -> Result<()> {
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit, tip: Option<BrushTip>, bench: u32, panel: Option<crate::tools::Tool>, sweep: Option<f32>) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
@@ -26,8 +26,17 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut segs = Vec::new();
     let runs = painting.segments(&mut segs);
     let layers = crate::xr::scene_layers(&painting);
-    let scene = Scene { segments: &segs, runs: &runs, version: 0, active: &[], active_layer: 0, layers: &layers };
+    let scene = Scene { segments: &segs, runs: &runs, version: 0, active: &[], active_layer: 0, layers: &layers, pigment: painting.mix == vdraw_core::Mix::Pigment };
     let eye = EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() };
+    let painting_mix = painting.mix;
+    // The stroke eraser's overlay, its ball (radius `sweep`) at the orbit target.
+    let mut lines = Vec::new();
+    if let Some(r) = sweep {
+        let active = painting.layers.len().saturating_sub(1);
+        let hot = crate::tools::swept(&segs, &runs, true, active, cam.target, cam.target, r, &[]);
+        crate::tools::overlay(&segs, &runs, true, active, cam.target, (r * 4.0).max(0.05), &hot, &[], &mut lines);
+        log::info!("stroke eraser: {} strokes under the ball, {} lines", hot.len(), lines.len());
+    }
 
     let d = &gpu.device;
     let mut readback = Buffer::new(&gpu, (width * height * 8) as u64, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "readback")?;
@@ -42,7 +51,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
                 d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
                 d.cmd_reset_query_pool(cmd, queries, 0, 2);
                 d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 0);
-                rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, laser: None })?;
+                rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, ..Default::default() })?;
                 d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::BOTTOM_OF_PIPE, queries, 1);
                 d.end_command_buffer(cmd)?;
                 let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
@@ -63,15 +72,20 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut ui = UiRenderer::new(gpu.clone(), OUT_FORMAT)?;
     let mut primitives = Vec::new();
     let mut placement = None;
-    if panel {
-        let mut brush = vdraw_core::Brush { hardness: 0.8, ..Default::default() };
-        let recent = [[0xe6, 0x4a, 0x2e], [0x31, 0xa8, 0xff], [0xf2, 0xc9, 0x4c], [0x5c, 0xb8, 0x5c], [0x9b, 0x59, 0xd0], [0x1e, 0x1e, 0x1e], [0xff, 0xff, 0xff]];
-        let mut p = Panel::new(&brush);
+    if let Some(tool) = panel {
+        let mut tools = crate::tools::Tools { tool, ..Default::default() };
+        tools.brush.hardness = 0.8;
+        tools.brush.roundness = 0.4;
+        tools.angle[0] = 30.0;
+        // A full set of recent colors (two rows), as after a while of painting.
+        let base = [[0xe6, 0x4a, 0x2e], [0x31, 0xa8, 0xff], [0xf2, 0xc9, 0x4c], [0x5c, 0xb8, 0x5c], [0x9b, 0x59, 0xd0], [0x1e, 0x1e, 0x1e], [0xff, 0xff, 0xff], [0x8a, 0x5a, 0x2b], [0x2b, 0x8a, 0x8a]];
+        let recent: Vec<[u8; 3]> = base.iter().chain(base.iter().rev()).copied().collect();
+        let mut p = Panel::new(&tools.brush);
         let (right, up, forward) = cam.axes();
         let place = Placement::centered(cam.eye() + forward * 0.45 + right * 0.12, right, -up, -forward);
         // Twice: egui lays out sizes it measured in the frame before.
         for _ in 0..2 {
-            let frame = p.run(Pointer { at: Some(egui::pos2(250.0, 96.0)), pressed: false }, Model { brush: &mut brush, recent: &recent, can_undo: true, can_redo: false });
+            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false }, Model { tools: &mut tools, mix: painting_mix, recent: &recent, can_undo: true, can_redo: false });
             ui.update_textures(&frame.textures)?;
             primitives = frame.primitives;
         }
@@ -82,7 +96,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let t0 = std::time::Instant::now();
     unsafe {
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, laser: None })?;
+        rm.record(cmd, 0, &scene, &[eye], &Overlays { tip, lines: &lines, ..Default::default() })?;
         barrier(d, cmd, out.image, 1, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);

@@ -90,14 +90,42 @@ public float smin(float a, float b, float k)
 }
 
 // A segment as stored: a.xyz, a.w = radius at a; b.xyz, b.w = radius at b; color = linear RGB
-// and opacity; style.x = hardness, style.y = stroke number. Four float4, so a port can read it
-// from a float texture (four texels).
+// and opacity; style.x = hardness, style.y = stroke number; shape.xyz = the tip's flat axis,
+// shape.w = its roundness (1: round). Five float4, so a port can read it from a float texture
+// (five texels).
 public struct Segment
 {
     public float4 a;
     public float4 b;
     public float4 color;
     public float4 style;
+    public float4 shape;
+}
+
+// A vector in the segment's round space: stretched along its flat axis by 1 / roundness,
+// where its tip (flattened along that axis) is round again.
+public float3 stretch(Segment s, float3 v)
+{
+    return v + s.shape.xyz * ((1.0 / s.shape.w - 1.0) * dot(s.shape.xyz, v));
+}
+
+// A segment and a ray (from o, unit dir) in the segment's round space (around its point a, for
+// precision). There the tip is round, so the round-cone and stamp math holds as it is.
+// `scale`: distances along the ray there are `scale` times those in the world. A round
+// segment stays as it is (scale 1).
+public Segment roundSpace(Segment s, inout float3 o, inout float3 dir, out float scale)
+{
+    scale = 1.0;
+    if (s.shape.w >= 0.999)
+        return s;
+    Segment r = s;
+    r.a.xyz = float3(0.0);
+    r.b.xyz = stretch(s, s.b.xyz - s.a.xyz);
+    o = stretch(s, o - s.a.xyz);
+    float3 d = stretch(s, dir);
+    scale = length(d);
+    dir = d / scale;
+    return r;
 }
 
 // Opaque with a hard edge: a surface. Else a volume.
@@ -106,9 +134,17 @@ public bool isSolid(Segment s)
     return s.color.a >= 0.999 && s.style.x >= 0.999;
 }
 
+// Where a ray first enters a segment: x = t, yzw = the normal (as rayRoundCone), the tip
+// flattened along the segment's axis (an exact hit: the round cone in the round space).
 public float4 raySegment(float3 o, float3 dir, Segment s)
 {
-    return rayRoundCone(o, dir, s.a.xyz, s.a.w, s.b.xyz, s.b.w);
+    float scale;
+    Segment r = roundSpace(s, o, dir, scale);
+    float4 hit = rayRoundCone(o, dir, r.a.xyz, r.a.w, r.b.xyz, r.b.w);
+    if (scale == 1.0 || hit.x < 0.0)
+        return hit;
+    // Normals go back by the same stretch (the stretch is symmetric).
+    return float4(hit.x / scale, normalize(stretch(s, hit.yzw)));
 }
 
 public float sdSegment(float3 p, Segment s)

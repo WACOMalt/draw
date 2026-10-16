@@ -5,12 +5,14 @@ use crate::stroke::{Brush, Stroke};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
-/// One round cone, as the GPU reads it: four float4, so a port can also keep segments in a
-/// float texture (four texels each). `a.w` and `b.w` are the radii; `color` is linear RGB and
+/// One round cone, as the GPU reads it: five float4, so a port can also keep segments in a
+/// float texture (five texels each). `a.w` and `b.w` are the radii; `color` is linear RGB and
 /// the opacity; `style` is the hardness, the stroke number, and the strengths of the density
 /// stamps at `a` (z) and at `b` (w, only on the last segment of a stroke). Segments of 2D app
 /// strokes are tubes instead: z and w are their density per meter at `a` and `b` (see
-/// `Stroke::tube_segments`).
+/// `Stroke::tube_segments`). `shape`: the tip's flat axis (xyz, unit) and its roundness (w):
+/// the tip is flattened along the axis to that part of its radius (1: round). The renderer
+/// stretches space along the axis by 1 / roundness, where the tip is round again.
 ///
 /// A solid stroke is drawn as the round cones' surface. A soft stroke is a row of density
 /// stamps, one at each resampled point: spheres whose density falls off from the center (the
@@ -22,7 +24,11 @@ pub struct GpuSegment {
     pub b: [f32; 4],
     pub color: [f32; 4],
     pub style: [f32; 4],
+    pub shape: [f32; 4],
 }
+
+/// The flattest a tip gets (roundness), so stretching by its inverse stays finite.
+pub const MIN_ROUNDNESS: f32 = 0.02;
 
 impl GpuSegment {
     pub fn new(a: Vec3, ra: f32, b: Vec3, rb: f32, brush: &Brush, stroke: u32) -> Self {
@@ -33,7 +39,23 @@ impl GpuSegment {
             // An eraser's opacity is negative (it takes paint away).
             color: [c[0], c[1], c[2], brush.opacity.clamp(0.0, 1.0) * if brush.erase { -1.0 } else { 1.0 }],
             style: [brush.hardness.clamp(0.0, 1.0), stroke as f32, 0.0, 0.0],
+            shape: [0.0, 1.0, 0.0, brush.roundness.clamp(MIN_ROUNDNESS, 1.0)],
         }
+    }
+
+    /// Flattened along `up` (unit) by the brush's roundness.
+    pub fn with_up(mut self, up: Vec3) -> Self {
+        let up = up.try_normalize().unwrap_or(Vec3::Y);
+        self.shape[..3].copy_from_slice(&up.to_array());
+        self
+    }
+
+    pub fn up(&self) -> Vec3 {
+        Vec3::new(self.shape[0], self.shape[1], self.shape[2])
+    }
+
+    pub fn roundness(&self) -> f32 {
+        self.shape[3]
     }
 
     /// Opaque with a hard edge: drawn as a surface. Else drawn as a volume.
@@ -48,6 +70,13 @@ impl GpuSegment {
     pub fn b(&self) -> Vec3 {
         Vec3::new(self.b[0], self.b[1], self.b[2])
     }
+}
+
+/// The pen's up direction turned to the side of the last one (a flat tip is the same either
+/// way up), so that directions in between do not pass through zero.
+fn align(up: Vec3, last: Option<Vec3>) -> Vec3 {
+    let up = up.try_normalize().unwrap_or(Vec3::Y);
+    if last.is_some_and(|l| l.dot(up) < 0.0) { -up } else { up }
 }
 
 /// Segments per chunk, at most.
@@ -295,11 +324,16 @@ impl Stroke {
         let brush = &self.brush;
         let Some(dabs) = brush.dabs else { return };
         let mut pts: Vec<(Vec3, f32)> = Vec::with_capacity(self.samples.len());
+        let mut ups: Vec<Vec3> = Vec::with_capacity(self.samples.len());
         for s in &self.samples {
             if pts.last().is_none_or(|&(p, _)| (s.pos - p).length() > 1e-4) {
                 pts.push((s.pos, s.pressure));
+                ups.push(align(s.up, ups.last().copied()));
             }
         }
+        // A tip that is not round: a segment also ends where the pen turns by over 10 degrees.
+        let flat = brush.roundness < 0.999;
+        let turned = |i: usize, j: usize| flat && ups[i].dot(ups[j]) < 0.985;
         if pts.is_empty() {
             return;
         }
@@ -314,7 +348,7 @@ impl Stroke {
         if pts.len() == 1 {
             let (p, q) = pts[0];
             let r = brush.radius_at(q);
-            let mut seg = GpuSegment::new(p, r, p, r, brush, id);
+            let mut seg = GpuSegment::new(p, r, p, r, brush, id).with_up(ups[0]);
             // One dab: covered by its flow through its center.
             seg.style[2] = -(1.0 - (dabs.flow * flow(q)).clamp(0.0, 0.999)).ln() / (1.0 + brush.hardness);
             out.push(seg);
@@ -329,14 +363,15 @@ impl Stroke {
             for j in i + 2..pts.len() {
                 let (b, qb) = pts[j];
                 let rb = brush.radius_at(qb);
-                if (b - a).length() > 6.0 * ra.min(rb) || !near(ra, rb) || !near(da, density(qb)) {
+                if (b - a).length() > 6.0 * ra.min(rb) || !near(ra, rb) || !near(da, density(qb)) || turned(i, j) {
                     break;
                 }
                 let tol = (0.1 * ra.min(rb)).max(2e-4);
                 let axis = (b - a).normalize_or_zero();
-                let straight = pts[i + 1..j].iter().all(|&(p, q)| {
+                let straight = (i + 1..j).all(|m| {
+                    let (p, q) = pts[m];
                     let d = p - a;
-                    (d - axis * d.dot(axis)).length() <= tol && near(ra, brush.radius_at(q)) && near(da, density(q))
+                    (d - axis * d.dot(axis)).length() <= tol && near(ra, brush.radius_at(q)) && near(da, density(q)) && !turned(i, m)
                 });
                 if !straight {
                     break;
@@ -344,7 +379,7 @@ impl Stroke {
                 end = j;
             }
             let (b, qb) = pts[end];
-            let mut seg = GpuSegment::new(a, ra, b, brush.radius_at(qb), brush, id);
+            let mut seg = GpuSegment::new(a, ra, b, brush.radius_at(qb), brush, id).with_up(ups[i] + ups[end]);
             seg.style[2] = da;
             seg.style[3] = density(qb);
             out.push(seg);
@@ -364,25 +399,37 @@ impl Stroke {
             self.tube_segments(id, out);
             return;
         }
-        // 1. Filter the positions (the pressure stays raw).
+        // 1. Filter the positions (the pressure and the pen's up direction stay raw).
         let mut f = filter;
         f.reset();
-        let pts: Vec<(Vec3, f32)> = self.samples.iter().map(|s| (f.filter(s.time, s.pos), s.pressure)).collect();
-        // 2. Resample by arc length, pressure interpolated. The step follows the radius at the
-        //    last point, so thin parts of a stroke get points as close (in radii) as thick ones.
-        let step_at = |q: f32| spacing(brush.radius_at(q));
-        let mut res: Vec<(Vec3, f32)> = vec![pts[0]];
+        let mut ups: Vec<Vec3> = Vec::with_capacity(self.samples.len());
+        for s in &self.samples {
+            ups.push(align(s.up, ups.last().copied()));
+        }
+        let pts: Vec<(Vec3, f32, Vec3)> = self.samples.iter().zip(&ups).map(|(s, &up)| (f.filter(s.time, s.pos), s.pressure, up)).collect();
+        // 2. Resample by arc length, pressure and up direction interpolated. The step follows
+        //    the radius at the last point, so thin parts of a stroke get points as close (in
+        //    radii) as thick ones. A flat tip moving along its thin side: as close as it is thin
+        //    that way (its extent along `along` is the radius over |A along|, A the stretch).
+        let flat = 1.0 / brush.roundness.clamp(MIN_ROUNDNESS, 1.0) - 1.0;
+        let step_at = |q: f32, along: Vec3, up: Vec3| {
+            let k = along.dot(up);
+            spacing(brush.radius_at(q) / (1.0 + flat * (flat + 2.0) * k * k).sqrt())
+        };
+        let mut res: Vec<(Vec3, f32, Vec3)> = vec![pts[0]];
         let mut carry = 0.0f32; // length walked since the last resampled point
         for w in pts.windows(2) {
-            let (p0, q0) = w[0];
-            let (p1, q1) = w[1];
+            let (p0, q0, u0) = w[0];
+            let (p1, q1, u1) = w[1];
             let len = (p1 - p0).length();
             if len <= 0.0 {
                 continue;
             }
+            let along = (p1 - p0) / len;
             let mut at = 0.0; // along this piece
             loop {
-                let need = step_at(res.last().unwrap().1) - carry;
+                let &(_, q, up) = res.last().unwrap();
+                let need = step_at(q, along, up.normalize_or_zero()) - carry;
                 if at + need > len {
                     carry += len - at;
                     break;
@@ -390,26 +437,26 @@ impl Stroke {
                 at += need;
                 carry = 0.0;
                 let t = at / len;
-                res.push((p0.lerp(p1, t), q0 + (q1 - q0) * t));
+                res.push((p0.lerp(p1, t), q0 + (q1 - q0) * t, u0.lerp(u1, t)));
             }
         }
         let last = *pts.last().unwrap();
-        if res.len() == 1 || (res.last().unwrap().0 - last.0).length() > step_at(last.1) * 0.25 {
+        if res.len() == 1 || (res.last().unwrap().0 - last.0).length() > step_at(last.1, Vec3::ZERO, last.2) * 0.25 {
             res.push(last);
         }
         // 3. Connect them, with the stamp strengths of a soft stroke.
-        let centers: Vec<(Vec3, f32)> = res.iter().map(|&(p, q)| (p, brush.radius_at(q))).collect();
+        let centers: Vec<(Vec3, f32)> = res.iter().map(|&(p, q, _)| (p, brush.radius_at(q))).collect();
         let strengths = if brush.solid() { vec![0.0; centers.len()] } else { stamp_strengths(&centers, brush) };
         if centers.len() == 1 {
             let (p, r) = centers[0];
-            let mut seg = GpuSegment::new(p, r, p, r, brush, id);
+            let mut seg = GpuSegment::new(p, r, p, r, brush, id).with_up(res[0].2);
             seg.style[2] = strengths[0];
             out.push(seg);
             return;
         }
         for i in 0..centers.len() - 1 {
             let ((a, ra), (b, rb)) = (centers[i], centers[i + 1]);
-            let mut seg = GpuSegment::new(a, ra, b, rb, brush, id);
+            let mut seg = GpuSegment::new(a, ra, b, rb, brush, id).with_up(res[i].2 + res[i + 1].2);
             seg.style[2] = strengths[i];
             if i + 2 == centers.len() {
                 seg.style[3] = strengths[i + 1];
@@ -428,7 +475,7 @@ mod tests {
     fn straight_line_is_evenly_resampled() {
         let mut s = Stroke::new(Brush { radius: 0.01, pressure_size: false, ..Default::default() });
         for i in 0..=10 {
-            s.push(Sample { pos: Vec3::new(i as f32 * 0.01, 0.0, 0.0), pressure: 1.0, time: i as f64 / 90.0 });
+            s.push(Sample::new(Vec3::new(i as f32 * 0.01, 0.0, 0.0), 1.0, i as f64 / 90.0));
         }
         let mut out = Vec::new();
         // No smoothing: a very high cutoff.
@@ -460,7 +507,7 @@ mod tests {
             let brush = Brush { radius: 0.02, hardness: h, opacity, pressure_size: false, ..Default::default() };
             let mut s = Stroke::new(brush);
             for i in 0..=200 {
-                s.push(Sample { pos: Vec3::new(i as f32 * 0.002, 0.0, 0.0), pressure: 1.0, time: i as f64 / 90.0 });
+                s.push(Sample::new(Vec3::new(i as f32 * 0.002, 0.0, 0.0), 1.0, i as f64 / 90.0));
             }
             let mut out = Vec::new();
             s.segments(OneEuro3::new(1e6, 0.0, 1.0), 0, &mut out);
@@ -487,7 +534,7 @@ mod tests {
         // Straight, 100 points 1 mm apart: segments of about six radii.
         let mut s = Stroke::new(brush);
         for i in 0..100 {
-            s.push(Sample { pos: Vec3::new(i as f32 * 0.001, 0.0, 0.0), pressure: 1.0, time: i as f64 });
+            s.push(Sample::new(Vec3::new(i as f32 * 0.001, 0.0, 0.0), 1.0, i as f64));
         }
         let mut out = Vec::new();
         s.tube_segments(0, &mut out);
@@ -497,14 +544,14 @@ mod tests {
         let mut z = Stroke::new(brush);
         for i in 0..=40 {
             let y = if (i / 4) % 2 == 0 { (i % 4) as f32 } else { 4.0 - (i % 4) as f32 };
-            z.push(Sample { pos: Vec3::new(i as f32 * 0.001, y * 0.001, 0.0), pressure: 1.0, time: i as f64 });
+            z.push(Sample::new(Vec3::new(i as f32 * 0.001, y * 0.001, 0.0), 1.0, i as f64));
         }
         out.clear();
         z.tube_segments(0, &mut out);
         assert_eq!(out.len(), 10);
         // One point: one stamp.
         let mut one = Stroke::new(brush);
-        one.push(Sample { pos: Vec3::ZERO, pressure: 1.0, time: 0.0 });
+        one.push(Sample::new(Vec3::ZERO, 1.0, 0.0));
         out.clear();
         one.tube_segments(0, &mut out);
         assert!(out.len() == 1 && out[0].a() == out[0].b());
@@ -554,7 +601,7 @@ mod tests {
         // Pressure 0.2 to 1: each step stays near 0.35 of the local radius.
         let mut s = Stroke::new(Brush { radius: 0.02, ..Default::default() });
         for i in 0..=100 {
-            s.push(Sample { pos: Vec3::new(i as f32 * 0.003, 0.0, 0.0), pressure: i as f32 / 100.0, time: i as f64 / 90.0 });
+            s.push(Sample::new(Vec3::new(i as f32 * 0.003, 0.0, 0.0), i as f32 / 100.0, i as f64 / 90.0));
         }
         let mut out = Vec::new();
         s.segments(OneEuro3::new(1e6, 0.0, 1.0), 0, &mut out);
@@ -571,7 +618,7 @@ mod tests {
             let mut s = Stroke::new(Brush { hardness: if id == 1 { 0.0 } else { 1.0 }, ..Default::default() });
             for i in 0..=40 {
                 let t = i as f32 / 40.0;
-                s.push(Sample { pos: Vec3::new(t.cos(), t * 0.3, (t * 3.0).sin()) * 0.4, pressure: t, time: i as f64 / 90.0 });
+                s.push(Sample::new(Vec3::new(t.cos(), t * 0.3, (t * 3.0).sin()) * 0.4, t, i as f64 / 90.0));
             }
             s.segments(OneEuro3::default(), id, &mut out);
         }
@@ -596,7 +643,7 @@ mod tests {
     #[test]
     fn one_sample_is_a_sphere() {
         let mut s = Stroke::new(Brush::default());
-        s.push(Sample { pos: Vec3::ONE, pressure: 1.0, time: 0.0 });
+        s.push(Sample::new(Vec3::ONE, 1.0, 0.0));
         let mut out = Vec::new();
         s.segments(OneEuro3::default(), 0, &mut out);
         assert_eq!(out.len(), 1);

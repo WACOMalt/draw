@@ -1,7 +1,7 @@
 //! Files: vdraw's own (.vdraw: gzip-compressed JSON of the painting), and the 2D app's
 //! (.bdraw), brought in as 3D strokes on a wall.
 
-use crate::painting::{Blend, Layer, Painting};
+use crate::painting::{Blend, Layer, Mix, Painting};
 use crate::segments::to_linear;
 use crate::stroke::{Brush, Dabs, Sample, Stroke};
 use anyhow::{Result, bail};
@@ -81,14 +81,15 @@ fn hex(s: &str) -> [f32; 3] {
 }
 
 /// Brings in a .bdraw (the 2D app's canvas) as 3D strokes on a wall: every stroke keeps its
-/// path and pressure and its 2D brush (flow, spacing, hardness, opacity, eraser), all its
-/// points at one depth (a vertical plane in front of the viewer). No paper. Its layers are ordered (strokes cover
-/// each other in their order, as in the 2D app). Seen square on with no perspective it matches
-/// the 2D drawing; in perspective the round strokes show their thickness. The layers come in
-/// order (groups that pass through flattened; a group's opacity multiplies its layers'), with
-/// their blend modes. A layer goes on top for painting in VR. What it cannot carry yet: isolated
-/// groups (drawn as if they passed through), layer masks, clipping, adjustment and shape
-/// layers, and brush tip shapes (angle, roundness).
+/// path and pressure and its 2D brush (flow, spacing, hardness, opacity, eraser, the tip's
+/// roundness and angle), all its points at one depth (a vertical plane in front of the
+/// viewer). No paper. Its layers are ordered (strokes cover each other in their order, as in
+/// the 2D app). Seen square on with no perspective it matches the 2D drawing; in perspective the
+/// strokes show their thickness. The layers come in order (groups that pass through flattened;
+/// a group's opacity multiplies its layers'), with their blend modes, and the canvas's paint
+/// mixing. A layer goes on top for painting in VR. What it cannot carry yet: isolated groups
+/// (drawn as if they passed through), layer masks, clipping, adjustment and shape layers, brush
+/// tips other than round (square, chalk, ...), and jitter, scatter and grain.
 pub fn import_bdraw(path: &Path) -> Result<Painting> {
     let doc: Value = serde_json::from_slice(&read_maybe_gzip(path)?)?;
     if doc.get("format").and_then(Value::as_str) != Some("bdraw") {
@@ -165,14 +166,30 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
             min_ratio: 0.02,
             opacity: num(b, "opacity", 1.0),
             hardness,
+            roundness: num(b, "roundness", 1.0).clamp(0.05, 1.0),
             erase: b.get("tool").and_then(Value::as_str) == Some("erase"),
             dabs: Some(Dabs { flow, spacing, pressure_flow: flag(b, "pressureFlow", false) }),
         };
+        // The tip's turn, as the 2D app's dabs (brush.ts DabWalker): its angle (degrees,
+        // clockwise on the canvas, whose y runs down), plus the direction of travel when it
+        // follows it. Its width lies along the turned x; it is squashed along the turned y,
+        // which on the wall (y up) is the pen's up direction.
+        let angle = num(b, "angle", 0.0).to_radians();
+        let follow = flag(b, "followDirection", false);
         let mut stroke = Stroke::new(brush);
         if let Some(pts) = s.get("pts").and_then(Value::as_array) {
-            for (i, p) in pts.chunks_exact(3).enumerate() {
-                let f = |v: &Value| v.as_f64().unwrap_or(0.0) as f32;
-                stroke.push(Sample { pos: to_wall(f(&p[0]), f(&p[1])), pressure: f(&p[2]), time: i as f64 });
+            let f = |v: &Value| v.as_f64().unwrap_or(0.0) as f32;
+            let pts: Vec<(f32, f32, f32)> = pts.chunks_exact(3).map(|p| (f(&p[0]), f(&p[1]), f(&p[2]))).collect();
+            let mut dir = 0.0f32;
+            for (i, &(x, y, pressure)) in pts.iter().enumerate() {
+                // The direction of the last piece (the first point: of the first piece).
+                let (from, to) = if i == 0 { (pts[0], pts.get(1).copied().unwrap_or(pts[0])) } else { (pts[i - 1], pts[i]) };
+                if (to.0 - from.0).hypot(to.1 - from.1) > 0.0 {
+                    dir = (to.1 - from.1).atan2(to.0 - from.0);
+                }
+                let rot = angle + if follow { dir } else { 0.0 };
+                let up = Vec3::new(-rot.sin(), -rot.cos(), 0.0);
+                stroke.push(Sample { up, ..Sample::new(to_wall(x, y), pressure, i as f64) });
             }
         }
         if !stroke.samples.is_empty() {
@@ -180,5 +197,7 @@ pub fn import_bdraw(path: &Path) -> Result<Painting> {
         }
     }
     out.push(Layer { name: "VR".into(), ..Default::default() });
-    Ok(Painting { layers: out, ..Default::default() })
+    // The canvas's paint mixing (version 10 on; older files mix as normal).
+    let mix = if doc.get("mix").and_then(Value::as_str) == Some("pigment") { Mix::Pigment } else { Mix::Normal };
+    Ok(Painting { layers: out, mix, ..Default::default() })
 }

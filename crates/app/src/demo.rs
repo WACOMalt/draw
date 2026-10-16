@@ -6,11 +6,16 @@ use std::f32::consts::TAU;
 use vdraw_core::{Brush, Painting, Sample, Stroke};
 
 fn stroke(brush: Brush, n: usize, f: impl Fn(f32) -> (Vec3, f32)) -> Stroke {
+    turned(brush, n, |t| (f(t), Vec3::Y))
+}
+
+/// A stroke whose pen turns: `f` gives the tip and pressure, and the pen's up direction.
+fn turned(brush: Brush, n: usize, f: impl Fn(f32) -> ((Vec3, f32), Vec3)) -> Stroke {
     let mut s = Stroke::new(brush);
     for i in 0..=n {
         let t = i as f32 / n as f32;
-        let (pos, pressure) = f(t);
-        s.push(Sample { pos, pressure, time: i as f64 / 90.0 });
+        let ((pos, pressure), up) = f(t);
+        s.push(Sample { up, ..Sample::new(pos, pressure, i as f64 / 90.0) });
     }
     s
 }
@@ -129,5 +134,49 @@ pub fn overlap() -> Painting {
         let a = t * std::f32::consts::PI;
         (Vec3::new(0.3 + (t - 0.5) * 0.06, 1.3 - t * 0.06, a.sin() * 0.3), 1.0)
     }));
+    p
+}
+
+/// Flat tips (roundness 0.15): a wave with the pen upright (thin where it runs level, wide where
+/// it climbs), the same wave with the pen rolling a half turn along it (a twisted ribbon), a
+/// calligraphy loop with the pen held at 45 degrees, and a soft flat stroke.
+pub fn flat() -> Painting {
+    let mut p = Painting::default();
+    let flat = |color, hardness: f32, opacity: f32| Brush { radius: 0.035, color, roundness: 0.15, hardness, opacity, pressure_size: false, ..Default::default() };
+    p.active().push(stroke(flat([0.9, 0.3, 0.15], 1.0, 1.0), 200, |t| {
+        (Vec3::new(-0.45 + t * 0.9, 1.6 + (t * TAU * 1.5).sin() * 0.07, 0.0), 1.0)
+    }));
+    p.active().push(turned(flat([0.2, 0.6, 0.9], 1.0, 1.0), 200, |t| {
+        let roll = t * std::f32::consts::PI;
+        ((Vec3::new(-0.45 + t * 0.9, 1.4, 0.0), 1.0), Vec3::new(0.0, roll.cos(), roll.sin()))
+    }));
+    let pen = Vec3::new(1.0, 1.0, 0.0).normalize();
+    p.active().push(turned(flat([0.95, 0.8, 0.2], 1.0, 1.0), 200, move |t| {
+        let a = t * TAU;
+        ((Vec3::new(-0.25 + a.cos() * 0.13, 1.12 + a.sin() * 0.13, 0.0), 1.0), pen)
+    }));
+    p.active().push(turned(flat([0.6, 0.3, 0.85], 0.3, 0.8), 200, move |t| {
+        let a = t * TAU;
+        ((Vec3::new(0.25 + a.cos() * 0.13, 1.12 + a.sin() * 0.13, 0.0), 1.0), pen)
+    }));
+    p
+}
+
+/// Paint over paint: yellow under blue, yellow under red, blue under red, white under blue
+/// (top to bottom), each pair a soft stroke at 70% over a solid one; on the right, the same as
+/// thin glazes (soft over soft, 40%). With `--mix pigment` they mix as paint.
+pub fn mix() -> Painting {
+    let mut p = Painting::default();
+    let srgb = |c: [f32; 3]| vdraw_core::segments::to_linear(c);
+    let pairs = [([0.98, 0.85, 0.1], [0.1, 0.3, 0.85]), ([0.98, 0.85, 0.1], [0.85, 0.1, 0.1]), ([0.1, 0.3, 0.85], [0.85, 0.1, 0.1]), ([1.0, 1.0, 1.0], [0.1, 0.3, 0.85])];
+    for (row, (under, over)) in pairs.into_iter().enumerate() {
+        let y = 1.58 - row as f32 * 0.15;
+        for (x0, under_brush, opacity) in [(-0.42f32, true, 0.7f32), (0.04, false, 0.4)] {
+            let base = Brush { radius: 0.03, color: srgb(under), pressure_size: false, hardness: if under_brush { 1.0 } else { 0.4 }, opacity: if under_brush { 1.0 } else { opacity }, ..Default::default() };
+            p.active().push(stroke(base, 60, move |t| (Vec3::new(x0 + t * 0.38, y, -0.02), 1.0)));
+            let top = Brush { radius: 0.03, color: srgb(over), pressure_size: false, hardness: 0.4, opacity, ..Default::default() };
+            p.active().push(stroke(top, 60, move |t| (Vec3::new(x0 + 0.12 + t * 0.26, y + 0.02, 0.02), 1.0)));
+        }
+    }
     p
 }

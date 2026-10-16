@@ -15,6 +15,8 @@ use vdraw_core::{GpuChunk, GpuCluster, GpuSegment, LayerRun};
 /// Frames in flight: each has its own parameter and segment buffers.
 pub const FRAMES: usize = 2;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raymarch.spv"));
+/// The same, mixing paint as paint (pigment).
+const SPIRV_PIGMENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raymarch_pigment.spv"));
 /// Pixels per side of a workgroup tile (`TILE` in shaders/raymarch.slang).
 const TILE: u32 = 16;
 pub const TARGET_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -44,10 +46,12 @@ struct ParamsGpu {
     brush_tip: [f32; 4],
     brush_color: [f32; 4],
     brush_style: [f32; 4],
+    brush_up: [f32; 4],
     laser_a: [f32; 4],
     laser_b: [f32; 4],
     cluster_count: u32,
-    pad2: [u32; 3],
+    line_count: u32,
+    pad2: [u32; 2],
 }
 
 /// A layer as the shader reads it: the 2D app's blend mode (its number) and the opacity.
@@ -72,15 +76,34 @@ pub struct Scene<'a> {
     pub active_layer: usize,
     /// Every layer of the painting, by its place (`LayerRun::layer`).
     pub layers: &'a [SceneLayer],
+    /// Paint mixes as paint (vdraw_core::Mix::Pigment), not as light.
+    pub pigment: bool,
 }
 
-/// What is drawn over the painting: the brush tip, and the pointer's laser.
+/// What is drawn over the painting: the brush tip, the pointer's laser, and lines.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Overlays {
+pub struct Overlays<'a> {
     pub tip: Option<BrushTip>,
     /// From the controller to where it points on the panel.
     pub laser: Option<(Vec3, Vec3)>,
+    /// Lines over everything (the stroke eraser's marks). At most `MAX_LINES` show per tile.
+    pub lines: &'a [OverlayLine],
 }
+
+/// A line drawn over the painting, as the 2D app draws stroke paths: from `a` to `b` (xyz), a
+/// line `a[3]` pixels wide in `color` over a dark halo `b[3]` pixels wide in `halo` (linear
+/// rgb, and how much each covers).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct OverlayLine {
+    pub a: [f32; 4],
+    pub b: [f32; 4],
+    pub color: [f32; 4],
+    pub halo: [f32; 4],
+}
+
+/// Overlay lines a tile keeps (`MAX_LINES` in shaders/raymarch.slang).
+pub const MAX_LINES: usize = 256;
 
 /// The brush tip to draw: where the next stroke starts, and how it will look.
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +113,9 @@ pub struct BrushTip {
     pub color: [f32; 3],
     pub opacity: f32,
     pub hardness: f32,
+    /// The pen's up direction, and the tip's roundness (it is flattened along `up`).
+    pub up: Vec3,
+    pub roundness: f32,
 }
 
 pub struct Buffer {
@@ -205,6 +231,8 @@ struct Frame {
     layers: Buffer,
     /// The chunks' clusters (binding 5).
     clusters: Buffer,
+    /// The overlay lines (binding 8).
+    lines: Buffer,
     /// The version of the finished strokes in these buffers (None: none yet).
     version: Option<u64>,
     set: vk::DescriptorSet,
@@ -217,6 +245,8 @@ pub struct Raymarcher {
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// The raymarcher that mixes paint as paint.
+    pigment: vk::Pipeline,
     pool: vk::DescriptorPool,
     frames: Vec<Frame>,
     target: Option<Target>,
@@ -355,19 +385,25 @@ impl Raymarcher {
         let clusters_binding = vk::DescriptorSetLayoutBinding::default().binding(5).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
         let chord_binding = vk::DescriptorSetLayoutBinding::default().binding(6).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
         let trail_binding = vk::DescriptorSetLayoutBinding::default().binding(7).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
-        let bindings: Vec<_> = bindings.into_iter().chain([layers_binding, clusters_binding, chord_binding, trail_binding]).collect();
+        let lines_binding = vk::DescriptorSetLayoutBinding::default().binding(8).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let bindings: Vec<_> = bindings.into_iter().chain([layers_binding, clusters_binding, chord_binding, trail_binding, lines_binding]).collect();
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }?;
         let layout = unsafe { d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]), None) }?;
-        let code = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV))?;
-        let module = unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }?;
-        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-        let pipeline = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None) }
-            .map_err(|(_, e)| e)?[0];
-        unsafe { d.destroy_shader_module(module, None) };
+        let compile = |spirv: &[u8]| -> Result<vk::Pipeline> {
+            let code = ash::util::read_spv(&mut std::io::Cursor::new(spirv))?;
+            let module = unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }?;
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+            let pipeline = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None) }
+                .map_err(|(_, e)| e)?[0];
+            unsafe { d.destroy_shader_module(module, None) };
+            Ok(pipeline)
+        };
+        let pipeline = compile(SPIRV)?;
+        let pigment = compile(SPIRV_PIGMENT)?;
 
         let sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: FRAMES as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5 * FRAMES as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 * FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: FRAMES as u32 },
         ];
@@ -381,13 +417,14 @@ impl Raymarcher {
             let chunks = Buffer::new(&gpu, 256 * size_of::<GpuChunk>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
             let layers = Buffer::new(&gpu, 64 * size_of::<SceneLayer>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "layers")?;
             let clusters = Buffer::new(&gpu, 64 * size_of::<GpuCluster>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "clusters")?;
-            frames.push(Frame { params, segments, chunks, layers, clusters, version: None, set, bound_view: vk::ImageView::null() });
+            let lines = Buffer::new(&gpu, 64 * size_of::<OverlayLine>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "overlay lines")?;
+            frames.push(Frame { params, segments, chunks, layers, clusters, lines, version: None, set, bound_view: vk::ImageView::null() });
         }
         let table = vdraw_core::chord_table();
         let mut chord = Buffer::new(&gpu, (table.len() * 4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chord table")?;
         chord.bytes()[..table.len() * 4].copy_from_slice(bytemuck::cast_slice(&table));
         let trail = TrailTexture::new(&gpu)?;
-        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord, trail };
+        let r = Self { gpu, set_layout, layout, pipeline, pigment, pool, frames, target: None, static_chunks: Vec::new(), static_clusters: Vec::new(), static_version: None, chord, trail };
         for i in 0..FRAMES {
             r.write_buffers(i);
         }
@@ -402,9 +439,11 @@ impl Raymarcher {
         let lay = [vk::DescriptorBufferInfo::default().buffer(f.layers.buffer).range(vk::WHOLE_SIZE)];
         let clu = [vk::DescriptorBufferInfo::default().buffer(f.clusters.buffer).range(vk::WHOLE_SIZE)];
         let cho = [vk::DescriptorBufferInfo::default().buffer(self.chord.buffer).range(vk::WHOLE_SIZE)];
+        let lin = [vk::DescriptorBufferInfo::default().buffer(f.lines.buffer).range(vk::WHOLE_SIZE)];
         let tra = [vk::DescriptorImageInfo::default().sampler(self.trail.sampler).image_view(self.trail.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(7).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&tra),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(8).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lin),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(6).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&cho),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(5).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&clu),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lay),
@@ -466,11 +505,12 @@ impl Raymarcher {
         let need_chunks = (n_chunks.max(1) * size_of::<GpuChunk>()) as u64;
         let need_layers = (scene.layers.len().max(1) * size_of::<SceneLayer>()) as u64;
         let need_clusters = (n_clusters.max(1) * size_of::<GpuCluster>()) as u64;
+        let need_lines = (overlays.lines.len().max(1) * size_of::<OverlayLine>()) as u64;
         {
             let gpu = self.gpu.clone();
             let f = &mut self.frames[frame];
             let mut rebind = false;
-            for (buffer, need, name) in [(&mut f.segments, need, "segments"), (&mut f.chunks, need_chunks, "chunks"), (&mut f.layers, need_layers, "layers"), (&mut f.clusters, need_clusters, "clusters")] {
+            for (buffer, need, name) in [(&mut f.segments, need, "segments"), (&mut f.chunks, need_chunks, "chunks"), (&mut f.layers, need_layers, "layers"), (&mut f.clusters, need_clusters, "clusters"), (&mut f.lines, need_lines, "overlay lines")] {
                 if buffer.size < need {
                     buffer.destroy(&gpu);
                     *buffer = Buffer::new(&gpu, need.next_power_of_two(), vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, name)?;
@@ -496,6 +536,7 @@ impl Raymarcher {
         let clu = size_of::<GpuCluster>();
         f.clusters.bytes()[n_static_clusters * clu..n_clusters * clu].copy_from_slice(bytemuck::cast_slice(&active_clusters));
         f.layers.bytes()[..scene.layers.len() * size_of::<SceneLayer>()].copy_from_slice(bytemuck::cast_slice(scene.layers));
+        f.lines.bytes()[..overlays.lines.len() * size_of::<OverlayLine>()].copy_from_slice(bytemuck::cast_slice(overlays.lines));
         let (segment_count, chunk_count) = (n_segments as u32, n_chunks as u32);
         let f = &mut self.frames[frame];
         let mut p = ParamsGpu::zeroed();
@@ -505,6 +546,7 @@ impl Raymarcher {
         p.seg_count = segment_count;
         p.chunk_count = chunk_count;
         p.cluster_count = n_clusters as u32;
+        p.line_count = overlays.lines.len() as u32;
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {
@@ -515,6 +557,7 @@ impl Raymarcher {
             p.brush_tip = [b.pos.x, b.pos.y, b.pos.z, b.radius];
             p.brush_color = [b.color[0], b.color[1], b.color[2], 1.0];
             p.brush_style = [b.opacity, b.hardness, 0.0, 0.0];
+            p.brush_up = [b.up.x, b.up.y, b.up.z, b.roundness];
         }
         f.params.bytes()[..size_of::<ParamsGpu>()].copy_from_slice(bytemuck::bytes_of(&p));
         if f.bound_view != view {
@@ -530,7 +573,7 @@ impl Raymarcher {
             barrier(d, cmd, image, layers, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
                 vk::PipelineStageFlags2::ALL_TRANSFER, vk::AccessFlags2::TRANSFER_READ,
                 vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE);
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, if scene.pigment { self.pigment } else { self.pipeline });
             d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &[self.frames[frame].set], &[]);
             d.cmd_dispatch(cmd, w.div_ceil(TILE), h.div_ceil(TILE), layers);
             barrier(d, cmd, image, layers, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -578,6 +621,7 @@ impl Drop for Raymarcher {
                 f.chunks.destroy(&gpu);
                 f.layers.destroy(&gpu);
                 f.clusters.destroy(&gpu);
+                f.lines.destroy(&gpu);
             }
 
             if let Some(mut t) = self.target.take() {
@@ -587,6 +631,7 @@ impl Drop for Raymarcher {
             self.trail.destroy(&gpu);
             gpu.device.destroy_descriptor_pool(self.pool, None);
             gpu.device.destroy_pipeline(self.pipeline, None);
+            gpu.device.destroy_pipeline(self.pigment, None);
             gpu.device.destroy_pipeline_layout(self.layout, None);
             gpu.device.destroy_descriptor_set_layout(self.set_layout, None);
         }

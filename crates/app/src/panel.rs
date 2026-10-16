@@ -1,20 +1,24 @@
-//! The brush panel. It floats above the hand that is not painting, turned to face the head;
+//! The tool panel. It floats above the hand that is not painting, turned to face the head;
 //! the painting hand points at it and clicks with the trigger.
 //!
 //! Made with egui and drawn by `vdraw_render::UiRenderer`, as bs-humany's xr-viewer does its
-//! panels. Its controls and look follow the 2D app (multiplayer-canvas: OptionsBar, Slider and
-//! ColorPanel) as far as they apply in 3D: size (logarithmic), opacity, hardness, pressure to
-//! size, an HSV square with a hue strip, recent colors, undo and redo.
+//! panels. Its controls and look follow the 2D app (multiplayer-canvas: Toolbar, OptionsBar,
+//! Slider, ColorPanel, and the Layers panel's paint mixing) as far as they apply in 3D: the
+//! tools (brush, eraser, stroke eraser, with the 2D app's icons), each tool's settings (size,
+//! logarithmic; opacity, hardness, roundness, angle, pressure to size; the stroke eraser's size
+//! and layers), an HSV square with a hue strip, recent colors, undo and redo, and how paint
+//! mixes.
 
+use crate::tools::{Tool, Tools};
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 use glam::{Mat4, Vec3, Vec4};
 use std::time::Instant;
-use vdraw_core::Brush;
+use vdraw_core::{Brush, Mix};
 
 /// Meters per panel point.
 pub const POINT: f32 = 0.0005;
-/// The panel's size in points (0.22 x 0.30 m).
-pub const SIZE: [f32; 2] = [440.0, 600.0];
+/// The panel's size in points (0.22 x 0.39 m).
+pub const SIZE: [f32; 2] = [440.0, 780.0];
 /// Texture pixels per point: sharp text at arm's length.
 const PIXELS_PER_POINT: f32 = 2.0;
 /// How far above the hand the panel's center floats (meters).
@@ -30,6 +34,7 @@ const TEXT_DIM: Color32 = Color32::from_rgb(0x9a, 0x9a, 0x9a);
 const ACCENT: Color32 = Color32::from_rgb(0x31, 0xa8, 0xff);
 const ACCENT_DIM: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xb0);
 const TOGGLE_ON: Color32 = Color32::from_rgb(0x24, 0x39, 0x4c);
+const BORDER: Color32 = Color32::from_rgb(0x16, 0x16, 0x16);
 
 /// A line of `width` points (typed, for egui's `impl Into<f32>`).
 fn stroke(width: f32, color: Color32) -> Stroke {
@@ -38,6 +43,8 @@ fn stroke(width: f32, color: Color32) -> Stroke {
 
 /// Brush diameter range, meters (the 2D app's 1 to 1000 px, as a log slider).
 const DIAMETER: (f32, f32) = (0.001, 0.4);
+/// The stroke eraser's diameter range, meters (the 2D app's 2 to 400 px).
+const SWEEP: (f32, f32) = (0.002, 0.4);
 /// Recent colors kept, as in the 2D app.
 pub const RECENT: usize = 18;
 
@@ -119,12 +126,14 @@ pub struct Pointer {
     pub pressed: bool,
 }
 
-/// What the panel asks for beyond the brush settings.
+/// What the panel asks for beyond the tool settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     Undo,
     Redo,
     Recenter,
+    /// Paint mixing (the painting's, an edit that undo takes back).
+    Mix(Mix),
 }
 
 /// One frame of the panel: what to draw, egui's texture changes, and what was asked.
@@ -136,7 +145,8 @@ pub struct Frame {
 
 /// What the panel shows and changes.
 pub struct Model<'a> {
-    pub brush: &'a mut Brush,
+    pub tools: &'a mut Tools,
+    pub mix: Mix,
     /// Newest first, sRGB.
     pub recent: &'a [[u8; 3]],
     pub can_undo: bool,
@@ -220,14 +230,14 @@ impl Panel {
             focused: true,
             ..Default::default()
         };
-        if model.brush.color != self.seen {
-            self.hsv = rgb_to_hsv(to_srgb(model.brush.color));
+        if model.tools.brush.color != self.seen {
+            self.hsv = rgb_to_hsv(to_srgb(model.tools.brush.color));
         }
         let mut actions = Vec::new();
         let hsv = &mut self.hsv;
         let output = self.ctx.run(input, |ctx| {
             let frame = egui::Frame { inner_margin: egui::Margin::same(16.0), rounding: egui::Rounding::same(8.0), fill: BG_2, stroke: stroke(1.0, LINE), ..Default::default() };
-            egui::CentralPanel::default().frame(frame).show(ctx, |ui| content(ui, model.brush, hsv, model.recent, model.can_undo, model.can_redo, &mut actions));
+            egui::CentralPanel::default().frame(frame).show(ctx, |ui| content(ui, model.tools, model.mix, hsv, model.recent, model.can_undo, model.can_redo, &mut actions));
             // The pointer: a ring where the ray meets the panel.
             if let Some(at) = pointer.at {
                 let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pointer")));
@@ -235,15 +245,22 @@ impl Panel {
                 p.circle_stroke(at, 8.0, stroke(1.5, Color32::from_black_alpha(160)));
             }
         });
-        self.seen = model.brush.color;
+        self.seen = model.tools.brush.color;
         let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         Frame { primitives, textures: output.textures_delta, actions }
     }
 }
 
-fn content(ui: &mut egui::Ui, brush: &mut Brush, hsv: &mut [f32; 3], recent: &[[u8; 3]], can_undo: bool, can_redo: bool, actions: &mut Vec<Action>) {
+#[allow(clippy::too_many_arguments)]
+fn content(ui: &mut egui::Ui, tools: &mut Tools, mix: Mix, hsv: &mut [f32; 3], recent: &[[u8; 3]], can_undo: bool, can_redo: bool, actions: &mut Vec<Action>) {
+    // The toolbar, as the 2D app's: its icons, the chosen one raised.
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Brush").strong().size(19.0));
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for tool in Tool::ALL {
+            if tool_button(ui, tool, tools.tool == tool).clicked() {
+                tools.tool = tool;
+            }
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
                 actions.push(Action::Redo);
@@ -253,47 +270,262 @@ fn content(ui: &mut egui::Ui, brush: &mut Brush, hsv: &mut [f32; 3], recent: &[[
             }
         });
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
+    // The tool's settings, under its name (the 2D app's options bar).
+    ui.label(RichText::new(tools.tool.name()).strong().size(19.0));
+    let tool = tools.tool;
+    match tools.current() {
+        Some((brush, angle)) => brush_settings(ui, brush, angle),
+        None => {
+            let mut diameter = tools.sweep_size;
+            if slider(ui, "Size", &mut diameter, SWEEP, true, length) {
+                tools.sweep_size = diameter;
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(94.0);
+                if toggle(ui, "All layers", tools.sweep_all).clicked() {
+                    tools.sweep_all = true;
+                }
+                if toggle(ui, "Active layer", !tools.sweep_all).clicked() {
+                    tools.sweep_all = false;
+                }
+            });
+            ui.label(RichText::new("Removes every stroke whose path the ball touches. Undo brings them back.").color(TEXT_DIM).size(14.0));
+        }
+    }
+
+    if tool == Tool::Brush {
+        ui.add_space(6.0);
+        section(ui, "COLOR");
+        let mut changed = sv_square(ui, hsv);
+        changed |= hue_strip(ui, hsv);
+        let srgb = hsv_to_rgb(*hsv);
+        let bytes = srgb.map(|c| (c * 255.0).round() as u8);
+        ui.horizontal(|ui| {
+            let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+            ui.painter().rect(chip, 4.0, Color32::from_rgb(bytes[0], bytes[1], bytes[2]), stroke(1.0, LINE));
+            ui.label(RichText::new(format!("#{:02X}{:02X}{:02X}", bytes[0], bytes[1], bytes[2])).monospace().color(TEXT_DIM));
+        });
+        if let Some(pick) = swatches(ui, recent) {
+            *hsv = rgb_to_hsv(pick.map(|c| c as f32 / 255.0));
+            changed = true;
+        }
+        if changed {
+            tools.brush.color = to_linear(hsv_to_rgb(*hsv));
+        }
+    }
+
+    // The bottom: the painting's paint mixing (the 2D app's canvas setting), and moving.
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Recenter").clicked() {
+                actions.push(Action::Recenter);
+            }
+            ui.label(RichText::new("Left stick: fly · Right stick: turn, rise").color(TEXT_DIM).size(13.0));
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            let (label, _) = ui.allocate_exact_size(vec2(120.0, 30.0), Sense::hover());
+            ui.painter().text(label.left_center(), egui::Align2::LEFT_CENTER, "Paint mixing", egui::FontId::proportional(15.0), TEXT_DIM);
+            for (name, m) in [("Normal", Mix::Normal), ("Pigment", Mix::Pigment)] {
+                if toggle(ui, name, mix == m).clicked() && mix != m {
+                    actions.push(Action::Mix(m));
+                }
+            }
+        });
+    });
+}
+
+/// The brush's or the eraser's settings: size (logarithmic), opacity, hardness, the tip's
+/// roundness and angle, and pressure to size.
+fn brush_settings(ui: &mut egui::Ui, brush: &mut Brush, angle: &mut f32) {
     let mut diameter = brush.radius * 2.0;
-    if slider(ui, "Size", &mut diameter, DIAMETER, true, |d| if d < 0.01 { format!("{:.1} mm", d * 1000.0) } else { format!("{:.1} cm", d * 100.0) }) {
+    if slider(ui, "Size", &mut diameter, DIAMETER, true, length) {
         brush.radius = diameter * 0.5;
     }
     slider(ui, "Opacity", &mut brush.opacity, (0.01, 1.0), false, percent);
     slider(ui, "Hardness", &mut brush.hardness, (0.0, 1.0), false, percent);
+    slider(ui, "Roundness", &mut brush.roundness, (0.05, 1.0), false, percent);
+    slider(ui, "Angle", angle, (0.0, 360.0), false, |a| format!("{a:.0}°"));
     ui.horizontal(|ui| {
-        ui.add_space(80.0);
+        ui.add_space(94.0);
         if toggle(ui, "P·size", brush.pressure_size).clicked() {
             brush.pressure_size = !brush.pressure_size;
         }
     });
+}
 
-    ui.add_space(6.0);
-    section(ui, "COLOR");
-    let mut changed = sv_square(ui, hsv);
-    changed |= hue_strip(ui, hsv);
-    let srgb = hsv_to_rgb(*hsv);
-    let bytes = srgb.map(|c| (c * 255.0).round() as u8);
-    ui.horizontal(|ui| {
-        let (chip, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-        ui.painter().rect(chip, 4.0, Color32::from_rgb(bytes[0], bytes[1], bytes[2]), stroke(1.0, LINE));
-        ui.label(RichText::new(format!("#{:02X}{:02X}{:02X}", bytes[0], bytes[1], bytes[2])).monospace().color(TEXT_DIM));
-    });
-    if let Some(pick) = swatches(ui, recent) {
-        *hsv = rgb_to_hsv(pick.map(|c| c as f32 / 255.0));
-        changed = true;
-    }
-    if changed {
-        brush.color = to_linear(hsv_to_rgb(*hsv));
-    }
+/// A length in millimeters or centimeters.
+fn length(d: f32) -> String {
+    if d < 0.01 { format!("{:.1} mm", d * 1000.0) } else { format!("{:.1} cm", d * 100.0) }
+}
 
-    ui.add_space(6.0);
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui.button("Recenter").clicked() {
-            actions.push(Action::Recenter);
+/// The 2D app's tool icons (multiplayer-canvas Icon.svelte: 16x16, drawn with a 1.6 line).
+fn icon_path(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Brush => "M14.5 1.5l-7 8M7.5 9.5c-1.5-1.5-4 -0.5-4 1.5 0 1.5-1 2.5-2 3 3 0.5 6 0 6-3z",
+        Tool::Eraser => "M6 14h8M2.5 10.5l7-7a1.4 1.4 0 0 1 2 0l2 2a1.4 1.4 0 0 1 0 2L7 14H5.5z M5.5 7.5l4 4",
+        Tool::StrokeEraser => "M1.5 12.5c2.5-5 4.5-5 6.5-1.5s4.5 3 6.5-3M8.5 2.5l4 4M12.5 2.5l-4 4",
+    }
+}
+
+/// A tool button: transparent, a lighter fill under the pointer, raised (bg-4 with a dark
+/// border) when chosen, as the 2D app's toolbar.
+fn tool_button(ui: &mut egui::Ui, tool: Tool, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(54.0, 44.0), Sense::click());
+    let painter = ui.painter();
+    if on {
+        painter.rect(rect, 4.0, BG_4, stroke(1.0, BORDER));
+    } else if response.hovered() {
+        painter.rect_filled(rect, 4.0, BG_3);
+    }
+    let size = 26.0;
+    let origin = rect.center() - vec2(size, size) * 0.5;
+    for (points, closed) in svg_polylines(icon_path(tool)) {
+        let points: Vec<Pos2> = points.into_iter().map(|p| origin + p.to_vec2() * (size / 16.0)).collect();
+        let line = stroke(1.6 * size / 16.0, TEXT);
+        painter.add(if closed { egui::Shape::closed_line(points, line) } else { egui::Shape::line(points, line) });
+    }
+    response
+}
+
+/// The polylines of an SVG path (M, L, H, V, C, S, A, Z, absolute and relative; arcs of
+/// circles), curves cut into short lines. Each: its points, and whether it closes.
+pub fn svg_polylines(d: &str) -> Vec<(Vec<Pos2>, bool)> {
+    // Tokens: command letters and numbers ("-4 -0.5", "1.4 1.4", "0-1.5").
+    let mut tokens: Vec<Result<char, f32>> = Vec::new();
+    let mut num = String::new();
+    let flush = |num: &mut String, tokens: &mut Vec<Result<char, f32>>| {
+        if !num.is_empty() {
+            tokens.push(Err(num.parse().unwrap_or(0.0)));
+            num.clear();
         }
-        ui.label(RichText::new("Left stick: fly · Right stick: turn, rise").color(TEXT_DIM).size(13.0));
-    });
+    };
+    for c in d.chars() {
+        if c.is_ascii_alphabetic() {
+            flush(&mut num, &mut tokens);
+            tokens.push(Ok(c));
+        } else if (c == '-' && !num.is_empty() && !num.ends_with('e')) || (c == '.' && num.contains('.')) {
+            // A sign, or a second point, starts the next number.
+            flush(&mut num, &mut tokens);
+            num.push(c);
+        } else if c.is_ascii_digit() || c == '.' || c == '-' {
+            num.push(c);
+        } else {
+            flush(&mut num, &mut tokens);
+        }
+    }
+    flush(&mut num, &mut tokens);
+
+    let mut out: Vec<(Vec<Pos2>, bool)> = Vec::new();
+    let mut line: Vec<Pos2> = Vec::new();
+    let (mut at, mut start, mut ctrl) = (Pos2::ZERO, Pos2::ZERO, None::<Pos2>);
+    let mut cmd = 'M';
+    let mut i = 0;
+    let take = |i: &mut usize, n: usize| -> Option<Vec<f32>> {
+        let v: Vec<f32> = tokens[*i..].iter().take(n).map_while(|t| t.err()).collect();
+        (v.len() == n).then(|| {
+            *i += n;
+            v
+        })
+    };
+    let cubic = |line: &mut Vec<Pos2>, p0: Pos2, c1: Pos2, c2: Pos2, p3: Pos2| {
+        for k in 1..=12 {
+            let t = k as f32 / 12.0;
+            let u = 1.0 - t;
+            line.push(pos2(
+                u * u * u * p0.x + 3.0 * u * u * t * c1.x + 3.0 * u * t * t * c2.x + t * t * t * p3.x,
+                u * u * u * p0.y + 3.0 * u * u * t * c1.y + 3.0 * u * t * t * c2.y + t * t * t * p3.y,
+            ));
+        }
+    };
+    while i < tokens.len() {
+        if let Ok(c) = tokens[i] {
+            cmd = c;
+            i += 1;
+            if c == 'Z' || c == 'z' {
+                if line.len() > 1 {
+                    out.push((std::mem::take(&mut line), true));
+                }
+                at = start;
+                continue;
+            }
+        }
+        let rel = cmd.is_ascii_lowercase();
+        let base = if rel { at.to_vec2() } else { egui::Vec2::ZERO };
+        let next = match cmd.to_ascii_uppercase() {
+            'M' => take(&mut i, 2).map(|v| {
+                if line.len() > 1 {
+                    out.push((std::mem::take(&mut line), false));
+                }
+                line.clear();
+                at = pos2(v[0], v[1]) + base;
+                start = at;
+                line.push(at);
+                // Pairs after a move are lines.
+                cmd = if rel { 'l' } else { 'L' };
+                ctrl = None;
+            }),
+            'L' => take(&mut i, 2).map(|v| {
+                at = pos2(v[0], v[1]) + base;
+                line.push(at);
+                ctrl = None;
+            }),
+            'H' => take(&mut i, 1).map(|v| {
+                at = pos2(v[0] + base.x, at.y);
+                line.push(at);
+                ctrl = None;
+            }),
+            'V' => take(&mut i, 1).map(|v| {
+                at = pos2(at.x, v[0] + base.y);
+                line.push(at);
+                ctrl = None;
+            }),
+            'C' => take(&mut i, 6).map(|v| {
+                let (c1, c2, p) = (pos2(v[0], v[1]) + base, pos2(v[2], v[3]) + base, pos2(v[4], v[5]) + base);
+                cubic(&mut line, at, c1, c2, p);
+                (at, ctrl) = (p, Some(c2));
+            }),
+            'S' => take(&mut i, 4).map(|v| {
+                let c1 = ctrl.map_or(at, |c| at + (at - c));
+                let (c2, p) = (pos2(v[0], v[1]) + base, pos2(v[2], v[3]) + base);
+                cubic(&mut line, at, c1, c2, p);
+                (at, ctrl) = (p, Some(c2));
+            }),
+            'A' => take(&mut i, 7).map(|v| {
+                // A circle's arc (the icons' arcs are round): its center from the ends, the
+                // radius and the flags (SVG implementation notes, F.6.5).
+                let (r, large, sweep, p) = (v[0].max(1e-6), v[3] != 0.0, v[4] != 0.0, pos2(v[5], v[6]) + base);
+                let half = (at - p) * 0.5;
+                let d2 = half.length_sq().max(1e-12);
+                let r = r.max(d2.sqrt());
+                let k = ((r * r - d2) / d2).max(0.0).sqrt() * if large == sweep { -1.0 } else { 1.0 };
+                let c = pos2(k * half.y, -k * half.x) + ((at.to_vec2() + p.to_vec2()) * 0.5);
+                let a0 = (at.y - c.y).atan2(at.x - c.x);
+                let mut da = (p.y - c.y).atan2(p.x - c.x) - a0;
+                if sweep && da < 0.0 {
+                    da += std::f32::consts::TAU;
+                } else if !sweep && da > 0.0 {
+                    da -= std::f32::consts::TAU;
+                }
+                for s in 1..=8 {
+                    let a = a0 + da * s as f32 / 8.0;
+                    line.push(c + vec2(a.cos(), a.sin()) * r);
+                }
+                at = p;
+                ctrl = None;
+            }),
+            _ => None,
+        };
+        if next.is_none() {
+            // A command with too few numbers, or one not handled: skip a token.
+            i += 1;
+        }
+    }
+    if line.len() > 1 {
+        out.push((line, false));
+    }
+    out
 }
 
 fn percent(v: f32) -> String {
@@ -336,7 +568,7 @@ pub fn slider_value(p: f32, (lo, hi): (f32, f32), log: bool) -> f32 {
 fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: (f32, f32), log: bool, text: impl Fn(f32) -> String) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        let (label_rect, _) = ui.allocate_exact_size(vec2(70.0, 30.0), Sense::hover());
+        let (label_rect, _) = ui.allocate_exact_size(vec2(84.0, 30.0), Sense::hover());
         ui.painter().text(label_rect.left_center(), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(15.0), TEXT_DIM);
         let width = ui.available_width() - 78.0;
         let (rect, response) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click_and_drag());
@@ -366,7 +598,7 @@ fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: (f32, f32), lo
 /// Saturation (left to right) and value (top to bottom) of the hue, as the 2D app's square:
 /// white to the hue across, black over it downward. Drawn as a grid so the colors match.
 fn sv_square(ui: &mut egui::Ui, hsv: &mut [f32; 3]) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 150.0), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 130.0), Sense::click_and_drag());
     let mut changed = false;
     if let Some(at) = response.interact_pointer_pos() {
         if response.is_pointer_button_down_on() || response.clicked() {
@@ -528,16 +760,35 @@ mod tests {
     }
 
     #[test]
+    fn icons_parse_into_their_lines() {
+        // The brush: a handle (one line) and a closed bristle (cubic curves).
+        let brush = svg_polylines(icon_path(Tool::Brush));
+        assert_eq!(brush.len(), 2);
+        assert_eq!(brush[0].0, vec![pos2(14.5, 1.5), pos2(7.5, 9.5)]);
+        assert!(brush[1].1 && brush[1].0.len() > 20);
+        // The eraser: its base, its body (with two round corners, closed), and the band.
+        let eraser = svg_polylines(icon_path(Tool::Eraser));
+        assert_eq!(eraser.iter().map(|l| l.1).collect::<Vec<_>>(), vec![false, true, false]);
+        // A round corner stays on its circle: from (9.5, 3.5) over to (11.5, 3.5), bulging up.
+        let body = &eraser[1].0;
+        assert!(body.iter().any(|p| p.y < 3.3 && (p.x - 10.5).abs() < 0.3), "{body:?}");
+        // The stroke eraser: a squiggle and two strokes of an X; all inside the 16x16 box.
+        let se = svg_polylines(icon_path(Tool::StrokeEraser));
+        assert_eq!(se.len(), 3);
+        assert!(se.iter().flat_map(|l| &l.0).all(|p| (0.0..=16.0).contains(&p.x) && (0.0..=16.0).contains(&p.y)));
+    }
+
+    #[test]
     fn a_ray_hits_the_panel_where_it_points() {
         let p = Placement::above_hand(Vec3::new(0.0, 1.0, -0.4), Vec3::new(0.0, 1.19, 0.0));
         // Straight at the center from the head.
         let center = p.to_stage(pos2(SIZE[0] * 0.5, SIZE[1] * 0.5));
         assert!(center.abs_diff_eq(Vec3::new(0.0, 1.19, -0.4), 1e-5));
         let (t, at) = p.hit(Vec3::new(0.0, 1.19, 0.0), Vec3::NEG_Z).unwrap();
-        assert!((t - 0.4).abs() < 1e-5 && (at - pos2(220.0, 300.0)).length() < 1e-3, "{t} {at:?}");
+        assert!((t - 0.4).abs() < 1e-5 && (at - pos2(SIZE[0] * 0.5, SIZE[1] * 0.5)).length() < 1e-3, "{t} {at:?}");
         // A little right and up: the point moves right and up on the panel.
         let (_, at) = p.hit(Vec3::new(0.02, 1.2, 0.0), Vec3::NEG_Z).unwrap();
-        assert!(at.x > 220.0 && at.y < 300.0, "{at:?}");
+        assert!(at.x > SIZE[0] * 0.5 && at.y < SIZE[1] * 0.5, "{at:?}");
         // Off the side: no hit, but the projection holds to the edge.
         assert!(p.hit(Vec3::new(0.5, 1.19, 0.0), Vec3::NEG_Z).is_none());
         assert_eq!(p.project(Vec3::new(0.5, 1.19, 0.0), Vec3::NEG_Z).unwrap().x, SIZE[0]);

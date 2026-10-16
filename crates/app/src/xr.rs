@@ -6,9 +6,11 @@
 //! (an sRGB array image, one layer per eye; the blit encodes sRGB).
 //!
 //! Controls (Valve Index; other controllers through the simple profile). Either hand paints;
-//! the hand that painted last is the painting hand, and the brush panel floats above the
-//! other one.
-//!   trigger                  paint (the pull is the pressure); pointed at the panel: click
+//! the hand that painted last is the painting hand, and the tool panel floats above the
+//! other one. The tip is held like a pen: a tip that is not round is flat along the
+//! controller's up side (turned by the tool's angle), so rolling the wrist turns it.
+//!   trigger                  use the tool: paint or erase (the pull is the pressure), or
+//!                            sweep the stroke eraser's ball; pointed at the panel: click
 //!   B / A                    undo / redo (simple profile: menu = undo)
 //!   left stick               fly where the head faces (up and down too), strafe
 //!   right stick              turn in 30 degree steps (left, right), rise and sink (up, down)
@@ -17,6 +19,7 @@
 use crate::camera::perspective_fov;
 use crate::panel::{self, Action, Model, Panel, Placement, Pointer};
 use crate::rig::{Locomotion, Rig};
+use crate::tools::{self, Tools};
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk::{self, Handle};
 use glam::{Mat4, Quat, Vec2, Vec3};
@@ -25,9 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use vdraw_core::{Brush, GpuSegment, LayerRun, Painting, Sample, Stroke};
+use vdraw_core::{GpuSegment, LayerRun, Mix, Painting, Sample, Stroke};
 use vdraw_render::raymarch::FRAMES;
-use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, Scene, SceneLayer, UiRenderer, barrier};
+use vdraw_render::{BrushTip, EyeView, Gpu, OverlayLine, Overlays, PanelDraw, Raymarcher, Scene, SceneLayer, UiRenderer, barrier};
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 const NEAR: f32 = 0.02;
@@ -176,6 +179,25 @@ impl Input {
     }
 }
 
+/// A change to the painting, as undo and redo keep it.
+enum Edit {
+    /// A stroke put at the end of a layer (`stroke`: kept while it is undone).
+    Add { layer: usize, stroke: Option<Stroke> },
+    /// Strokes taken out by the stroke eraser: where each was (layer, place), in that order
+    /// (`strokes`: kept while they are out).
+    Erase { at: Vec<(usize, usize)>, strokes: Vec<Stroke> },
+    /// The paint mixing set (it holds the other one).
+    Mix(Mix),
+}
+
+/// The stroke eraser's drag: the strokes it took so far (by number, sorted; hidden from the
+/// renderer until the drag ends and they are taken out, as one edit), and where the ball was.
+struct Sweep {
+    hand: usize,
+    taken: Vec<u32>,
+    last: Vec3,
+}
+
 /// What the hands do to the painting, frame to frame.
 struct Painter {
     painting: Painting,
@@ -186,9 +208,11 @@ struct Painter {
     version: u64,
     /// The stroke being drawn, as segments (made every frame).
     drawing: Vec<GpuSegment>,
-    redo: Vec<Stroke>,
+    undo: Vec<Edit>,
+    redo: Vec<Edit>,
     active: Option<(usize, Stroke)>,
-    brush: Brush,
+    sweep: Option<Sweep>,
+    tools: Tools,
     /// Colors used, newest first (sRGB), for the panel's swatches.
     recent: Vec<[u8; 3]>,
     /// The strokes changed since the last save.
@@ -203,9 +227,11 @@ impl Painter {
             runs: Vec::new(),
             version: 0,
             drawing: Vec::new(),
+            undo: Vec::new(),
             redo: Vec::new(),
             active: None,
-            brush: Brush::default(),
+            sweep: None,
+            tools: Tools::default(),
             recent: Vec::new(),
             changed: false,
         };
@@ -218,19 +244,78 @@ impl Painter {
         self.version += 1;
     }
 
+    /// The layer VR strokes go to, and the stroke eraser takes from when not from all.
+    fn active_layer(&self) -> usize {
+        self.painting.layers.len().saturating_sub(1)
+    }
+
+    /// Where stroke number `id` is: its layer and its place there (numbers count on through
+    /// the visible layers, as `Painting::segments` gives them).
+    fn place(&self, id: u32) -> Option<(usize, usize)> {
+        let mut first = 0usize;
+        for (l, layer) in self.painting.layers.iter().enumerate().filter(|(_, l)| l.visible) {
+            let n = layer.strokes.len();
+            if (id as usize) < first + n {
+                return Some((l, id as usize - first));
+            }
+            first += n;
+        }
+        None
+    }
+
     fn undo(&mut self) {
-        if let Some(s) = self.painting.active().pop() {
-            self.redo.push(s);
-            self.rebuild();
-            self.changed = true;
+        self.end_sweep();
+        if let Some(edit) = self.undo.pop() {
+            let edit = self.apply(edit);
+            self.redo.push(edit);
         }
     }
 
     fn redo(&mut self) {
-        if let Some(s) = self.redo.pop() {
-            self.painting.active().push(s);
-            self.rebuild();
-            self.changed = true;
+        self.end_sweep();
+        if let Some(edit) = self.redo.pop() {
+            let edit = self.apply(edit);
+            self.undo.push(edit);
+        }
+    }
+
+    /// Undoes or redoes an edit (each is the other's opposite), and returns its opposite.
+    fn apply(&mut self, edit: Edit) -> Edit {
+        let edit = match edit {
+            Edit::Add { layer, stroke: None } => Edit::Add { layer, stroke: self.painting.layers[layer].strokes.pop() },
+            Edit::Add { layer, stroke: Some(s) } => {
+                self.painting.layers[layer].strokes.push(s);
+                Edit::Add { layer, stroke: None }
+            }
+            Edit::Erase { at, strokes } if strokes.is_empty() => {
+                // Take them out, last first, so the places before stay right.
+                let mut strokes: Vec<Stroke> = at.iter().rev().map(|&(l, i)| self.painting.layers[l].strokes.remove(i)).collect();
+                strokes.reverse();
+                Edit::Erase { at, strokes }
+            }
+            Edit::Erase { at, strokes } => {
+                for (&(l, i), s) in at.iter().zip(strokes) {
+                    self.painting.layers[l].strokes.insert(i, s);
+                }
+                Edit::Erase { at, strokes: Vec::new() }
+            }
+            Edit::Mix(mix) => {
+                self.changed = true;
+                return Edit::Mix(std::mem::replace(&mut self.painting.mix, mix));
+            }
+        };
+        self.rebuild();
+        self.changed = true;
+        edit
+    }
+
+    /// Sets the paint mixing, as an edit.
+    fn set_mix(&mut self, mix: Mix) {
+        if mix != self.painting.mix {
+            self.end_sweep();
+            let edit = self.apply(Edit::Mix(mix));
+            self.undo.push(edit);
+            self.redo.clear();
         }
     }
 
@@ -253,32 +338,99 @@ impl Painter {
             }
         }
         self.changed = true;
+        self.undo.push(Edit::Add { layer, stroke: None });
         self.redo.clear();
     }
 
-    /// One hand's trigger at time `t` (seconds), the tip at `tip`.
-    fn hand(&mut self, hand: usize, t: f64, tip: Vec3, pull: f32) {
-        let painting = pull > TRIGGER_DEAD;
+    /// One hand's trigger at time `t` (seconds), the tip at `tip`, the pen's up side facing
+    /// `up`: the brush and the eraser paint, the stroke eraser sweeps.
+    fn hand(&mut self, hand: usize, t: f64, tip: Vec3, up: Vec3, pull: f32) {
+        let down = pull > TRIGGER_DEAD;
+        if self.sweep.as_ref().is_some_and(|s| s.hand == hand) {
+            if down {
+                self.sweep_to(tip);
+            } else {
+                self.end_sweep();
+            }
+            return;
+        }
         match &mut self.active {
             Some((h, stroke)) if *h == hand => {
-                if painting {
-                    stroke.push(Sample { pos: tip, pressure: pull, time: t });
+                if down {
+                    stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
                 } else {
                     let (_, stroke) = self.active.take().unwrap();
                     self.finish(stroke);
                 }
             }
-            None if painting => {
-                let c = panel::to_srgb(self.brush.color).map(|c| (c * 255.0).round() as u8);
-                self.recent.retain(|&r| r != c);
-                self.recent.insert(0, c);
-                self.recent.truncate(panel::RECENT);
-                let mut stroke = Stroke::new(self.brush);
-                stroke.push(Sample { pos: tip, pressure: pull, time: t });
-                self.active = Some((hand, stroke));
-            }
+            None if down && self.sweep.is_none() => match self.tools.paint() {
+                Some(brush) => {
+                    if !brush.erase {
+                        let c = panel::to_srgb(brush.color).map(|c| (c * 255.0).round() as u8);
+                        self.recent.retain(|&r| r != c);
+                        self.recent.insert(0, c);
+                        self.recent.truncate(panel::RECENT);
+                    }
+                    let mut stroke = Stroke::new(brush);
+                    stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
+                    self.active = Some((hand, stroke));
+                }
+                None => {
+                    self.sweep = Some(Sweep { hand, taken: Vec::new(), last: tip });
+                    self.sweep_to(tip);
+                }
+            },
             _ => {}
         }
+    }
+
+    /// The stroke eraser's ball moved to `tip` with the trigger down: the strokes its path
+    /// touches go (hidden now, taken out when the drag ends).
+    fn sweep_to(&mut self, tip: Vec3) {
+        let Some(mut sweep) = self.sweep.take() else { return };
+        let r = self.tools.sweep_size * 0.5;
+        let hit = tools::swept(&self.done, &self.runs, self.tools.sweep_all, self.active_layer(), sweep.last, tip, r, &sweep.taken);
+        for &id in &hit {
+            // Hidden: the renderer sees a speck of nothing until the strokes are taken out.
+            let from = self.done.partition_point(|g| (g.style[1] as u32) < id);
+            for g in self.done[from..].iter_mut().take_while(|g| g.style[1] as u32 == id) {
+                g.a[3] = 1e-9;
+                g.b[3] = 1e-9;
+                g.color[3] = 0.0;
+                g.style[2] = 0.0;
+                g.style[3] = 0.0;
+            }
+        }
+        if !hit.is_empty() {
+            sweep.taken.extend(hit);
+            sweep.taken.sort_unstable();
+            self.version += 1;
+        }
+        sweep.last = tip;
+        self.sweep = Some(sweep);
+    }
+
+    /// The stroke eraser's drag ends: what it took goes, as one edit (undo brings it back).
+    fn end_sweep(&mut self) {
+        let Some(sweep) = self.sweep.take() else { return };
+        let at: Vec<(usize, usize)> = sweep.taken.iter().filter_map(|&id| self.place(id)).collect();
+        if at.is_empty() {
+            return;
+        }
+        log::info!("removed {} stroke{}", at.len(), if at.len() == 1 { "" } else { "s" });
+        let edit = self.apply(Edit::Erase { at, strokes: Vec::new() });
+        self.undo.push(edit);
+        self.redo.clear();
+    }
+
+    /// The stroke eraser's overlay, its ball at `tip`: the center lines of the strokes it can
+    /// take nearby, those under the ball in red (while it is not sweeping, as in the 2D app).
+    fn eraser_lines(&self, tip: Vec3, out: &mut Vec<OverlayLine>) {
+        let r = self.tools.sweep_size * 0.5;
+        let (all, active) = (self.tools.sweep_all, self.active_layer());
+        let taken: &[u32] = self.sweep.as_ref().map_or(&[], |s| &s.taken);
+        let hot = if self.sweep.is_some() { Vec::new() } else { tools::swept(&self.done, &self.runs, all, active, tip, tip, r, taken) };
+        tools::overlay(&self.done, &self.runs, all, active, tip, (r * 4.0).max(0.05), &hot, taken, out);
     }
 
     /// The stroke being drawn, as segments, into `drawing`.
@@ -291,7 +443,7 @@ impl Painter {
 
     /// What the renderer draws this frame.
     fn scene<'a>(&'a self, layers: &'a [SceneLayer]) -> Scene<'a> {
-        Scene { segments: &self.done, runs: &self.runs, version: self.version, active: &self.drawing, active_layer: self.painting.layers.len().saturating_sub(1), layers }
+        Scene { segments: &self.done, runs: &self.runs, version: self.version, active: &self.drawing, active_layer: self.active_layer(), layers, pigment: self.painting.mix == Mix::Pigment }
     }
 }
 
@@ -396,7 +548,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     let mut loco = Locomotion::default();
     let mut press = [Press::Off; 2];
     let mut click = false; // the trigger is clicked down on the panel
-    let mut panel = Panel::new(&painter.brush);
+    let mut panel = Panel::new(&painter.tools.brush);
     let mut panel_shown = true;
     let mut ui: Option<UiRenderer> = None;
 
@@ -458,8 +610,11 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             }
         }
         let head_pose = pose_mat(head.locate(&stage, time)?.pose);
-        // Aim pose: -z is forward; the tip is a little in front.
+        // Aim pose: -z is forward; the tip is a little in front. The pen's up side (+y), turned
+        // by the tool's angle about the pen.
         let tip_of = |aim: Mat4| aim.transform_point3(Vec3::new(0.0, 0.0, -TIP_OFFSET));
+        let turn = painter.tools.clone();
+        let up_of = |aim: Mat4| turn.tip_up(aim.y_axis.truncate(), -aim.z_axis.truncate());
         let tick = |h: usize, amplitude: f32, ms: i64| {
             let pulse = xr::HapticVibration::new().amplitude(amplitude).frequency(xr::FREQUENCY_UNSPECIFIED).duration(xr::Duration::from_nanos(ms * 1_000_000));
             input.haptic.apply_feedback(&session, input.hands[h], &pulse)
@@ -502,7 +657,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                 Press::Panel | Press::Paint if pull <= TRIGGER_DEAD => Press::Off,
                 p => p,
             };
-            painter.hand(h, t, rig.point(tip_of(aim)), if press[h] == Press::Paint { pull } else { 0.0 });
+            painter.hand(h, t, rig.point(tip_of(aim)), rig.dir(up_of(aim)), if press[h] == Press::Paint { pull } else { 0.0 });
             if h == painting_hand {
                 if press[h] == Press::Panel {
                     let was = click;
@@ -541,8 +696,8 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
         // The panel: laid out with this frame's pointer.
         let panel_frame = placement.map(|_| {
-            let (can_undo, can_redo) = (!painter.painting.active().is_empty(), !painter.redo.is_empty());
-            panel.run(pointer, Model { brush: &mut painter.brush, recent: &painter.recent, can_undo, can_redo })
+            let (can_undo, can_redo) = (!painter.undo.is_empty(), !painter.redo.is_empty());
+            panel.run(pointer, Model { tools: &mut painter.tools, mix: painter.painting.mix, recent: &painter.recent, can_undo, can_redo })
         });
         if let Some(f) = &panel_frame {
             for action in &f.actions {
@@ -550,17 +705,32 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                     Action::Undo => painter.undo(),
                     Action::Redo => painter.redo(),
                     Action::Recenter => rig = Rig::default(),
+                    Action::Mix(mix) => painter.set_mix(*mix),
                 }
             }
         }
 
-        // The brush tip, on the painting hand, unless it points at the panel.
-        let tip = aims[painting_hand].filter(|_| pointer.at.is_none()).map(|aim| BrushTip {
-            pos: rig.point(tip_of(aim)),
-            radius: painter.brush.radius,
-            color: painter.brush.color,
-            opacity: painter.brush.opacity,
-            hardness: painter.brush.hardness,
+        // The tip, on the painting hand, unless it points at the panel: the brush's (a preview
+        // of the next stroke), the eraser's and the stroke eraser's (rings), and the stroke
+        // eraser's overlay.
+        let mut lines = Vec::new();
+        let tip = aims[painting_hand].filter(|_| pointer.at.is_none()).map(|aim| {
+            let (pos, up) = (rig.point(tip_of(aim)), rig.dir(up_of(aim)));
+            match painter.tools.paint() {
+                Some(b) => BrushTip {
+                    pos,
+                    radius: b.radius,
+                    color: if b.erase { [1.0; 3] } else { b.color },
+                    opacity: if b.erase { 0.0 } else { b.opacity },
+                    hardness: b.hardness,
+                    up,
+                    roundness: b.roundness,
+                },
+                None => {
+                    painter.eraser_lines(pos, &mut lines);
+                    BrushTip { pos, radius: painter.tools.sweep_size * 0.5, color: [1.0; 3], opacity: 0.0, hardness: 1.0, up, roundness: 1.0 }
+                }
+            }
         });
         painter.update_drawing();
         let layers = scene_layers(&painter.painting);
@@ -611,7 +781,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
-            rm.record(cmd, frame, &painter.scene(&layers), &eyes, &Overlays { tip, laser })?;
+            rm.record(cmd, frame, &painter.scene(&layers), &eyes, &Overlays { tip, laser, lines: &lines })?;
             barrier(d, cmd, dst, 2, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
@@ -716,4 +886,79 @@ fn make_swapchain(instance: &xr::Instance, system: xr::SystemId, session: &xr::S
     })?;
     let images = handle.enumerate_images()?.into_iter().map(vk::Image::from_raw).collect();
     Ok(Swapchain { handle, images, format, width, height })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::Tool;
+    use vdraw_core::Brush;
+
+    /// A painting of three straight strokes along x, at heights 0, 0.1 and 0.2 m.
+    fn painter() -> Painter {
+        let strokes = (0..3)
+            .map(|k| {
+                let mut s = Stroke::new(Brush::default());
+                for i in 0..=10 {
+                    s.push(Sample::new(Vec3::new(i as f32 * 0.01, k as f32 * 0.1, 0.0), 1.0, i as f64));
+                }
+                s
+            })
+            .collect();
+        Painter::new(Painting::with_strokes(strokes))
+    }
+
+    fn heights(p: &Painter) -> Vec<f32> {
+        p.painting.layers[0].strokes.iter().map(|s| s.samples[0].pos.y).collect()
+    }
+
+    #[test]
+    fn a_sweep_takes_strokes_as_one_edit() {
+        let mut p = painter();
+        p.tools.tool = Tool::StrokeEraser;
+        p.tools.sweep_size = 0.02;
+        // Down across the lower two strokes, the trigger held over three frames.
+        p.hand(0, 0.0, Vec3::new(0.05, 0.15, 0.0), Vec3::Y, 1.0);
+        p.hand(0, 0.1, Vec3::new(0.05, 0.05, 0.0), Vec3::Y, 1.0);
+        p.hand(0, 0.2, Vec3::new(0.05, -0.05, 0.0), Vec3::Y, 1.0);
+        // While the drag goes on, nothing is taken out yet: the strokes are only hidden.
+        assert_eq!(heights(&p), vec![0.0, 0.1, 0.2]);
+        assert_eq!(p.sweep.as_ref().unwrap().taken, vec![0, 1]);
+        p.hand(0, 0.3, Vec3::new(0.05, -0.05, 0.0), Vec3::Y, 0.0);
+        assert_eq!(heights(&p), vec![0.2]);
+        // One undo brings both back, in their places; redo takes them again.
+        p.undo();
+        assert_eq!(heights(&p), vec![0.0, 0.1, 0.2]);
+        p.redo();
+        assert_eq!(heights(&p), vec![0.2]);
+    }
+
+    #[test]
+    fn strokes_and_mixing_undo_in_turn() {
+        let mut p = painter();
+        p.hand(1, 0.0, Vec3::new(0.0, 0.5, 0.0), Vec3::Y, 1.0);
+        p.hand(1, 0.1, Vec3::new(0.05, 0.5, 0.0), Vec3::Y, 1.0);
+        p.hand(1, 0.2, Vec3::new(0.05, 0.5, 0.0), Vec3::Y, 0.0);
+        p.set_mix(Mix::Pigment);
+        assert_eq!((heights(&p).len(), p.painting.mix), (4, Mix::Pigment));
+        p.undo();
+        assert_eq!((heights(&p).len(), p.painting.mix), (4, Mix::Normal));
+        p.undo();
+        assert_eq!(heights(&p).len(), 3);
+        p.redo();
+        p.redo();
+        assert_eq!((heights(&p).len(), p.painting.mix), (4, Mix::Pigment));
+    }
+
+    #[test]
+    fn the_eraser_paints_eraser_strokes() {
+        let mut p = painter();
+        p.tools.tool = Tool::Eraser;
+        p.hand(0, 0.0, Vec3::ZERO, Vec3::Y, 1.0);
+        p.hand(0, 0.1, Vec3::X * 0.05, Vec3::Y, 0.0);
+        let last = p.painting.layers[0].strokes.last().unwrap();
+        assert!(last.brush.erase && last.brush.hardness == 0.6);
+        // Erasing does not add a recent color.
+        assert!(p.recent.is_empty());
+    }
 }

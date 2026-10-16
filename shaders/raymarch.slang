@@ -17,6 +17,13 @@
 // Writes linear color (RGBA16F); the present step encodes sRGB.
 import sdf;
 import brush;
+import pigment;
+
+// 1: paint mixes as paint (pigment.slang), 0: as light. Two builds of this shader (see
+// crates/render/build.rs), as the pigment math needs many registers.
+#ifndef PIGMENT
+#define PIGMENT 0
+#endif
 
 static const uint TILE = 16;
 static const uint MAX_TILE = 2048;
@@ -37,10 +44,12 @@ struct Params
     float4 brushTip;   // xyz, w = radius (0: no tip shown)
     float4 brushColor; // rgb: the color the next stroke gets
     float4 brushStyle; // x = opacity, y = hardness of the next stroke
+    float4 brushUp;    // xyz: the pen's up direction, w: the tip's roundness
     float4 laserA;     // the pointer's laser: from xyz (w = radius, 0: none)
     float4 laserB;     // to xyz
     uint clusterCount;
-    uint3 pad2;
+    uint lineCount;
+    uint2 pad2;
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -120,7 +129,15 @@ float trail(float q, float v, float hard)
 // A tube's optical depth along a ray: its dabs spread evenly from a to b (density per meter
 // at a and b in style.z and style.w), the radius and density taken at the point nearest the
 // ray. A segment with a == b is one stamp (its strength in style.z).
-float tubeWhole(Segment g, float3 o, float3 dir)
+float tubeWhole(Segment world, float3 o, float3 dir)
+{
+    // A flat tip: in its round space, and the result back by the stretch.
+    float scale;
+    Segment g = roundSpace(world, o, dir, scale);
+    return tubeRound(g, o, dir) / scale;
+}
+
+float tubeRound(Segment g, float3 o, float3 dir)
 {
     float3 ab = g.b.xyz - g.a.xyz;
     // Rays that pass outside the segment's bounding sphere (most that reach it through its
@@ -155,6 +172,20 @@ float tubeWhole(Segment g, float3 o, float3 dir)
     float k = sn / r;
     return lambda / k * (trail(q0, (len - x0) * k, g.style.x) - trail(q0, -x0 * k, g.style.x));
 }
+
+// Lines drawn over everything (the stroke eraser's marks): a.xyz to b.xyz, a line a.w pixels
+// wide in `color` over a halo b.w pixels wide in `halo` (linear rgb, and how much each covers).
+struct OverlayLine
+{
+    float4 a;
+    float4 b;
+    float4 color;
+    float4 halo;
+};
+[[vk::binding(8, 0)]] StructuredBuffer<OverlayLine> overlayLines;
+static const uint MAX_LINES = 256;
+groupshared uint lineList[MAX_LINES];
+groupshared uint lineCount;
 
 // Up to 16 consecutive chunks of one layer, in a sphere: tiles test clusters before chunks.
 struct Cluster
@@ -281,6 +312,17 @@ float3 softLit(Segment g, float3 n)
     // Softer strokes get flatter light: a haze has no clear surface to shade.
     float lit = 0.35 * hemi + 0.75 * diff;
     return g.color.rgb * lerp(0.85, lit, 0.4 + 0.6 * g.style.x);
+}
+
+// A segment's stamps (at a, and at b on a stroke's last segment) into the slices. A flat tip:
+// in its round space, where distances along the ray are `scale` times longer.
+void addStamps(Segment world, float3 o, float3 dir, float t0, float t1)
+{
+    float scale;
+    Segment g = roundSpace(world, o, dir, scale);
+    addStamp(g, g.a.xyz, g.a.w, g.style.z / scale, o, dir, t0 * scale, t1 * scale);
+    if (g.style.w > 0.0)
+        addStamp(g, g.b.xyz, g.b.w, g.style.w / scale, o, dir, t0 * scale, t1 * scale);
 }
 
 // One stamp (center c, radius r, strength) into the slices: its optical depth along the ray,
@@ -470,8 +512,28 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             subAxis[gi] = float4(sax, c);
         }
         if (gi == 0)
+        {
             tileCount = 0;
+            lineCount = 0;
+        }
         GroupMemoryBarrierWithGroupSync();
+        // The overlay lines in the tile's cone. Their width is in pixels: a line's sphere grows
+        // by that many pixels (at its far side) so the cone test keeps it.
+        float tilePix = length(rayDir(eye, lo + float2(1.0, 0.0)) - rayDir(eye, lo));
+        for (uint li = gi; li < params.lineCount; li += TILE * TILE)
+        {
+            OverlayLine l = overlayLines[li];
+            float3 mid = (l.a.xyz + l.b.xyz) * 0.5;
+            float reach = length(l.b.xyz - l.a.xyz) * 0.5;
+            float wide = max(l.a.w, l.b.w) * 0.5 + 1.0;
+            float4 sphere = float4(mid, reach + (length(mid - o) + reach) * tilePix * wide);
+            if (!sphereInCone(o, axis, cosAngle, sinAngle, sphere))
+                continue;
+            uint k;
+            InterlockedAdd(lineCount, 1, k);
+            if (k < MAX_LINES)
+                lineList[k] = li;
+        }
         // Clusters first: each thread takes clusters, and the chunks of those in the cone.
         for (uint cl = gi; cl < params.clusterCount; cl += TILE * TILE)
         {
@@ -574,18 +636,21 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             // tubes, whole), covering 1 - exp(-dabs), capped by its opacity, over the strokes
             // before it, or taking from them (an eraser). Unlit, in sRGB. Taken top stroke
             // first (each stroke's paint shows through the strokes after it), so a pixel stops
-            // once the strokes over it cover it.
+            // once the strokes over it cover it. Pigment mixing: bottom stroke first, each
+            // mixed into the paint under it (the mix depends on what is under it).
+            bool pigment = PIGMENT != 0;
             float3 lc = 0.0; // premultiplied sRGB
             float la = 0.0;
             float through = 1.0; // what shows through the strokes taken so far
             float stroke = -1.0;
             float dabs = 0.0;
             float4 strokeColor = 0.0;
-            for (int ki = int(end) - 1; ki >= int(j) - 1; ki--)
+            int count = int(end - j);
+            for (int step = 0; step <= count; step++)
             {
-                // Past the first chunk: one more round, to put the last stroke taken down.
-                bool more = ki >= int(j);
-                uint k = uint(max(ki, 0));
+                // Past the last chunk: one more round, to put the last stroke taken down.
+                bool more = step < count;
+                uint k = more ? (pigment ? j + uint(step) : end - 1 - uint(step)) : 0;
                 Chunk ch;
                 if (more)
                 {
@@ -602,14 +667,31 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                     if (stroke >= 0.0 && dabs > 0.0)
                     {
                         float alpha = abs(strokeColor.a) * (1.0 - exp(-dabs));
-                        if (strokeColor.a > 0.0)
+                        if (pigment)
                         {
-                            lc += through * alpha * srgbFromLinear(strokeColor.rgb);
-                            la += through * alpha;
+                            if (strokeColor.a > 0.0)
+                            {
+                                float4 mixed = pigmentOver(float4(lc, la), float4(srgbFromLinear(strokeColor.rgb) * alpha, alpha));
+                                lc = mixed.rgb;
+                                la = mixed.a;
+                            }
+                            else
+                            {
+                                lc *= 1.0 - alpha;
+                                la *= 1.0 - alpha;
+                            }
                         }
-                        through *= 1.0 - alpha;
-                        if (through < 1.0 / 512.0)
-                            break;
+                        else
+                        {
+                            if (strokeColor.a > 0.0)
+                            {
+                                lc += through * alpha * srgbFromLinear(strokeColor.rgb);
+                                la += through * alpha;
+                            }
+                            through *= 1.0 - alpha;
+                            if (through < 1.0 / 512.0)
+                                break;
+                        }
                     }
                     stroke = id;
                     dabs = 0.0;
@@ -698,12 +780,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                     if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
                         continue;
                     for (uint s = ch.first; s < ch.first + ch.count; s++)
-                    {
-                        Segment g = segments[s];
-                        addStamp(g, g.a.xyz, g.a.w, g.style.z, o, dir, t0, t1);
-                        if (g.style.w > 0.0)
-                            addStamp(g, g.b.xyz, g.b.w, g.style.w, o, dir, t0, t1);
-                    }
+                        addStamps(segments[s], o, dir, t0, t1);
                 }
                 // Back to front, over the solid hit.
                 for (uint b = BINS; b-- > 0;)
@@ -714,8 +791,20 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                         continue;
                     float3 c = float3(f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
                     float alpha = 1.0 - exp(-tau);
-                    lc = lc * (1.0 - alpha) + alpha * c / tau;
-                    la = la * (1.0 - alpha) + alpha;
+                    if (PIGMENT != 0 && la > 1e-4)
+                    {
+                        // As paint: the slice's paint into the paint behind it (in sRGB, as the
+                        // 2D app mixes).
+                        float4 back = float4(srgbFromLinear(lc / la) * la, la);
+                        float4 mixed = pigmentOver(back, float4(srgbFromLinear(c / tau) * alpha, alpha));
+                        lc = linearFromSrgb(mixed.rgb / max(mixed.a, 1e-6)) * mixed.a;
+                        la = mixed.a;
+                    }
+                    else
+                    {
+                        lc = lc * (1.0 - alpha) + alpha * c / tau;
+                        la = la * (1.0 - alpha) + alpha;
+                    }
                 }
             }
         }
@@ -735,10 +824,14 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                     continue;
                 for (uint s = ch.first; s < ch.first + ch.count; s++)
                 {
-                    Segment g = segments[s];
-                    erased += stampTau(g.a.xyz, g.a.w, g.style.z, g.style.x, o, dir, tBehind);
+                    float3 so = o, sd = dir;
+                    float scale;
+                    Segment g = roundSpace(segments[s], so, sd, scale);
+                    float tEnd = tBehind * scale;
+                    float e = stampTau(g.a.xyz, g.a.w, g.style.z, g.style.x, so, sd, tEnd);
                     if (g.style.w > 0.0)
-                        erased += stampTau(g.b.xyz, g.b.w, g.style.w, g.style.x, o, dir, tBehind);
+                        e += stampTau(g.b.xyz, g.b.w, g.style.w, g.style.x, so, sd, tEnd);
+                    erased += e / scale;
                 }
             }
             float keep = exp(-erased);
@@ -760,12 +853,17 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     //    hardness (drawn over everything), with a thin outline so it shows at any opacity.
     if (params.brushTip.w > 0.0)
     {
+        // A flat tip: in its round space (stretched along the pen's up direction).
+        float3 up = params.brushUp.xyz;
+        float k = 1.0 / max(params.brushUp.w, 0.02) - 1.0;
         float3 oc = params.brushTip.xyz - o;
+        float3 ocR = oc + up * (k * dot(up, oc));
+        float3 dirR = normalize(dir + up * (k * dot(up, dir)));
         float along = dot(oc, dir);
         if (along > 0.0)
         {
             float r = params.brushTip.w;
-            float q = length(oc - dir * along) / r; // the ray's distance from the center, in radii
+            float q = length(ocR - dirR * dot(ocR, dirR)) / r; // the ray's distance from the center, in radii
             float px = pix * along / r;             // one pixel, in radii
             float hard = params.brushStyle.y;
             float e = saturate((1.0 - q) / max(1.0 - hard, px));
@@ -777,7 +875,17 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         }
     }
 
-    // 5. The pointer's laser: a thin line, at least a pixel wide, in the 2D app's accent.
+    // 5. Overlay lines: each a halo, then the line, widths in pixels.
+    for (uint li = 0; li < min(lineCount, MAX_LINES); li++)
+    {
+        OverlayLine l = overlayLines[lineList[li]];
+        float t, s;
+        float dist = length(rayToSegment(o, dir, l.a.xyz, l.b.xyz, t, s)) / max(pix * t, 1e-7); // pixels
+        color = lerp(color, l.halo.rgb, l.halo.a * saturate(l.b.w * 0.5 - dist + 0.5));
+        color = lerp(color, l.color.rgb, l.color.a * saturate(l.a.w * 0.5 - dist + 0.5));
+    }
+
+    // 6. The pointer's laser: a thin line, at least a pixel wide, in the 2D app's accent.
     if (params.laserA.w > 0.0)
     {
         float t, s;

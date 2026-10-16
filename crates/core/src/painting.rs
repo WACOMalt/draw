@@ -60,11 +60,23 @@ impl Default for Layer {
     }
 }
 
+/// How paint mixes with the paint under it in a layer, as the 2D app's canvas setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mix {
+    /// Over, as light: blue over yellow is grey.
+    #[default]
+    Normal,
+    /// As paint (Kubelka-Munk, shaders/pigment.slang): blue and yellow make green.
+    Pigment,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Painting {
     /// Bottom to top.
     pub layers: Vec<Layer>,
+    pub mix: Mix,
     /// The filter for every VR stroke's path.
     #[serde(skip)]
     pub filter: OneEuro3,
@@ -72,7 +84,7 @@ pub struct Painting {
 
 impl Default for Painting {
     fn default() -> Self {
-        Self { layers: vec![Layer { name: "Layer 1".into(), ..Default::default() }], filter: OneEuro3::default() }
+        Self { layers: vec![Layer { name: "Layer 1".into(), ..Default::default() }], mix: Mix::Normal, filter: OneEuro3::default() }
     }
 }
 
@@ -154,8 +166,8 @@ mod tests {
     fn segments_come_in_layer_runs() {
         let stroke = |x: f32| {
             let mut s = Stroke::new(Brush::default());
-            s.push(Sample { pos: Vec3::new(x, 1.0, 0.0), pressure: 1.0, time: 0.0 });
-            s.push(Sample { pos: Vec3::new(x + 0.1, 1.0, 0.0), pressure: 1.0, time: 0.1 });
+            s.push(Sample::new(Vec3::new(x, 1.0, 0.0), 1.0, 0.0));
+            s.push(Sample::new(Vec3::new(x + 0.1, 1.0, 0.0), 1.0, 0.1));
             s
         };
         let mut p = Painting::default();
@@ -174,7 +186,7 @@ mod tests {
     #[test]
     fn a_painting_saves_and_loads() {
         let mut p = Painting::with_strokes(vec![Stroke::new(Brush::default())]);
-        p.active()[0].push(Sample { pos: Vec3::ONE, pressure: 0.5, time: 1.0 });
+        p.active()[0].push(Sample::new(Vec3::ONE, 0.5, 1.0));
         p.layers[0].blend = Blend::Multiply;
         let path = std::env::temp_dir().join(format!("vdraw-test-{}.vdraw", std::process::id()));
         crate::file::save(&path, &p).unwrap();

@@ -84,6 +84,70 @@ pub fn ray_round_cone(o: Vec3, dir: Vec3, a: Vec3, ra: f32, b: Vec3, rb: f32) ->
     }
 }
 
+/// A vector in a flat tip's round space: stretched along its flat axis `up` (unit) by
+/// 1 / `roundness`, where the tip is round again (`stretch` in shaders/sdf.slang).
+pub fn stretch(up: Vec3, roundness: f32, v: Vec3) -> Vec3 {
+    v + up * ((1.0 / roundness - 1.0) * up.dot(v))
+}
+
+/// Where a ray (from `o`, unit `dir`) first enters a segment whose tip is flattened along
+/// `up` to `roundness` of its radius: the round cone in the round space (`raySegment` in
+/// shaders/sdf.slang).
+#[allow(clippy::too_many_arguments)]
+pub fn ray_flat_cone(o: Vec3, dir: Vec3, a: Vec3, ra: f32, b: Vec3, rb: f32, up: Vec3, roundness: f32) -> Option<(f32, Vec3)> {
+    if roundness >= 0.999 {
+        return ray_round_cone(o, dir, a, ra, b, rb);
+    }
+    let s = |v| stretch(up, roundness, v);
+    let d = s(dir);
+    let scale = d.length();
+    let (t, n) = ray_round_cone(s(o - a), d / scale, Vec3::ZERO, ra, s(b - a), rb)?;
+    Some((t / scale, s(n).normalize()))
+}
+
+/// How far `p` is from a segment with a flat tip, about: the distance in the round space,
+/// which is at most the true one (and at least `roundness` times it).
+#[allow(clippy::too_many_arguments)]
+pub fn flat_cone(p: Vec3, a: Vec3, ra: f32, b: Vec3, rb: f32, up: Vec3, roundness: f32) -> f32 {
+    if roundness >= 0.999 {
+        return round_cone(p, a, ra, b, rb);
+    }
+    let s = |v| stretch(up, roundness, v);
+    round_cone(s(p - a), Vec3::ZERO, ra, s(b - a), rb) * roundness
+}
+
+/// The distance between two segments, p0..p1 and q0..q1 (either may be a point).
+pub fn segment_distance(p0: Vec3, p1: Vec3, q0: Vec3, q1: Vec3) -> f32 {
+    let (d1, d2, r) = (p1 - p0, q1 - q0, p0 - q0);
+    let (a, e, f) = (d1.dot(d1), d2.dot(d2), d2.dot(r));
+    let (s, t) = if a <= 1e-12 && e <= 1e-12 {
+        (0.0, 0.0)
+    } else if a <= 1e-12 {
+        (0.0, (f / e).clamp(0.0, 1.0))
+    } else {
+        let c = d1.dot(r);
+        if e <= 1e-12 {
+            ((-c / a).clamp(0.0, 1.0), 0.0)
+        } else {
+            // The closest points of the two lines, held to the segments (Ericson, "Real-Time
+            // Collision Detection", 5.1.9).
+            let b = d1.dot(d2);
+            let den = a * e - b * b;
+            let mut s = if den > 1e-12 { ((b * f - c * e) / den).clamp(0.0, 1.0) } else { 0.0 };
+            let mut t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            (s, t)
+        }
+    };
+    ((p0 + d1 * s) - (q0 + d2 * t)).length()
+}
+
 /// Smooth minimum (polynomial, Inigo Quilez): blends two distances over `k`.
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     if k <= 0.0 {
@@ -172,6 +236,59 @@ mod tests {
             }
         }
         assert!(hits > 1000, "{hits} hits: the test rays miss too often");
+    }
+
+    #[test]
+    fn a_flat_tip_is_an_ellipsoid() {
+        // One point (a == b), flattened along a tilted axis: the ray's hit is where the
+        // ellipsoid's equation is 1, and the normal is its gradient.
+        let mut rng = Lcg(11);
+        let mut hits = 0;
+        for _ in 0..2000 {
+            let up = rng.v().normalize();
+            let (r, k) = (0.05 + rng.f() * 0.1, 0.1 + rng.f() * 0.9);
+            let c = rng.v() * 0.2;
+            let o = rng.v().normalize() * 1.5;
+            let dir = (c + rng.v() * 0.12 - o).normalize();
+            // In the ellipsoid's frame: |p|^2 + (1/k^2 - 1) (p.up)^2 = r^2.
+            let f = |p: Vec3| p.dot(p) + (1.0 / (k * k) - 1.0) * p.dot(up).powi(2) - r * r;
+            let Some((t, n)) = ray_flat_cone(o, dir, c, r, c, r, up, k) else { continue };
+            hits += 1;
+            let p = o + dir * t - c;
+            assert!(f(p).abs() < 1e-4, "off the surface: {}", f(p));
+            let g = (p + up * ((1.0 / (k * k) - 1.0) * p.dot(up))).normalize();
+            assert!(n.dot(g) > 0.999, "normal {n} vs {g}");
+            assert!(f(o + dir * (t - 1e-3) - c) > 0.0, "not the first entry");
+        }
+        assert!(hits > 500, "{hits}");
+    }
+
+    #[test]
+    fn segments_apart_and_crossing() {
+        let d = |a: [f32; 3], b: [f32; 3], c: [f32; 3], e: [f32; 3]| segment_distance(a.into(), b.into(), c.into(), e.into());
+        // Crossing at right angles, 0.5 apart in z.
+        assert!((d([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.5], [0.0, 1.0, 0.5]) - 0.5).abs() < 1e-6);
+        // Parallel, overlapping.
+        assert!((d([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.2, 0.0], [2.0, 0.2, 0.0]) - 0.2).abs() < 1e-6);
+        // End to end along a line.
+        assert!((d([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.5, 0.0, 0.0], [3.0, 0.0, 0.0]) - 0.5).abs() < 1e-6);
+        // A point and a segment; two points.
+        assert!((d([0.5, 1.0, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!((d([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 3.0, 4.0], [0.0, 3.0, 4.0]) - 5.0).abs() < 1e-6);
+        // Against brute force, at random.
+        let mut rng = Lcg(3);
+        for _ in 0..500 {
+            let (p0, p1, q0, q1) = (rng.v(), rng.v(), rng.v(), rng.v());
+            let mut best = f32::MAX;
+            for i in 0..=200 {
+                for j in 0..=200 {
+                    let (s, t) = (i as f32 / 200.0, j as f32 / 200.0);
+                    best = best.min((p0.lerp(p1, s) - q0.lerp(q1, t)).length());
+                }
+            }
+            let got = segment_distance(p0, p1, q0, q1);
+            assert!(got <= best + 1e-5 && got >= best - 0.02, "{got} vs {best}");
+        }
     }
 
     #[test]

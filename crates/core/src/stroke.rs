@@ -3,12 +3,33 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-/// One sample of the brush tip: where it was, how hard it pressed (0..1) and when (seconds).
+/// One sample of the brush tip: where it was, how hard it pressed (0..1), when (seconds), and
+/// which way the pen's up side faced.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     pub pos: Vec3,
     pub pressure: f32,
     pub time: f64,
+    /// The pen's up direction (unit). A tip that is not round is flattened along it, as a flat
+    /// brush held like a pen: wide across, thin up and down. (Files from before roundness have
+    /// none: straight up.)
+    #[serde(default = "up", skip_serializing_if = "is_up")]
+    pub up: Vec3,
+}
+
+fn up() -> Vec3 {
+    Vec3::Y
+}
+
+fn is_up(v: &Vec3) -> bool {
+    *v == Vec3::Y
+}
+
+impl Sample {
+    /// A sample with the pen upright.
+    pub fn new(pos: Vec3, pressure: f32, time: f64) -> Self {
+        Self { pos, pressure, time, up: Vec3::Y }
+    }
 }
 
 /// A brush of the 2D app: a trail of dabs. Strokes brought in from a .bdraw keep it.
@@ -37,6 +58,9 @@ pub struct Brush {
     /// Where the density starts to fall off, as a part of the radius: 1 is a hard edge, 0
     /// falls off from the center (an airbrush).
     pub hardness: f32,
+    /// The tip's thickness along the pen's up direction, as a part of its width: 1 is round,
+    /// lower is flatter (a flat brush, or a calligraphy nib).
+    pub roundness: f32,
     /// Takes paint away from its layer.
     pub erase: bool,
     /// A 2D app brush (a stroke brought in from a .bdraw): its points are kept as they are, and
@@ -46,7 +70,7 @@ pub struct Brush {
 
 impl Default for Brush {
     fn default() -> Self {
-        Self { radius: 0.01, color: [0.9, 0.3, 0.2], pressure_size: true, min_ratio: 0.2, opacity: 1.0, hardness: 1.0, erase: false, dabs: None }
+        Self { radius: 0.01, color: [0.9, 0.3, 0.2], pressure_size: true, min_ratio: 0.2, opacity: 1.0, hardness: 1.0, roundness: 1.0, erase: false, dabs: None }
     }
 }
 

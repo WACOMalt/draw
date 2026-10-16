@@ -6,8 +6,9 @@
 //!                               ~/.local/share/vdraw/painting.vdraw unless told otherwise
 //!   vdraw --import in.bdraw [out.vdraw]
 //!                               bring a 2D app canvas in, as 3D strokes on a plane ahead
-//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap] [--orbit x y z yaw pitch distance]
-//!                               [--tip opacity hardness] [--size WxH] [--bench N] [--panel]
+//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap|flat|mix] [--orbit x y z yaw pitch distance]
+//!                               [--tip opacity hardness] [--size WxH] [--bench N] [--mix normal|pigment]
+//!                               [--panel [brush|eraser|stroke-eraser]] [--sweep radius]
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
@@ -15,11 +16,12 @@ mod demo;
 mod panel;
 mod rig;
 mod snapshot;
+mod tools;
 mod xr;
 
 use anyhow::{Context, Result};
 
-/// The painting of `--demo shapes|soft|compare|dense|overlap` (shapes when not given), and a camera for it.
+/// The painting of `--demo shapes|soft|compare|dense|overlap|flat|mix` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
     // --open file.vdraw: a saved painting, seen from where the viewer starts, toward its middle.
     if let Some(path) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
@@ -35,7 +37,9 @@ fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
         "compare" => (demo::compare(), camera::Orbit { target: glam::Vec3::new(0.0, 1.22, 0.0), yaw: 0.0, pitch: 0.05, distance: 1.25 }),
         "dense" => (demo::dense(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.3, pitch: 0.1, distance: 0.9 }),
         "overlap" => (demo::overlap(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
-        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense or overlap"),
+        "flat" => (demo::flat(), camera::Orbit { target: glam::Vec3::new(0.0, 1.35, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.0 }),
+        "mix" => (demo::mix(), camera::Orbit { target: glam::Vec3::new(0.0, 1.35, 0.0), yaw: 0.0, pitch: 0.0, distance: 0.9 }),
+        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense, overlap, flat or mix"),
     })
 }
 
@@ -71,7 +75,15 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("--snapshot") => {
             let path = args.get(1).map(String::as_str).unwrap_or("snapshot.png");
-            let (painting, cam) = demo(&args)?;
+            let (mut painting, cam) = demo(&args)?;
+            // --mix normal|pigment: the painting's paint mixing.
+            if let Some(m) = args.iter().position(|a| a == "--mix").and_then(|i| args.get(i + 1)) {
+                painting.mix = match m.as_str() {
+                    "normal" => vdraw_core::Mix::Normal,
+                    "pigment" => vdraw_core::Mix::Pigment,
+                    _ => anyhow::bail!("--mix normal|pigment"),
+                };
+            }
             // --orbit x y z yaw pitch distance: look at (x, y, z) from another place.
             let cam = match args.iter().position(|a| a == "--orbit") {
                 Some(i) => {
@@ -86,7 +98,7 @@ fn main() -> Result<()> {
                 Some(i) => {
                     let v: Vec<f32> = args[i + 1..].iter().take(2).map(|s| s.parse()).collect::<Result<_, _>>()?;
                     anyhow::ensure!(v.len() == 2, "--tip needs opacity hardness");
-                    Some(vdraw_render::BrushTip { pos: cam.target, radius: 0.05, color: [0.2, 0.6, 0.95], opacity: v[0], hardness: v[1] })
+                    Some(vdraw_render::BrushTip { pos: cam.target, radius: 0.05, color: [0.2, 0.6, 0.95], opacity: v[0], hardness: v[1], up: glam::Vec3::Y, roundness: 1.0 })
                 }
                 None => None,
             };
@@ -102,7 +114,18 @@ fn main() -> Result<()> {
                 Some(n) => n.parse()?,
                 None => 0,
             };
-            snapshot::run(path, size.0, size.1, painting, cam, tip, bench, args.iter().any(|a| a == "--panel"))
+            // --panel [tool]: the tool panel beside the view; --sweep r: the stroke eraser's
+            // overlay, its ball (radius r) at the orbit target.
+            let panel = args.iter().position(|a| a == "--panel").map(|i| match args.get(i + 1).map(String::as_str) {
+                Some("eraser") => tools::Tool::Eraser,
+                Some("stroke-eraser") => tools::Tool::StrokeEraser,
+                _ => tools::Tool::Brush,
+            });
+            let sweep = match args.iter().position(|a| a == "--sweep").and_then(|i| args.get(i + 1)) {
+                Some(r) => Some(r.parse()?),
+                None => None,
+            };
+            snapshot::run(path, size.0, size.1, painting, cam, tip, bench, panel, sweep)
         }
         Some("--import") => import(&args),
         Some("--xr") => {

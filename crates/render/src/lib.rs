@@ -6,5 +6,5 @@ pub mod raymarch;
 pub mod ui;
 
 pub use gpu::Gpu;
-pub use raymarch::{BrushTip, EyeView, Overlays, Raymarcher, Scene, SceneLayer, Target, barrier, color_range};
+pub use raymarch::{BrushTip, EyeView, MAX_LINES, OverlayLine, Overlays, Raymarcher, Scene, SceneLayer, Target, barrier, color_range};
 pub use ui::{PanelDraw, UiRenderer};
