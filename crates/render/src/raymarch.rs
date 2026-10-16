@@ -44,6 +44,16 @@ struct ParamsGpu {
     brush_tip: [f32; 4],
     brush_color: [f32; 4],
     brush_style: [f32; 4],
+    laser_a: [f32; 4],
+    laser_b: [f32; 4],
+}
+
+/// What is drawn over the painting: the brush tip, and the pointer's laser.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Overlays {
+    pub tip: Option<BrushTip>,
+    /// From the controller to where it points on the panel.
+    pub laser: Option<(Vec3, Vec3)>,
 }
 
 /// The brush tip to draw: where the next stroke starts, and how it will look.
@@ -103,18 +113,24 @@ pub struct Target {
 
 impl Target {
     fn new(gpu: &Gpu, width: u32, height: u32, layers: u32) -> Result<Self> {
+        Self::image(gpu, width, height, layers, TARGET_FORMAT, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
+    }
+
+    /// Any color image array (with a view of all its layers), such as an sRGB image to present
+    /// into. `destroy` frees it.
+    pub fn image(gpu: &Gpu, width: u32, height: u32, layers: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> Result<Self> {
         let d = &gpu.device;
         let image = unsafe {
             d.create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
-                    .format(TARGET_FORMAT)
+                    .format(format)
                     .extent(vk::Extent3D { width, height, depth: 1 })
                     .mip_levels(1)
                     .array_layers(layers)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC),
+                    .usage(usage),
                 None,
             )
         }?;
@@ -132,7 +148,7 @@ impl Target {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
-                    .format(TARGET_FORMAT)
+                    .format(format)
                     .subresource_range(color_range(layers)),
                 None,
             )
@@ -140,7 +156,7 @@ impl Target {
         Ok(Self { image, view, alloc: Some(alloc), width, height, layers })
     }
 
-    fn destroy(&mut self, gpu: &Gpu) {
+    pub fn destroy(&mut self, gpu: &Gpu) {
         if let Some(a) = self.alloc.take() {
             unsafe {
                 gpu.device.destroy_image_view(self.view, None);
@@ -244,7 +260,7 @@ impl Raymarcher {
 
     /// Records the raymarch of `eyes` (one per target layer) into `cmd`, for frame slot `frame`
     /// (its previous use must be finished). Leaves the target in TRANSFER_SRC_OPTIMAL.
-    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], brush_tip: Option<BrushTip>) -> Result<()> {
+    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], overlays: &Overlays) -> Result<()> {
         let target = self.target.as_ref().expect("call target() first");
         let (view, image, w, h, layers) = (target.view, target.image, target.width, target.height, target.layers);
         assert!(eyes.len() as u32 == layers && layers <= 2);
@@ -281,7 +297,11 @@ impl Raymarcher {
         p.chunk_count = chunk_count;
         p.width = w;
         p.height = h;
-        if let Some(b) = brush_tip {
+        if let Some((a, b)) = overlays.laser {
+            p.laser_a = [a.x, a.y, a.z, 0.0012];
+            p.laser_b = [b.x, b.y, b.z, 0.0];
+        }
+        if let Some(b) = overlays.tip {
             p.brush_tip = [b.pos.x, b.pos.y, b.pos.z, b.radius];
             p.brush_color = [b.color[0], b.color[1], b.color[2], 1.0];
             p.brush_style = [b.opacity, b.hardness, 0.0, 0.0];

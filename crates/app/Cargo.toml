@@ -20,4 +20,5 @@ log.workspace = true
 env_logger.workspace = true
 png.workspace = true
 ctrlc.workspace = true
+egui.workspace = true
 gpu-allocator.workspace = true

@@ -6,24 +6,20 @@
 //! (an sRGB array image, one layer per eye; the blit encodes sRGB).
 //!
 //! Controls (Valve Index; other controllers through the simple profile). Either hand paints;
-//! the hand that painted last is the brush hand, the other one is the move hand.
-//!   trigger                    paint (the pull is the pressure)
-//!   B / A                      undo / redo (simple profile: menu = undo)
-//!   brush hand:
-//!     thumbstick up/down       brush size (logarithmic)
-//!     thumbstick left/right    hue
-//!     grip + thumbstick        opacity (up/down), hardness (left/right); a tick every 10%
-//!   move hand:
-//!     thumbstick up/down       fly where the controller points (also up and down)
-//!     thumbstick left/right    turn 30 degrees
-//!     grip                     hold on to the painting and drag it (any direction)
-//!     thumbstick click         back to the start
+//! the hand that painted last is the painting hand, and the brush panel floats above the
+//! other one.
+//!   trigger                  paint (the pull is the pressure); pointed at the panel: click
+//!   B / A                    undo / redo (simple profile: menu = undo)
+//!   left stick               fly where the head faces (up and down too), strafe
+//!   right stick              turn in 30 degree steps (left, right), rise and sink (up, down)
+//!   panel hand: stick click  hide or show the panel
 
 use crate::camera::perspective_fov;
-use crate::rig::Rig;
+use crate::panel::{self, Action, Model, Panel, Placement, Pointer};
+use crate::rig::{Locomotion, Rig};
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk::{self, Handle};
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 use openxr as xr;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use vdraw_core::{Brush, GpuSegment, Painting, Sample, Stroke};
 use vdraw_render::raymarch::FRAMES;
-use vdraw_render::{BrushTip, EyeView, Gpu, Raymarcher, barrier};
+use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, UiRenderer, barrier};
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 const NEAR: f32 = 0.02;
@@ -40,11 +36,9 @@ const FAR: f32 = 100.0;
 const TIP_OFFSET: f32 = 0.03;
 /// Trigger pull below this is not painting (a resting finger).
 const TRIGGER_DEAD: f32 = 0.05;
-/// Grip pull that counts as held.
-const GRIP_HELD: f32 = 0.5;
-/// Flying speed at full thumbstick, meters per second.
-const FLY_SPEED: f32 = 1.5;
-const TURN_STEP: f32 = std::f32::consts::PI / 6.0;
+/// A trigger click on the panel: down past this pull, up again below the next one.
+const CLICK_DOWN: f32 = 0.6;
+const CLICK_UP: f32 = 0.25;
 
 fn load_entry() -> Result<xr::Entry> {
     // The crate looks for the unversioned libopenxr_loader.so (a dev package); most systems
@@ -65,33 +59,62 @@ fn vec3(v: xr::Vector3f) -> Vec3 {
     Vec3::new(v.x, v.y, v.z)
 }
 
-/// A thumbstick with a dead zone, and only its stronger axis.
-fn stick_axis(v: xr::Vector2f) -> (f32, f32) {
-    let dead = |x: f32| if x.abs() < 0.2 { 0.0 } else { x };
-    if v.x.abs() > v.y.abs() { (dead(v.x), 0.0) } else { (0.0, dead(v.y)) }
-}
-
-fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let h = h.rem_euclid(1.0) * 6.0;
-    let c = v * s;
-    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
-    let (r, g, b) = match h as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = v - c;
-    [r + m, g + m, b + m]
-}
-
 struct Swapchain {
     handle: xr::Swapchain<xr::Vulkan>,
     images: Vec<vk::Image>,
+    format: vk::Format,
     width: u32,
     height: u32,
+}
+
+/// Where a hand's trigger press went: the panel or the painting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Press {
+    Off,
+    Panel,
+    Paint,
+}
+
+/// GPU time and late frames, logged every few seconds.
+struct Stats {
+    since: Instant,
+    frames: u32,
+    late: u32,
+    gpu_frames: u32,
+    gpu_ms: f64,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self { since: Instant::now(), frames: 0, late: 0, gpu_frames: 0, gpu_ms: 0.0 }
+    }
+
+    fn gpu(&mut self, ms: f64) {
+        self.gpu_frames += 1;
+        self.gpu_ms += ms;
+    }
+
+    /// One frame `dt` after the last; late when it took over 1.5 display periods.
+    fn frame(&mut self, dt: f32, period: f32) {
+        self.frames += 1;
+        if period > 0.0 && dt > period * 1.5 {
+            self.late += 1;
+        }
+    }
+
+    fn log(&mut self, segments: usize, width: u32, height: u32) {
+        if self.since.elapsed() < Duration::from_secs(3) || self.gpu_frames == 0 {
+            return;
+        }
+        let secs = self.since.elapsed().as_secs_f32();
+        log::info!(
+            "{segments} segments, GPU {:.2} ms/frame at {width}x{height} per eye, {:.0} fps, {} late frames",
+            self.gpu_ms / self.gpu_frames as f64,
+            self.frames as f32 / secs,
+            self.late
+        );
+        *self = Self::new();
+    }
 }
 
 /// The controller actions, one subaction path per hand.
@@ -102,8 +125,7 @@ struct Input {
     stick: xr::Action<xr::Vector2f>,
     undo: xr::Action<bool>,
     redo: xr::Action<bool>,
-    grip: xr::Action<f32>,
-    reset: xr::Action<bool>,
+    toggle: xr::Action<bool>,
     haptic: xr::Action<xr::Haptic>,
     hands: [xr::Path; 2],
     spaces: [xr::Space; 2],
@@ -115,11 +137,10 @@ impl Input {
         let set = instance.create_action_set("paint", "Paint", 0)?;
         let aim = set.create_action::<xr::Posef>("aim", "Brush pose", &hands)?;
         let paint = set.create_action::<f32>("paint", "Paint", &hands)?;
-        let stick = set.create_action::<xr::Vector2f>("brush", "Brush size and color", &hands)?;
+        let stick = set.create_action::<xr::Vector2f>("move", "Fly, turn", &hands)?;
         let undo = set.create_action::<bool>("undo", "Undo", &hands)?;
         let redo = set.create_action::<bool>("redo", "Redo", &hands)?;
-        let grip = set.create_action::<f32>("grip", "Grab, or brush style", &hands)?;
-        let reset = set.create_action::<bool>("reset", "Back to the start", &hands)?;
+        let toggle = set.create_action::<bool>("panel", "Hide or show the panel", &hands)?;
         let haptic = set.create_action::<xr::Haptic>("tick", "Tick", &hands)?;
 
         let p = |s: &str| instance.string_to_path(s);
@@ -131,8 +152,7 @@ impl Input {
             index.push(xr::Binding::new(&stick, h("thumbstick")?));
             index.push(xr::Binding::new(&undo, h("b/click")?));
             index.push(xr::Binding::new(&redo, h("a/click")?));
-            index.push(xr::Binding::new(&grip, h("squeeze/value")?));
-            index.push(xr::Binding::new(&reset, h("thumbstick/click")?));
+            index.push(xr::Binding::new(&toggle, h("thumbstick/click")?));
             index.push(xr::Binding::new(&haptic, p(&format!("/user/hand/{side}/output/haptic"))?));
         }
         instance.suggest_interaction_profile_bindings(p("/interaction_profiles/valve/index_controller")?, &index)?;
@@ -152,7 +172,7 @@ impl Input {
             aim.create_space(session, hands[0], xr::Posef::IDENTITY)?,
             aim.create_space(session, hands[1], xr::Posef::IDENTITY)?,
         ];
-        Ok(Self { set, aim, paint, stick, undo, redo, grip, reset, haptic, hands, spaces })
+        Ok(Self { set, aim, paint, stick, undo, redo, toggle, haptic, hands, spaces })
     }
 }
 
@@ -164,14 +184,13 @@ struct Painter {
     redo: Vec<Stroke>,
     active: Option<(usize, Stroke)>,
     brush: Brush,
-    hue: f32,
+    /// Colors used, newest first (sRGB), for the panel's swatches.
+    recent: Vec<[u8; 3]>,
 }
 
 impl Painter {
     fn new(painting: Painting) -> Self {
-        let hue = 0.02;
-        let brush = Brush { color: hsv(hue, 0.75, 0.9), ..Default::default() };
-        let mut p = Self { painting, done: Vec::new(), redo: Vec::new(), active: None, brush, hue };
+        let mut p = Self { painting, done: Vec::new(), redo: Vec::new(), active: None, brush: Brush::default(), recent: Vec::new() };
         p.rebuild();
         p
     }
@@ -209,32 +228,16 @@ impl Painter {
                 }
             }
             None if painting => {
+                let c = panel::to_srgb(self.brush.color).map(|c| (c * 255.0).round() as u8);
+                self.recent.retain(|&r| r != c);
+                self.recent.insert(0, c);
+                self.recent.truncate(panel::RECENT);
                 let mut stroke = Stroke::new(self.brush);
                 stroke.push(Sample { pos: tip, pressure: pull, time: t });
                 self.active = Some((hand, stroke));
             }
             _ => {}
         }
-    }
-
-    /// The brush hand's thumbstick: y scales the brush (logarithmic), x turns the hue; with
-    /// `style` (grip held) y sets the opacity and x the hardness. Only the stronger axis acts,
-    /// so a push up does not also turn the hue. True when opacity or hardness passed a 10% step
-    /// (or an end), for a haptic tick.
-    fn stick(&mut self, v: xr::Vector2f, dt: f32, style: bool) -> bool {
-        let (x, y) = stick_axis(v);
-        let b = &mut self.brush;
-        if !style {
-            b.radius = (b.radius * (y * dt * 1.5).exp()).clamp(0.001, 0.1);
-            self.hue += x * dt * 0.4;
-            b.color = hsv(self.hue, 0.75, 0.9);
-            return false;
-        }
-        let step = |old: f32, new: f32| (old * 10.0).floor() != (new * 10.0).floor() || (new != old && (new == 0.0 || new == 1.0));
-        let (o, h) = (b.opacity, b.hardness);
-        b.opacity = (o + y * dt * 0.5).clamp(0.05, 1.0);
-        b.hardness = (h + x * dt * 0.5).clamp(0.0, 1.0);
-        step(o, b.opacity) || step(h, b.hardness)
     }
 
     fn segments(&self, out: &mut Vec<GpuSegment>) {
@@ -332,12 +335,16 @@ pub fn run(painting: Painting) -> Result<()> {
     let mut running = false;
     let mut frame = 0usize;
     let mut last = Instant::now();
-    let mut stats = (Instant::now(), 0u32, 0.0f64); // since, frames, gpu ms sum
-    let (mut undo_was, mut redo_was) = ([false; 2], [false; 2]);
-    let mut tip_hand = 1usize;
+    let mut stats = Stats::new();
+    let (mut undo_was, mut redo_was, mut toggle_was) = ([false; 2], [false; 2], [false; 2]);
+    let mut painting_hand = 1usize;
     let mut rig = Rig::default();
-    let mut held: Option<Vec3> = None; // the painting point the move hand holds
-    let (mut turned, mut reset_was) = (false, false);
+    let mut loco = Locomotion::default();
+    let mut press = [Press::Off; 2];
+    let mut click = false; // the trigger is clicked down on the panel
+    let mut panel = Panel::new(&painter.brush);
+    let mut panel_shown = true;
+    let mut ui: Option<UiRenderer> = None;
 
     'main: loop {
         if quit.swap(false, Ordering::Relaxed) {
@@ -396,21 +403,70 @@ pub fn run(painting: Painting) -> Result<()> {
                 *aim = Some(pose_mat(loc.pose));
             }
         }
+        let head_pose = pose_mat(head.locate(&stage, time)?.pose);
         // Aim pose: -z is forward; the tip is a little in front.
         let tip_of = |aim: Mat4| aim.transform_point3(Vec3::new(0.0, 0.0, -TIP_OFFSET));
-        let tick = |h: usize| {
-            let pulse = xr::HapticVibration::new().amplitude(0.5).frequency(xr::FREQUENCY_UNSPECIFIED).duration(xr::Duration::from_nanos(12_000_000));
+        let tick = |h: usize, amplitude: f32, ms: i64| {
+            let pulse = xr::HapticVibration::new().amplitude(amplitude).frequency(xr::FREQUENCY_UNSPECIFIED).duration(xr::Duration::from_nanos(ms * 1_000_000));
             input.haptic.apply_feedback(&session, input.hands[h], &pulse)
         };
 
-        // Paint, undo, redo (either hand). Painting makes that hand the brush hand.
+        // The panel floats above the hand that is not painting.
+        let panel_hand = 1 - painting_hand;
+        let placement = match aims[panel_hand] {
+            Some(aim) if panel_shown => Some(Placement::above_hand(aim.w_axis.truncate(), head_pose.w_axis.truncate())),
+            _ => None,
+        };
+        let toggle = input.toggle.state(&session, input.hands[panel_hand])?.current_state;
+        if toggle && !toggle_was[panel_hand] {
+            panel_shown = !panel_shown;
+        }
+        toggle_was = [false; 2];
+        toggle_was[panel_hand] = toggle;
+
+        // Triggers. A press that begins on the panel stays with the panel until it is let go;
+        // one that begins anywhere else paints, also when it sweeps across the panel.
+        let mut pointer = Pointer::default();
+        let mut laser = None;
         for h in 0..2 {
-            let Some(aim) = aims[h] else { continue };
+            let Some(aim) = aims[h] else {
+                press[h] = Press::Off;
+                continue;
+            };
             let pull = input.paint.state(&session, input.hands[h])?.current_state;
-            if pull > TRIGGER_DEAD {
-                tip_hand = h;
+            let (from, dir) = (aim.w_axis.truncate(), aim.transform_vector3(Vec3::NEG_Z));
+            let on_panel = if h == painting_hand { placement.and_then(|p| p.hit(from, dir)) } else { None };
+            press[h] = match press[h] {
+                Press::Off if pull > TRIGGER_DEAD => {
+                    if on_panel.is_some() {
+                        Press::Panel
+                    } else {
+                        painting_hand = h;
+                        Press::Paint
+                    }
+                }
+                Press::Panel | Press::Paint if pull <= TRIGGER_DEAD => Press::Off,
+                p => p,
+            };
+            painter.hand(h, t, rig.point(tip_of(aim)), if press[h] == Press::Paint { pull } else { 0.0 });
+            if h == painting_hand {
+                if press[h] == Press::Panel {
+                    let was = click;
+                    click = if click { pull > CLICK_UP } else { pull > CLICK_DOWN };
+                    if click && !was {
+                        tick(h, 0.3, 15)?;
+                    }
+                    pointer = Pointer { at: placement.and_then(|p| p.project(from, dir)), pressed: click };
+                } else {
+                    click = false;
+                    if press[h] == Press::Off {
+                        pointer = Pointer { at: on_panel.map(|(_, at)| at), pressed: false };
+                    }
+                }
+                if let (Some(p), Some(at)) = (placement, pointer.at) {
+                    laser = Some((rig.point(from), rig.point(p.to_stage(at))));
+                }
             }
-            painter.hand(h, t, rig.point(tip_of(aim)), pull);
             let undo = input.undo.state(&session, input.hands[h])?.current_state;
             let redo = input.redo.state(&session, input.hands[h])?.current_state;
             if undo && !undo_was[h] {
@@ -422,49 +478,30 @@ pub fn run(painting: Painting) -> Result<()> {
             (undo_was[h], redo_was[h]) = (undo, redo);
         }
 
-        // The brush hand: size and hue, or with the grip held opacity and hardness.
-        let brush = tip_hand;
-        if aims[brush].is_some() {
-            let stick = input.stick.state(&session, input.hands[brush])?;
-            let style = input.grip.state(&session, input.hands[brush])?.current_state > GRIP_HELD;
-            if stick.is_active && painter.stick(stick.current_state, dt, style) {
-                tick(brush)?;
-            }
-        }
+        // Moving: VRChat's sticks, without gravity.
+        let stick = |h: usize| -> Result<Vec2> {
+            let s = input.stick.state(&session, input.hands[h])?;
+            Ok(if s.is_active { Vec2::new(s.current_state.x, s.current_state.y) } else { Vec2::ZERO })
+        };
+        loco.update(&mut rig, head_pose, stick(0)?, stick(1)?, dt);
 
-        // The move hand: hold on to the painting, fly, turn, go back to the start.
-        let mover = 1 - brush;
-        if let Some(aim) = aims[mover] {
-            let hand = aim.w_axis.truncate();
-            if input.grip.state(&session, input.hands[mover])?.current_state > GRIP_HELD {
-                let at = *held.get_or_insert(rig.point(hand));
-                rig.hold(at, hand);
-            } else {
-                held = None;
-                let stick = input.stick.state(&session, input.hands[mover])?;
-                let (x, y) = if stick.is_active { stick_axis(stick.current_state) } else { (0.0, 0.0) };
-                // Squared, for fine control near the center.
-                let forward = aim.transform_vector3(Vec3::NEG_Z);
-                rig.pos += rig.dir(forward) * (y * y.abs()) * FLY_SPEED * dt;
-                if !turned && x.abs() > 0.7 {
-                    let head_at = head.locate(&stage, time)?.pose.position;
-                    rig.turn(-x.signum() * TURN_STEP, rig.point(vec3(head_at)));
-                    turned = true;
-                } else if x.abs() < 0.3 {
-                    turned = false;
+        // The panel: laid out with this frame's pointer.
+        let panel_frame = placement.map(|_| {
+            let (can_undo, can_redo) = (!painter.painting.strokes.is_empty(), !painter.redo.is_empty());
+            panel.run(pointer, Model { brush: &mut painter.brush, recent: &painter.recent, can_undo, can_redo })
+        });
+        if let Some(f) = &panel_frame {
+            for action in &f.actions {
+                match action {
+                    Action::Undo => painter.undo(),
+                    Action::Redo => painter.redo(),
+                    Action::Recenter => rig = Rig::default(),
                 }
             }
-            let reset = input.reset.state(&session, input.hands[mover])?.current_state;
-            if reset && !reset_was {
-                rig = Rig::default();
-                held = None;
-            }
-            reset_was = reset;
-        } else {
-            held = None;
         }
 
-        let tip = aims[brush].or(aims[mover]).map(|aim| BrushTip {
+        // The brush tip, on the painting hand, unless it points at the panel.
+        let tip = aims[painting_hand].filter(|_| pointer.at.is_none()).map(|aim| BrushTip {
             pos: rig.point(tip_of(aim)),
             radius: painter.brush.radius,
             color: painter.brush.color,
@@ -477,6 +514,13 @@ pub fn run(painting: Painting) -> Result<()> {
             Some(s) => s,
             None => swapchain.insert(make_swapchain(&instance, system, &session, scale)?),
         };
+        let ui = match &mut ui {
+            Some(u) => u,
+            None => ui.insert(UiRenderer::new(gpu.clone(), sc.format)?),
+        };
+        if let Some(f) = &panel_frame {
+            ui.update_textures(&f.textures)?;
+        }
         let image_index = sc.handle.acquire_image()? as usize;
 
         // This slot's last submission must be done before its buffers are reused.
@@ -486,15 +530,12 @@ pub fn run(painting: Painting) -> Result<()> {
             if queried[frame] {
                 let mut ts = [0u64; 2];
                 if d.get_query_pool_results(queries, 2 * frame as u32, &mut ts, vk::QueryResultFlags::TYPE_64).is_ok() {
-                    stats.1 += 1;
-                    stats.2 += (ts[1].wrapping_sub(ts[0])) as f64 * tick_ns * 1e-6;
+                    stats.gpu((ts[1].wrapping_sub(ts[0])) as f64 * tick_ns * 1e-6);
                 }
             }
         }
-        if stats.0.elapsed() > Duration::from_secs(3) && stats.1 > 0 {
-            log::info!("{} segments, GPU {:.2} ms/frame at {}x{} per eye", segs.len(), stats.2 / stats.1 as f64, sc.width, sc.height);
-            stats = (Instant::now(), 0, 0.0);
-        }
+        stats.frame(dt, state.predicted_display_period.as_nanos() as f32 * 1e-9);
+        stats.log(segs.len(), sc.width, sc.height);
 
         // Views as late as possible, for the least latency.
         let (_, views) = session.locate_views(VIEW_TYPE, state.predicted_display_time, &stage)?;
@@ -515,7 +556,7 @@ pub fn run(painting: Painting) -> Result<()> {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
-            rm.record(cmd, frame, &segs, &eyes, tip)?;
+            rm.record(cmd, frame, &segs, &eyes, &Overlays { tip, laser })?;
             barrier(d, cmd, dst, 2, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
@@ -527,10 +568,16 @@ pub fn run(painting: Painting) -> Result<()> {
                 .dst_subresource(layers)
                 .dst_offsets([vk::Offset3D::default(), corner]);
             d.cmd_blit_image(cmd, target, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::NEAREST);
-            // The runtime takes the image back in COLOR_ATTACHMENT_OPTIMAL.
+            // The panel over the painting. The runtime takes the image back in
+            // COLOR_ATTACHMENT_OPTIMAL.
             barrier(d, cmd, dst, 2, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+            if let (Some(p), Some(f)) = (placement, &panel_frame) {
+                let model = rig.mat() * p.model();
+                let draw = PanelDraw { clip_from_point: [eyes[0].view_proj * model, eyes[1].view_proj * model], primitives: &f.primitives };
+                ui.record(cmd, frame, dst, w, h, 2, &[draw])?;
+            }
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::BOTTOM_OF_PIPE, queries, 2 * frame as u32 + 1);
             d.end_command_buffer(cmd)?;
         }
@@ -554,6 +601,7 @@ pub fn run(painting: Painting) -> Result<()> {
 
     // OpenXR lets go of the swapchain images before Vulkan objects go away.
     unsafe { d.device_wait_idle() }?;
+    drop(ui);
     drop(swapchain);
     drop((input, head, stage, stream, waiter, session));
     unsafe {
@@ -592,5 +640,5 @@ fn make_swapchain(instance: &xr::Instance, system: xr::SystemId, session: &xr::S
         mip_count: 1,
     })?;
     let images = handle.enumerate_images()?.into_iter().map(vk::Image::from_raw).collect();
-    Ok(Swapchain { handle, images, width, height })
+    Ok(Swapchain { handle, images, format, width, height })
 }

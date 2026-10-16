@@ -3,11 +3,12 @@
 //!   vdraw                       paint in a desktop window (mouse)
 //!   vdraw --xr [--demo ...]     paint in VR (OpenXR: SteamVR, Monado, WiVRn)
 //!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense] [--orbit x y z yaw pitch distance]
-//!                               [--tip opacity hardness] [--size WxH] [--bench N]
+//!                               [--tip opacity hardness] [--size WxH] [--bench N] [--panel]
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
 mod demo;
+mod panel;
 mod rig;
 mod snapshot;
 mod xr;
@@ -63,7 +64,7 @@ fn main() -> Result<()> {
                 Some(n) => n.parse()?,
                 None => 0,
             };
-            snapshot::run(path, size.0, size.1, painting, cam, tip, bench)
+            snapshot::run(path, size.0, size.1, painting, cam, tip, bench, args.iter().any(|a| a == "--panel"))
         }
         Some("--xr") => xr::run(demo(&args)?.0),
         _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),

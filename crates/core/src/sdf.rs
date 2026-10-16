@@ -59,13 +59,10 @@ pub fn ray_round_cone(o: Vec3, dir: Vec3, a: Vec3, ra: f32, b: Vec3, rb: f32) ->
         return if ra >= rb { ray_sphere(o, dir, a, ra) } else { ray_sphere(o, dir, b, rb) };
     }
     let oa = o - a;
-    let ob = o - b;
     let m1 = ba.dot(oa);
     let m2 = ba.dot(dir);
     let m3 = dir.dot(oa);
     let m5 = oa.dot(oa);
-    let m6 = ob.dot(dir);
-    let m7 = ob.dot(ob);
     // The side: a quadratic in t.
     let d2 = m0 - rr * rr;
     let k2 = d2 - m2 * m2;

@@ -56,8 +56,9 @@ pub fn create_instance_with(
     Ok(unsafe { ash::Instance::load(entry.static_fn(), raw) })
 }
 
-/// Creates the device through `create`, with the features vdraw needs (synchronization2, dynamic
-/// rendering, timeline semaphores) and one queue of `queue_family`.
+/// Creates the device through `create`, with the features vdraw needs (synchronization2 and
+/// dynamic rendering) and one queue of `queue_family`. Only the Vulkan 1.3 struct: SteamVR adds
+/// its own 1.2-era feature structs to the chain, which a Vulkan 1.2 struct would conflict with.
 pub fn create_device_with(
     instance: &ash::Instance,
     _physical: vk::PhysicalDevice,
@@ -67,12 +68,10 @@ pub fn create_device_with(
 ) -> Result<ash::Device> {
     let prio = [1.0f32];
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
-    let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).dynamic_rendering(true);
     let info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queues)
         .enabled_extension_names(extensions)
-        .push_next(&mut f12)
         .push_next(&mut f13);
     let raw = create(&info)?;
     Ok(unsafe { ash::Device::load(instance.fp_v1_0(), raw) })

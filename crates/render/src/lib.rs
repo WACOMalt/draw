@@ -3,6 +3,8 @@
 
 pub mod gpu;
 pub mod raymarch;
+pub mod ui;
 
 pub use gpu::Gpu;
-pub use raymarch::{BrushTip, EyeView, Raymarcher, Target, barrier, color_range};
+pub use raymarch::{BrushTip, EyeView, Overlays, Raymarcher, Target, barrier, color_range};
+pub use ui::{PanelDraw, UiRenderer};

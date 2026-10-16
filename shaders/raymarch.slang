@@ -36,6 +36,8 @@ struct Params
     float4 brushTip;   // xyz, w = radius (0: no tip shown)
     float4 brushColor; // rgb: the color the next stroke gets
     float4 brushStyle; // x = opacity, y = hardness of the next stroke
+    float4 laserA;     // the pointer's laser: from xyz (w = radius, 0: none)
+    float4 laserB;     // to xyz
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -132,24 +134,31 @@ float3 softLit(Segment g, float3 n)
     return g.color.rgb * lerp(0.85, lit, 0.4 + 0.6 * g.style.x);
 }
 
-// One soft segment along the ray: its cover (0 when the ray passes outside it), the depth of
-// the nearest pass, and the lit color there. `tBehind`: a solid surface or the floor; a pass
-// beyond it fades out within half a radius.
-float softCover(Segment g, float3 o, float3 dir, float tBehind, out float t, out float3 color, out float r)
+// The nearest points of a ray (o + t dir, t >= 0) and a segment (a + s (b - a), s in 0..1).
+// Returns the offset from the segment's point to the ray's.
+float3 rayToSegment(float3 o, float3 dir, float3 a, float3 b, out float t, out float s)
 {
-    // The nearest points of the ray (t >= 0) and the segment (s in 0..1).
-    float3 ba = g.b.xyz - g.a.xyz;
-    float3 w = o - g.a.xyz;
+    float3 ba = b - a;
+    float3 w = o - a;
     float bb = dot(ba, ba);
     float bd = dot(ba, dir);
     float ob = dot(w, ba);
     float od = dot(w, dir);
     float den = bb - bd * bd;
-    float s = den > 1e-12 ? saturate((ob - od * bd) / den) : 0.0;
+    s = den > 1e-12 ? saturate((ob - od * bd) / den) : 0.0;
     t = max(s * bd - od, 0.0);
     s = bb > 1e-12 ? saturate((ob + t * bd) / bb) : 0.0;
     t = max(s * bd - od, 0.0);
-    float3 off = w + dir * t - ba * s;
+    return w + dir * t - ba * s;
+}
+
+// One soft segment along the ray: its cover (0 when the ray passes outside it), the depth of
+// the nearest pass, and the lit color there. `tBehind`: a solid surface or the floor; a pass
+// beyond it fades out within half a radius.
+float softCover(Segment g, float3 o, float3 dir, float tBehind, out float t, out float3 color, out float r)
+{
+    float s;
+    float3 off = rayToSegment(o, dir, g.a.xyz, g.b.xyz, t, s);
     r = lerp(g.a.w, g.b.w, s);
     float u = length(off) / r;
     color = 0.0;
@@ -428,6 +437,16 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             float ring = saturate(1.0 - abs(q - 1.0) / (1.5 * px));
             color = lerp(color, float3(1.0, 1.0, 1.0), ring * 0.5);
         }
+    }
+
+    // 5. The pointer's laser: a thin line, at least a pixel wide, in the 2D app's accent.
+    if (params.laserA.w > 0.0)
+    {
+        float t, s;
+        float dist = length(rayToSegment(o, dir, params.laserA.xyz, params.laserB.xyz, t, s));
+        float px = max(pix * t, 1e-5);
+        float cover = saturate((max(params.laserA.w, px) - dist) / px + 0.5);
+        color = lerp(color, float3(0.03, 0.39, 1.0), 0.85 * cover);
     }
 
     outImage[id] = float4(color, 1.0);

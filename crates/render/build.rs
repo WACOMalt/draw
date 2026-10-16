@@ -8,17 +8,23 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", shaders.display());
     println!("cargo:rerun-if-env-changed=SLANGC");
-    for name in ["raymarch"] {
+    // (file, entry point, stage, output)
+    let jobs = [
+        ("raymarch", "main", "compute", "raymarch"),
+        ("ui", "vsMain", "vertex", "ui.vert"),
+        ("ui", "fsMain", "fragment", "ui.frag"),
+    ];
+    for (name, entry, stage, output) in jobs {
         let src = shaders.join(format!("{name}.slang"));
-        let spv = out.join(format!("{name}.spv"));
+        let spv = out.join(format!("{output}.spv"));
         let status = Command::new(&slangc)
             .arg(&src)
             .arg("-I")
             .arg(&shaders)
-            .args(["-target", "spirv", "-entry", "main", "-stage", "compute", "-matrix-layout-column-major", "-O2", "-o"])
+            .args(["-target", "spirv", "-entry", entry, "-stage", stage, "-matrix-layout-column-major", "-O2", "-o"])
             .arg(&spv)
             .status()
             .unwrap_or_else(|e| panic!("cannot run {} ({e}); install Slang in tools/slang or set SLANGC", slangc.display()));
-        assert!(status.success(), "slangc failed on {}", src.display());
+        assert!(status.success(), "slangc failed on {} ({entry})", src.display());
     }
 }
