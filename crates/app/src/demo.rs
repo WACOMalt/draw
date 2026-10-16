@@ -180,3 +180,33 @@ pub fn mix() -> Painting {
     }
     p
 }
+
+/// Soft strokes in depth (crossing at different distances, and two big ones crossing at the
+/// same depth far off), and one faint soft stroke just in front of the eye across the middle of
+/// the view: the slices the far ones are sorted in must not show as bands where the near one
+/// stretches the depth range.
+pub fn near() -> Painting {
+    let mut p = overlap();
+    let soft = |color, opacity| Brush { radius: 0.05, color, hardness: 0.0, opacity, pressure_size: false, ..Default::default() };
+    for (k, color) in [[0.9, 0.85, 0.2], [0.2, 0.8, 0.4], [0.8, 0.3, 0.9]].into_iter().enumerate() {
+        let (z, tilt) = (-0.25 + k as f32 * 0.2, k as f32 * 0.6 - 0.6);
+        p.active().push(stroke(soft(color, 0.6), 150, move |t| {
+            let x = (t - 0.5) * 0.9;
+            (Vec3::new(x, 1.3 + x * tilt * 0.4, z + (t * TAU).sin() * 0.1), 1.0)
+        }));
+    }
+    // Far off (2.5 m from the eye), two big soft strokes crossing at the same depth.
+    for (color, tilt) in [([0.9, 0.2, 0.2], 0.3f32), ([0.2, 0.35, 0.95], -0.3)] {
+        p.active().push(stroke(soft(color, 0.7), 120, move |t| {
+            let x = (t - 0.5) * 1.6;
+            (Vec3::new(x, 1.45 + x * tilt, -1.4 + x * tilt * 0.2), 1.0)
+        }));
+    }
+    for s in p.active().iter_mut().rev().take(2) {
+        s.brush.radius = 0.12;
+    }
+    // 25 cm in front of the eye (at z 1.1), faint, across the view.
+    let faint = Brush { radius: 0.025, color: [0.95, 0.95, 0.95], hardness: 0.0, opacity: 0.12, pressure_size: false, ..Default::default() };
+    p.active().push(stroke(faint, 60, |t| (Vec3::new((t - 0.5) * 0.3, 1.31, 0.85), 1.0)));
+    p
+}

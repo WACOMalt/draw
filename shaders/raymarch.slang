@@ -314,42 +314,55 @@ float3 softLit(Segment g, float3 n)
     return g.color.rgb * lerp(0.85, lit, 0.4 + 0.6 * g.style.x);
 }
 
+// The slices along this pixel's ray (world distances): the near group, bins 0 to
+// sliceSplit - 1 from sliceT0 to sliceGap0, and the far group, the rest from sliceGap1 to sliceT1.
+// With no wide empty gap in the soft strokes' span, one group: sliceSplit = BINS, and
+// sliceGap0 = sliceGap1 = sliceT1. (See where they are set.)
+static float sliceT0, sliceT1, sliceGap0, sliceGap1;
+static uint sliceSplit;
+
 // A segment's stamps (at a, and at b on a stroke's last segment) into the slices. A flat tip:
 // in its round space, where distances along the ray are `scale` times longer.
-void addStamps(Segment world, float3 o, float3 dir, float t0, float t1)
+void addStamps(Segment world, float3 o, float3 dir)
 {
     float scale;
     Segment g = roundSpace(world, o, dir, scale);
-    addStamp(g, g.a.xyz, g.a.w, g.style.z / scale, o, dir, t0 * scale, t1 * scale);
+    addStamp(g, g.a.xyz, g.a.w, g.style.z / scale, o, dir, scale);
     if (g.style.w > 0.0)
-        addStamp(g, g.b.xyz, g.b.w, g.style.w / scale, o, dir, t0 * scale, t1 * scale);
+        addStamp(g, g.b.xyz, g.b.w, g.style.w / scale, o, dir, scale);
 }
 
 // One stamp (center c, radius r, strength) into the slices: its optical depth along the ray,
-// between t0 and t1 (the slices' span), split where the slice edges cut its chord.
-void addStamp(Segment g, float3 c, float r, float strength, float3 o, float3 dir, float t0, float t1)
+// within its slice group (near or far, by its center), split where the slice edges cut its
+// chord. `scale`: distances along the ray here are that many times the world's.
+void addStamp(Segment g, float3 c, float r, float strength, float3 o, float3 dir, float scale)
 {
     float tc = dot(c - o, dir);
     float3 off = o + dir * tc - c;
     float q = length(off) / r;
     if (q >= 1.0 || strength <= 0.0)
         return;
+    bool near = tc < (sliceGap0 + sliceGap1) * 0.5 * scale;
+    float t0 = (near ? sliceT0 : sliceGap1) * scale;
+    float t1 = (near ? sliceGap0 : sliceT1) * scale;
+    uint first = near ? 0 : sliceSplit;
+    uint count = near ? sliceSplit : BINS - sliceSplit;
     float half = r * sqrt(1.0 - q * q);
     float a = max(tc - half, t0);
     float b = min(tc + half, t1);
     if (a >= b)
         return;
     float3 lit = softLit(g, off / r);
-    float perBin = (t1 - t0) / float(BINS);
-    uint k0 = min(uint((a - t0) / perBin), BINS - 1);
-    uint k1 = min(uint((b - t0) / perBin), BINS - 1);
+    float perBin = (t1 - t0) / float(count);
+    uint k0 = min(uint((a - t0) / perBin), count - 1);
+    uint k1 = min(uint((b - t0) / perBin), count - 1);
     float before = stampLine(q, (a - tc) / r, g.style.x);
     for (uint k = k0; k <= k1; k++)
     {
         float edge = min(b, t0 + perBin * float(k + 1));
         float upto = stampLine(q, (edge - tc) / r, g.style.x);
         float tau = strength * (upto - before);
-        binAdd(k, tau, tau * lit);
+        binAdd(first + k, tau, tau * lit);
         before = upto;
     }
 }
@@ -750,8 +763,11 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         float la = solid ? 1.0 : 0.0;
         if (anySoft)
         {
-            // The span the soft chunks cover along the ray.
+            // The span the soft chunks cover along the ray, and its widest empty gap: the
+            // chunks come about near to far, so a gap shows between where the ones so far
+            // reach and where the next starts.
             float t0 = tBehind, t1 = 0.0;
+            float reach = -1.0, gap0 = 0.0, gap1 = 0.0;
             for (uint k = j; k < end && tileNear(k) < tBehind; k++)
             {
                 if (!inPart(k))
@@ -762,9 +778,55 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                 float2 tc = raySphere(o, dir, ch.sphere);
                 if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
                     continue;
-                t0 = min(t0, max(tc.x, 0.0));
-                t1 = max(t1, min(tc.y, tBehind));
+                float s = max(tc.x, 0.0), e = min(tc.y, tBehind);
+                t0 = min(t0, s);
+                t1 = max(t1, e);
+                if (reach >= 0.0 && s - reach > gap1 - gap0)
+                {
+                    gap0 = reach;
+                    gap1 = s;
+                }
+                reach = max(reach, e);
             }
+            // A wide gap (a soft stroke near the eye, the others far off): the near part and the
+            // far part each get slices, in proportion to their lengths. Else the far strokes
+            // would share a few coarse slices, and their order, kept only between slices, would
+            // show as bands at the slice edges. The chunks are only about in order: those in
+            // the gap first make it narrower.
+            sliceSplit = BINS;
+            if (gap1 - gap0 > 0.25 * (t1 - t0))
+            {
+                for (uint k = j; k < end && tileNear(k) < tBehind; k++)
+                {
+                    if (!inPart(k))
+                        continue;
+                    Chunk ch = chunks[tileSeg(k)];
+                    if (ch.flags != 1)
+                        continue;
+                    float2 tc = raySphere(o, dir, ch.sphere);
+                    float s = max(tc.x, 0.0), e = min(tc.y, tBehind);
+                    if (tc.x > tc.y || e <= gap0 || s >= gap1)
+                        continue;
+                    if (s - gap0 > gap1 - e)
+                        gap1 = s;
+                    else
+                        gap0 = e;
+                }
+                if (gap1 - gap0 > 0.25 * (t1 - t0))
+                {
+                    float near = gap0 - t0, far = t1 - gap1;
+                    sliceSplit = clamp(uint(round(float(BINS) * near / max(near + far, 1e-6))), 1u, BINS - 1);
+                }
+            }
+            if (sliceSplit == BINS)
+            {
+                gap0 = t1;
+                gap1 = t1;
+            }
+            sliceT0 = t0;
+            sliceT1 = t1;
+            sliceGap0 = gap0;
+            sliceGap1 = gap1;
             if (t1 > t0)
             {
                 for (uint b = 0; b < BINS; b++)
@@ -780,7 +842,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                     if (tc.x > tc.y || tc.y < 0.0 || tc.x >= tBehind)
                         continue;
                     for (uint s = ch.first; s < ch.first + ch.count; s++)
-                        addStamps(segments[s], o, dir, t0, t1);
+                        addStamps(segments[s], o, dir);
                 }
                 // Back to front, over the solid hit.
                 for (uint b = BINS; b-- > 0;)

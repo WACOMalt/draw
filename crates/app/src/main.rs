@@ -6,7 +6,7 @@
 //!                               ~/.local/share/vdraw/painting.vdraw unless told otherwise
 //!   vdraw --import in.bdraw [out.vdraw]
 //!                               bring a 2D app canvas in, as 3D strokes on a plane ahead
-//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap|flat|mix] [--orbit x y z yaw pitch distance]
+//!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap|flat|mix|near] [--orbit x y z yaw pitch distance]
 //!                               [--tip opacity hardness] [--size WxH] [--bench N] [--mix normal|pigment]
 //!                               [--panel [brush|eraser|stroke-eraser]] [--sweep radius]
 //!                               render a demo painting to a PNG (no window, no headset)
@@ -21,7 +21,7 @@ mod xr;
 
 use anyhow::{Context, Result};
 
-/// The painting of `--demo shapes|soft|compare|dense|overlap|flat|mix` (shapes when not given), and a camera for it.
+/// The painting of `--demo shapes|soft|compare|dense|overlap|flat|mix|near` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
     // --open file.vdraw: a saved painting, seen from where the viewer starts, toward its middle.
     if let Some(path) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
@@ -38,8 +38,9 @@ fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
         "dense" => (demo::dense(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.3, pitch: 0.1, distance: 0.9 }),
         "overlap" => (demo::overlap(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
         "flat" => (demo::flat(), camera::Orbit { target: glam::Vec3::new(0.0, 1.35, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.0 }),
+        "near" => (demo::near(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
         "mix" => (demo::mix(), camera::Orbit { target: glam::Vec3::new(0.0, 1.35, 0.0), yaw: 0.0, pitch: 0.0, distance: 0.9 }),
-        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense, overlap, flat or mix"),
+        other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense, overlap, flat, mix or near"),
     })
 }
 
