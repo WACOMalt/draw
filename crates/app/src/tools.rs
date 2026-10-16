@@ -14,6 +14,8 @@ pub enum Tool {
     StrokeEraser,
     /// Picks the color of the painting where the pen points (all layers, as seen).
     Eyedropper,
+    /// Moves, turns and scales the active layer with the hand (the 2D app's transform).
+    Transform,
 }
 
 impl Tool {
@@ -24,6 +26,7 @@ impl Tool {
             Tool::Eraser => "Eraser",
             Tool::StrokeEraser => "Stroke eraser",
             Tool::Eyedropper => "Eyedropper",
+            Tool::Transform => "Move layer",
         }
     }
 }
@@ -63,7 +66,7 @@ impl Tools {
         match self.tool {
             Tool::Brush => Some(Brush { erase: false, ..self.brush }),
             Tool::Eraser => Some(Brush { erase: true, ..self.eraser }),
-            Tool::StrokeEraser | Tool::Eyedropper => None,
+            Tool::StrokeEraser | Tool::Eyedropper | Tool::Transform => None,
         }
     }
 
@@ -83,7 +86,7 @@ impl Tools {
         match self.tool {
             Tool::Brush => Some((&mut self.brush, &mut self.angle[0])),
             Tool::Eraser => Some((&mut self.eraser, &mut self.angle[1])),
-            Tool::StrokeEraser | Tool::Eyedropper => None,
+            Tool::StrokeEraser | Tool::Eyedropper | Tool::Transform => None,
         }
     }
 

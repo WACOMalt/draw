@@ -33,6 +33,36 @@ pub enum Edit {
     /// their strokes; `kept`, the layers the edit took out (with their strokes); `masks`, the
     /// masks it took off (by layer id).
     Layers { layout: Vec<Layer>, kept: Vec<Layer>, masks: Vec<(u32, Mask)>, active: u32 },
+    /// Layers (by id) moved, turned and scaled (uniformly) by a matrix.
+    Transform { layers: Vec<u32>, matrix: glam::Mat4 },
+}
+
+/// The Move layer tool's grab: the hand, its pose when it took hold (world), the scale the
+/// stick has set, the layers held (by id), and their segments as they were (the ranges of
+/// `done`, and a copy), moved each frame until it lets go.
+pub struct Grab {
+    pub hand: usize,
+    start: glam::Mat4,
+    scale: f32,
+    layers: Vec<u32>,
+    ranges: Vec<std::ops::Range<usize>>,
+    base: Vec<GpuSegment>,
+    matrix: glam::Mat4,
+}
+
+/// A matrix's uniform scale.
+fn scale_of(m: glam::Mat4) -> f32 {
+    m.x_axis.truncate().length()
+}
+
+/// A segment moved by a matrix (with a uniform scale): its ends, its radii and its flat axis.
+fn move_segment(g: &mut GpuSegment, m: glam::Mat4) {
+    let s = scale_of(m);
+    let (a, b) = (m.transform_point3(g.a()), m.transform_point3(g.b()));
+    g.a = [a.x, a.y, a.z, g.a[3] * s];
+    g.b = [b.x, b.y, b.z, g.b[3] * s];
+    let up = m.transform_vector3(g.up()).normalize_or(Vec3::Y);
+    g.shape[..3].copy_from_slice(&up.to_array());
 }
 
 /// The layers as they are, without their strokes (a layer edit's undo).
@@ -71,6 +101,7 @@ pub struct Painter {
     pub redo: Vec<Edit>,
     pub active: Option<(usize, Stroke)>,
     pub sweep: Option<Sweep>,
+    pub grab: Option<Grab>,
     pub tools: Tools,
     /// The layer strokes go to (by id), and whether to its mask (the 2D app's mask target).
     pub active_layer: u32,
@@ -102,6 +133,7 @@ impl Painter {
             redo: Vec::new(),
             active: None,
             sweep: None,
+            grab: None,
             tools: Tools::default(),
             active_layer,
             mask_target: false,
@@ -147,8 +179,16 @@ impl Painter {
         if mask { l.mask.as_mut().map(|m| &mut m.strokes) } else { Some(&mut l.strokes) }
     }
 
+    /// A grab let go of without keeping it: the layers back where they were.
+    fn drop_grab(&mut self) {
+        if self.grab.take().is_some() {
+            self.rebuild();
+        }
+    }
+
     pub fn undo(&mut self) {
         self.end_sweep();
+        self.drop_grab();
         if let Some(edit) = self.undo.pop() {
             let edit = self.apply(edit);
             self.redo.push(edit);
@@ -157,6 +197,7 @@ impl Painter {
 
     pub fn redo(&mut self) {
         self.end_sweep();
+        self.drop_grab();
         if let Some(edit) = self.redo.pop() {
             let edit = self.apply(edit);
             self.undo.push(edit);
@@ -199,6 +240,10 @@ impl Painter {
                 return Edit::Mix(std::mem::replace(&mut self.painting.mix, mix));
             }
             Edit::Layers { layout: to, kept, masks, active } => self.restore(to, kept, masks, active),
+            Edit::Transform { layers, matrix } => {
+                self.transform_layers(&layers, matrix);
+                Edit::Transform { layers, matrix: matrix.inverse() }
+            }
         };
         self.rebuild();
         self.changed = true;
@@ -269,6 +314,66 @@ impl Painter {
         self.redo.clear();
         self.rebuild();
         self.changed = true;
+    }
+
+    /// Moves the strokes of layers (by id; their masks' too) by a matrix with a uniform scale.
+    fn transform_layers(&mut self, ids: &[u32], m: glam::Mat4) {
+        let s = scale_of(m);
+        for l in self.painting.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+            let masks = l.mask.as_mut().map(|m| &mut m.strokes);
+            for stroke in l.strokes.iter_mut().chain(masks.into_iter().flatten()) {
+                stroke.brush.radius *= s;
+                for p in &mut stroke.samples {
+                    p.pos = m.transform_point3(p.pos);
+                    p.up = m.transform_vector3(p.up).normalize_or(Vec3::Y);
+                }
+            }
+        }
+    }
+
+    /// The Move layer tool, each frame: the hand's pose (world), its trigger, its stick (up
+    /// scales), and the frame's time. Pressed: takes hold of the active layer (a group: all its
+    /// layers); held: they follow the hand; let go: they stay there, one step of undo.
+    pub fn grab(&mut self, hand: usize, pose: glam::Mat4, down: bool, stick: f32, dt: f32) {
+        match (&mut self.grab, down) {
+            (None, true) => {
+                let i = self.active_index();
+                let block = self.painting.block(i);
+                let layers: Vec<u32> = self.painting.layers[block.clone()].iter().map(|l| l.id).collect();
+                let steps: Vec<usize> = (0..self.built.steps.len())
+                    .filter(|&s| matches!(self.built.steps[s], vdraw_core::Step::Layer(l) | vdraw_core::Step::Mask(l) if block.contains(&l)))
+                    .collect();
+                let ranges: Vec<_> = self.built.runs.iter().filter(|r| steps.contains(&r.step)).map(|r| r.first..r.first + r.count).collect();
+                let base = ranges.iter().flat_map(|r| self.done[r.clone()].iter().copied()).collect();
+                self.grab = Some(Grab { hand, start: pose, scale: 1.0, layers, ranges, base, matrix: glam::Mat4::IDENTITY });
+            }
+            (Some(g), true) if g.hand == hand => {
+                // The stick scales about the hand, faster the further it is pushed.
+                if stick.abs() > 0.15 {
+                    g.scale = (g.scale * (stick * dt * 1.2).exp()).clamp(0.01, 100.0);
+                }
+                g.matrix = pose * glam::Mat4::from_scale(Vec3::splat(g.scale)) * g.start.inverse();
+                let mut k = 0;
+                for r in g.ranges.clone() {
+                    for d in &mut self.done[r] {
+                        let mut s = g.base[k];
+                        move_segment(&mut s, g.matrix);
+                        *d = s;
+                        k += 1;
+                    }
+                }
+                self.version += 1;
+            }
+            (Some(g), false) if g.hand == hand => {
+                let g = self.grab.take().unwrap();
+                self.transform_layers(&g.layers, g.matrix);
+                self.undo.push(Edit::Transform { layers: g.layers, matrix: g.matrix.inverse() });
+                self.redo.clear();
+                self.rebuild();
+                self.changed = true;
+            }
+            _ => {}
+        }
     }
 
     /// Puts a color (sRGB) first among the recent ones (the 2D app keeps 18).
@@ -351,7 +456,9 @@ impl Painter {
                 }
             }
             // The eyedropper picks where the pen points (the frame loop renders that).
-            None if self.tools.tool == crate::tools::Tool::Eyedropper => {}
+            // The eyedropper picks where the pen points (the frame loop renders that); the
+            // Move layer tool takes hold with `grab`.
+            None if matches!(self.tools.tool, crate::tools::Tool::Eyedropper | crate::tools::Tool::Transform) => {}
             None if down && self.sweep.is_none() => match self.tools.paint() {
                 Some(mut brush) => {
                     // Not on a hidden layer, a group, or a mask that is not there.
@@ -581,6 +688,34 @@ mod tests {
         assert!(p.painting.layers[0].mask.is_none() && !p.mask_target);
         p.undo();
         assert_eq!(p.painting.layers[0].mask.as_ref().unwrap().strokes.len(), 1);
+    }
+
+    #[test]
+    fn the_move_layer_tool_moves_and_scales_and_undoes() {
+        let mut p = painter();
+        p.tools.tool = Tool::Transform;
+        let start = glam::Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0));
+        p.grab(1, start, true, 0.0, 0.01);
+        // The hand moves 10 cm along x; the stick scales up for a while.
+        let moved = glam::Mat4::from_translation(Vec3::new(0.1, 1.0, 0.0));
+        for _ in 0..10 {
+            p.grab(1, moved, true, 1.0, 0.05);
+        }
+        let s = p.grab.as_ref().unwrap().scale;
+        assert!(s > 1.5, "{s}");
+        // While held, the segments move (the strokes not yet).
+        assert_eq!(p.painting.layers[0].strokes[0].samples[0].pos, Vec3::ZERO);
+        p.grab(1, moved, false, 0.0, 0.01);
+        // Let go: the strokes moved, scaled about the hand; their radius too.
+        let first = p.painting.layers[0].strokes[0].samples[0].pos;
+        let want = Vec3::new(0.1, 1.0, 0.0) + (Vec3::ZERO - Vec3::new(0.0, 1.0, 0.0)) * s;
+        assert!(first.abs_diff_eq(want, 1e-4), "{first} {want}");
+        assert!((p.painting.layers[0].strokes[0].brush.radius - 0.01 * s).abs() < 1e-6);
+        p.undo();
+        assert!(p.painting.layers[0].strokes[0].samples[0].pos.abs_diff_eq(Vec3::ZERO, 1e-5));
+        assert!((p.painting.layers[0].strokes[0].brush.radius - 0.01).abs() < 1e-6);
+        p.redo();
+        assert!(p.painting.layers[0].strokes[0].samples[0].pos.abs_diff_eq(want, 1e-4));
     }
 
     #[test]

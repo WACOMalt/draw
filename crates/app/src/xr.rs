@@ -9,11 +9,13 @@
 //! the hand that painted last is the painting hand, and the tool panel floats above the
 //! other one. The tip is held like a pen: a tip that is not round is flat along the
 //! controller's up side (turned by the tool's angle), so rolling the wrist turns it.
-//!   trigger                  use the tool: paint or erase (the pull is the pressure), or
-//!                            sweep the stroke eraser's ball; pointed at the panel: click
+//!   trigger                  use the tool: paint or erase (the pull is the pressure); sweep
+//!                            the stroke eraser's ball; pick a color (eyedropper); hold the
+//!                            active layer (move layer). Pointed at the panel: click
 //!   B / A                    undo / redo (simple profile: menu = undo)
 //!   left stick               fly where the head faces (up and down too), strafe
 //!   right stick              turn in 30 degree steps (left, right), rise and sink (up, down)
+//!   painting hand's stick    pointed at the panel: scroll; holding a layer: scale it
 //!   panel hand: stick click  hide or show the panel
 
 use crate::camera::perspective_fov;
@@ -437,6 +439,15 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             pointer.scroll = sticks[painting_hand].y;
             sticks[painting_hand] = Vec2::ZERO;
         }
+        // The Move layer tool: the trigger holds the active layer, which follows the hand; its
+        // stick scales it (and does not move you meanwhile).
+        let grabbing = painter.tools.tool == Tool::Transform && press[painting_hand] == Press::Paint;
+        if grabbing || painter.grab.is_some() {
+            if let Some(aim) = aims[painting_hand] {
+                painter.grab(painting_hand, rig.mat() * aim, grabbing, sticks[painting_hand].y, dt);
+            }
+            sticks[painting_hand] = Vec2::ZERO;
+        }
         loco.update(&mut rig, head_pose, sticks[0], sticks[1], dt);
 
         // The panel: laid out with this frame's pointer.
@@ -459,7 +470,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             let from = aim.w_axis.truncate();
             laser = Some((rig.point(from), rig.point(from + aim.transform_vector3(Vec3::NEG_Z) * 4.0)));
         }
-        let tip = aims[painting_hand].filter(|_| pointer.at.is_none() && painter.tools.tool != Tool::Eyedropper).map(|aim| {
+        let tip = aims[painting_hand].filter(|_| pointer.at.is_none() && !matches!(painter.tools.tool, Tool::Eyedropper | Tool::Transform)).map(|aim| {
             let (pos, up) = (rig.point(tip_of(aim)), rig.dir(up_of(aim)));
             match painter.tools.paint() {
                 Some(b) => BrushTip {

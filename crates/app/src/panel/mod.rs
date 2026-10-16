@@ -392,6 +392,10 @@ impl Panel {
         if icon_button(ui, "eyedropper", size, painter.tools.tool == Tool::Eyedropper, true).clicked() {
             painter.tools.tool = Tool::Eyedropper;
         }
+        ui.add_space(6.0);
+        if icon_button(ui, "transform", size, painter.tools.tool == Tool::Transform, true).clicked() {
+            painter.tools.tool = Tool::Transform;
+        }
     }
 }
 
@@ -426,6 +430,9 @@ fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, dyn
             }
             Tool::Eyedropper => {
                 ui.label(RichText::new("Point at the painting and pull the trigger to pick its color there, from all layers.").color(TEXT_DIM).size(14.0));
+            }
+            Tool::Transform => {
+                ui.label(RichText::new("Hold the trigger to take the active layer (a group: all its layers) in your hand: it moves and turns with it; the stick scales it about your hand. Undo puts it back.").color(TEXT_DIM).size(14.0));
             }
         }
     });
@@ -560,6 +567,8 @@ fn settings_tab(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     for line in [
         "Trigger: use the tool (the pull is the pressure)",
         "Point at the panel: the trigger clicks, the stick scrolls",
+        "Move layer: hold the trigger; the stick scales the layer",
+        "Eyedropper: point and hold the trigger",
         "B / A: undo / redo",
         "Left stick: fly where you look",
         "Right stick: turn (left, right), rise and sink",
