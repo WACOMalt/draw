@@ -37,6 +37,7 @@ struct Params
     uint pad0;
     float4 brushTip;   // xyz, w = radius (0: no tip shown)
     float4 brushColor; // rgb: the color the next stroke gets
+    float4 brushStyle; // x = opacity, y = hardness of the next stroke
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -408,15 +409,24 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         color = sum + T * color;
     }
 
-    // 5. The brush tip: a translucent ball in the brush color, where the next stroke starts.
+    // 5. The brush tip, where the next stroke starts: a preview of its color, opacity and
+    //    hardness (drawn over everything), with a thin outline so it shows at any opacity.
     if (params.brushTip.w > 0.0)
     {
-        float2 tt = raySphere(o, dir, params.brushTip);
-        if (tt.x <= tt.y && tt.y > 0.0)
+        float3 oc = params.brushTip.xyz - o;
+        float along = dot(oc, dir);
+        if (along > 0.0)
         {
-            float3 p = o + dir * max(tt.x, 0.0);
-            float edge = 1.0 - saturate(dot(normalize(p - params.brushTip.xyz), -dir));
-            color = lerp(color, params.brushColor.rgb, 0.35 + 0.5 * edge * edge);
+            float r = params.brushTip.w;
+            float q = length(oc - dir * along) / r; // the ray's distance from the center, in radii
+            float px = pix * along / r;             // one pixel, in radii
+            float hard = params.brushStyle.y;
+            float e = saturate((1.0 - q) / max(1.0 - hard, px));
+            float fill = params.brushStyle.x * smoothstep(0.0, 1.0, e);
+            float ball = 0.7 + 0.3 * sqrt(saturate(1.0 - q * q));
+            color = lerp(color, params.brushColor.rgb * ball, fill);
+            float ring = saturate(1.0 - abs(q - 1.0) / (1.5 * px));
+            color = lerp(color, float3(1.0, 1.0, 1.0), ring * 0.5);
         }
     }
 

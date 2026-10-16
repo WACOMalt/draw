@@ -7,7 +7,7 @@ use ash::vk;
 use gpu_allocator::MemoryLocation;
 use std::sync::Arc;
 use vdraw_render::raymarch::Buffer;
-use vdraw_render::{EyeView, Gpu, Raymarcher};
+use vdraw_render::{BrushTip, EyeView, Gpu, Raymarcher};
 
 fn f16_to_f32(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
@@ -26,7 +26,7 @@ fn srgb(x: f32) -> u8 {
     (y * 255.0 + 0.5) as u8
 }
 
-pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit) -> Result<()> {
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, cam: Orbit, tip: Option<BrushTip>) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
@@ -44,7 +44,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let t0 = std::time::Instant::now();
     unsafe {
         d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        rm.record(cmd, 0, &segs, &[eye], None)?;
+        rm.record(cmd, 0, &segs, &[eye], tip)?;
         let region = vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
             .image_extent(vk::Extent3D { width, height, depth: 1 });

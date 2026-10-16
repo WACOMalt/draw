@@ -3,10 +3,12 @@
 //!   vdraw                       paint in a desktop window (mouse)
 //!   vdraw --xr [--demo ...]     paint in VR (OpenXR: SteamVR, Monado, WiVRn)
 //!   vdraw --snapshot out.png [--demo shapes|soft|compare] [--orbit x y z yaw pitch distance]
+//!                               [--tip opacity hardness]
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
 mod demo;
+mod rig;
 mod snapshot;
 mod xr;
 
@@ -39,7 +41,16 @@ fn main() -> Result<()> {
                 }
                 None => cam,
             };
-            snapshot::run(path, 1280, 800, painting, cam)
+            // --tip opacity hardness: draw the brush tip at the orbit target.
+            let tip = match args.iter().position(|a| a == "--tip") {
+                Some(i) => {
+                    let v: Vec<f32> = args[i + 1..].iter().take(2).map(|s| s.parse()).collect::<Result<_, _>>()?;
+                    anyhow::ensure!(v.len() == 2, "--tip needs opacity hardness");
+                    Some(vdraw_render::BrushTip { pos: cam.target, radius: 0.05, color: [0.2, 0.6, 0.95], opacity: v[0], hardness: v[1] })
+                }
+                None => None,
+            };
+            snapshot::run(path, 1280, 800, painting, cam, tip)
         }
         Some("--xr") => xr::run(demo(&args)?.0),
         _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),

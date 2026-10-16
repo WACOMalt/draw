@@ -5,13 +5,22 @@
 //! writes both eyes into a two-layer RGBA16F target, and a blit copies it into the swapchain
 //! (an sRGB array image, one layer per eye; the blit encodes sRGB).
 //!
-//! Controls (Valve Index; other controllers through the simple profile):
-//!   trigger          paint (the pull is the pressure)
-//!   thumbstick up    bigger brush, down smaller (logarithmic)
-//!   thumbstick side  change the hue
-//!   B                undo, A redo (simple profile: menu = undo)
+//! Controls (Valve Index; other controllers through the simple profile). Either hand paints;
+//! the hand that painted last is the brush hand, the other one is the move hand.
+//!   trigger                    paint (the pull is the pressure)
+//!   B / A                      undo / redo (simple profile: menu = undo)
+//!   brush hand:
+//!     thumbstick up/down       brush size (logarithmic)
+//!     thumbstick left/right    hue
+//!     grip + thumbstick        opacity (up/down), hardness (left/right); a tick every 10%
+//!   move hand:
+//!     thumbstick up/down       fly where the controller points (also up and down)
+//!     thumbstick left/right    turn 30 degrees
+//!     grip                     hold on to the painting and drag it (any direction)
+//!     thumbstick click         back to the start
 
 use crate::camera::perspective_fov;
+use crate::rig::Rig;
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk::{self, Handle};
 use glam::{Mat4, Quat, Vec3};
@@ -22,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use vdraw_core::{Brush, GpuSegment, Painting, Sample, Stroke};
 use vdraw_render::raymarch::FRAMES;
-use vdraw_render::{EyeView, Gpu, Raymarcher, barrier};
+use vdraw_render::{BrushTip, EyeView, Gpu, Raymarcher, barrier};
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 const NEAR: f32 = 0.02;
@@ -31,6 +40,11 @@ const FAR: f32 = 100.0;
 const TIP_OFFSET: f32 = 0.03;
 /// Trigger pull below this is not painting (a resting finger).
 const TRIGGER_DEAD: f32 = 0.05;
+/// Grip pull that counts as held.
+const GRIP_HELD: f32 = 0.5;
+/// Flying speed at full thumbstick, meters per second.
+const FLY_SPEED: f32 = 1.5;
+const TURN_STEP: f32 = std::f32::consts::PI / 6.0;
 
 fn load_entry() -> Result<xr::Entry> {
     // The crate looks for the unversioned libopenxr_loader.so (a dev package); most systems
@@ -49,6 +63,12 @@ fn quat(q: xr::Quaternionf) -> Quat {
 
 fn vec3(v: xr::Vector3f) -> Vec3 {
     Vec3::new(v.x, v.y, v.z)
+}
+
+/// A thumbstick with a dead zone, and only its stronger axis.
+fn stick_axis(v: xr::Vector2f) -> (f32, f32) {
+    let dead = |x: f32| if x.abs() < 0.2 { 0.0 } else { x };
+    if v.x.abs() > v.y.abs() { (dead(v.x), 0.0) } else { (0.0, dead(v.y)) }
 }
 
 fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
@@ -82,6 +102,9 @@ struct Input {
     stick: xr::Action<xr::Vector2f>,
     undo: xr::Action<bool>,
     redo: xr::Action<bool>,
+    grip: xr::Action<f32>,
+    reset: xr::Action<bool>,
+    haptic: xr::Action<xr::Haptic>,
     hands: [xr::Path; 2],
     spaces: [xr::Space; 2],
 }
@@ -95,6 +118,9 @@ impl Input {
         let stick = set.create_action::<xr::Vector2f>("brush", "Brush size and color", &hands)?;
         let undo = set.create_action::<bool>("undo", "Undo", &hands)?;
         let redo = set.create_action::<bool>("redo", "Redo", &hands)?;
+        let grip = set.create_action::<f32>("grip", "Grab, or brush style", &hands)?;
+        let reset = set.create_action::<bool>("reset", "Back to the start", &hands)?;
+        let haptic = set.create_action::<xr::Haptic>("tick", "Tick", &hands)?;
 
         let p = |s: &str| instance.string_to_path(s);
         let mut index = Vec::new();
@@ -105,6 +131,9 @@ impl Input {
             index.push(xr::Binding::new(&stick, h("thumbstick")?));
             index.push(xr::Binding::new(&undo, h("b/click")?));
             index.push(xr::Binding::new(&redo, h("a/click")?));
+            index.push(xr::Binding::new(&grip, h("squeeze/value")?));
+            index.push(xr::Binding::new(&reset, h("thumbstick/click")?));
+            index.push(xr::Binding::new(&haptic, p(&format!("/user/hand/{side}/output/haptic"))?));
         }
         instance.suggest_interaction_profile_bindings(p("/interaction_profiles/valve/index_controller")?, &index)?;
         let mut simple = Vec::new();
@@ -113,6 +142,7 @@ impl Input {
             simple.push(xr::Binding::new(&aim, h("aim/pose")?));
             simple.push(xr::Binding::new(&paint, h("select/click")?));
             simple.push(xr::Binding::new(&undo, h("menu/click")?));
+            simple.push(xr::Binding::new(&haptic, p(&format!("/user/hand/{side}/output/haptic"))?));
         }
         if let Err(e) = instance.suggest_interaction_profile_bindings(p("/interaction_profiles/khr/simple_controller")?, &simple) {
             log::warn!("simple controller bindings refused: {e}");
@@ -122,7 +152,7 @@ impl Input {
             aim.create_space(session, hands[0], xr::Posef::IDENTITY)?,
             aim.create_space(session, hands[1], xr::Posef::IDENTITY)?,
         ];
-        Ok(Self { set, aim, paint, stick, undo, redo, hands, spaces })
+        Ok(Self { set, aim, paint, stick, undo, redo, grip, reset, haptic, hands, spaces })
     }
 }
 
@@ -187,13 +217,24 @@ impl Painter {
         }
     }
 
-    /// The thumbstick: y scales the brush (logarithmic), x turns the hue.
-    fn stick(&mut self, v: xr::Vector2f, dt: f32) {
-        let dead = |x: f32| if x.abs() < 0.2 { 0.0 } else { x };
-        let (x, y) = (dead(v.x), dead(v.y));
-        self.brush.radius = (self.brush.radius * (y * dt * 1.5).exp()).clamp(0.001, 0.1);
-        self.hue += x * dt * 0.4;
-        self.brush.color = hsv(self.hue, 0.75, 0.9);
+    /// The brush hand's thumbstick: y scales the brush (logarithmic), x turns the hue; with
+    /// `style` (grip held) y sets the opacity and x the hardness. Only the stronger axis acts,
+    /// so a push up does not also turn the hue. True when opacity or hardness passed a 10% step
+    /// (or an end), for a haptic tick.
+    fn stick(&mut self, v: xr::Vector2f, dt: f32, style: bool) -> bool {
+        let (x, y) = stick_axis(v);
+        let b = &mut self.brush;
+        if !style {
+            b.radius = (b.radius * (y * dt * 1.5).exp()).clamp(0.001, 0.1);
+            self.hue += x * dt * 0.4;
+            b.color = hsv(self.hue, 0.75, 0.9);
+            return false;
+        }
+        let step = |old: f32, new: f32| (old * 10.0).floor() != (new * 10.0).floor() || (new != old && (new == 0.0 || new == 1.0));
+        let (o, h) = (b.opacity, b.hardness);
+        b.opacity = (o + y * dt * 0.5).clamp(0.05, 1.0);
+        b.hardness = (h + x * dt * 0.5).clamp(0.0, 1.0);
+        step(o, b.opacity) || step(h, b.hardness)
     }
 
     fn segments(&self, out: &mut Vec<GpuSegment>) {
@@ -267,6 +308,8 @@ pub fn run(painting: Painting) -> Result<()> {
         .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
         .or_else(|_| session.create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY))?;
 
+    let head = session.create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)?;
+
     let mut rm = Raymarcher::new(gpu.clone())?;
     let d = &gpu.device;
     let pool = unsafe {
@@ -292,6 +335,9 @@ pub fn run(painting: Painting) -> Result<()> {
     let mut stats = (Instant::now(), 0u32, 0.0f64); // since, frames, gpu ms sum
     let (mut undo_was, mut redo_was) = ([false; 2], [false; 2]);
     let mut tip_hand = 1usize;
+    let mut rig = Rig::default();
+    let mut held: Option<Vec3> = None; // the painting point the move hand holds
+    let (mut turned, mut reset_was) = (false, false);
 
     'main: loop {
         if quit.swap(false, Ordering::Relaxed) {
@@ -339,26 +385,32 @@ pub fn run(painting: Painting) -> Result<()> {
         last = now;
         let t = state.predicted_display_time.as_nanos() as f64 * 1e-9;
 
-        // Input.
+        // Input. Poses come in stage space; the rig places them in the painting.
         session.sync_actions(&[(&input.set).into()])?;
-        let mut tip = None;
-        for h in 0..2 {
-            let loc = input.spaces[h].locate(&stage, state.predicted_display_time)?;
+        let time = state.predicted_display_time;
+        let mut aims: [Option<Mat4>; 2] = [None; 2];
+        for (h, aim) in aims.iter_mut().enumerate() {
+            let loc = input.spaces[h].locate(&stage, time)?;
             let tracked = loc.location_flags.contains(xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID);
-            if !tracked || !input.aim.is_active(&session, input.hands[h])? {
-                continue;
+            if tracked && input.aim.is_active(&session, input.hands[h])? {
+                *aim = Some(pose_mat(loc.pose));
             }
-            // Aim pose: -z is forward.
-            let pos = pose_mat(loc.pose).transform_point3(Vec3::new(0.0, 0.0, -TIP_OFFSET));
+        }
+        // Aim pose: -z is forward; the tip is a little in front.
+        let tip_of = |aim: Mat4| aim.transform_point3(Vec3::new(0.0, 0.0, -TIP_OFFSET));
+        let tick = |h: usize| {
+            let pulse = xr::HapticVibration::new().amplitude(0.5).frequency(xr::FREQUENCY_UNSPECIFIED).duration(xr::Duration::from_nanos(12_000_000));
+            input.haptic.apply_feedback(&session, input.hands[h], &pulse)
+        };
+
+        // Paint, undo, redo (either hand). Painting makes that hand the brush hand.
+        for h in 0..2 {
+            let Some(aim) = aims[h] else { continue };
             let pull = input.paint.state(&session, input.hands[h])?.current_state;
             if pull > TRIGGER_DEAD {
                 tip_hand = h;
             }
-            painter.hand(h, t, pos, pull);
-            let stick = input.stick.state(&session, input.hands[h])?;
-            if stick.is_active && h == tip_hand {
-                painter.stick(stick.current_state, dt);
-            }
+            painter.hand(h, t, rig.point(tip_of(aim)), pull);
             let undo = input.undo.state(&session, input.hands[h])?.current_state;
             let redo = input.redo.state(&session, input.hands[h])?.current_state;
             if undo && !undo_was[h] {
@@ -368,10 +420,57 @@ pub fn run(painting: Painting) -> Result<()> {
                 painter.redo();
             }
             (undo_was[h], redo_was[h]) = (undo, redo);
-            if h == tip_hand || tip.is_none() {
-                tip = Some(pos);
+        }
+
+        // The brush hand: size and hue, or with the grip held opacity and hardness.
+        let brush = tip_hand;
+        if aims[brush].is_some() {
+            let stick = input.stick.state(&session, input.hands[brush])?;
+            let style = input.grip.state(&session, input.hands[brush])?.current_state > GRIP_HELD;
+            if stick.is_active && painter.stick(stick.current_state, dt, style) {
+                tick(brush)?;
             }
         }
+
+        // The move hand: hold on to the painting, fly, turn, go back to the start.
+        let mover = 1 - brush;
+        if let Some(aim) = aims[mover] {
+            let hand = aim.w_axis.truncate();
+            if input.grip.state(&session, input.hands[mover])?.current_state > GRIP_HELD {
+                let at = *held.get_or_insert(rig.point(hand));
+                rig.hold(at, hand);
+            } else {
+                held = None;
+                let stick = input.stick.state(&session, input.hands[mover])?;
+                let (x, y) = if stick.is_active { stick_axis(stick.current_state) } else { (0.0, 0.0) };
+                // Squared, for fine control near the center.
+                let forward = aim.transform_vector3(Vec3::NEG_Z);
+                rig.pos += rig.dir(forward) * (y * y.abs()) * FLY_SPEED * dt;
+                if !turned && x.abs() > 0.7 {
+                    let head_at = head.locate(&stage, time)?.pose.position;
+                    rig.turn(-x.signum() * TURN_STEP, rig.point(vec3(head_at)));
+                    turned = true;
+                } else if x.abs() < 0.3 {
+                    turned = false;
+                }
+            }
+            let reset = input.reset.state(&session, input.hands[mover])?.current_state;
+            if reset && !reset_was {
+                rig = Rig::default();
+                held = None;
+            }
+            reset_was = reset;
+        } else {
+            held = None;
+        }
+
+        let tip = aims[brush].or(aims[mover]).map(|aim| BrushTip {
+            pos: rig.point(tip_of(aim)),
+            radius: painter.brush.radius,
+            color: painter.brush.color,
+            opacity: painter.brush.opacity,
+            hardness: painter.brush.hardness,
+        });
         painter.segments(&mut segs);
 
         let sc = match &mut swapchain {
@@ -404,7 +503,7 @@ pub fn run(painting: Painting) -> Result<()> {
             .map(|v| {
                 let f = v.fov;
                 let proj = perspective_fov(f.angle_left, f.angle_right, f.angle_up, f.angle_down, NEAR, FAR);
-                EyeView { view_proj: proj * pose_mat(v.pose).inverse(), pos: vec3(v.pose.position) }
+                EyeView { view_proj: proj * (rig.mat() * pose_mat(v.pose)).inverse(), pos: rig.point(vec3(v.pose.position)) }
             })
             .collect();
 
@@ -416,7 +515,7 @@ pub fn run(painting: Painting) -> Result<()> {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
-            rm.record(cmd, frame, &segs, &eyes, tip.map(|p| (p, painter.brush.radius, painter.brush.color)))?;
+            rm.record(cmd, frame, &segs, &eyes, tip)?;
             barrier(d, cmd, dst, 2, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE);
@@ -456,7 +555,7 @@ pub fn run(painting: Painting) -> Result<()> {
     // OpenXR lets go of the swapchain images before Vulkan objects go away.
     unsafe { d.device_wait_idle() }?;
     drop(swapchain);
-    drop((input, stage, stream, waiter, session));
+    drop((input, head, stage, stream, waiter, session));
     unsafe {
         for f in fences {
             d.destroy_fence(f, None);

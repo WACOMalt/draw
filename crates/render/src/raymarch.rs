@@ -43,6 +43,17 @@ struct ParamsGpu {
     pad: u32,
     brush_tip: [f32; 4],
     brush_color: [f32; 4],
+    brush_style: [f32; 4],
+}
+
+/// The brush tip to draw: where the next stroke starts, and how it will look.
+#[derive(Clone, Copy, Debug)]
+pub struct BrushTip {
+    pub pos: Vec3,
+    pub radius: f32,
+    pub color: [f32; 3],
+    pub opacity: f32,
+    pub hardness: f32,
 }
 
 pub struct Buffer {
@@ -226,7 +237,7 @@ impl Raymarcher {
 
     /// Records the raymarch of `eyes` (one per target layer) into `cmd`, for frame slot `frame`
     /// (its previous use must be finished). Leaves the target in TRANSFER_SRC_OPTIMAL.
-    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], brush_tip: Option<(Vec3, f32, [f32; 3])>) -> Result<()> {
+    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], brush_tip: Option<BrushTip>) -> Result<()> {
         let target = self.target.as_ref().expect("call target() first");
         let (view, image, w, h, layers) = (target.view, target.image, target.width, target.height, target.layers);
         assert!(eyes.len() as u32 == layers && layers <= 2);
@@ -248,9 +259,10 @@ impl Raymarcher {
         p.seg_count = segments.len() as u32;
         p.width = w;
         p.height = h;
-        if let Some((tip, r, c)) = brush_tip {
-            p.brush_tip = [tip.x, tip.y, tip.z, r];
-            p.brush_color = [c[0], c[1], c[2], 1.0];
+        if let Some(b) = brush_tip {
+            p.brush_tip = [b.pos.x, b.pos.y, b.pos.z, b.radius];
+            p.brush_color = [b.color[0], b.color[1], b.color[2], 1.0];
+            p.brush_style = [b.opacity, b.hardness, 0.0, 0.0];
         }
         f.params.bytes()[..size_of::<ParamsGpu>()].copy_from_slice(bytemuck::bytes_of(&p));
         if f.bound_view != view {

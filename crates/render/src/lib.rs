@@ -5,4 +5,4 @@ pub mod gpu;
 pub mod raymarch;
 
 pub use gpu::Gpu;
-pub use raymarch::{EyeView, Raymarcher, Target, barrier, color_range};
+pub use raymarch::{BrushTip, EyeView, Raymarcher, Target, barrier, color_range};
