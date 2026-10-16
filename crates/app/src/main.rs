@@ -7,6 +7,7 @@
 mod camera;
 mod demo;
 mod snapshot;
+mod xr;
 
 use anyhow::Result;
 
@@ -18,6 +19,7 @@ fn main() -> Result<()> {
             let path = args.get(1).map(String::as_str).unwrap_or("snapshot.png");
             snapshot::run(path, 1280, 800)
         }
-        _ => anyhow::bail!("usage: vdraw --snapshot out.png"),
+        Some("--xr") => xr::run(),
+        _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),
     }
 }

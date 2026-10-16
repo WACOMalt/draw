@@ -1,10 +1,16 @@
 // Raymarches the painting: the exact round cones of every stroke, no voxels.
 //
-// One thread per pixel, one image layer per eye (dispatch z = eye). Each ray first collects the
-// segments whose bounding spheres it crosses (at most MAX_CAND), starting at the nearest entry,
-// then sphere-traces only those. Writes linear color (RGBA16F); the present step encodes sRGB.
+// One thread per pixel, one image layer per eye (dispatch z = eye). Two culling steps keep the
+// work per pixel small:
+//   1. Tile: a 16x16 workgroup first collects, together, the segments whose bounding spheres
+//      touch the cone of view of its tile (in shared memory, at most MAX_TILE).
+//   2. Ray: each pixel then collects the tile segments its own ray crosses (at most MAX_CAND),
+//      and sphere-traces only those, from the nearest entry.
+// Writes linear color (RGBA16F); the present step encodes sRGB.
 import sdf;
 
+static const uint TILE = 16;
+static const uint MAX_TILE = 1024;
 static const uint MAX_CAND = 64;
 static const uint MAX_STEPS = 192;
 
@@ -21,20 +27,49 @@ struct Params
     uint width;
     uint height;
     uint pad0;
-    float4 brushTip; // xyz, w = radius (0: no tip shown)
+    float4 brushTip;   // xyz, w = radius (0: no tip shown)
+    float4 brushColor; // rgb: the color the next stroke gets
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
 [[vk::binding(1, 0)]] StructuredBuffer<Segment> segments;
 [[vk::binding(2, 0)]] ConstantBuffer<Params> params;
 
+// Segments that touch this tile's cone of view (shared by the workgroup).
+groupshared uint tileList[MAX_TILE];
+groupshared uint tileCount;
+static bool tileAll; // more than fit: the tile uses every segment
+
+uint tileN() { return tileAll ? params.segCount : tileCount; }
+uint tileSeg(uint i) { return tileAll ? i : tileList[i]; }
+
 // Candidate segments of this ray (indices).
 static uint cand[MAX_CAND];
 static uint candCount;
-static bool useAll; // more candidates than fit: test every segment
+static bool useAll; // more candidates than fit: test every tile segment
 
-uint candidateCount() { return useAll ? params.segCount : candCount; }
-uint candidate(uint i) { return useAll ? i : cand[i]; }
+uint candidateCount() { return useAll ? tileN() : candCount; }
+uint candidate(uint i) { return useAll ? tileSeg(i) : cand[i]; }
+
+// The world-space direction of the ray through pixel position `px` (pixels, may be fractional).
+float3 rayDir(Eye eye, float2 px)
+{
+    float2 ndc = px / float2(params.width, params.height) * 2.0 - 1.0;
+    float4 far = mul(eye.invViewProj, float4(ndc, 1.0, 1.0));
+    return normalize(far.xyz / far.w - eye.pos.xyz);
+}
+
+// Whether a sphere (xyz, w = radius) touches the cone from `o` along `axis` with half angle
+// `angle`: the angle to its center, less its angular radius, is inside the cone.
+bool sphereInCone(float3 o, float3 axis, float angle, float4 sphere)
+{
+    float3 v = sphere.xyz - o;
+    float d = length(v);
+    if (d <= sphere.w)
+        return true;
+    float toCenter = acos(clamp(dot(v, axis) / d, -1.0, 1.0));
+    return toCenter <= angle + asin(sphere.w / d);
+}
 
 // The distance to the nearest candidate, and which one it is.
 float scene(float3 p, out uint nearest)
@@ -98,26 +133,50 @@ float3 background(float3 o, float3 dir, float pix, out float tFloor)
 }
 
 [shader("compute")]
-[numthreads(8, 8, 1)]
-void main(uint3 id: SV_DispatchThreadID)
+[numthreads(TILE, TILE, 1)]
+void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_GroupIndex)
 {
+    Eye eye = params.eyes[id.z];
+    float3 o = eye.pos.xyz;
+
+    // 1. The tile's segments. Every thread helps, also those outside the image.
+    {
+        float2 lo = float2(group.xy * TILE);
+        float2 hi = min(lo + TILE, float2(params.width, params.height));
+        float3 axis = rayDir(eye, (lo + hi) * 0.5);
+        float cosAngle = min(min(dot(axis, rayDir(eye, lo)), dot(axis, rayDir(eye, hi))),
+                             min(dot(axis, rayDir(eye, float2(lo.x, hi.y))), dot(axis, rayDir(eye, float2(hi.x, lo.y)))));
+        float angle = acos(clamp(cosAngle, -1.0, 1.0));
+        if (gi == 0)
+            tileCount = 0;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = gi; s < params.segCount; s += TILE * TILE)
+        {
+            if (sphereInCone(o, axis, angle, segmentBounds(segments[s])))
+            {
+                uint k;
+                InterlockedAdd(tileCount, 1, k);
+                if (k < MAX_TILE)
+                    tileList[k] = s;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        tileAll = tileCount > MAX_TILE;
+    }
+
     if (id.x >= params.width || id.y >= params.height)
         return;
-    Eye eye = params.eyes[id.z];
-    float2 ndc = (float2(id.xy) + 0.5) / float2(params.width, params.height) * 2.0 - 1.0;
-    float4 far = mul(eye.invViewProj, float4(ndc, 1.0, 1.0));
-    float3 o = eye.pos.xyz;
-    float3 dir = normalize(far.xyz / far.w - o);
+    float3 dir = rayDir(eye, float2(id.xy) + 0.5);
     // The ray of the next pixel to the right: the angle of one pixel.
-    float4 far1 = mul(eye.invViewProj, float4(ndc.x + 2.0 / float(params.width), ndc.y, 1.0, 1.0));
-    float pix = length(normalize(far1.xyz / far1.w - o) - dir);
+    float pix = length(rayDir(eye, float2(id.xy) + float2(1.5, 0.5)) - dir);
 
-    // 1. Candidates: segments whose bounding sphere the ray crosses in front of the eye.
+    // 2. Candidates: tile segments whose bounding sphere the ray crosses in front of the eye.
     candCount = 0;
     useAll = false;
     float tStart = 1e9, tEnd = 0.0;
-    for (uint s = 0; s < params.segCount; s++)
+    for (uint j = 0; j < tileN(); j++)
     {
+        uint s = tileSeg(j);
         float2 tt = raySphere(o, dir, segmentBounds(segments[s]));
         if (tt.x > tt.y || tt.y < 0.0)
             continue;
@@ -133,7 +192,7 @@ void main(uint3 id: SV_DispatchThreadID)
     float tFloor;
     float3 color = background(o, dir, pix, tFloor);
 
-    // 2. Sphere trace from the first entry to the last exit.
+    // 3. Sphere trace from the first entry to the last exit.
     if (candCount > 0)
     {
         float t = tStart;
@@ -161,7 +220,7 @@ void main(uint3 id: SV_DispatchThreadID)
         }
     }
 
-    // 3. The brush tip: a translucent ring where the next stroke would start.
+    // 4. The brush tip: a translucent ball in the brush color, where the next stroke starts.
     if (params.brushTip.w > 0.0)
     {
         float2 tt = raySphere(o, dir, params.brushTip);
@@ -169,7 +228,7 @@ void main(uint3 id: SV_DispatchThreadID)
         {
             float3 p = o + dir * max(tt.x, 0.0);
             float edge = 1.0 - saturate(dot(normalize(p - params.brushTip.xyz), -dir));
-            color = lerp(color, float3(1.0, 1.0, 1.0), 0.15 + 0.5 * edge * edge);
+            color = lerp(color, params.brushColor.rgb, 0.35 + 0.5 * edge * edge);
         }
     }
 

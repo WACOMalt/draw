@@ -15,6 +15,8 @@ use vdraw_core::GpuSegment;
 /// Frames in flight: each has its own parameter and segment buffers.
 pub const FRAMES: usize = 2;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/raymarch.spv"));
+/// Pixels per side of a workgroup tile (`TILE` in shaders/raymarch.slang).
+const TILE: u32 = 16;
 pub const TARGET_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// One eye: its view-projection (world to Vulkan clip space: y down, depth 0..1) and position.
@@ -40,6 +42,7 @@ struct ParamsGpu {
     height: u32,
     pad: u32,
     brush_tip: [f32; 4],
+    brush_color: [f32; 4],
 }
 
 pub struct Buffer {
@@ -223,7 +226,7 @@ impl Raymarcher {
 
     /// Records the raymarch of `eyes` (one per target layer) into `cmd`, for frame slot `frame`
     /// (its previous use must be finished). Leaves the target in TRANSFER_SRC_OPTIMAL.
-    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], brush_tip: Option<(Vec3, f32)>) -> Result<()> {
+    pub fn record(&mut self, cmd: vk::CommandBuffer, frame: usize, segments: &[GpuSegment], eyes: &[EyeView], brush_tip: Option<(Vec3, f32, [f32; 3])>) -> Result<()> {
         let target = self.target.as_ref().expect("call target() first");
         let (view, image, w, h, layers) = (target.view, target.image, target.width, target.height, target.layers);
         assert!(eyes.len() as u32 == layers && layers <= 2);
@@ -245,8 +248,9 @@ impl Raymarcher {
         p.seg_count = segments.len() as u32;
         p.width = w;
         p.height = h;
-        if let Some((tip, r)) = brush_tip {
+        if let Some((tip, r, c)) = brush_tip {
             p.brush_tip = [tip.x, tip.y, tip.z, r];
+            p.brush_color = [c[0], c[1], c[2], 1.0];
         }
         f.params.bytes()[..size_of::<ParamsGpu>()].copy_from_slice(bytemuck::bytes_of(&p));
         if f.bound_view != view {
@@ -264,7 +268,7 @@ impl Raymarcher {
                 vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE);
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &[self.frames[frame].set], &[]);
-            d.cmd_dispatch(cmd, w.div_ceil(8), h.div_ceil(8), layers);
+            d.cmd_dispatch(cmd, w.div_ceil(TILE), h.div_ceil(TILE), layers);
             barrier(d, cmd, image, layers, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 vk::PipelineStageFlags2::ALL_TRANSFER, vk::AccessFlags2::TRANSFER_READ);
