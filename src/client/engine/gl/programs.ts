@@ -402,6 +402,108 @@ uniform sampler2D uPaint;
 uniform float uOpacity;
 out vec4 o;
 ${SPECTRAL_GLSL}
+// OKLab (Björn Ottosson), from linear sRGB.
+vec3 oklab(vec3 c) {
+  vec3 lms = vec3(
+    dot(vec3(0.4122214708, 0.5363325363, 0.0514459929), c),
+    dot(vec3(0.2119034982, 0.6806995451, 0.1073969566), c),
+    dot(vec3(0.0883024619, 0.2817188376, 0.6299787005), c));
+  lms = sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));
+  return vec3(
+    dot(vec3(0.2104542553, 0.7936177850, -0.0040720468), lms),
+    dot(vec3(1.9779984951, -2.4285922050, 0.4505937099), lms),
+    dot(vec3(0.0259040371, 0.7827717662, -0.8086757660), lms));
+}
+// Linear sRGB of an OKLab color, not clamped.
+vec3 linear(vec3 lab) {
+  vec3 l = vec3(
+    dot(vec3(1.0, 0.3963377774, 0.2158037573), lab),
+    dot(vec3(1.0, -0.1055613458, -0.0638541728), lab),
+    dot(vec3(1.0, -0.0894841775, -1.2914855480), lab));
+  l = l * l * l;
+  return vec3(
+    dot(vec3(4.0767416621, -3.3077115913, 0.2309699292), l),
+    dot(vec3(-1.2684380046, 2.6097574011, -0.3413193965), l),
+    dot(vec3(-0.0041960863, -0.7034186147, 1.7076147010), l));
+}
+float overshoot(vec3 c) { return max(max(max(c.r, c.g), c.b) - 1.0, -min(min(c.r, c.g), c.b)); }
+/**
+ * sRGB of an OKLab color, into the gamut with its hue kept: along the line to a grey (L0, 0, 0)
+ * (Björn Ottosson's adaptive L0 projection, alpha 0.05), by bisection. Near the corners of the
+ * gamut (pure blue, green) a hue 1 or 2 degrees off the corner can hold much less chroma, so the
+ * projection alone would band where a mix grazes the edge. Thus a small overshoot clamps (its
+ * hue error is small), and the projection takes over by an overshoot of 0.02.
+ */
+vec3 srgb(vec3 lab) {
+  vec3 c = linear(lab);
+  float over = overshoot(c);
+  if (over <= 0.0) return spectral_linear_to_srgb(c);
+  float C = length(lab.yz), Ld = lab.x - 0.5, e1 = 0.5 + abs(Ld) + 0.05 * C;
+  vec3 g = vec3(0.5 * (1.0 + sign(Ld) * (e1 - sqrt(max(e1 * e1 - 2.0 * abs(Ld), 0.0)))), 0.0, 0.0);
+  float lo = 0.0, hi = 1.0;
+  for (int n = 0; n < 12; n++) {
+    float m = 0.5 * (lo + hi);
+    if (overshoot(linear(g + (lab - g) * m)) <= 1e-5) lo = m; else hi = m;
+  }
+  vec3 kept = oklab(clamp(linear(g + (lab - g) * lo), 0.0, 1.0));
+  vec3 clamped = oklab(clamp(c, 0.0, 1.0));
+  return spectral_linear_to_srgb(linear(mix(clamped, kept, smoothstep(0.0, 0.02, over))));
+}
+/**
+ * Paint d (amount wd) and paint s (amount ws).
+ *
+ * Kubelka-Munk at an even rate: where one paint absorbs a band of wavelengths almost fully, a
+ * trace of it overrules the other paint, so a plain mix by amount stays at the strong paint for
+ * most of the way and then jumps to the weak one in the last percent (a hard edge at the end of a
+ * gradient, a glaze that does nothing until it is opaque). A bisection on the KM amount (in
+ * logit space, which reaches 6e-6 from either end) finds the mix that sits the fraction t of the
+ * OKLab way from d to s.
+ *
+ * Kubelka-Munk alone also mixes red and blue into a grey brown: the spectral curves of sRGB red
+ * and blue share almost no wavelength. Painters expect purple (real crimson and ultramarine
+ * reflect a little of each other's light). A second mix keeps the lightness and the hue (along
+ * the short way round) of the two paints in OKLab, with less chroma lost to cancellation (avg
+ * chroma × cos(dh/2)^0.5 in the middle of the mix). The more colorful of the two mixes wins,
+ * smoothly (weights chroma^4). Thus blue and yellow stay the Kubelka-Munk green, and red and blue
+ * make purple.
+ */
+vec3 pigment_mix(vec3 d, float wd, vec3 s, float ws) {
+  float t = ws / (ws + wd);
+  vec3 ld = spectral_srgb_to_linear(d), ls = spectral_srgb_to_linear(s);
+  float R[SPECTRAL_SIZE], K1[SPECTRAL_SIZE], K2[SPECTRAL_SIZE];
+  spectral_linear_to_reflectance(ld, R);
+  float l1 = spectral_reflectance_to_xyz(R).y;
+  for (int i = 0; i < SPECTRAL_SIZE; i++) K1[i] = KS(R[i]);
+  spectral_linear_to_reflectance(ls, R);
+  float l2 = spectral_reflectance_to_xyz(R).y;
+  for (int i = 0; i < SPECTRAL_SIZE; i++) K2[i] = KS(R[i]);
+  vec3 a = oklab(ld), b = oklab(ls);
+  // The amount of s is 1 / (1 + e^-z), and the concentrations are amount × luminance
+  // (spectral.js).
+  float lo = -12.0, hi = 12.0, plo = 0.0, phi = 1.0;
+  for (int n = 0; n < 6; n++) {
+    float z = 0.5 * (lo + hi);
+    vec3 m = oklab(spectral_km(K1, K2, l1 / (1.0 + exp(z)), l2 / (1.0 + exp(-z))));
+    float da = distance(m, a), db = distance(m, b);
+    float p = da / (da + db + 1e-9);
+    if (p < t) { lo = z; plo = p; } else { hi = z; phi = p; }
+  }
+  float z = mix(lo, hi, clamp((t - plo) / max(phi - plo, 1e-6), 0.0, 1.0));
+  vec3 k = oklab(spectral_km(K1, K2, l1 / (1.0 + exp(z)), l2 / (1.0 + exp(-z))));
+  float ca = length(a.yz), cb = length(b.yz);
+  float ha = atan(a.z, a.y), hb = atan(b.z, b.y);
+  if (ca < 1e-4) ha = hb; // a grey has no hue: the other paint's
+  if (cb < 1e-4) hb = ha;
+  float dh = mod(hb - ha + 3.14159265, 6.28318531) - 3.14159265;
+  float h = ha + t * dh;
+  float f = 1.0 - (1.0 - sqrt(abs(cos(dh * 0.5)))) * 4.0 * t * (1.0 - t);
+  float c = mix(ca, cb, t) * f;
+  vec3 v = vec3(mix(a.x, b.x, t), c * cos(h), c * sin(h));
+  float ck = length(k.yz), cv = length(v.yz);
+  float ck4 = ck * ck * ck * ck, cv4 = cv * cv * cv * cv;
+  float w = cv4 / (cv4 + ck4 + 1e-12);
+  return srgb(mix(k, v, w));
+}
 void main() {
   vec4 d = texture(uBack, vScreen);
   vec4 s = texture(uPaint, vUv) * uOpacity;
@@ -409,9 +511,7 @@ void main() {
   if (d.a <= 1e-4) { o = s; return; }
   float ws = s.a, wd = d.a * (1.0 - s.a);
   float a = ws + wd;
-  // spectral.js weighs paints by the square of their factor: the square root keeps the weight
-  // in proportion to the coverage, so a thin glaze still tints.
-  vec3 c = spectral_mix2(clamp(d.rgb / d.a, 0.0, 1.0), sqrt(wd), clamp(s.rgb / s.a, 0.0, 1.0), sqrt(ws));
+  vec3 c = pigment_mix(clamp(d.rgb / d.a, 0.0, 1.0), wd, clamp(s.rgb / s.a, 0.0, 1.0), ws);
   o = vec4(c * a, a);
 }`;
 
