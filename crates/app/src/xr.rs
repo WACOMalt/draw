@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ash::vk::{self, Handle};
 use glam::{Mat4, Quat, Vec2, Vec3};
 use openxr as xr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -186,13 +186,20 @@ struct Painter {
     brush: Brush,
     /// Colors used, newest first (sRGB), for the panel's swatches.
     recent: Vec<[u8; 3]>,
+    /// The strokes changed since the last save.
+    changed: bool,
 }
 
 impl Painter {
     fn new(painting: Painting) -> Self {
-        let mut p = Self { painting, done: Vec::new(), redo: Vec::new(), active: None, brush: Brush::default(), recent: Vec::new() };
+        let mut p = Self { painting, done: Vec::new(), redo: Vec::new(), active: None, brush: Brush::default(), recent: Vec::new(), changed: false };
         p.rebuild();
         p
+    }
+
+    /// The stroke number the next volume stroke gets (after every visible volume stroke).
+    fn next_id(&self) -> u32 {
+        self.painting.layers.iter().filter(|l| !l.flat && l.visible).map(|l| l.strokes.len() as u32).sum()
     }
 
     fn rebuild(&mut self) {
@@ -200,16 +207,18 @@ impl Painter {
     }
 
     fn undo(&mut self) {
-        if let Some(s) = self.painting.strokes.pop() {
+        if let Some(s) = self.painting.active().pop() {
             self.redo.push(s);
             self.rebuild();
+            self.changed = true;
         }
     }
 
     fn redo(&mut self) {
         if let Some(s) = self.redo.pop() {
-            self.painting.strokes.push(s);
+            self.painting.active().push(s);
             self.rebuild();
+            self.changed = true;
         }
     }
 
@@ -222,8 +231,9 @@ impl Painter {
                     stroke.push(Sample { pos: tip, pressure: pull, time: t });
                 } else {
                     let (_, stroke) = self.active.take().unwrap();
-                    stroke.segments(self.painting.filter, self.painting.strokes.len() as u32, &mut self.done);
-                    self.painting.strokes.push(stroke);
+                    stroke.segments(self.painting.filter, self.next_id(), &mut self.done);
+                    self.painting.active().push(stroke);
+                    self.changed = true;
                     self.redo.clear();
                 }
             }
@@ -244,12 +254,14 @@ impl Painter {
         out.clear();
         out.extend_from_slice(&self.done);
         if let Some((_, s)) = &self.active {
-            s.segments(self.painting.filter, self.painting.strokes.len() as u32, out);
+            s.segments(self.painting.filter, self.next_id(), out);
         }
     }
 }
 
-pub fn run(painting: Painting) -> Result<()> {
+/// Paints in VR. `save_to`: where the painting is saved, after changes (every half minute, in
+/// the background) and on the way out.
+pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     // Ctrl-C asks the runtime to end the session, so it can leave the headset cleanly.
     let quit = Arc::new(AtomicBool::new(false));
     let q = quit.clone();
@@ -329,7 +341,10 @@ pub fn run(painting: Painting) -> Result<()> {
 
     let scale: f32 = std::env::var("VDRAW_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let mut swapchain: Option<Swapchain> = None;
+    rm.set_flat(painting.canvas.as_ref(), &painting.flat())?;
     let mut painter = Painter::new(painting);
+    let mut saving: Option<std::thread::JoinHandle<()>> = None;
+    let mut saved_at = Instant::now();
     let mut segs = Vec::new();
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
@@ -487,7 +502,7 @@ pub fn run(painting: Painting) -> Result<()> {
 
         // The panel: laid out with this frame's pointer.
         let panel_frame = placement.map(|_| {
-            let (can_undo, can_redo) = (!painter.painting.strokes.is_empty(), !painter.redo.is_empty());
+            let (can_undo, can_redo) = (!painter.painting.active().is_empty(), !painter.redo.is_empty());
             panel.run(pointer, Model { brush: &mut painter.brush, recent: &painter.recent, can_undo, can_redo })
         });
         if let Some(f) = &panel_frame {
@@ -597,6 +612,26 @@ pub fn run(painting: Painting) -> Result<()> {
             .collect();
         stream.end(state.predicted_display_time, blend, &[&xr::CompositionLayerProjection::new().space(&stage).views(&proj_views)])?;
         frame = (frame + 1) % FRAMES;
+
+        // Save in the background, at most every half minute, when something changed.
+        if let Some(path) = &save_to {
+            if painter.changed && saved_at.elapsed() > Duration::from_secs(30) && saving.as_ref().is_none_or(|t| t.is_finished()) {
+                let (painting, path) = (painter.painting.clone(), path.clone());
+                saving = Some(std::thread::spawn(move || match vdraw_core::file::save(&path, &painting) {
+                    Ok(()) => log::info!("saved {}", path.display()),
+                    Err(e) => log::error!("saving {}: {e:#}", path.display()),
+                }));
+                painter.changed = false;
+                saved_at = Instant::now();
+            }
+        }
+    }
+    if let Some(t) = saving {
+        let _ = t.join();
+    }
+    if let Some(path) = &save_to {
+        vdraw_core::file::save(path, &painter.painting)?;
+        log::info!("saved {}", path.display());
     }
 
     // OpenXR lets go of the swapchain images before Vulkan objects go away.

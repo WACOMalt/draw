@@ -16,6 +16,7 @@
 //      chunk that starts behind its solid hit.
 // Writes linear color (RGBA16F); the present step encodes sRGB.
 import sdf;
+import brush;
 
 static const uint TILE = 16;
 static const uint MAX_TILE = 1024;
@@ -38,6 +39,12 @@ struct Params
     float4 brushStyle; // x = opacity, y = hardness of the next stroke
     float4 laserA;     // the pointer's laser: from xyz (w = radius, 0: none)
     float4 laserB;     // to xyz
+    // The canvas on a wall (flat layers), if any.
+    float4 canvasOrigin; // xyz; w: 1 with a canvas
+    float4 canvasRight;  // xyz unit; w: the rectangle's min x (plane meters)
+    float4 canvasUp;     // xyz unit; w: its min y
+    float4 canvasMax;    // xy: its max; z: flat layers; w: 1 with paper
+    float4 paper;        // rgb: the paper color (sRGB)
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -55,6 +62,10 @@ struct Chunk
     uint pad;
 };
 [[vk::binding(3, 0)]] StructuredBuffer<Chunk> chunks;
+
+// The canvas, composited from the flat layers' strokes by shaders/bake.slang: sRGB,
+// premultiplied, row 0 at the top; with mipmaps.
+[[vk::binding(4, 0)]] Sampler2D canvasImage;
 
 // Chunks that touch this tile's cone of view (shared by the workgroup), sorted near to far by
 // where their spheres start.
@@ -128,47 +139,6 @@ void binAdd(uint k, float tau, float3 c)
     bins[i] = uint2(f32tof16(a.x) | (f32tof16(a.y) << 16), f32tof16(b.x) | (f32tof16(b.y) << 16));
 }
 
-// The brush falloff of the 2D app: 1 inside `hard` of the radius, then a raised cosine down
-// to 0 at the edge. `u`: the distance from the center, in radii. (vdraw_core::segments::falloff)
-float brushFalloff(float u, float hard)
-{
-    if (u >= 1.0)
-        return 0.0;
-    if (u <= hard)
-        return 1.0;
-    float x = (u - hard) / max(1.0 - hard, 1e-6);
-    return 0.5 + 0.5 * cos(3.14159265 * x);
-}
-
-// The falloff integrated along a line at distance q (radii) from a stamp's center, from the
-// line's nearest point to y further on (radii; negative: backward). The full-density core is
-// exact; the falloff shell, which is smooth, by 4-point Gauss.
-float stampLine(float q, float y, float hard)
-{
-    float sgn = y < 0.0 ? -1.0 : 1.0;
-    y = min(abs(y), sqrt(max(1.0 - q * q, 0.0)));
-    if (y <= 0.0)
-        return 0.0;
-    float yc = sqrt(max(hard * hard - q * q, 0.0)); // where the core ends
-    float core = min(y, yc);
-    float shell = 0.0;
-    if (y > yc)
-    {
-        const float X[2] = { 0.3399810436, 0.8611363116 };
-        const float W[2] = { 0.6521451549, 0.3478548451 };
-        float mid = 0.5 * (y + yc);
-        float half = 0.5 * (y - yc);
-        for (uint k = 0; k < 2; k++)
-        {
-            float s0 = mid - X[k] * half;
-            float s1 = mid + X[k] * half;
-            shell += W[k] * (brushFalloff(sqrt(q * q + s0 * s0), hard) + brushFalloff(sqrt(q * q + s1 * s1), hard));
-        }
-        shell *= half;
-    }
-    return sgn * (core + shell);
-}
-
 // The light of a soft stamp. `n`: the offset of the ray's nearest point from the center, in
 // radii (0 through the middle, so the light changes smoothly; the light is linear in n).
 float3 softLit(Segment g, float3 n)
@@ -225,6 +195,19 @@ float3 rayToSegment(float3 o, float3 dir, float3 a, float3 b, out float t, out f
     s = bb > 1e-12 ? saturate((ob + t * bd) / bb) : 0.0;
     t = max(s * bd - od, 0.0);
     return w + dir * t - ba * s;
+}
+
+// ---- The canvas on a wall ----
+
+float3 srgbFromLinear(float3 c)
+{
+    c = saturate(c);
+    return lerp(c * 12.92, 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+float3 linearFromSrgb(float3 c)
+{
+    return lerp(c / 12.92, pow((c + 0.055) / 1.055, float3(2.4)), step(0.04045, c));
 }
 
 // ---- Background ----
@@ -334,6 +317,34 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
 
     float tFloor;
     float3 color = background(o, dir, pix, tFloor);
+    // The canvas on its wall, in front of the floor; where it is opaque (the paper), it hides
+    // what is behind it.
+    if (params.canvasOrigin.w > 0.0)
+    {
+        float3 n = cross(params.canvasRight.xyz, params.canvasUp.xyz);
+        float den = dot(dir, n);
+        if (abs(den) > 1e-6)
+        {
+            float t = dot(params.canvasOrigin.xyz - o, n) / den;
+            float3 at = o + dir * t - params.canvasOrigin.xyz;
+            float2 p = float2(dot(at, params.canvasRight.xyz), dot(at, params.canvasUp.xyz));
+            float2 lo = float2(params.canvasRight.w, params.canvasUp.w);
+            float2 hi = params.canvasMax.xy;
+            if (t > 0.0 && t < tFloor && all(p >= lo) && all(p <= hi))
+            {
+                float2 uv = float2((p.x - lo.x) / (hi.x - lo.x), (hi.y - p.y) / (hi.y - lo.y));
+                // The mip level: one pixel on the canvas (longer at a slant) over one texel.
+                uint w, h, levels;
+                canvasImage.GetDimensions(0, w, h, levels);
+                float texel = (hi.x - lo.x) / float(w);
+                float footprint = pix * t / max(abs(den), 0.05);
+                float4 c = canvasImage.SampleLevel(uv, max(log2(footprint / texel), 0.0));
+                color = linearFromSrgb(c.rgb + (1.0 - c.a) * srgbFromLinear(color));
+                if (c.a > 0.99)
+                    tFloor = t;
+            }
+        }
+    }
 
     // 2. Solid: the nearest exact hit among the tile's solid segments.
     float tBehind = tFloor;

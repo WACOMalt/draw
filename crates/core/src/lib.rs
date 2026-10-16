@@ -8,6 +8,7 @@
 //! Portability: a segment is four `[f32; 4]`, so a port can keep segments in a float texture
 //! (a VRChat world has no structured buffers), and `sdf` mirrors `shaders/sdf.slang` one to one.
 
+pub mod file;
 pub mod filter;
 pub mod painting;
 pub mod sdf;
@@ -15,6 +16,6 @@ pub mod segments;
 pub mod stroke;
 
 pub use filter::OneEuro3;
-pub use painting::Painting;
+pub use painting::{Blend, Canvas, FlatData, GpuFlatLayer, Layer, Painting, Plane, GRID};
 pub use segments::{GpuChunk, GpuSegment, chunks};
-pub use stroke::{Brush, Sample, Stroke};
+pub use stroke::{Brush, Dabs, Sample, Stroke};

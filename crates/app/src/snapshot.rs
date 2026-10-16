@@ -25,11 +25,13 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
 
     let mut segs = Vec::new();
     painting.segments(None, &mut segs);
+    let flat = painting.flat();
+    rm.set_flat(painting.canvas.as_ref(), &flat)?;
     let eye = EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() };
 
     let d = &gpu.device;
     let mut readback = Buffer::new(&gpu, (width * height * 8) as u64, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "readback")?;
-    let pool = unsafe { d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family), None) }?;
+    let pool = unsafe { d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None) }?;
     let cmd = unsafe { d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)) }?[0];
     if bench > 0 {
         let queries = unsafe { d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None) }?;

@@ -2,6 +2,7 @@
 //! every eye into a layer of an RGBA16F image array (the target). Whoever presents (a window,
 //! an OpenXR swapchain, a snapshot) copies from the target afterwards.
 
+use crate::canvas::{self, CanvasImage};
 use crate::gpu::Gpu;
 use anyhow::Result;
 use ash::vk;
@@ -10,7 +11,7 @@ use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use std::sync::Arc;
-use vdraw_core::{GpuChunk, GpuSegment};
+use vdraw_core::{Canvas, FlatData, GpuChunk, GpuSegment};
 
 /// Frames in flight: each has its own parameter and segment buffers.
 pub const FRAMES: usize = 2;
@@ -46,6 +47,11 @@ struct ParamsGpu {
     brush_style: [f32; 4],
     laser_a: [f32; 4],
     laser_b: [f32; 4],
+    canvas_origin: [f32; 4],
+    canvas_right: [f32; 4],
+    canvas_up: [f32; 4],
+    canvas_max: [f32; 4],
+    paper: [f32; 4],
 }
 
 /// What is drawn over the painting: the brush tip, and the pointer's laser.
@@ -190,6 +196,11 @@ pub struct Raymarcher {
     target: Option<Target>,
     /// This frame's chunks (kept to reuse the allocation).
     chunks: Vec<GpuChunk>,
+    /// The canvas image (binding 4), set by `set_flat`, shared by the frames.
+    canvas_image: CanvasImage,
+    sampler: vk::Sampler,
+    /// The canvas's part of the parameters.
+    canvas: [[f32; 4]; 5],
 }
 
 impl Raymarcher {
@@ -201,6 +212,8 @@ impl Raymarcher {
             vk::DescriptorSetLayoutBinding::default().binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default().binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
+        let canvas_binding = vk::DescriptorSetLayoutBinding::default().binding(4).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let bindings: Vec<_> = bindings.into_iter().chain([canvas_binding]).collect();
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }?;
         let layout = unsafe { d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]), None) }?;
         let code = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV))?;
@@ -213,6 +226,7 @@ impl Raymarcher {
         let sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * FRAMES as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: FRAMES as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: FRAMES as u32 },
         ];
         let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES as u32).pool_sizes(&sizes), None) }?;
@@ -225,11 +239,57 @@ impl Raymarcher {
             let chunks = Buffer::new(&gpu, 256 * size_of::<GpuChunk>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "chunks")?;
             frames.push(Frame { params, segments, chunks, set, bound_view: vk::ImageView::null() });
         }
-        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, chunks: Vec::new() };
+        let canvas_image = canvas::empty(&gpu)?;
+        let sampler = unsafe {
+            d.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .max_lod(vk::LOD_CLAMP_NONE)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+        }?;
+        let r = Self { gpu, set_layout, layout, pipeline, pool, frames, target: None, chunks: Vec::new(), canvas_image, sampler, canvas: [[0.0; 4]; 5] };
         for i in 0..FRAMES {
             r.write_buffers(i);
         }
         Ok(r)
+    }
+
+    /// The canvas on a wall and its flat layers (from `Painting::flat`), until set again: they
+    /// are composited into the canvas image here. Waits for the GPU: call it when they change,
+    /// not every frame.
+    pub fn set_flat(&mut self, canvas: Option<&Canvas>, data: &FlatData) -> Result<()> {
+        unsafe { self.gpu.device.device_wait_idle() }?;
+        let gpu = self.gpu.clone();
+        let image = match canvas {
+            Some(c) if !data.layers.is_empty() || c.paper.is_some() => canvas::bake(&gpu, c, data)?,
+            _ => canvas::empty(&gpu)?,
+        };
+        let mut old = std::mem::replace(&mut self.canvas_image, image);
+        old.destroy(&gpu);
+        self.canvas = match canvas {
+            Some(c) => {
+                let (o, r, u) = (c.plane.origin, c.plane.right, c.plane.up);
+                let paper = c.paper.unwrap_or([0.0; 3]);
+                [
+                    [o.x, o.y, o.z, 1.0],
+                    [r.x, r.y, r.z, c.min.x],
+                    [u.x, u.y, u.z, c.min.y],
+                    [c.max.x, c.max.y, data.layers.len() as f32, c.paper.is_some() as u32 as f32],
+                    [paper[0], paper[1], paper[2], 0.0],
+                ]
+            }
+            None => [[0.0; 4]; 5],
+        };
+        for i in 0..FRAMES {
+            self.write_buffers(i);
+        }
+        Ok(())
     }
 
     fn write_buffers(&self, i: usize) {
@@ -237,7 +297,9 @@ impl Raymarcher {
         let seg = [vk::DescriptorBufferInfo::default().buffer(f.segments.buffer).range(vk::WHOLE_SIZE)];
         let chk = [vk::DescriptorBufferInfo::default().buffer(f.chunks.buffer).range(vk::WHOLE_SIZE)];
         let par = [vk::DescriptorBufferInfo::default().buffer(f.params.buffer).range(vk::WHOLE_SIZE)];
+        let canvas = [vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(self.canvas_image.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(4).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&canvas),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&seg),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&chk),
             vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&par),
@@ -295,6 +357,7 @@ impl Raymarcher {
         }
         p.seg_count = segments.len() as u32;
         p.chunk_count = chunk_count;
+        [p.canvas_origin, p.canvas_right, p.canvas_up, p.canvas_max, p.paper] = self.canvas;
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {
@@ -367,6 +430,8 @@ impl Drop for Raymarcher {
                 f.segments.destroy(&gpu);
                 f.chunks.destroy(&gpu);
             }
+            self.canvas_image.destroy(&gpu);
+            gpu.device.destroy_sampler(self.sampler, None);
             if let Some(mut t) = self.target.take() {
                 t.destroy(&gpu);
             }

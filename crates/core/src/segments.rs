@@ -1,9 +1,10 @@
 //! From samples to round cones: filter, resample by arc length, connect.
 
 use crate::filter::OneEuro3;
-use crate::stroke::{Brush, Stroke};
+use crate::painting::Plane;
+use crate::stroke::{Brush, Dabs, Stroke};
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
 /// One round cone, as the GPU reads it: four float4, so a port can also keep segments in a
 /// float texture (four texels each). `a.w` and `b.w` are the radii; `color` is linear RGB and
@@ -148,7 +149,66 @@ fn stamp_strengths(pts: &[(Vec3, f32)], brush: &Brush) -> Vec<f32> {
         .collect()
 }
 
+/// Linear to sRGB (0..1).
+pub fn to_srgb(c: [f32; 3]) -> [f32; 3] {
+    c.map(|c| {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+    })
+}
+
+/// sRGB (0..1) to linear.
+pub fn to_linear(c: [f32; 3]) -> [f32; 3] {
+    c.map(|c| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) })
+}
+
 impl Stroke {
+    /// A flat layer's stroke, as the 2D app's trail of dabs, in the plane's coordinates (meters,
+    /// z 0). No filter: the points are the 2D app's, only merged to steps of at least half the
+    /// radius (or 1 mm). Color is sRGB (the 2D app composites in sRGB); color.a is the opacity,
+    /// negative for an eraser; style is (hardness, stroke number, dab density at a, at b). The
+    /// dab density is flow / (2 spacing): summed along the trail, dabs give a covering of
+    /// density times the line integral of the falloff (in radii).
+    pub fn flat_segments(&self, plane: &Plane, id: u32, out: &mut Vec<GpuSegment>) {
+        let brush = &self.brush;
+        if self.samples.is_empty() {
+            return;
+        }
+        let dabs = brush.dabs.unwrap_or(Dabs { flow: 1.0, spacing: 0.1, pressure_flow: false });
+        let spacing = dabs.spacing.max(0.005);
+        let density = |p: f32| dabs.flow * if dabs.pressure_flow { p.clamp(0.0, 1.0).max(0.02) } else { 1.0 } / (2.0 * spacing);
+        let mut pts: Vec<(Vec2, f32)> = Vec::new();
+        let n = self.samples.len();
+        for (i, s) in self.samples.iter().enumerate() {
+            let q = plane.to_plane(s.pos);
+            if let Some(&(last, lp)) = pts.last() {
+                if i + 1 < n && (q - last).length() < (0.5 * brush.radius_at(lp)).max(0.001) {
+                    continue;
+                }
+            }
+            pts.push((q, s.pressure));
+        }
+        let color = to_srgb(brush.color);
+        let alpha = if brush.erase { -brush.opacity } else { brush.opacity };
+        let seg = |a: Vec2, ra: f32, ka: f32, b: Vec2, rb: f32, kb: f32| GpuSegment {
+            a: [a.x, a.y, 0.0, ra],
+            b: [b.x, b.y, 0.0, rb],
+            color: [color[0], color[1], color[2], alpha],
+            style: [brush.hardness, id as f32, ka, kb],
+        };
+        if pts.len() == 1 {
+            // One dab: a trail as long as one dab's share of it.
+            let (p, q) = pts[0];
+            let r = brush.radius_at(q);
+            out.push(seg(p, r, density(q), p + Vec2::X * (2.0 * spacing * r), r, density(q)));
+            return;
+        }
+        for w in pts.windows(2) {
+            let ((a, qa), (b, qb)) = (w[0], w[1]);
+            out.push(seg(a, brush.radius_at(qa), density(qa), b, brush.radius_at(qb), density(qb)));
+        }
+    }
+
     /// The stroke's round cones, appended to `out`. A single sample is a sphere. `id`: the
     /// stroke's number in the painting (exact in an f32 up to 2^24).
     pub fn segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {

@@ -1,7 +1,11 @@
 //! vdraw: volumetric painting. Strokes are round cones, raymarched exactly (no voxels).
 //!
 //!   vdraw                       paint in a desktop window (mouse)
-//!   vdraw --xr [--demo ...]     paint in VR (OpenXR: SteamVR, Monado, WiVRn)
+//!   vdraw --xr [--open file.vdraw | --demo ...]
+//!                               paint in VR (OpenXR: SteamVR, Monado, WiVRn); opens and saves
+//!                               ~/.local/share/vdraw/painting.vdraw unless told otherwise
+//!   vdraw --import in.bdraw [out.vdraw]
+//!                               bring a 2D app canvas in, as a canvas on a wall
 //!   vdraw --snapshot out.png [--demo shapes|soft|compare|dense|overlap] [--orbit x y z yaw pitch distance]
 //!                               [--tip opacity hardness] [--size WxH] [--bench N] [--panel]
 //!                               render a demo painting to a PNG (no window, no headset)
@@ -17,6 +21,13 @@ use anyhow::{Context, Result};
 
 /// The painting of `--demo shapes|soft|compare|dense|overlap` (shapes when not given), and a camera for it.
 fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
+    // --open file.vdraw: a saved painting, seen from where the viewer starts (its canvas ahead).
+    if let Some(path) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
+        let painting = vdraw_core::file::load(std::path::Path::new(path))?;
+        let target = painting.canvas.map_or(glam::Vec3::new(0.0, 1.3, -1.0), |c| c.plane.to_room((c.min + c.max) * 0.5));
+        let cam = camera::Orbit { target, yaw: 0.0, pitch: 0.0, distance: target.z.abs().max(0.5) };
+        return Ok((painting, cam));
+    }
     let name = args.iter().position(|a| a == "--demo").and_then(|i| args.get(i + 1)).map(String::as_str);
     Ok(match name.unwrap_or("shapes") {
         "shapes" => (demo::painting(), camera::Orbit::default()),
@@ -26,6 +37,31 @@ fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
         "overlap" => (demo::overlap(), camera::Orbit { target: glam::Vec3::new(0.0, 1.3, 0.0), yaw: 0.0, pitch: 0.0, distance: 1.1 }),
         other => anyhow::bail!("no demo {other:?}: shapes, soft, compare, dense or overlap"),
     })
+}
+
+/// The painting `vdraw --xr` opens and saves: $XDG_DATA_HOME/vdraw/painting.vdraw (or
+/// ~/.local/share/vdraw/painting.vdraw).
+fn painting_path() -> std::path::PathBuf {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/share")))
+        .unwrap_or_else(|| ".".into());
+    data.join("vdraw/painting.vdraw")
+}
+
+/// `--import in.bdraw [out.vdraw]`: brings a 2D app canvas in as a canvas on a wall.
+fn import(args: &[String]) -> Result<()> {
+    let from = args.get(1).context("usage: vdraw --import in.bdraw [out.vdraw]")?;
+    let to = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(painting_path);
+    let painting = vdraw_core::file::import_bdraw(std::path::Path::new(from))?;
+    let flat = painting.flat();
+    for l in &painting.layers {
+        log::info!("layer {:?}: {} strokes, {:?}, opacity {:.2}{}{}", l.name, l.strokes.len(), l.blend, l.opacity, if l.flat { ", flat" } else { "" }, if l.visible { "" } else { ", hidden" });
+    }
+    log::info!("{} flat segments, {} chunks, {} cell entries", flat.segments.len(), flat.chunks.len(), flat.items.len());
+    vdraw_core::file::save(&to, &painting)?;
+    log::info!("saved {}", to.display());
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -67,7 +103,18 @@ fn main() -> Result<()> {
             };
             snapshot::run(path, size.0, size.1, painting, cam, tip, bench, args.iter().any(|a| a == "--panel"))
         }
-        Some("--xr") => xr::run(demo(&args)?.0),
+        Some("--import") => import(&args),
+        Some("--xr") => {
+            // A demo is not saved; anything else opens and saves a painting file: --open's, or
+            // the default one (the demo shapes when it does not exist yet).
+            if args.iter().any(|a| a == "--demo") {
+                return xr::run(demo(&args)?.0, None);
+            }
+            let path = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from).unwrap_or_else(painting_path);
+            let painting = if path.exists() { vdraw_core::file::load(&path)? } else { demo::painting() };
+            log::info!("painting: {}", path.display());
+            xr::run(painting, Some(path))
+        }
         _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),
     }
 }
