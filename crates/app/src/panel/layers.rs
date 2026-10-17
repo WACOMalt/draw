@@ -9,7 +9,7 @@ use super::widgets::*;
 use crate::painter::{Painter, Removed};
 use egui::{Color32, Rect, RichText, Sense, pos2, vec2};
 use std::collections::HashSet;
-use vdraw_core::{Blend, Mask, Mix, Place};
+use vdraw_core::{Adjust, Blend, Mask, Mix, Place};
 
 /// Rows' height (the 2D app's 34 px, larger for a laser).
 const ROW: f32 = 40.0;
@@ -176,6 +176,10 @@ pub fn layers_tab(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersSt
             }
         }
     });
+    // An adjustment layer's settings (the 2D app's Adjust panel).
+    if painter.painting.layers[painter.active_index()].adjust.is_some() {
+        adjust_settings(ui, painter);
+    }
     // The mask row: paint the layer or its mask; the mask on or off.
     let active = painter.active_index();
     if let Some(enabled) = painter.painting.layers[active].mask.as_ref().map(|m| m.enabled) {
@@ -329,7 +333,7 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
     let i = painter.active_index();
     let p = &painter.painting;
     let (group, has_mask, clip, can_clip) = (p.layers[i].group, p.layers[i].mask.is_some(), p.layers[i].clip, p.can_clip(i));
-    let (vr, id) = (p.layers[i].is_3d(), p.layers[i].id);
+    let (vr, id, adjusts) = (p.layers[i].is_3d(), p.layers[i].id, p.layers[i].adjust.is_some());
     // (A shared canvas's row has a button more.)
     let size = vec2(if painter.shared { 38.0 } else { 44.0 }, 40.0);
     let mut hint = String::new();
@@ -357,6 +361,26 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
                 }
             });
         }
+        // A new adjustment layer above (the 2D app's Adjustment menu).
+        let r = ui.add_sized(size, egui::Button::new(RichText::new("Adj").size(14.0))).on_hover_text("New adjustment layer");
+        let menu = egui::Id::new("adjust menu");
+        if r.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(menu));
+        }
+        egui::popup_below_widget(ui, menu, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.set_min_width(200.0);
+            for kind in [ADJUST_KINDS[0], ADJUST_KINDS[1], ADJUST_KINDS[2], ADJUST_KINDS[3]] {
+                if ui.add(egui::Button::new(RichText::new(kind.0).size(15.0)).min_size(vec2(200.0, 34.0))).clicked() {
+                    painter.edit_layers(|p| {
+                        let at = p.add_layer(Some(i));
+                        p.layers[at].name = kind.0.to_string();
+                        p.layers[at].ordered = true;
+                        p.layers[at].adjust = Some(kind.1());
+                        (Some(at), Removed::default())
+                    });
+                }
+            }
+        });
         let r = icon_button(ui, "mask", size, has_mask, !group);
         note(&r, if has_mask { "Delete the layer mask" } else { "Add a layer mask" });
         if r.clicked() {
@@ -389,7 +413,7 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
             ui.painter().rect(rect, 4.0, fill, stroke(1.0, if vr { ACCENT } else { LINE }));
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "3D", egui::FontId::proportional(14.0), if group { TEXT_FAINT } else if vr { ACCENT } else { TEXT });
             note(&r, if vr { "Make it a flat layer (drawn as in 2D)" } else { "Make it a 3D layer: its strokes get depth, and it moves in 3D (seen flat in 2D)" });
-            if r.clicked() && !group {
+            if r.clicked() && !group && !adjusts {
                 painter.edit_layers(|p| {
                     // Its strokes cover each other in order either way, as the 2D app draws them.
                     p.layers[i].threed = !vr;
@@ -434,4 +458,57 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
         });
     });
     (!hint.is_empty()).then_some(hint)
+}
+
+/// The adjustments a layer can be made with, and their settings to begin with (the 2D app's
+/// ADJUST_NAMES and DEFAULT_ADJUST; a blur is not drawn in VR, so not made here).
+const ADJUST_KINDS: [(&str, fn() -> Adjust); 4] = [
+    ("Levels", || Adjust::Levels { in_black: 0.0, in_white: 1.0, gamma: 1.0, out_black: 0.0, out_white: 1.0 }),
+    ("Curves", || Adjust::Curves { points: vec![[0.0, 0.0], [1.0, 1.0]] }),
+    ("Hue/Saturation", || Adjust::HueSat { hue: 0.0, saturation: 0.0, lightness: 0.0 }),
+    ("Brightness/Contrast", || Adjust::BrightContrast { brightness: 0.0, contrast: 0.0 }),
+];
+
+/// The active adjustment layer's settings, as sliders (a drag is one step of undo).
+fn adjust_settings(ui: &mut egui::Ui, painter: &mut Painter) {
+    let i = painter.active_index();
+    let Some(mut a) = painter.painting.layers[i].adjust.clone() else { return };
+    let num = |v: f32| format!("{v:.2}");
+    let deg = |v: f32| format!("{v:.0}°");
+    let pct = |v: f32| format!("{:.0}%", v * 100.0);
+    let mut changed = false;
+    match &mut a {
+        Adjust::Levels { in_black, in_white, gamma, out_black, out_white } => {
+            changed |= slider(ui, "Input black", in_black, (0.0, 1.0), false, num);
+            changed |= slider(ui, "Input white", in_white, (0.0, 1.0), false, num);
+            changed |= slider(ui, "Gamma", gamma, (0.1, 10.0), true, num);
+            changed |= slider(ui, "Output black", out_black, (0.0, 1.0), false, num);
+            changed |= slider(ui, "Output white", out_white, (0.0, 1.0), false, num);
+        }
+        Adjust::HueSat { hue, saturation, lightness } => {
+            changed |= slider(ui, "Hue", hue, (-180.0, 180.0), false, deg);
+            changed |= slider(ui, "Saturation", saturation, (-1.0, 1.0), false, pct);
+            changed |= slider(ui, "Lightness", lightness, (-1.0, 1.0), false, pct);
+        }
+        Adjust::BrightContrast { brightness, contrast } => {
+            changed |= slider(ui, "Brightness", brightness, (-1.0, 1.0), false, pct);
+            changed |= slider(ui, "Contrast", contrast, (-1.0, 1.0), false, pct);
+        }
+        Adjust::Curves { points } => {
+            ui.label(RichText::new(format!("A curve of {} points: shape it in the 2D app.", points.len())).color(TEXT_DIM).size(13.0));
+            if ui.button("Reset the curve").clicked() {
+                *points = vec![[0.0, 0.0], [1.0, 1.0]];
+                changed = true;
+            }
+        }
+        Adjust::Blur { radius } => {
+            ui.label(RichText::new(format!("A blur ({radius:.1}): not drawn in VR yet.")).color(TEXT_DIM).size(13.0));
+        }
+    }
+    if changed {
+        painter.edit_layers_merged("adjust", |p| {
+            p.layers[i].adjust = Some(a);
+            (None, Removed::default())
+        });
+    }
 }

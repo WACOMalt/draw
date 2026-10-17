@@ -86,12 +86,13 @@ struct Meta {
     mask: Option<bool>,
     /// A 3D layer (its strokes in 3D).
     threed: bool,
+    adjust: Option<vdraw_core::Adjust>,
 }
 
 fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
     p.layers
         .iter()
-        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d() })
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d(), adjust: l.adjust.clone() })
         .collect()
 }
 
@@ -234,6 +235,9 @@ pub struct Canvas {
     paper_sent: Instant,
     /// Why the server refused edits, and when (the panel shows the last a while).
     pub refused: Vec<(String, Instant)>,
+    /// When layer edits were last sent, and the last step of undo made.
+    layers_sent: Instant,
+    stepped: Instant,
     /// This user's head and hands as last sent, and when.
     avatar: (Option<vdraw_net::session::Avatar>, Instant),
 }
@@ -264,6 +268,8 @@ impl Canvas {
             paper_sent: Instant::now(),
             refused: Vec::new(),
             avatar: (None, Instant::now()),
+            layers_sent: Instant::now(),
+            stepped: Instant::now(),
         }
     }
 
@@ -674,7 +680,8 @@ impl Canvas {
         }
         let outbox = std::mem::take(&mut painter.outbox);
         let asked = std::mem::take(&mut painter.asked);
-        let edited = metas(&painter.painting) != self.synced;
+        // Layer edits go at most ten times a second (a slider drags them every frame).
+        let edited = metas(&painter.painting) != self.synced && self.layers_sent.elapsed().as_millis() >= 100;
         // The canvas's settings: its paint mixing, and its paper (sent at most every 150 ms
         // while a slider drags it).
         let doc_mix = if self.session.view().mix == "pigment" { vdraw_core::Mix::Pigment } else { vdraw_core::Mix::Normal };
@@ -768,13 +775,46 @@ impl Canvas {
         }
         if edited {
             self.layer_ops(painter, &mut ops, &mut step);
+            self.layers_sent = Instant::now();
         }
         for op in ops {
             self.session.send_op(op);
         }
         // Sent: not to be sent again (the document brings the painting up to date).
         self.synced = metas(&painter.painting);
+        // Changes to the same layers' settings within two seconds (a slider's drag) are one
+        // step of undo: it takes them back to how they were before the first.
+        let only_updates = |s: &UndoStep| !s.redo.is_empty() && s.redo.iter().all(|o| o["type"] == "layer.update");
+        let merge = !step.undo.is_empty() && only_updates(&step) && self.stepped.elapsed().as_secs_f32() < 2.0 && self.undo.last().is_some_and(only_updates);
         if !step.undo.is_empty() {
+            self.stepped = Instant::now();
+        }
+        if merge {
+            let last = self.undo.last_mut().unwrap();
+            for op in step.redo {
+                match last.redo.iter_mut().find(|o| o["id"] == op["id"]) {
+                    Some(o) => {
+                        if let (Some(have), Some(new)) = (o["props"].as_object_mut(), op["props"].as_object()) {
+                            have.extend(new.clone());
+                        }
+                    }
+                    None => last.redo.push(op),
+                }
+            }
+            for op in step.undo {
+                match last.undo.iter_mut().find(|o| o["id"] == op["id"]) {
+                    Some(o) => {
+                        if let (Some(have), Some(old)) = (o["props"].as_object_mut(), op["props"].as_object()) {
+                            for (k, v) in old {
+                                have.entry(k.clone()).or_insert(v.clone());
+                            }
+                        }
+                    }
+                    None => last.undo.push(op),
+                }
+            }
+            self.redo.clear();
+        } else if !step.undo.is_empty() {
             step.undo.reverse();
             self.undo.push(step);
             if self.undo.len() > 300 {
@@ -877,8 +917,12 @@ impl Canvas {
                 if m.clip {
                     layer["clip"] = true.into();
                 }
-                if m.threed {
+                if m.threed && m.adjust.is_none() {
                     layer["threed"] = true.into();
+                }
+                if let Some(a) = &m.adjust {
+                    layer["kind"] = "adjust".into();
+                    layer["adjust"] = serde_json::to_value(a).unwrap_or(Value::Null);
                 }
                 adds.push(json!({ "type": "layer.add", "layer": layer }));
             }
@@ -910,7 +954,12 @@ impl Canvas {
             if m.clip != b.clip {
                 set("clip", m.clip.into(), dl.clip.unwrap_or(false).into());
             }
-            if m.threed != b.threed && !m.group {
+            if m.adjust != b.adjust {
+                if let Some(a) = &m.adjust {
+                    set("adjust", serde_json::to_value(a).unwrap_or(Value::Null), dl.extra.get("adjust").cloned().unwrap_or(Value::Null));
+                }
+            }
+            if m.threed != b.threed && !m.group && m.adjust.is_none() {
                 set("threed", m.threed.into(), dl.threed.into());
             }
             if m.parent != b.parent {
@@ -1397,6 +1446,33 @@ mod tests {
         painter.undo();
         wait(&mut c, &mut painter, &mut other, "the delete undone", &|o| o.doc.paint_order().len() == 2);
         assert_eq!(painter.painting.layers.len(), 2);
+        // An adjustment layer made here, and a slider dragged on it over a while of frames:
+        // the others get it; one undo takes the whole drag back.
+        let at = painter.active_index();
+        painter.edit_layers(|p| {
+            let i = p.add_layer(Some(at));
+            p.layers[i].name = "Hue/Saturation".into();
+            p.layers[i].ordered = true;
+            p.layers[i].adjust = Some(vdraw_core::Adjust::HueSat { hue: 0.0, saturation: 0.0, lightness: 0.0 });
+            (Some(i), crate::painter::Removed::default())
+        });
+        let hue = |o: &Session| o.doc.layers.values().find(|l| l.kind.as_deref() == Some("adjust") && !l.deleted).and_then(|l| l.extra.get("adjust")?.get("hue")?.as_f64());
+        wait(&mut c, &mut painter, &mut other, "the adjustment layer", &|o| hue(o) == Some(0.0));
+        for k in 1..=30 {
+            let i = painter.active_index();
+            painter.edit_layers_merged("adjust", |p| {
+                p.layers[i].adjust = Some(vdraw_core::Adjust::HueSat { hue: k as f32 * 3.0, saturation: 0.0, lightness: 0.0 });
+                (None, crate::painter::Removed::default())
+            });
+            c.update(&mut painter, head);
+            c.commit(&mut painter);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        wait(&mut c, &mut painter, &mut other, "the drag's end", &|o| hue(o) == Some(90.0));
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the drag undone", &|o| hue(o) == Some(0.0));
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the adjustment layer undone", &|o| hue(o).is_none());
         // The paper, see-through and red; the paint mixing; undo takes the paper back.
         painter.paper = [1.0, 0.0, 0.0, 0.5];
         wait(&mut c, &mut painter, &mut other, "the paper", &|o| o.doc.paper.color == "#ff0000" && o.doc.paper.alpha == 0.5);

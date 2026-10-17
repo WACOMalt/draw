@@ -228,7 +228,7 @@ impl Layer {
     /// A layer of strokes in 3D: a 3D layer, or one whose strokes are drawn by depth (a new
     /// layer made in VR).
     pub fn is_3d(&self) -> bool {
-        !self.group && (self.threed || !self.ordered)
+        !self.group && self.adjust.is_none() && (self.threed || !self.ordered)
     }
 }
 
