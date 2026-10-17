@@ -315,6 +315,13 @@ export class GLRenderer implements Renderer {
   private fillBudget: number;
   private fillMoving: number;
   private lastFrameAt = 0;
+  /**
+   * Offline: the most time one render() spends on tiles (ms) before it returns with work left,
+   * so a caller can let the page paint between calls (the export, renderAsync). Infinity: all at once.
+   */
+  offlineSlice = Infinity;
+  /** Tiles drawn so far (a count for progress). */
+  tilesDrawn = 0;
   /** How long the last frame's compositing took (ms; JavaScript time, the GPU may add to it). */
   private compositeMs = 0;
   private lastViewChange = 0;
@@ -648,6 +655,17 @@ export class GLRenderer implements Renderer {
       this.render();
       if (!this.lastPending) return;
     }
+  }
+
+  /** Offline: one render() (see offlineSlice). True: work is left, call again. */
+  renderStep(): boolean {
+    this.render();
+    return this.lastPending && !this.contextLost();
+  }
+
+  /** The graphics context is gone (the GPU reset): nothing renders any more. */
+  contextLost(): boolean {
+    return this.lost || this.gl.isContextLost();
   }
 
   /**
@@ -1642,6 +1660,8 @@ export class GLRenderer implements Renderer {
     const fill = (moving ? this.fillMoving : this.fillBudget) * slow;
     const jsBudget = Math.max(moving ? TILE_BUDGET_MS : TILE_BUDGET_STILL_MS, this.compositeMs / 2);
     let spent = 0;
+    // Tile work stops here: on screen at the frame's budgets, offline at the slice (if any).
+    const over = () => (this.offline ? performance.now() - start > this.offlineSlice : spent >= fill || performance.now() - start > jsBudget);
     let pending = false;
     /** Work left in the view and its prefetch ring (not just in the coarser levels). */
     let viewPending = false;
@@ -1682,7 +1702,7 @@ export class GLRenderer implements Renderer {
           const key = tileKey(layer, r.lod, tx, ty);
           let t = this.tiles.get(key);
           if (!this.needsWork(t)) continue;
-          if (!this.offline && (spent >= fill || performance.now() - start > jsBudget)) {
+          if (over()) {
             pending = true;
             if (r === ranges[0]) viewPending = true;
             break outer;
@@ -1693,18 +1713,22 @@ export class GLRenderer implements Renderer {
           }
           t.used = this.frame;
           spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+          this.tilesDrawn++;
         }
       }
     }
     // Then the tiles the last frame drew missing or out of date (kaleidoscope frames), coarse first.
-    if (this.wanted.size) {
+    if (this.wanted.size && !pending) {
       const list = [...this.wanted.values()].sort((a, b) => b.lod - a.lod);
       this.wanted.clear();
-      for (const w of list) {
+      for (let i = 0; i < list.length; i++) {
+        const w = list[i];
         const key = tileKey(w.layer, w.lod, w.tx, w.ty);
         let t = this.tiles.get(key);
         if (!this.needsWork(t)) continue;
-        if (!this.offline && (spent >= fill || performance.now() - start > jsBudget)) {
+        if (over()) {
+          // The rest stay asked for.
+          for (const x of list.slice(i)) this.wanted.set(tileKey(x.layer, x.lod, x.tx, x.ty), x);
           pending = true;
           break;
         }
@@ -1714,9 +1738,16 @@ export class GLRenderer implements Renderer {
         }
         t.used = this.frame;
         spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+        this.tilesDrawn++;
       }
     }
     this.tileWorkLastFrame = spent > 0;
+    // Offline in slices (offlineSlice): while tiles are left, no composite (it would be thrown
+    // away); the caller lets the page breathe and calls again.
+    if (this.offline && pending) {
+      this.lastPending = true;
+      return;
+    }
     const c0 = performance.now();
     this.lastPendingWork = pending;
     this.lastViewPending = viewPending;

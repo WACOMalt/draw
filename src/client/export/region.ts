@@ -9,6 +9,8 @@ import { GLRenderer } from '../engine/gl/glRenderer';
 
 /** Largest piece, in pixels per side. */
 export const PIECE = 2048;
+/** Tile work per step of renderAsync (ms), between pauses for the page. */
+const SLICE = 100;
 
 export class RegionRenderer {
   private canvas = document.createElement('canvas');
@@ -54,6 +56,34 @@ export class RegionRenderer {
     this.r.setView(x, y, scale);
     this.r.renderSync();
     const px = this.r.readRGBA(this.alpha);
+    if (!px) throw new Error('The graphics context was lost');
+    return px;
+  }
+
+  /**
+   * As render, in slices of SLICE ms of tile work with a pause between them, so the page can paint
+   * and take a Cancel: a phone needs long to draw the tiles of a first piece. `onTiles`: the tiles
+   * drawn for this piece so far. `signal` stops it (an AbortError).
+   */
+  async renderAsync(x: number, y: number, scale: number, w: number, h: number, opts: { onTiles?: (n: number) => void; signal?: AbortSignal } = {}): Promise<Uint8ClampedArray<ArrayBuffer>> {
+    if (w !== this.w || h !== this.h) {
+      this.r.resize(w, h, 1);
+      this.w = w;
+      this.h = h;
+    }
+    this.r.setView(x, y, scale);
+    const t0 = this.r.tilesDrawn;
+    this.r.offlineSlice = SLICE;
+    try {
+      while (this.r.renderStep()) {
+        opts.onTiles?.(this.r.tilesDrawn - t0);
+        await new Promise((r) => setTimeout(r, 0));
+        if (opts.signal?.aborted) throw new DOMException('cancelled', 'AbortError');
+      }
+    } finally {
+      this.r.offlineSlice = Infinity;
+    }
+    const px = this.r.contextLost() ? null : this.r.readRGBA(this.alpha);
     if (!px) throw new Error('The graphics context was lost');
     return px;
   }

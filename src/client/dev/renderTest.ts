@@ -350,6 +350,78 @@ async function suite(files: string[], width = 1024): Promise<Record<string, unkn
   return rows;
 }
 
+/**
+ * The real export (exportImage, adaptive pieces, the PNG or TIFF writer) into memory, timed, with
+ * its progress and status events; a PNG is decoded back into a canvas. `lose`: the first `lose`
+ * pieces of more than 256 px act as if the GPU reset (a lost context), to try the splitting.
+ */
+async function exportFile(d: Doc, b: Box, width: number, format: 'png' | 'tiff' = 'png', lose = 0): Promise<{ ms: number; bytes: number; events: string[]; canvas: HTMLCanvasElement | null }> {
+  const { exportImage } = await import('../export/exportImage');
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const sink = {
+    name: 'test',
+    get size() {
+      return size;
+    },
+    async write(data: Uint8Array) {
+      chunks.push(data.slice());
+      size += data.length;
+    },
+    async patch(position: number, data: Uint8Array) {
+      // Rare (headers): rewrite in place across the chunks.
+      let o = 0;
+      for (const c of chunks) {
+        for (let i = 0; i < data.length; i++) {
+          const k = position + i - o;
+          if (k >= 0 && k < c.length) c[k] = data[i];
+        }
+        o += c.length;
+      }
+    },
+    async close() {},
+    async abort() {},
+  };
+  const height = Math.max(1, Math.round(((b.y1 - b.y0) * width) / (b.x1 - b.x0)));
+  const events: string[] = [];
+  const proto = RegionRenderer.prototype as unknown as { renderAsync: (...a: unknown[]) => Promise<unknown> };
+  const real = proto.renderAsync;
+  let lost = 0;
+  if (lose)
+    proto.renderAsync = function (this: unknown, ...a: unknown[]) {
+      if (lost < lose && ((a[3] as number) > 256 || (a[4] as number) > 256)) {
+        lost++;
+        events.push(`lost context on a ${a[3]}×${a[4]} piece`);
+        return Promise.reject(new Error('The graphics context was lost'));
+      }
+      return real.apply(this, a);
+    };
+  const t0 = performance.now();
+  try {
+    await exportImage({
+      layers: d.layers, strokes: d.strokes, shapes: d.shapes, seq: 0, bounds: b, width, height, format,
+      transparent: true, paper: d.paper ?? { color: '#ffffff', alpha: 1 }, mix: d.mix ?? 'normal', sink,
+      onPrepare: () => events.push(`${(performance.now() - t0).toFixed(0)} ms: preparing`),
+      onTiles: (n) => n % 50 === 0 && events.push(`${(performance.now() - t0).toFixed(0)} ms: ${n} tiles`),
+      onProgress: (p, i, n) => events.push(`${(performance.now() - t0).toFixed(0)} ms: piece ${i} of about ${n} (${Math.round(p * 100)}%)`),
+      signal: new AbortController().signal,
+    });
+  } finally {
+    proto.renderAsync = real;
+  }
+  const ms = performance.now() - t0;
+  let canvas: HTMLCanvasElement | null = null;
+  if (format === 'png') {
+    const bmp = await createImageBitmap(new Blob(chunks as BlobPart[], { type: 'image/png' }));
+    canvas = document.createElement('canvas');
+    canvas.width = bmp.width;
+    canvas.height = bmp.height;
+    canvas.getContext('2d')!.drawImage(bmp, 0, 0);
+    show(canvas, `exportImage ${format} ${width}×${height}: ${(ms / 1000).toFixed(1)} s, ${size} bytes`);
+  }
+  return { ms, bytes: size, events, canvas };
+}
+
 function show(c: HTMLCanvasElement, caption: string): void {
   const f = document.createElement('figure');
   const cap = document.createElement('figcaption');
@@ -363,4 +435,4 @@ function clear(): void {
   out.replaceChildren();
 }
 
-(window as unknown as { rt: unknown }).rt = { verbose: (v: boolean) => (verbose = v), suite, pixelDiff, load, expand, bounds, exportRender, viewport, compare, clear, steps };
+(window as unknown as { rt: unknown }).rt = { verbose: (v: boolean) => (verbose = v), suite, exportFile, pixelDiff, load, expand, bounds, exportRender, viewport, compare, clear, steps };
