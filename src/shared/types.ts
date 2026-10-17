@@ -185,11 +185,11 @@ export interface Layer {
   /** Layer effects (paint and shape layers, groups). Absent: none. */
   effects?: LayerEffect[];
   /**
-   * A VR layer: a paint layer whose strokes may carry depth (Stroke.vr), made by the VR app
+   * A 3D layer: a paint layer whose strokes may carry depth (Stroke.threed), made by the VR app
    * (vdraw) or turned into one there (layer.update; strokes stay as they are). It draws as any
    * paint layer here. Paint layers only.
    */
-  vr?: boolean;
+  threed?: boolean;
 }
 
 export interface Stroke {
@@ -209,20 +209,20 @@ export interface Stroke {
    */
   vector?: StrokeVector;
   /**
-   * A VR stroke (painted in 3D in vdraw, or moved by a 3D layer transform): the depth of its
+   * A 3D stroke (painted in 3D in vdraw, or moved by a 3D layer transform): the depth of its
    * points. 2D clients draw x, y and pressure only (the paper seen straight on), so it changes
    * nothing they draw. Not on vector strokes.
    */
-  vr?: StrokeVr;
+  threed?: StrokeThreeD;
 }
 
 /**
- * The 3D part of a VR stroke, per point of `pts`. `z`: one number per point, its depth in world
+ * The 3D part of a 3D stroke, per point of `pts`. `z`: one number per point, its depth in world
  * units, positive toward the viewer of the 2D canvas (out of the paper), within ±LIMITS.maxCoord.
  * `up` (optional): three numbers per point, the pen's up direction there in canvas axes (x right,
  * y down, z toward the viewer), each -1 to 1 (clients round them to 3 decimals).
  */
-export interface StrokeVr {
+export interface StrokeThreeD {
   z: number[];
   up?: number[];
 }
@@ -382,7 +382,7 @@ export interface Shape extends ShapeInput {
   deleted?: boolean;
 }
 
-export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent' | 'vr'> & {
+export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent' | 'threed'> & {
   /** null or [] removes the effects. */
   effects?: LayerEffect[] | null;
 };
@@ -391,7 +391,7 @@ export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 
 export type Affine = [number, number, number, number, number, number];
 
 /**
- * A 3D affine transform in world units, column-major 3×4 (axes as Stroke.vr: x right, y down,
+ * A 3D affine transform in world units, column-major 3×4 (axes as Stroke.threed: x right, y down,
  * z toward the viewer of the 2D canvas):
  * x' = m[0]·x + m[3]·y + m[6]·z + m[9], y' = m[1]·x + m[4]·y + m[7]·z + m[10],
  * z' = m[2]·x + m[5]·y + m[8]·z + m[11].
@@ -417,11 +417,11 @@ export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p
 export const MIX_MODES = ['normal', 'pigment'] as const;
 export type MixMode = (typeof MIX_MODES)[number];
 
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'vr'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'threed'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
-  | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts' | 'mask' | 'vr'> }
+  | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts' | 'mask' | 'threed'> }
   | { type: 'stroke.remove'; id: string }
   | { type: 'stroke.restore'; id: string }
   | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind'> & LayerProps }
@@ -435,7 +435,7 @@ export type Op =
    */
   | { type: 'layer.transform'; id: string; m: Affine }
   /**
-   * A 3D transform of a VR layer (from vdraw): a turn, a uniform scale and a move in 3D. Every
+   * A 3D transform of a 3D layer (from vdraw): a turn, a uniform scale and a move in 3D. Every
    * stroke of the layer (masks included, deleted ones too) moves in 3D: a stroke without depth
    * gets it. Not for groups, other layers, or layers with vector strokes.
    */
@@ -533,8 +533,8 @@ export type ClientMsg =
       embed?: boolean;
     }
   | { t: 'op'; opId: string; op: Op }
-  /** A stroke being drawn: its new points since the last message (`vr`: their depth, as Stroke.vr). */
-  | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; vr?: StrokeVr; start: boolean }
+  /** A stroke being drawn: its new points since the last message (`threed`: their depth, as Stroke.threed). */
+  | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; threed?: StrokeThreeD; start: boolean }
   | { t: 'live.end'; id: string }
   /**
    * Shapes as this client shows them during a drag (not persisted): new ones, or changed copies
@@ -587,7 +587,7 @@ export type ServerMsg =
   | { t: 'denied'; reason: DeniedReason }
   | { t: 'op'; seq: number; by: string; opId: string; op: AppliedOp }
   | { t: 'reject'; opId: string; reason: string }
-  | { t: 'live'; by: string; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; vr?: StrokeVr; start: boolean }
+  | { t: 'live'; by: string; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; threed?: StrokeThreeD; start: boolean }
   | { t: 'live.end'; by: string; id: string }
   | { t: 'shape.live'; by: string; shapes: ShapeInput[] }
   | { t: 'cursor'; by: string; x: number | null; y: number | null; layerId: string | null }

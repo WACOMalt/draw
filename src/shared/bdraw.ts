@@ -17,7 +17,7 @@ export const BDRAW_MIME = 'application/x-bdraw';
  * paths (`curve: 'spline'`). 6: compound shapes (kind 'compound', `parts`). 7: ellipse arcs and
  * holes, custom shapes, dashes and arrowheads. 8: see-through shape fill and stroke
  * (`fillOpacity`, `strokeOpacity`) and the paper (`paper`). 10: the canvas mix mode (`mix`). 9: layer effects (`effects`) and blur
- * adjustment layers. 11: VR layers (`vr`) and VR strokes with depth (`vr`, from vdraw). A file
+ * adjustment layers. 11: 3D layers (`threed`) and 3D strokes with depth (`threed`, from vdraw). A file
  * is written with the lowest version that holds it, so older servers accept what they can read.
  */
 export const BDRAW_VERSION = 11;
@@ -80,7 +80,7 @@ export function makeBdraw(
 /** The lowest version that holds these layers, strokes and shapes. */
 function fileVersion(layers: Layer[], strokes: Stroke[], shapes: Shape[], paper?: Paper, mix?: MixMode): number {
   const f = docFeatures(layers, strokes, shapes, paper, mix);
-  if (f.includes('vr')) return 11;
+  if (f.includes('threed')) return 11;
   if (f.includes('pigment')) return 10;
   if (f.some((x) => x === 'effects' || x === 'blur')) return 9;
   if (f.some((x) => x === 'shapeAlpha' || x === 'paper')) return 8;

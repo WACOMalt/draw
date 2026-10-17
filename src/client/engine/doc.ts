@@ -23,7 +23,7 @@ function applyLayerOp(layers: Map<string, Layer>, op: Op | AppliedOp): boolean {
         const next = { ...l, ...op.props } as Layer;
         if (next.parent === null) delete next.parent;
         if (!next.effects?.length) delete next.effects;
-        if (!next.vr) delete next.vr;
+        if (!next.threed) delete next.threed;
         layers.set(op.id, next);
       }
       return true;
@@ -256,7 +256,7 @@ export class Doc {
     return null;
   }
 
-  /** A 3D transform of a VR layer (shared/docState.ts transform3, which the server checked). */
+  /** A 3D transform of a 3D layer (shared/docState.ts transform3, which the server checked). */
   private transform3(id: string, m3: Affine3): StrokeChanges {
     const changed: Stroke[] = [];
     for (const st of this.strokes.values()) {

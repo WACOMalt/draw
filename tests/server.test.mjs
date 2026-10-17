@@ -233,8 +233,8 @@ try {
   // Canvas link off: the plain code gives nothing; a private view link still works.
   await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'code', role: 'none' });
   check((await first(await new Browser().join('friday-jam')))?.reason === 'login_required', 'canvas link off: the plain code gives nothing');
-  const vr = (await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'view', action: 'enable' })).data;
-  const viewTok = new URL(vr.viewLink).searchParams.get('k');
+  const threed = (await funky.api('POST', '/api/canvases/friday-jam/links', { kind: 'view', action: 'enable' })).data;
+  const viewTok = new URL(threed.viewLink).searchParams.get('k');
   check(viewTok?.length === 22, 'private view link has a token');
   check((await first(await new Browser().join('friday-jam', { link: viewTok, grant: pwWelcome.grant })))?.role === 'viewer', 'private view link gives viewer');
 
@@ -1053,11 +1053,11 @@ try {
     check(imp.status === 201 && imp.data.skipped === 0 && iw.shapes.length === file.shapes.length && iw.features.includes('arcs') && iw.features.includes('custom'), 'custom: a .bdraw with arcs and custom shapes imports');
   }
 
-  // --- VR layers and strokes with depth (vdraw) ----------------------------------------------------
+  // --- 3D layers and strokes with depth (vdraw) ----------------------------------------------------
   {
     const vb = new Browser();
-    await account(vb, 'vr@example.com', 'VR Tester');
-    const vc = (await vb.api('POST', '/api/sessions', { name: 'vr-test' })).data.key;
+    await account(vb, 'threed@example.com', '3D Tester');
+    const vc = (await vb.api('POST', '/api/sessions', { name: 'threed-test' })).data.key;
     const o = await vb.join(vc);
     const w = await first(o);
     const L1 = layerId(w);
@@ -1068,56 +1068,56 @@ try {
       return o.next((m) => (m.t === 'reject' || m.t === 'op') && m.opId === `v${n}xxxxx`, 2000);
     };
     const welcome = async () => first(await vb.join(vc));
-    const layer = (id, extra = {}) => ({ id, name: 'VR', order: 5, blend: 'normal', opacity: 1, visible: true, ...extra });
+    const layer = (id, extra = {}) => ({ id, name: '3D', order: 5, blend: 'normal', opacity: 1, visible: true, ...extra });
     const stroke = (id, lid, extra = {}) => ({ ...strokeOp(lid).op.stroke, id, ...extra });
     const brush0 = strokeOp(L1).op.stroke.brush;
 
-    // Layers: vr at creation, on paint layers only.
-    let r = await tryOp({ type: 'layer.add', layer: layer('vrLAYER001', { vr: true }) });
-    check(r?.t === 'op' && r.op.layer.vr === true, 'vr: add a VR layer');
-    r = await tryOp({ type: 'layer.add', layer: layer('vrLAYER002', { vr: true, kind: 'paint' }) });
-    check(r?.t === 'op' && r.op.layer.vr === true, 'vr: a VR layer may say kind paint');
-    r = await tryOp({ type: 'layer.add', layer: layer('vrSHAPE001', { vr: true, kind: 'shape' }) });
-    check(r?.t === 'reject', 'vr: not on a shape layer');
-    r = await tryOp({ type: 'layer.add', layer: layer('vrGROUP001', { vr: true, kind: 'group', blend: 'pass' }) });
-    check(r?.t === 'reject', 'vr: not on a group');
-    r = await tryOp({ type: 'layer.add', layer: layer('vrBAD00001', { vr: 'yes' }) });
-    check(r?.t === 'reject', 'vr: a layer vr is a boolean');
-    r = await tryOp({ type: 'layer.add', layer: layer('vrFALSE001', { vr: false }) });
-    check(r?.t === 'op' && r.op.layer.vr === undefined, 'vr: vr false is left out');
+    // Layers: threed at creation, on paint layers only.
+    let r = await tryOp({ type: 'layer.add', layer: layer('vrLAYER001', { threed: true }) });
+    check(r?.t === 'op' && r.op.layer.threed === true, '3D: add a 3D layer');
+    r = await tryOp({ type: 'layer.add', layer: layer('vrLAYER002', { threed: true, kind: 'paint' }) });
+    check(r?.t === 'op' && r.op.layer.threed === true, '3D: a 3D layer may say kind paint');
+    r = await tryOp({ type: 'layer.add', layer: layer('vrSHAPE001', { threed: true, kind: 'shape' }) });
+    check(r?.t === 'reject', '3D: not on a shape layer');
+    r = await tryOp({ type: 'layer.add', layer: layer('vrGROUP001', { threed: true, kind: 'group', blend: 'pass' }) });
+    check(r?.t === 'reject', '3D: not on a group');
+    r = await tryOp({ type: 'layer.add', layer: layer('vrBAD00001', { threed: 'yes' }) });
+    check(r?.t === 'reject', '3D: a layer threed is a boolean');
+    r = await tryOp({ type: 'layer.add', layer: layer('vrFALSE001', { threed: false }) });
+    check(r?.t === 'op' && r.op.layer.threed === undefined, '3D: threed false is left out');
 
-    // layer.update turns a paint layer into a VR layer and back (strokes stay); other kinds refuse it.
+    // layer.update turns a paint layer into a 3D layer and back (strokes stay); other kinds refuse it.
     r = await tryOp({ type: 'stroke.add', stroke: stroke('flatSTROKE', L1) });
-    r = await tryOp({ type: 'layer.update', id: L1, props: { vr: true } });
+    r = await tryOp({ type: 'layer.update', id: L1, props: { threed: true } });
     let vw = await welcome();
-    check(r?.t === 'op' && r.op.props.vr === true && vw.layers.find((l) => l.id === L1)?.vr === true && vw.strokes.find((x) => x.id === 'flatSTROKE')?.vr === undefined, 'vr: layer.update makes a paint layer a VR layer (its strokes unchanged)');
-    r = await tryOp({ type: 'layer.update', id: L1, props: { vr: false } });
+    check(r?.t === 'op' && r.op.props.threed === true && vw.layers.find((l) => l.id === L1)?.threed === true && vw.strokes.find((x) => x.id === 'flatSTROKE')?.threed === undefined, '3D: layer.update makes a paint layer a 3D layer (its strokes unchanged)');
+    r = await tryOp({ type: 'layer.update', id: L1, props: { threed: false } });
     vw = await welcome();
-    check(r?.t === 'op' && vw.layers.find((l) => l.id === L1)?.vr === undefined, 'vr: layer.update vr false makes it flat again (undo)');
-    r = await tryOp({ type: 'layer.update', id: L1, props: { vr: 1 } });
-    check(r?.t === 'reject', 'vr: layer.update vr is a boolean');
+    check(r?.t === 'op' && vw.layers.find((l) => l.id === L1)?.threed === undefined, '3D: layer.update threed false makes it flat again (undo)');
+    r = await tryOp({ type: 'layer.update', id: L1, props: { threed: 1 } });
+    check(r?.t === 'reject', '3D: layer.update threed is a boolean');
     await tryOp({ type: 'layer.add', layer: layer('vrSHAPEL01', { kind: 'shape' }) });
     await tryOp({ type: 'layer.add', layer: layer('vrGROUPL01', { kind: 'group', blend: 'pass' }) });
     await tryOp({ type: 'layer.add', layer: layer('vrADJUST01', { kind: 'adjust', adjust: { type: 'hueSat', hue: 0, saturation: 0, lightness: 0 } }) });
     for (const lid of ['vrSHAPEL01', 'vrGROUPL01', 'vrADJUST01']) {
-      r = await tryOp({ type: 'layer.update', id: lid, props: { vr: true } });
-      check(r?.t === 'reject' && /paint layers/.test(r.reason), `vr: layer.update refuses vr on a ${lid.slice(2, 7).toLowerCase()} layer`);
+      r = await tryOp({ type: 'layer.update', id: lid, props: { threed: true } });
+      check(r?.t === 'reject' && /paint layers/.test(r.reason), `3D: layer.update refuses threed on a ${lid.slice(2, 7).toLowerCase()} layer`);
     }
-    r = await tryOp({ type: 'layer.update', id: 'vrSHAPEL01', props: { vr: false } });
-    check(r?.t === 'op', 'vr: vr false is fine on any layer');
+    r = await tryOp({ type: 'layer.update', id: 'vrSHAPEL01', props: { threed: false } });
+    check(r?.t === 'op', '3D: threed false is fine on any layer');
     r = await tryOp({ type: 'layer.update', id: 'vrLAYER001', props: { opacity: 0.8 } });
     vw = await welcome();
-    check(r?.t === 'op' && vw.layers.find((l) => l.id === 'vrLAYER001')?.vr === true, 'vr: other updates keep it');
+    check(r?.t === 'op' && vw.layers.find((l) => l.id === 'vrLAYER001')?.threed === true, '3D: other updates keep it');
     await tryOp({ type: 'layer.add', layer: layer('vrFLAT0001') });
-    r = await tryOp({ type: 'layer.update', id: 'vrFLAT0001', props: { vr: true } });
-    check(r?.t === 'op', 'vr: another flat layer becomes VR (kept for the file round trip)');
+    r = await tryOp({ type: 'layer.update', id: 'vrFLAT0001', props: { threed: true } });
+    check(r?.t === 'op', '3D: another flat layer becomes 3D (kept for the file round trip)');
 
     // Strokes: z per point, optional up (three per point).
     const up = [1, 0, 0, 0, 0, 1];
-    r = await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKE01', 'vrLAYER001', { vr: { z: [1, -3], up } }) });
-    check(r?.t === 'op' && r.op.stroke.vr.z.join() === '1,-3' && r.op.stroke.vr.up.join() === up.join(), 'vr: a stroke with depth and up directions');
-    r = await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKE02', L1, { vr: { z: [0, 2.5] } }) });
-    check(r?.t === 'op' && r.op.stroke.vr.z.join() === '0,2.5' && r.op.stroke.vr.up === undefined, 'vr: a stroke with depth on any paint layer, up optional');
+    r = await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKE01', 'vrLAYER001', { threed: { z: [1, -3], up } }) });
+    check(r?.t === 'op' && r.op.stroke.threed.z.join() === '1,-3' && r.op.stroke.threed.up.join() === up.join(), '3D: a stroke with depth and up directions');
+    r = await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKE02', L1, { threed: { z: [0, 2.5] } }) });
+    check(r?.t === 'op' && r.op.stroke.threed.z.join() === '0,2.5' && r.op.stroke.threed.up === undefined, '3D: a stroke with depth on any paint layer, up optional');
     const bad = [
       [{ z: [1] }, 'z: one per point'],
       [{ z: [1, 2, 3] }, 'z: not more than the points'],
@@ -1127,50 +1127,50 @@ try {
       [{ z: [1, 2], up: [1, 0, 0, 0, 0, 1.5] }, 'up: each -1 to 1'],
       [{ z: [1, 2], up: 'up' }, 'up: an array'],
       [{ up }, 'z is needed'],
-      [[1, 2], 'vr is an object'],
+      [[1, 2], 'threed is an object'],
     ];
-    for (const [vr, label] of bad) {
-      r = await tryOp({ type: 'stroke.add', stroke: stroke(`vrBAD${opn}xx`, 'vrLAYER001', { vr }) });
-      check(r?.t === 'reject', `vr: bad stroke vr is refused (${label})`);
+    for (const [threed, label] of bad) {
+      r = await tryOp({ type: 'stroke.add', stroke: stroke(`vrBAD${opn}xx`, 'vrLAYER001', { threed }) });
+      check(r?.t === 'reject', `3D: bad stroke threed is refused (${label})`);
     }
     const vector = { kind: 'rect', w: 10, h: 10, m: [1, 0, 0, 1, 0, 0], radii: [0, 0, 0, 0], fill: '#000000', stroke: null, strokeWidth: 0, align: 'center', cap: 'round', join: 'miter' };
-    r = await tryOp({ type: 'stroke.add', stroke: stroke('vrVECTOR01', 'vrLAYER001', { vr: { z: [0, 0] }, vector }) });
-    check(r?.t === 'reject', 'vr: not on a vector stroke');
+    r = await tryOp({ type: 'stroke.add', stroke: stroke('vrVECTOR01', 'vrLAYER001', { threed: { z: [0, 0] }, vector }) });
+    check(r?.t === 'reject', '3D: not on a vector stroke');
     vw = await welcome();
-    check(vw.features.includes('vr') && vw.supports.includes('vr'), 'vr: welcome lists the vr feature; the server supports it');
-    check(vw.strokes.find((x) => x.id === 'vrSTROKE01')?.vr.up.length === 6, 'vr: the depth persists');
+    check(vw.features.includes('threed') && vw.supports.includes('threed'), '3D: welcome lists the threed feature; the server supports it');
+    check(vw.strokes.find((x) => x.id === 'vrSTROKE01')?.threed.up.length === 6, '3D: the depth persists');
 
-    // Duplicate: the copy is a VR layer, its strokes keep their depth.
+    // Duplicate: the copy is a 3D layer, its strokes keep their depth.
     await tryOp({ type: 'layer.duplicate', id: 'vrLAYER001', newId: 'vrLAYERDUP', name: 'Copy', order: 6, parent: null });
     vw = await welcome();
     const dup = vw.strokes.find((x) => x.layerId === 'vrLAYERDUP');
-    check(vw.layers.find((l) => l.id === 'vrLAYERDUP')?.vr === true && dup?.vr.z.join() === '1,-3' && dup.vr.up.join() === up.join(), 'vr: a duplicate keeps vr on the layer and its strokes');
+    check(vw.layers.find((l) => l.id === 'vrLAYERDUP')?.threed === true && dup?.threed.z.join() === '1,-3' && dup.threed.up.join() === up.join(), '3D: a duplicate keeps threed on the layer and its strokes');
 
     // Transform: depth scales by √|det|, up directions turn (and stay unit).
     r = await tryOp({ type: 'layer.transform', id: 'vrLAYER001', m: [0, 2, -2, 0, 5, 5] });
     vw = await welcome();
     let t = vw.strokes.find((x) => x.id === 'vrSTROKE01');
-    check(r?.t === 'op' && t.vr.z.join() === '2,-6' && t.vr.up.join() === '0,1,0,0,0,1' && t.pts[0] === 5, 'vr: a rotation and scale by 2 doubles the depth and turns up');
+    check(r?.t === 'op' && t.threed.z.join() === '2,-6' && t.threed.up.join() === '0,1,0,0,0,1' && t.pts[0] === 5, '3D: a rotation and scale by 2 doubles the depth and turns up');
     await tryOp({ type: 'layer.transform', id: L1, m: [4, 0, 0, 1, 0, 0] });
     vw = await welcome();
     t = vw.strokes.find((x) => x.id === 'vrSTROKE02');
-    check(t.vr.z.join() === '0,5', 'vr: a non-uniform scale scales depth by the mean scale');
-    await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKE03', 'vrLAYERDUP', { vr: { z: [0, 0], up: [0.6, 0, 0.8, 0, 0, 0] } }) });
+    check(t.threed.z.join() === '0,5', '3D: a non-uniform scale scales depth by the mean scale');
+    await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKE03', 'vrLAYERDUP', { threed: { z: [0, 0], up: [0.6, 0, 0.8, 0, 0, 0] } }) });
     await tryOp({ type: 'layer.transform', id: 'vrLAYERDUP', m: [4, 0, 0, 1, 0, 0] });
     vw = await welcome();
     t = vw.strokes.find((x) => x.id === 'vrSTROKE03');
-    check(t.vr.up.join() === '0.832,0,0.555,0,0,0', 'vr: up follows a non-uniform scale (normalized, rounded); a zero up stays');
-    await tryOp({ type: 'layer.add', layer: layer('vrLAYERFAR', { vr: true }) });
-    await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKEFA', 'vrLAYERFAR', { vr: { z: [9e14, 0] } }) });
+    check(t.threed.up.join() === '0.832,0,0.555,0,0,0', '3D: up follows a non-uniform scale (normalized, rounded); a zero up stays');
+    await tryOp({ type: 'layer.add', layer: layer('vrLAYERFAR', { threed: true }) });
+    await tryOp({ type: 'stroke.add', stroke: stroke('vrSTROKEFA', 'vrLAYERFAR', { threed: { z: [9e14, 0] } }) });
     r = await tryOp({ type: 'layer.transform', id: 'vrLAYERFAR', m: [2, 0, 0, 2, 0, 0] });
-    check(r?.t === 'reject' && /range/.test(r.reason), 'vr: a transform that puts a depth out of range is refused');
+    check(r?.t === 'reject' && /range/.test(r.reason), '3D: a transform that puts a depth out of range is refused');
 
-    // 3D transforms (m3, column-major 3×4) of a VR layer: a turn times a uniform scale, and a move.
-    await tryOp({ type: 'layer.add', layer: layer('vr3DLAYER1', { vr: true, mask: { id: 'mask3d0001', enabled: true } }) });
-    await tryOp({ type: 'stroke.add', stroke: stroke('vr3DSTRK01', 'vr3DLAYER1', { vr: { z: [1, 2], up }, brush: { ...brush0, tip: 'square', angle: 10 } }) });
+    // 3D transforms (m3, column-major 3×4) of a 3D layer: a turn times a uniform scale, and a move.
+    await tryOp({ type: 'layer.add', layer: layer('vr3DLAYER1', { threed: true, mask: { id: 'mask3d0001', enabled: true } }) });
+    await tryOp({ type: 'stroke.add', stroke: stroke('vr3DSTRK01', 'vr3DLAYER1', { threed: { z: [1, 2], up }, brush: { ...brush0, tip: 'square', angle: 10 } }) });
     await tryOp({ type: 'stroke.add', stroke: stroke('vr3DSTRK02', 'vr3DLAYER1', { pts: [5, 0, 1] }) });
-    r = await tryOp({ type: 'stroke.add', stroke: stroke('vr3DMASK01', 'vr3DLAYER1', { mask: 'mask3d0001', vr: { z: [0, 0] } }) });
-    check(r?.t === 'op' && r.op.stroke.vr.z.length === 2, 'vr: a mask stroke may have depth (a 3D transform moves the mask too)');
+    r = await tryOp({ type: 'stroke.add', stroke: stroke('vr3DMASK01', 'vr3DLAYER1', { mask: 'mask3d0001', threed: { z: [0, 0] } }) });
+    check(r?.t === 'op' && r.op.stroke.threed.z.length === 2, '3D: a mask stroke may have depth (a 3D transform moves the mask too)');
     // Turn 90° about the y axis (x to -z, z to x), scale 2, move (1, 2, 3).
     const m3 = [0, 0, -2, 0, 2, 0, 2, 0, 0, 1, 2, 3];
     // A similarity's inverse: the transposed linear part over s², and the move undone.
@@ -1191,34 +1191,34 @@ try {
     ];
     for (const [x, label] of bad3) {
       r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', ...x });
-      check(r?.t === 'reject' && /bad transform/.test(r.reason), `vr 3D: refused: ${label}`);
+      check(r?.t === 'reject' && /bad transform/.test(r.reason), `3D transform: refused: ${label}`);
     }
     r = await tryOp({ type: 'layer.transform', id: 'vrSHAPEL01', m3 });
-    check(r?.t === 'reject' && /VR layers/.test(r.reason), 'vr 3D: refused on a layer that is not VR');
+    check(r?.t === 'reject' && /3D layers/.test(r.reason), '3D transform: refused on a layer that is not 3D');
     r = await tryOp({ type: 'layer.transform', id: 'vrGROUPL01', m3 });
-    check(r?.t === 'reject' && /VR layers/.test(r.reason), 'vr 3D: refused on a group');
+    check(r?.t === 'reject' && /3D layers/.test(r.reason), '3D transform: refused on a group');
     r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: [1, 0, 0, 0, 1, 0, 0, 0, 1, 2e15, 0, 0] });
-    check(r?.t === 'reject' && /range/.test(r.reason), 'vr 3D: refused when it goes out of range');
-    await tryOp({ type: 'layer.add', layer: layer('vrVECLAYER', { vr: true }) });
+    check(r?.t === 'reject' && /range/.test(r.reason), '3D transform: refused when it goes out of range');
+    await tryOp({ type: 'layer.add', layer: layer('vrVECLAYER', { threed: true }) });
     await tryOp({ type: 'stroke.add', stroke: stroke('vrVECSTRK1', 'vrVECLAYER', { vector }) });
     r = await tryOp({ type: 'layer.transform', id: 'vrVECLAYER', m3 });
-    check(r?.t === 'reject' && /vector/.test(r.reason), 'vr 3D: refused on a layer with vector strokes');
+    check(r?.t === 'reject' && /vector/.test(r.reason), '3D transform: refused on a layer with vector strokes');
 
     r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3 });
     vw = await welcome();
     let a = vw.strokes.find((x) => x.id === 'vr3DSTRK01');
     let b = vw.strokes.find((x) => x.id === 'vr3DSTRK02');
     let mk = vw.strokes.find((x) => x.id === 'vr3DMASK01');
-    check(r?.t === 'op' && r.op.m3.join() === m3.join() && r.op.m === undefined, 'vr 3D: a turn, a scale and a move');
-    check(a.pts.join() === '3,2,1,5,22,1' && a.vr.z.join() === '3,-17', 'vr 3D: points and depths move in 3D');
-    check(a.vr.up.join() === '0,0,-1,1,0,0' && a.brush.size === 8 && a.brush.angle === 10, 'vr 3D: up directions turn; the size scales; no turn in the paper keeps the tip angle');
-    check(b.pts.join() === '1,2,1' && b.vr?.z.join() === '-7' && b.vr.up === undefined, 'vr 3D: a stroke without depth gets it');
-    check(mk.vr.z.join() === '3,-17' && !vw.features.includes('vr3') && vw.features.includes('vr'), 'vr 3D: the mask moves too; no new feature');
+    check(r?.t === 'op' && r.op.m3.join() === m3.join() && r.op.m === undefined, '3D transform: a turn, a scale and a move');
+    check(a.pts.join() === '3,2,1,5,22,1' && a.threed.z.join() === '3,-17', '3D transform: points and depths move in 3D');
+    check(a.threed.up.join() === '0,0,-1,1,0,0' && a.brush.size === 8 && a.brush.angle === 10, '3D transform: up directions turn; the size scales; no turn in the paper keeps the tip angle');
+    check(b.pts.join() === '1,2,1' && b.threed?.z.join() === '-7' && b.threed.up === undefined, '3D transform: a stroke without depth gets it');
+    check(mk.threed.z.join() === '3,-17' && !vw.features.includes('vr3') && vw.features.includes('threed'), '3D transform: the mask moves too; no new feature');
     const spin = [0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0];
     await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: spin });
     vw = await welcome();
     a = vw.strokes.find((x) => x.id === 'vr3DSTRK01');
-    check(a.brush.angle === 100 && a.pts.join() === '-2,3,1,-22,5,1', 'vr 3D: a turn in the paper turns the tip angle');
+    check(a.brush.angle === 100 && a.pts.join() === '-2,3,1,-22,5,1', '3D transform: a turn in the paper turns the tip angle');
     // Undo: the inverses, last first.
     await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: inv3(spin) });
     r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: inv3(m3) });
@@ -1226,29 +1226,29 @@ try {
     a = vw.strokes.find((x) => x.id === 'vr3DSTRK01');
     b = vw.strokes.find((x) => x.id === 'vr3DSTRK02');
     const near = (xs, ys) => xs.length === ys.length && xs.every((v, i) => Math.abs(v - ys[i]) < 1e-9);
-    check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.vr.z, [1, 2]) && a.vr.up.join() === up.join() && a.brush.size === 4 && a.brush.angle === 10, 'vr 3D: undo with the inverse brings the stroke back');
-    check(near(b.pts, [5, 0, 1]) && near(b.vr.z, [0]), 'vr 3D: undo brings the flat stroke back (at depth 0)');
+    check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.threed.z, [1, 2]) && a.threed.up.join() === up.join() && a.brush.size === 4 && a.brush.angle === 10, '3D transform: undo with the inverse brings the stroke back');
+    check(near(b.pts, [5, 0, 1]) && near(b.threed.z, [0]), '3D transform: undo brings the flat stroke back (at depth 0)');
 
     // Live strokes relay the depth of their points.
     const other = await new Browser().join(vc);
     await first(other);
     const brush = strokeOp(L1).op.stroke.brush;
-    o.send({ t: 'live', id: 'vrLIVE0001', layerId: 'vrLAYER001', brush, pts: [0, 0, 1], vr: { z: [4], up: [0, 1, 0] }, start: true });
+    o.send({ t: 'live', id: 'vrLIVE0001', layerId: 'vrLAYER001', brush, pts: [0, 0, 1], threed: { z: [4], up: [0, 1, 0] }, start: true });
     let seen = await other.next((m) => m.t === 'live' && m.id === 'vrLIVE0001', 2000);
-    check(seen?.vr?.z.join() === '4' && seen.vr.up.join() === '0,1,0', 'vr: live points carry their depth');
-    o.send({ t: 'live', id: 'vrLIVE0002', layerId: 'vrLAYER001', brush, pts: [], vr: { z: [] }, start: true });
+    check(seen?.threed?.z.join() === '4' && seen.threed.up.join() === '0,1,0', '3D: live points carry their depth');
+    o.send({ t: 'live', id: 'vrLIVE0002', layerId: 'vrLAYER001', brush, pts: [], threed: { z: [] }, start: true });
     seen = await other.next((m) => m.t === 'live' && m.id === 'vrLIVE0002', 2000);
-    check(seen?.vr?.z.length === 0, 'vr: a live message with no points');
-    o.send({ t: 'live', id: 'vrLIVE0003', layerId: 'vrLAYER001', brush, pts: [0, 0, 1], vr: { z: [4, 5] }, start: true });
-    check(!(await other.next((m) => m.t === 'live' && m.id === 'vrLIVE0003', 500)), 'vr: live data with a bad depth is dropped');
-    o.send({ t: 'live', id: 'vrLIVE0005', layerId: 'vrLAYER001', mask: 'maskmask01', brush, pts: [0, 0, 1], vr: { z: [4] }, start: true });
+    check(seen?.threed?.z.length === 0, '3D: a live message with no points');
+    o.send({ t: 'live', id: 'vrLIVE0003', layerId: 'vrLAYER001', brush, pts: [0, 0, 1], threed: { z: [4, 5] }, start: true });
+    check(!(await other.next((m) => m.t === 'live' && m.id === 'vrLIVE0003', 500)), '3D: live data with a bad depth is dropped');
+    o.send({ t: 'live', id: 'vrLIVE0005', layerId: 'vrLAYER001', mask: 'maskmask01', brush, pts: [0, 0, 1], threed: { z: [4] }, start: true });
     seen = await other.next((m) => m.t === 'live' && m.id === 'vrLIVE0005', 2000);
-    check(seen?.mask === 'maskmask01' && seen.vr?.z.join() === '4', 'vr: live mask data may carry depth');
+    check(seen?.mask === 'maskmask01' && seen.threed?.z.join() === '4', '3D: live mask data may carry depth');
     o.send({ t: 'live', id: 'vrLIVE0004', layerId: 'vrLAYER001', brush, pts: [0, 0, 1], start: true });
     seen = await other.next((m) => m.t === 'live' && m.id === 'vrLIVE0004', 2000);
-    check(!!seen && seen.vr === undefined, 'vr: live data without depth as before');
+    check(!!seen && seen.threed === undefined, '3D: live data without depth as before');
 
-    // .bdraw: version 11 keeps vr; a bad vr stroke is skipped. Shared code: the version of a saved file.
+    // .bdraw: version 11 keeps threed; a bad threed stroke is skipped. Shared code: the version of a saved file.
     const out = path.join(dir, 'shared.mjs');
     buildSync({
       stdin: { contents: "export * from './src/shared/bdraw'; export * from './src/shared/layers';", resolveDir: process.cwd(), loader: 'ts' },
@@ -1257,18 +1257,18 @@ try {
     const shared = await import(pathToFileURL(out).href);
     vw = await welcome();
     const plain = vw.layers.filter((l) => l.id === 'vrFALSE001');
-    check(shared.makeBdraw(plain, [], 'test').version === 2 && shared.BDRAW_VERSION === 11, 'vr: a file without vr keeps its old version');
+    check(shared.makeBdraw(plain, [], 'test').version === 2 && shared.BDRAW_VERSION === 11, '3D: a file without threed keeps its old version');
     const onlyStroke = shared.makeBdraw([vw.layers.find((l) => l.id === L1)], vw.strokes, 'test');
-    check(onlyStroke.version === 11 && onlyStroke.strokes.find((x) => x.vr)?.vr.z.join() === '0,5', 'vr: a VR stroke makes a version 11 file');
+    check(onlyStroke.version === 11 && onlyStroke.strokes.find((x) => x.threed)?.threed.z.join() === '0,5', '3D: a 3D stroke makes a version 11 file');
     const vrLayers = vw.layers.filter((l) => l.id === 'vrLAYER001' || l.id === 'vrFALSE001');
-    check(shared.makeBdraw(vrLayers, [], 'test').version === 11, 'vr: a VR layer makes a version 11 file');
+    check(shared.makeBdraw(vrLayers, [], 'test').version === 11, '3D: a 3D layer makes a version 11 file');
     const file = shared.makeBdraw(vw.layers, vw.strokes, 'test');
-    file.strokes.push({ ...stroke('vrBADFILE1', 'vrLAYER001', { vr: { z: [1] } }), seq: 1e9, author: 'x' });
+    file.strokes.push({ ...stroke('vrBADFILE1', 'vrLAYER001', { threed: { z: [1] } }), seq: 1e9, author: 'x' });
     const imp = await vb.upload(zlib.gzipSync(JSON.stringify(file)), {});
     const iw = await first(await new Browser().join(imp.data.key));
     const istroke = iw.strokes.find((x) => x.id === 'vrSTROKE01');
-    check(imp.status === 201 && imp.data.skipped === 1 && iw.layers.find((l) => l.id === 'vrLAYER001')?.vr === true && istroke?.vr.z.join() === '2,-6' && istroke.vr.up.length === 6 && iw.layers.find((l) => l.id === 'vrFLAT0001')?.vr === true && iw.features.includes('vr'), 'vr: a .bdraw v11 round trip keeps vr (a bad vr stroke is skipped)');
-    check(shared.transformVr({ z: [1] }, [1, 0, 0, 1, 7, 7], 1e15).z[0] === 1, 'vr: a move keeps the depth');
+    check(imp.status === 201 && imp.data.skipped === 1 && iw.layers.find((l) => l.id === 'vrLAYER001')?.threed === true && istroke?.threed.z.join() === '2,-6' && istroke.threed.up.length === 6 && iw.layers.find((l) => l.id === 'vrFLAT0001')?.threed === true && iw.features.includes('threed'), '3D: a .bdraw v11 round trip keeps threed (a bad threed stroke is skipped)');
+    check(shared.transformThreeD({ z: [1] }, [1, 0, 0, 1, 7, 7], 1e15).z[0] === 1, '3D: a move keeps the depth');
   }
 
   // --- admins manage every owned canvas like its owner ------------------------------------------

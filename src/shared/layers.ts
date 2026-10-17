@@ -10,7 +10,7 @@
 //   before the group itself. The panel shows the reverse: the group's row, then its layers.
 
 import { derivedId } from './ids';
-import type { Affine, Affine3, Brush, Layer, Shape, Stroke, StrokeVr } from './types';
+import type { Affine, Affine3, Brush, Layer, Shape, Stroke, StrokeThreeD } from './types';
 
 export interface LayerNode {
   layer: Layer;
@@ -146,11 +146,11 @@ export const applyPoint = (m: Affine, x: number, y: number): [number, number] =>
 /**
  * A stroke after a transform: points mapped, the brush size scaled by √|det| (the average scale),
  * and a fixed tip angle turned with the rotation. A non-uniform scale or a skew keeps the tip
- * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). The depth of a VR
- * stroke follows (transformVr). Null: a point or a depth would go past `maxCoord` or the size out
+ * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). The depth of a 3D
+ * stroke follows (transformThreeD). Null: a point or a depth would go past `maxCoord` or the size out
  * of range.
  */
-export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector' | 'vr'> | null {
+export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector' | 'threed'> | null {
   const pts = s.pts.slice();
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1];
@@ -168,10 +168,10 @@ export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRang
     if (!validAffine(vm)) return null;
     return { pts, brush, vector: { ...s.vector, m: vm } };
   }
-  if (s.vr) {
-    const vr = transformVr(s.vr, m, maxCoord);
-    if (!vr) return null;
-    return { pts, brush, vr };
+  if (s.threed) {
+    const threed = transformThreeD(s.threed, m, maxCoord);
+    if (!threed) return null;
+    return { pts, brush, threed };
   }
   return { pts, brush };
 }
@@ -193,16 +193,16 @@ function scaledBrush(b: Brush, scale: number, turn: number, sizeRange: [number, 
 }
 
 /**
- * The depth of a VR stroke after a transform of the paper: the 2D affine `m` as a 3D map that
+ * The depth of a 3D stroke after a transform of the paper: the 2D affine `m` as a 3D map that
  * scales depth by √|det| (the average scale, as brush sizes). Depths scale; the up directions
  * turn with the map (turnUps). Null: a depth would go past `maxCoord`.
  */
-export function transformVr(vr: StrokeVr, m: Affine, maxCoord: number): StrokeVr | null {
+export function transformThreeD(threed: StrokeThreeD, m: Affine, maxCoord: number): StrokeThreeD | null {
   const [a, b, c, d] = m;
   const k = Math.sqrt(Math.abs(a * d - b * c));
-  const z = vr.z.map((v) => v * k);
+  const z = threed.z.map((v) => v * k);
   if (!z.every((v) => Math.abs(v) <= maxCoord)) return null;
-  return vr.up ? { z, up: turnUps(vr.up, [a, b, 0, c, d, 0, 0, 0, k]) } : { z };
+  return threed.up ? { z, up: turnUps(threed.up, [a, b, 0, c, d, 0, 0, 0, k]) } : { z };
 }
 
 /**
@@ -234,7 +234,7 @@ export function validAffine(m: unknown): m is Affine {
   return det > 1e-24 && det < 1e24;
 }
 
-// --- 3D transforms (VR layers) ---------------------------------------------------------------
+// --- 3D transforms (3D layers) ---------------------------------------------------------------
 
 /** The uniform scale of a 3D transform's linear part: ∛|det|. */
 export function scale3(m: Affine3): number {
@@ -265,18 +265,18 @@ export function validAffine3(m: unknown): m is Affine3 {
 }
 
 /**
- * A stroke of a VR layer after a 3D transform: each point (x, y, depth) moves in 3D (a stroke
+ * A stroke of a 3D layer after a 3D transform: each point (x, y, depth) moves in 3D (a stroke
  * without depth is at depth 0, and gets its depth), the up directions turn, the brush size
  * scales by ∛|det|, and a fixed tip angle turns with the turn of the x axis in the paper (as a
  * 2D transform does). Null: a vector stroke (it cannot move in 3D), or a point, a depth or the
  * size would go out of range.
  */
-export function transformStroke3(s: Stroke, m: Affine3, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vr'> | null {
+export function transformStroke3(s: Stroke, m: Affine3, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'threed'> | null {
   if (s.vector) return null;
   const pts = s.pts.slice();
   const z = new Array<number>(pts.length / 3);
   for (let i = 0, j = 0; i < pts.length; i += 3, j++) {
-    const x = pts[i], y = pts[i + 1], d = s.vr?.z[j] ?? 0;
+    const x = pts[i], y = pts[i + 1], d = s.threed?.z[j] ?? 0;
     const nx = m[0] * x + m[3] * y + m[6] * d + m[9];
     const ny = m[1] * x + m[4] * y + m[7] * d + m[10];
     const nz = m[2] * x + m[5] * y + m[8] * d + m[11];
@@ -287,7 +287,7 @@ export function transformStroke3(s: Stroke, m: Affine3, maxCoord: number, sizeRa
   }
   const brush = scaledBrush(s.brush, scale3(m), Math.atan2(m[1], m[0]), sizeRange);
   if (!brush) return null;
-  return { pts, brush, vr: s.vr?.up ? { z, up: turnUps(s.vr.up, m) } : { z } };
+  return { pts, brush, threed: s.threed?.up ? { z, up: turnUps(s.threed.up, m) } : { z } };
 }
 
 /**

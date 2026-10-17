@@ -1,7 +1,7 @@
 import type { WebSocket } from 'ws';
 import { newId } from '../shared/ids';
 import { DOC_FEATURES, LIMITS, PREVIEW_LIMITS, type AppliedOp, type ClientMsg, type Op, type Peer, type ServerMsg } from '../shared/types';
-import { ValidationError, validateBrush, validateColor, validateId, validateNumber, validateOp, validatePoints, validateShapeInput, validateString, validateStrokeVr } from '../shared/validate';
+import { ValidationError, validateBrush, validateColor, validateId, validateNumber, validateOp, validatePoints, validateShapeInput, validateString, validateStrokeThreeD } from '../shared/validate';
 import { docFeatures } from '../shared/features';
 import { DocState, OpError, importOps } from '../shared/docState';
 import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
@@ -168,8 +168,8 @@ export class Session {
               ...(msg.mask !== undefined ? { mask: validateId(msg.mask, 'mask') } : {}),
               brush: validateBrush(msg.brush),
               pts,
-              // The depth of these points (a VR stroke).
-              ...(msg.vr !== undefined ? { vr: validateStrokeVr(msg.vr, pts) } : {}),
+              // The depth of these points (a 3D stroke).
+              ...(msg.threed !== undefined ? { threed: validateStrokeThreeD(msg.threed, pts) } : {}),
               start: msg.start === true,
             },
             client,

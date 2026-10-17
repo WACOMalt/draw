@@ -40,13 +40,13 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, 
     if (l.kind === 'shape') f.add('shapes');
     if (l.effects?.length) f.add('effects');
     if (l.adjust?.type === 'blur') f.add('blur');
-    if (l.vr) f.add('vr');
+    if (l.threed) f.add('threed');
   }
   for (const s of strokes) {
     if (s.deleted) continue;
     if (s.mask) f.add('mask');
     if (brushHasDynamics(s.brush)) f.add('tips');
-    if (s.vr) f.add('vr');
+    if (s.threed) f.add('threed');
     if (!s.vector) continue;
     f.add('vectors');
     for (const g of [s.vector, ...(s.vector.parts ?? [])]) shapeFeatures(g, f);

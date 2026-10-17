@@ -35,7 +35,7 @@ import {
   type ShapeProps,
   type ShapeUpdate,
   type StrokeVector,
-  type StrokeVr,
+  type StrokeThreeD,
   POINT_STRIDE,
   POINT_TYPES,
 } from './types';
@@ -243,17 +243,17 @@ export function validatePoints(v: unknown, minPoints = 1): number[] {
 }
 
 /**
- * The depth of a VR stroke's points `pts` (validated): `z`, one depth per point within
+ * The depth of a 3D stroke's points `pts` (validated): `z`, one depth per point within
  * ±LIMITS.maxCoord, and optionally `up`, a direction per point (three numbers, each -1 to 1).
  */
-export function validateStrokeVr(v: unknown, pts: number[]): StrokeVr {
-  const o = obj(v, 'vr');
+export function validateStrokeThreeD(v: unknown, pts: number[]): StrokeThreeD {
+  const o = obj(v, 'threed');
   const n = pts.length / 3;
-  if (!Array.isArray(o.z) || o.z.length !== n) fail('bad vr.z length');
-  const z = o.z.map((x) => num(x, -LIMITS.maxCoord, LIMITS.maxCoord, 'vr.z'));
+  if (!Array.isArray(o.z) || o.z.length !== n) fail('bad threed.z length');
+  const z = o.z.map((x) => num(x, -LIMITS.maxCoord, LIMITS.maxCoord, 'threed.z'));
   if (o.up === undefined) return { z };
-  if (!Array.isArray(o.up) || o.up.length !== pts.length) fail('bad vr.up length');
-  return { z, up: o.up.map((x) => num(x, -1, 1, 'vr.up')) };
+  if (!Array.isArray(o.up) || o.up.length !== pts.length) fail('bad threed.up length');
+  return { z, up: o.up.map((x) => num(x, -1, 1, 'threed.up')) };
 }
 
 function blend(v: unknown): LayerBlend {
@@ -276,8 +276,8 @@ function layerProps(v: unknown, partial: boolean): Partial<LayerProps> {
   if (p.mask !== undefined) out.mask = layerMask(p.mask);
   if (p.parent !== undefined) out.parent = p.parent === null ? null : id(p.parent, 'parent');
   if (p.effects !== undefined) out.effects = validateEffects(p.effects);
-  // A VR layer (paint layers only: checked where the kind is known).
-  if (p.vr !== undefined) out.vr = bool(p.vr, 'vr');
+  // A 3D layer (paint layers only: checked where the kind is known).
+  if (p.threed !== undefined) out.threed = bool(p.threed, 'threed');
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -289,8 +289,8 @@ export function validateOp(v: unknown): Op {
       const s = obj(o.stroke, 'stroke');
       const pts = validatePoints(s.pts);
       // A vector stroke draws its shape, flat: no depth. (A mask stroke may have one: a 3D
-      // transform of a VR layer moves its mask too.)
-      if (s.vr !== undefined && s.vector !== undefined) fail('vector strokes take no vr');
+      // transform of a 3D layer moves its mask too.)
+      if (s.threed !== undefined && s.vector !== undefined) fail('vector strokes take no threed');
       return {
         type: 'stroke.add',
         stroke: {
@@ -301,7 +301,7 @@ export function validateOp(v: unknown): Op {
           ...(s.mask !== undefined ? { mask: id(s.mask, 'mask') } : {}),
           // A vector stroke (from a .bdraw file; live clients make them with shapes.toPaint).
           ...(s.vector !== undefined && s.mask === undefined ? { vector: validateVector(s.vector) } : {}),
-          ...(s.vr !== undefined ? { vr: validateStrokeVr(s.vr, pts) } : {}),
+          ...(s.threed !== undefined ? { threed: validateStrokeThreeD(s.threed, pts) } : {}),
         },
       };
     }
@@ -327,14 +327,14 @@ export function validateOp(v: unknown): Op {
         if (props.effects && !takesEffects(kind)) fail('adjustment layers take no effects');
         if (!props.effects) delete props.effects;
       }
-      if (props.vr && kind !== undefined && kind !== 'paint') fail('vr layers are paint layers');
-      if (props.vr === false) delete props.vr;
+      if (props.threed && kind !== undefined && kind !== 'paint') fail('3D layers are paint layers');
+      if (props.threed === false) delete props.threed;
       return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
     }
     case 'layer.update':
       return { type: 'layer.update', id: id(o.id), props: layerProps(o.props, true) };
     case 'layer.transform':
-      // A 2D transform `m`, or a 3D one `m3` (VR layers): exactly one.
+      // A 2D transform `m`, or a 3D one `m3` (3D layers): exactly one.
       if ((o.m === undefined) === (o.m3 === undefined)) fail('bad transform');
       if (o.m3 !== undefined) {
         if (!validAffine3(o.m3)) fail('bad transform');

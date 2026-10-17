@@ -84,11 +84,11 @@ export class DocState {
           this.checkParent(op.props.parent, subtreeHeight(this.layers.values(), l.id));
         }
         if (op.props.effects && !takesEffects(l.kind)) throw new OpError('adjustment layers take no effects');
-        if (op.props.vr && (l.kind ?? 'paint') !== 'paint') throw new OpError('vr layers are paint layers');
+        if (op.props.threed && (l.kind ?? 'paint') !== 'paint') throw new OpError('3D layers are paint layers');
         Object.assign(l, op.props);
         if (l.parent === null) delete l.parent;
         if (!l.effects?.length) delete l.effects;
-        if (!l.vr) delete l.vr;
+        if (!l.threed) delete l.threed;
         return op;
       }
       case 'layer.transform': {
@@ -99,7 +99,7 @@ export class DocState {
           return op;
         }
         const ids = subtreeIds(this.layers.values(), l.id);
-        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'vector' | 'vr'>][] = [];
+        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'vector' | 'threed'>][] = [];
         for (const st of this.strokes.values()) {
           if (!ids.has(st.layerId)) continue;
           const t = transformStroke(st, op.m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
@@ -207,13 +207,13 @@ export class DocState {
   }
 
   /**
-   * A 3D transform of the VR layer `l` (layer.transform with m3): every stroke of it moves in
-   * 3D, masks and deleted ones too. Throws when the layer is not a VR layer or holds vector
+   * A 3D transform of the 3D layer `l` (layer.transform with m3): every stroke of it moves in
+   * 3D, masks and deleted ones too. Throws when the layer is not a 3D layer or holds vector
    * strokes or shapes, or when the result goes out of range.
    */
   private transform3(l: Layer, m3: Affine3): void {
-    if (!l.vr) throw new OpError('3D transforms are for VR layers');
-    const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'vr'>][] = [];
+    if (!l.threed) throw new OpError('3D transforms are for 3D layers');
+    const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'threed'>][] = [];
     for (const st of this.strokes.values()) {
       if (st.layerId !== l.id) continue;
       if (st.vector) throw new OpError('a 3D transform cannot move vector strokes');
