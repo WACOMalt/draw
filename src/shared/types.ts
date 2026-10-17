@@ -143,6 +143,15 @@ export interface LayerEffect {
   cx?: number;
   cy?: number;
   order?: 'front' | 'behind';
+  /**
+   * Kaleidoscope, a 3D step (feature 'kaleido3d'): the turn as a unit quaternion (x, y, z, w; axes
+   * as Stroke.threed), in place of `angle`; the pivot's depth `cz` and the move's `dz` (world
+   * units, absent: 0). On a 3D layer the copies move in 3D; the 2D view, and a flat layer, show
+   * them seen straight on (kaleidoscopeCopies).
+   */
+  turn?: [number, number, number, number];
+  cz?: number;
+  dz?: number;
 }
 
 /**
@@ -418,7 +427,7 @@ export const MIX_MODES = ['normal', 'pigment'] as const;
 export type MixMode = (typeof MIX_MODES)[number];
 
 // 'threedGroups' is never in a document: it says the server takes 3D transforms of groups.
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'threed', 'threedGroups'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'threed', 'threedGroups', 'kaleido3d'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =

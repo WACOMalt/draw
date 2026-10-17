@@ -1074,7 +1074,7 @@ try {
     // Shared code the server does not run (the .bdraw writer, the 3D gizmo's math), bundled for the test.
     const out = path.join(dir, 'shared.mjs');
     buildSync({
-      stdin: { contents: "export * from './src/shared/bdraw'; export * from './src/shared/layers'; export * from './src/shared/transform3';", resolveDir: process.cwd(), loader: 'ts' },
+      stdin: { contents: "export * from './src/shared/bdraw'; export * from './src/shared/layers'; export * from './src/shared/transform3'; export * from './src/shared/effects';", resolveDir: process.cwd(), loader: 'ts' },
       bundle: true, format: 'esm', platform: 'node', outfile: out, logLevel: 'silent',
     });
     const shared = await import(pathToFileURL(out).href);
@@ -1286,6 +1286,48 @@ try {
     a = vw.strokes.find((x) => x.id === 'vrGSTRK001');
     check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.threed.z, [1, 2]), '3D group: undo with the inverse brings it back');
 
+    // A 3D kaleidoscope step (feature kaleido3d): a turn as a unit quaternion, pivot and move depths.
+    check(w.supports.includes('kaleido3d'), 'kaleido3d: the server takes 3D kaleidoscope steps');
+    const kal3 = { type: 'kaleidoscope', enabled: true, radius: 0, count: 4, angle: 0, scale: 0.9, cx: 5, cy: 5, dx: 1, dy: 0, order: 'behind', turn: [0.2, 0, 0, Math.sqrt(1 - 0.04)], cz: 3, dz: 2 };
+    r = await tryOp({ type: 'layer.update', id: 'vrLAYER001', props: { effects: [kal3] } });
+    const t3 = r?.op?.props.effects[0];
+    check(r?.t === 'op' && Math.abs(Math.hypot(...t3.turn) - 1) < 1e-12 && t3.cz === 3 && t3.dz === 2, 'kaleido3d: the turn is made unit, depths kept');
+    for (const [turn, label] of [[[0.2, 0, 0], 'four numbers'], [[2, 0, 0, 0], 'a unit length'], ['x', 'an array']]) {
+      r = await tryOp({ type: 'layer.update', id: 'vrLAYER001', props: { effects: [{ ...kal3, turn }] } });
+      check(r?.t === 'reject' && /effect.turn/.test(r.reason), `kaleido3d: the turn needs ${label}`);
+    }
+    vw = await welcome();
+    check(vw.features.includes('kaleido3d'), 'kaleido3d: a document with one lists the feature');
+    // The flat step is the old step applied i times.
+    const flatK = { type: 'kaleidoscope', enabled: true, radius: 0, count: 6, angle: 37, scale: 1.1, cx: 3, cy: -4, dx: 2, dy: 1, order: 'front' };
+    let mm = [1, 0, 0, 1, 0, 0];
+    const st2 = shared.kaleidoscopeStep(flatK);
+    const flatOk = shared.kaleidoscopeCopies(flatK).every((c) => { mm = shared.compose(st2, mm); return c.every((v, i) => Math.abs(v - mm[i]) < 1e-9); });
+    check(flatOk && !shared.kaleidoscopeTilts(flatK), 'kaleido3d: a flat step gives the same copies as before');
+    // A 3D layer transform carries the step along exactly: copy i of the moved layer is the
+    // moved copy i (m3 · copy · m3⁻¹). Turning a flat step's layer out of the paper tilts it.
+    await tryOp({ type: 'layer.add', layer: layer('vrKAL3D001', { threed: true, effects: [flatK] }) });
+    await tryOp({ type: 'stroke.add', stroke: stroke('vrKALSTRK1', 'vrKAL3D001', { threed: { z: [1, 2] } }) });
+    r = await tryOp({ type: 'layer.transform', id: 'vrKAL3D001', m3 });
+    vw = await welcome();
+    const moved = vw.layers.find((l) => l.id === 'vrKAL3D001').effects[0];
+    const before = shared.kaleidoscopeCopies3(flatK), after = shared.kaleidoscopeCopies3(moved);
+    const p0 = [7, -3, 2];
+    const carried = before.every((c, i) => close3(shared.applyM3(after[i], ...shared.applyM3(m3, ...p0)), shared.applyM3(m3, ...shared.applyM3(c, ...p0)), 1e-6));
+    check(r?.t === 'op' && moved.turn && shared.kaleidoscopeTilts(moved) && carried, 'kaleido3d: a 3D layer transform carries the step (a turned flat step gets a 3D turn)');
+    // Back: the inverse leaves a flat step again (its turn in the paper as an angle).
+    await tryOp({ type: 'layer.transform', id: 'vrKAL3D001', m3: inv3(m3) });
+    vw = await welcome();
+    const back3 = vw.layers.find((l) => l.id === 'vrKAL3D001').effects[0];
+    check(!back3.turn && Math.abs(back3.angle - 37) < 1e-6 && Math.abs(back3.cx - 3) < 1e-6 && Math.abs(back3.dy - 1) < 1e-6, 'kaleido3d: the inverse transform gives the flat step back');
+    // A 2D layer transform turns a 3D step's turn with the layer in the paper.
+    r = await tryOp({ type: 'layer.transform', id: 'vrLAYER001', m: [0, 1, -1, 0, 0, 0] });
+    vw = await welcome();
+    const turned = vw.layers.find((l) => l.id === 'vrLAYER001').effects[0];
+    const lift = [0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0];
+    const b4 = shared.kaleidoscopeCopies3({ ...t3 }), af = shared.kaleidoscopeCopies3(turned);
+    check(r?.t === 'op' && b4.every((c, i) => close3(shared.applyM3(af[i], ...shared.applyM3(lift, ...p0)), shared.applyM3(lift, ...shared.applyM3(c, ...p0)), 1e-6)), 'kaleido3d: a 2D layer transform turns the 3D step with the layer');
+
     // Live strokes relay the depth of their points.
     const other = await new Browser().join(vc);
     await first(other);
@@ -1308,11 +1350,14 @@ try {
     // .bdraw: version 11 keeps threed; a bad threed stroke is skipped. Shared code: the version of a saved file.
     vw = await welcome();
     const plain = vw.layers.filter((l) => l.id === 'vrFALSE001');
-    check(shared.makeBdraw(plain, [], 'test').version === 2 && shared.BDRAW_VERSION === 11, '3D: a file without threed keeps its old version');
+    check(shared.makeBdraw(plain, [], 'test').version === 2 && shared.BDRAW_VERSION === 12, '3D: a file without threed keeps its old version');
     const onlyStroke = shared.makeBdraw([vw.layers.find((l) => l.id === L1)], vw.strokes, 'test');
     check(onlyStroke.version === 11 && onlyStroke.strokes.find((x) => x.threed)?.threed.z.join() === '0,5', '3D: a 3D stroke makes a version 11 file');
-    const vrLayers = vw.layers.filter((l) => l.id === 'vrLAYER001' || l.id === 'vrFALSE001');
+    // (vrLAYER001 has a 3D kaleidoscope step by now: without it, a plain 3D layer.)
+    const vrLayers = vw.layers.filter((l) => l.id === 'vrLAYER001' || l.id === 'vrFALSE001').map((l) => ({ ...l, effects: undefined }));
     check(shared.makeBdraw(vrLayers, [], 'test').version === 11, '3D: a 3D layer makes a version 11 file');
+    const withKal3 = vw.layers.filter((l) => l.id === 'vrLAYER001');
+    check(shared.makeBdraw(withKal3, [], 'test').version === 12, 'kaleido3d: a 3D kaleidoscope step makes a version 12 file');
     const file = shared.makeBdraw(vw.layers, vw.strokes, 'test');
     file.strokes.push({ ...stroke('vrBADFILE1', 'vrLAYER001', { threed: { z: [1] } }), seq: 1e9, author: 'x' });
     const imp = await vb.upload(zlib.gzipSync(JSON.stringify(file)), {});

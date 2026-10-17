@@ -18,8 +18,8 @@ import {
 import { ValidationError, validateOp, validateShapeInput } from './validate';
 import { transformShapeMatrix } from './shapes';
 import { planFromPaint, planToPaint } from './flatten';
-import { depthOf, duplicateOf, effectivelyDeleted, flatAffine, subtreeHeight, subtreeIds, threeDTargets, transformStroke, transformStroke3 } from './layers';
-import { takesEffects, transformLayerLengths } from './effects';
+import { depthOf, duplicateOf, effectivelyDeleted, subtreeHeight, subtreeIds, threeDTargets, transformStroke, transformStroke3 } from './layers';
+import { takesEffects, transformLayerLengths, transformLayerLengths3 } from './effects';
 
 /** An op that does not make sense for the current state (the client is told why). */
 export class OpError extends Error {}
@@ -226,7 +226,7 @@ export class DocState {
     // Effect lengths scale with the layers (as the paper sees the transform).
     for (const id of ids) {
       const x = this.layers.get(id);
-      if (x) this.layers.set(id, transformLayerLengths(x, flatAffine(m3)));
+      if (x) this.layers.set(id, transformLayerLengths3(x, m3));
     }
   }
 

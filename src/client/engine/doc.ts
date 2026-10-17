@@ -1,8 +1,8 @@
 // Client document: the confirmed state from the server, plus this client's ops that the
 // server has not echoed yet. The UI shows confirmed state with pending layer ops on top.
 
-import { duplicateOf, flatAffine, paintOrder, subtreeIds, transformStroke, transformStroke3 } from '../../shared/layers';
-import { transformLayerLengths } from '../../shared/effects';
+import { duplicateOf, paintOrder, subtreeIds, transformStroke, transformStroke3 } from '../../shared/layers';
+import { transformLayerLengths, transformLayerLengths3 } from '../../shared/effects';
 import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
 import { planFromPaint, planToPaint, vectorShape } from '../../shared/flatten';
 import { DEFAULT_PAPER, LIMITS, type Affine3, type AppliedOp, type Layer, type MixMode, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
@@ -272,7 +272,7 @@ export class Doc {
     }
     for (const lid of ids) {
       const l = this.layers.get(lid);
-      if (l) this.layers.set(lid, transformLayerLengths(l, flatAffine(m3)));
+      if (l) this.layers.set(lid, transformLayerLengths3(l, m3));
     }
     this.version++;
     return { changed, added: [], shapes: [], shapesGone: [] };

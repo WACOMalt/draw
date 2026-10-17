@@ -2285,7 +2285,7 @@ export class Engine {
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
         // A server from before effects sends no list: it refuses effects and blur layers.
         // A server from before `supports` takes none of the features that came with it or later.
-        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment' && f !== 'threed' && f !== 'threedGroups');
+        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment' && f !== 'threed' && f !== 'threedGroups' && f !== 'kaleido3d');
         this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper, m.mix);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);
