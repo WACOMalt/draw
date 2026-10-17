@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 vdraw-core.workspace = true
 vdraw-render.workspace = true
+vdraw-net.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 winit.workspace = true

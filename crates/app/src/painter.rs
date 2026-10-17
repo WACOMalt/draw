@@ -95,8 +95,10 @@ pub struct Painter {
     pub done: Vec<GpuSegment>,
     pub built: Built,
     pub version: u64,
-    /// The stroke being drawn, as segments (made every frame).
+    /// The strokes being drawn, as segments (made every frame): yours, and others' on a shared
+    /// canvas (see `add_drawing`), and their runs by step.
     pub drawing: Vec<GpuSegment>,
+    pub drawing_runs: Vec<vdraw_core::LayerRun>,
     pub undo: Vec<Edit>,
     pub redo: Vec<Edit>,
     pub active: Option<(usize, Stroke)>,
@@ -117,6 +119,9 @@ pub struct Painter {
     pub recent: Vec<[u8; 3]>,
     /// The strokes changed since the last save.
     pub changed: bool,
+    /// Scene units per meter (1 in the room; a shared canvas's zoom): brush sizes are meters
+    /// as they look, at any zoom.
+    pub scale: f32,
 }
 
 impl Painter {
@@ -129,6 +134,7 @@ impl Painter {
             built: Built::default(),
             version: 0,
             drawing: Vec::new(),
+            drawing_runs: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             active: None,
@@ -142,14 +148,47 @@ impl Painter {
             last_point: 0.0,
             recent: Vec::new(),
             changed: false,
+            scale: 1.0,
         };
         p.rebuild();
         p
     }
 
+    /// Another painting opened: all as new but the tools and the recent colors.
+    pub fn reopen(&mut self, painting: Painting) {
+        let (tools, recent) = (self.tools.clone(), std::mem::take(&mut self.recent));
+        *self = Self { tools, recent, ..Self::new(painting) };
+    }
+
     pub fn rebuild(&mut self) {
         self.built = self.painting.build(&mut self.done);
         self.version += 1;
+    }
+
+    /// A painting in place of this one (a shared canvas's, made again): `active` the active
+    /// layer (by id). What was being done to the last one (undo, a sweep, a grab) goes.
+    pub fn replace_painting(&mut self, painting: Painting, active: u32) {
+        self.painting = painting;
+        self.active_layer = active;
+        self.mask_target = self.mask_target && self.painting.index_of(active).is_some_and(|i| self.painting.layers[i].mask.is_some());
+        self.sweep = None;
+        self.grab = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.rebuild();
+    }
+
+    /// A stroke put into layer number `layer` (by place) at `index`, without building all again.
+    pub fn insert_stroke(&mut self, layer: usize, mask: bool, index: usize, stroke: Stroke) {
+        self.painting.insert_stroke(&mut self.built, &mut self.done, layer, mask, index, stroke);
+        self.version += 1;
+    }
+
+    /// A stroke taken out of layer number `layer` (by place), without building all again.
+    pub fn remove_stroke(&mut self, layer: usize, mask: bool, index: usize) -> Stroke {
+        let s = self.painting.remove_stroke(&mut self.built, &mut self.done, layer, mask, index);
+        self.version += 1;
+        s
     }
 
     /// The active layer's place (the top paint layer when the active one is gone).
@@ -442,7 +481,7 @@ impl Painter {
                 if down {
                     let last = stroke.samples.last().map(|s| s.pos).unwrap_or(tip);
                     self.smoothed += (tip - self.smoothed) * follow;
-                    if (self.smoothed - last).length() > 5e-4 {
+                    if (self.smoothed - last).length() > 5e-4 * self.scale {
                         stroke.push(Sample { up, ..Sample::new(self.smoothed, pull, t) });
                         self.last_point = t;
                     } else if stroke.brush.buildup && t - self.last_point >= 0.03 {
@@ -473,6 +512,7 @@ impl Painter {
                     } else if !brush.erase {
                         self.add_recent(panel::to_srgb(brush.color));
                     }
+                    brush.radius *= self.scale;
                     // The dynamics' random numbers: a seed of the stroke's own.
                     brush.seed = (t * 1e6) as u64 as u32 ^ (tip.x.to_bits().rotate_left(13) ^ tip.z.to_bits());
                     let mut stroke = Stroke::new(brush);
@@ -499,7 +539,7 @@ impl Painter {
     /// touches go (hidden now, taken out when the drag ends).
     fn sweep_to(&mut self, tip: Vec3) {
         let Some(mut sweep) = self.sweep.take() else { return };
-        let r = self.tools.sweep_size * 0.5;
+        let r = self.tools.sweep_size * 0.5 * self.scale;
         let hit = tools::swept(&self.done, &self.built.runs, self.sweep_step(), sweep.last, tip, r, &sweep.taken);
         for &id in &hit {
             // Hidden: the renderer sees a speck of nothing until the strokes are taken out.
@@ -538,20 +578,33 @@ impl Painter {
     /// The stroke eraser's overlay, its ball at `tip`: the center lines of the strokes it can
     /// take nearby, those under the ball in red (while it is not sweeping, as in the 2D app).
     pub fn eraser_lines(&self, tip: Vec3, out: &mut Vec<OverlayLine>) {
-        let r = self.tools.sweep_size * 0.5;
+        let r = self.tools.sweep_size * 0.5 * self.scale;
         let only = self.sweep_step();
         let taken: &[u32] = self.sweep.as_ref().map_or(&[], |s| &s.taken);
         let hot = if self.sweep.is_some() { Vec::new() } else { tools::swept(&self.done, &self.built.runs, only, tip, tip, r, taken) };
-        tools::overlay(&self.done, &self.built.runs, only, tip, (r * 4.0).max(0.05), &hot, taken, out);
+        tools::overlay(&self.done, &self.built.runs, only, tip, (r * 4.0).max(0.05 * self.scale), &hot, taken, out);
     }
 
-    /// The stroke being drawn, as segments, into `drawing`.
+    /// The stroke being drawn, as segments, into `drawing` (and nothing else there yet).
     pub fn update_drawing(&mut self) {
         self.drawing.clear();
-        if let Some((_, s)) = &self.active {
+        self.drawing_runs.clear();
+        if let (Some((_, s)), Some(step)) = (&self.active, self.target_step()) {
             let ordered = self.painting.layers[self.active_index()].ordered;
             s.segments_in(self.painting.filter, self.built.strokes.len() as u32, ordered, &mut self.drawing);
+            self.drawing_runs.push(vdraw_core::LayerRun { step, first: 0, count: self.drawing.len() });
         }
+    }
+
+    /// Another stroke being drawn (someone else's), into layer number `layer` (by place), or
+    /// its mask: drawn over the finished strokes there. `n`: its place among them (it takes a
+    /// stroke number of its own).
+    pub fn add_drawing(&mut self, layer: usize, mask: bool, stroke: &Stroke, n: u32) {
+        let Some(step) = self.built.step_of(layer, mask) else { return };
+        let first = self.drawing.len();
+        let ordered = self.painting.layers[layer].ordered;
+        stroke.segments_in(self.painting.filter, self.built.strokes.len() as u32 + 1 + n, ordered, &mut self.drawing);
+        self.drawing_runs.push(vdraw_core::LayerRun { step, first, count: self.drawing.len() - first });
     }
 
     /// The steps as the renderer reads them.
@@ -566,10 +619,12 @@ impl Painter {
             runs: &self.built.runs,
             version: self.version,
             active: &self.drawing,
-            active_step: self.target_step(),
+            active_runs: &self.drawing_runs,
             steps,
             pigment: self.painting.mix == Mix::Pigment,
             world_from_scene: glam::Mat4::IDENTITY,
+            paper: [0.0; 4],
+            paper_grid: 0.0,
         }
     }
 }

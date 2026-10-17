@@ -23,8 +23,16 @@ pub enum View {
 /// time of the raymarch (median and worst). `panel`: the tool panel in front of the camera, as
 /// VR draws it (orbit views only). `sweep`: the stroke eraser's overlay, its ball (that radius)
 /// at the orbit target.
+/// A shared canvas's place and paper (the painting is in its scene).
+#[derive(Clone, Copy, Debug)]
+pub struct CanvasView {
+    pub world_from_scene: glam::Mat4,
+    pub paper: [f32; 4],
+    pub grid: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, view: View, tip: Option<BrushTip>, bench: u32, panel: Option<(crate::tools::Tool, crate::panel::Tab)>, sweep: Option<f32>) -> Result<()> {
+pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, view: View, tip: Option<BrushTip>, bench: u32, panel: Option<(crate::tools::Tool, crate::panel::Tab)>, sweep: Option<f32>, canvas: Option<CanvasView>) -> Result<()> {
     let entry = unsafe { ash::Entry::load() }.context("no Vulkan loader")?;
     let instance = Gpu::create_instance(&entry, &[])?;
     let gpu = Arc::new(Gpu::new(entry, instance, &[], &|_, _| true)?);
@@ -37,11 +45,14 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let built = painting.build(&mut segs);
     let runs = &built.runs;
     let steps = vdraw_render::scene_steps(&painting, &built.steps);
-    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_step: None, steps: &steps, pigment: painting.mix == vdraw_core::Mix::Pigment, world_from_scene: glam::Mat4::IDENTITY };
+    let cv = canvas.unwrap_or(CanvasView { world_from_scene: glam::Mat4::IDENTITY, paper: [0.0; 4], grid: 0.0 });
+    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_runs: &[], steps: &steps, pigment: painting.mix == vdraw_core::Mix::Pigment, world_from_scene: cv.world_from_scene, paper: cv.paper, paper_grid: cv.grid };
     let (eye, cam) = match view {
         View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
         View::Eye(eye) => (eye, None),
     };
+    // The eye in the scene.
+    let eye = EyeView { view_proj: eye.view_proj * cv.world_from_scene, pos: cv.world_from_scene.inverse().transform_point3(eye.pos) };
     // The stroke eraser's overlay, its ball (radius `sweep`) at the orbit target.
     let mut lines = Vec::new();
     if let (Some(r), Some(cam)) = (sweep, cam) {
@@ -107,11 +118,15 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         if std::env::var("VDRAW_PALETTES").is_ok() {
             p.show_palettes();
         }
+        // VDRAW_HOME: the start screen (no server asked: no account).
+        p.screen = if std::env::var("VDRAW_HOME").is_ok() { crate::panel::Screen::Home } else { crate::panel::Screen::Paint };
+        let mut lobby = crate::lobby::Lobby::new(vdraw_net::identity::Identity::default());
+        lobby.identity.recent = vec![vdraw_net::identity::Recent { key: "K7QX-2MPD".into(), server: lobby.identity.server.clone(), at: 0.0, link: None }];
         let (right, up, forward) = cam.axes();
         let place = Placement::centered(cam.eye() + forward * 0.5, right, -up, -forward);
         // Twice: egui lays out sizes it measured in the frame before.
         for _ in 0..2 {
-            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets });
+            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets, lobby: &mut lobby, canvas: None });
             ui.update_textures(&frame.textures)?;
             primitives = frame.primitives;
         }

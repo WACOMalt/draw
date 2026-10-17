@@ -10,6 +10,7 @@
 //! Settings. Names and hex colors are typed on a keyboard on the panel.
 
 mod color;
+pub mod home;
 mod keyboard;
 mod layers;
 pub mod widgets;
@@ -124,11 +125,33 @@ pub struct Pointer {
 }
 
 /// What the panel asks for beyond the painting and the tools.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Recenter,
     /// Write a debug snapshot: both eyes as shown, the view, and the state (debug.rs).
     DebugSnapshot,
+    /// Paint on this device alone (vdraw's own painting), from the start screen.
+    PaintLocal,
+    /// Back to the start screen (leaving the canvas, or this device's painting).
+    Leave,
+    /// The canvas's password, to try.
+    Password(String),
+}
+
+/// What the panel shows: the start screen, or the tools for painting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Home,
+    Paint,
+}
+
+/// The open canvas, as the Settings tab shows it.
+#[derive(Clone, Debug, Default)]
+pub struct CanvasInfo {
+    pub key: String,
+    pub role: String,
+    pub state: String,
+    pub peers: Vec<(String, String)>,
 }
 
 /// One frame of the panel: what to draw, egui's texture changes, and what was asked.
@@ -143,6 +166,9 @@ pub struct Model<'a> {
     pub painter: &'a mut Painter,
     pub palettes: &'a mut Palettes,
     pub presets: &'a mut Presets,
+    pub lobby: &'a mut crate::lobby::Lobby,
+    /// The open canvas (None: this device's painting).
+    pub canvas: Option<CanvasInfo>,
 }
 
 /// The panel's tabs.
@@ -165,6 +191,10 @@ pub struct Panel {
     typing: Option<Typing>,
     /// The Tool tab's dynamics shown.
     dynamics_open: bool,
+    pub screen: Screen,
+    home: home::HomeState,
+    /// A canvas being opened (the start screen shows how it goes).
+    pub opening: Option<home::Opening>,
 }
 
 impl Panel {
@@ -200,7 +230,7 @@ impl Panel {
             s.spacing.scroll = egui::style::ScrollStyle::solid();
             s.interaction.selectable_labels = false;
         });
-        Self { ctx, started: Instant::now(), was_pressed: false, was_on: false, tab: Tab::Tool, color: color::ColorState::new(brush.color), layers: layers::LayersState::default(), typing: None, dynamics_open: false }
+        Self { ctx, started: Instant::now(), was_pressed: false, was_on: false, tab: Tab::Tool, color: color::ColorState::new(brush.color), layers: layers::LayersState::default(), typing: None, dynamics_open: false, screen: Screen::Home, home: home::HomeState::default(), opening: None }
     }
 
     /// Opens the Color tab on its palettes.
@@ -246,10 +276,13 @@ impl Panel {
             ..Default::default()
         };
         let mut actions = Vec::new();
-        let Model { painter, palettes, presets } = model;
+        let Model { painter, palettes, presets, lobby, canvas } = model;
         let output = self.ctx.clone().run(input, |ctx| {
             let frame = egui::Frame { inner_margin: egui::Margin::same(12.0), rounding: egui::Rounding::same(8.0), fill: BG_2, stroke: stroke(1.0, LINE), ..Default::default() };
-            egui::CentralPanel::default().frame(frame).show(ctx, |ui| self.content(ui, painter, palettes, presets, &mut actions));
+            egui::CentralPanel::default().frame(frame).show(ctx, |ui| match self.screen {
+                Screen::Home => self.home_screen(ui, painter, palettes, presets, lobby, &mut actions),
+                Screen::Paint => self.content(ui, painter, palettes, presets, lobby, canvas.as_ref(), &mut actions),
+            });
             // The pointer: a ring where the ray meets the panel.
             if let Some(at) = pointer.at {
                 let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pointer")));
@@ -261,7 +294,24 @@ impl Panel {
         Frame { primitives, textures: output.textures_delta, actions }
     }
 
-    fn content(&mut self, ui: &mut egui::Ui, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, actions: &mut Vec<Action>) {
+    /// The start screen, with the keyboard below it when it is typing.
+    fn home_screen(&mut self, ui: &mut egui::Ui, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, lobby: &mut crate::lobby::Lobby, actions: &mut Vec<Action>) {
+        if let Some(typing) = &mut self.typing {
+            let done = ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| keyboard::keyboard(ui, typing)).inner;
+            match done {
+                Some(Done::Commit(target, text)) => {
+                    self.typing = None;
+                    self.commit(painter, palettes, presets, lobby, actions, &target, &text);
+                }
+                Some(Done::Cancel) => self.typing = None,
+                None => {}
+            }
+            return;
+        }
+        home::home(ui, lobby, &mut self.home, self.opening.as_ref(), &mut self.typing, actions);
+    }
+
+    fn content(&mut self, ui: &mut egui::Ui, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, lobby: &mut crate::lobby::Lobby, canvas: Option<&CanvasInfo>, actions: &mut Vec<Action>) {
         // The tabs, and undo and redo.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -302,7 +352,7 @@ impl Panel {
                     match done {
                         Some(Done::Commit(target, text)) => {
                             self.typing = None;
-                            self.commit(painter, palettes, presets, &target, &text);
+                            self.commit(painter, palettes, presets, lobby, actions, &target, &text);
                         }
                         Some(Done::Cancel) => self.typing = None,
                         None => {}
@@ -313,15 +363,25 @@ impl Panel {
                     Tab::Tool => tool_tab(ui, painter, presets, &mut self.dynamics_open, &mut self.typing),
                     Tab::Color => color::color_tab(ui, painter, palettes, &mut self.color, &mut self.typing),
                     Tab::Layers => layers::layers_tab(ui, painter, &mut self.layers, &mut self.typing),
-                    Tab::Settings => settings_tab(ui, actions),
+                    Tab::Settings => settings_tab(ui, canvas, actions),
                 }
             });
         });
     }
 
     /// The keyboard's text, committed.
-    fn commit(&mut self, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, target: &Target, text: &str) {
+    #[allow(clippy::too_many_arguments)]
+    fn commit(&mut self, painter: &mut Painter, palettes: &mut Palettes, presets: &mut Presets, lobby: &mut crate::lobby::Lobby, actions: &mut Vec<Action>, target: &Target, text: &str) {
         match target {
+            Target::Join => {
+                self.home.join = text.trim().to_string();
+                if !self.home.join.is_empty() {
+                    lobby.join(self.home.join.clone());
+                }
+            }
+            Target::CanvasName => self.home.name = text.trim().to_string(),
+            Target::UserName => lobby.set_name(text),
+            Target::Password => actions.push(Action::Password(text.to_string())),
             Target::PresetName => {
                 let name: String = text.trim().chars().take(40).collect();
                 if let (false, Some((brush, angle))) = (name.is_empty(), painter.tools.current()) {
@@ -553,7 +613,33 @@ fn presets_section(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Prese
 }
 
 /// The Settings tab: moving back to the start, the debug snapshot, and the controls.
-fn settings_tab(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+fn settings_tab(ui: &mut egui::Ui, canvas: Option<&CanvasInfo>, actions: &mut Vec<Action>) {
+    match canvas {
+        Some(c) => {
+            section(ui, "CANVAS");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&c.key).monospace().size(16.0));
+                ui.label(RichText::new(format!("{} · {}", c.role, c.state)).size(13.0).color(TEXT_DIM));
+            });
+            for (name, color) in &c.peers {
+                ui.horizontal(|ui| {
+                    let rgb = vdraw_core::doc::hex_rgb(color).map(|v| (v * 255.0).round() as u8);
+                    let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 5.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                    ui.label(RichText::new(name).size(14.0));
+                });
+            }
+            if ui.button("Leave canvas").clicked() {
+                actions.push(Action::Leave);
+            }
+        }
+        None => {
+            if ui.button("Start screen").clicked() {
+                actions.push(Action::Leave);
+            }
+        }
+    }
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button("Recenter").clicked() {
             actions.push(Action::Recenter);
@@ -574,6 +660,7 @@ fn settings_tab(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         "Right stick: turn (left, right), rise and sink",
         "Panel hand's stick click: hide or show the panel",
         "Roll the wrist: a flat tip turns with it",
+        "Grips: hold the canvas; with both hands, turn and zoom it",
     ] {
         ui.label(RichText::new(line).color(TEXT_DIM).size(14.0));
     }

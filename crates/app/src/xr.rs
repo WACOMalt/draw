@@ -17,10 +17,17 @@
 //!   right stick              turn in 30 degree steps (left, right), rise and sink (up, down)
 //!   painting hand's stick    pointed at the panel: scroll; holding a layer: scale it
 //!   panel hand: stick click  hide or show the panel
+//!   grip                     on a shared canvas: hold it (drag); both grips: move, turn and
+//!                            zoom it
+//!
+//! It starts at the start screen (the 2D app's): a shared canvas, or this device's painting.
 
 use crate::camera::perspective_fov;
 use crate::debug;
-use crate::panel::{Action, Model, Panel, Placement, Pointer};
+use crate::canvas::Canvas;
+use crate::lobby::Lobby;
+use crate::panel::home::Opening;
+use crate::panel::{Action, CanvasInfo, Model, Panel, Placement, Pointer, Screen};
 use crate::rig::{Locomotion, Rig};
 use crate::painter::Painter;
 use crate::tools::Tool;
@@ -34,7 +41,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use vdraw_core::Painting;
 use vdraw_render::raymarch::{Buffer, FRAMES};
+use vdraw_net::identity::Identity;
+use vdraw_net::session::{Session, State};
 use vdraw_render::{BrushTip, EyeView, Gpu, Overlays, PanelDraw, Raymarcher, UiRenderer, barrier};
+
+/// Where `run` starts.
+pub enum Start {
+    /// The start screen.
+    Home,
+    /// This device's painting (saved to the path, if there is one).
+    Local(Painting, Option<PathBuf>),
+    /// A shared canvas, by its code, name or link.
+    Canvas(String),
+}
+
+/// What is open.
+enum Mode {
+    Home,
+    Local,
+    Canvas(Box<Canvas>),
+}
+
+/// A grip's pull that holds the canvas, and lets go below the next.
+const GRIP_DOWN: f32 = 0.6;
+const GRIP_UP: f32 = 0.35;
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 const NEAR: f32 = 0.02;
@@ -131,6 +161,7 @@ struct Input {
     undo: xr::Action<bool>,
     redo: xr::Action<bool>,
     toggle: xr::Action<bool>,
+    grip: xr::Action<f32>,
     haptic: xr::Action<xr::Haptic>,
     hands: [xr::Path; 2],
     spaces: [xr::Space; 2],
@@ -146,6 +177,7 @@ impl Input {
         let undo = set.create_action::<bool>("undo", "Undo", &hands)?;
         let redo = set.create_action::<bool>("redo", "Redo", &hands)?;
         let toggle = set.create_action::<bool>("panel", "Hide or show the panel", &hands)?;
+        let grip = set.create_action::<f32>("grip", "Hold the canvas", &hands)?;
         let haptic = set.create_action::<xr::Haptic>("tick", "Tick", &hands)?;
 
         let p = |s: &str| instance.string_to_path(s);
@@ -158,6 +190,7 @@ impl Input {
             index.push(xr::Binding::new(&undo, h("b/click")?));
             index.push(xr::Binding::new(&redo, h("a/click")?));
             index.push(xr::Binding::new(&toggle, h("thumbstick/click")?));
+            index.push(xr::Binding::new(&grip, h("squeeze/value")?));
             index.push(xr::Binding::new(&haptic, p(&format!("/user/hand/{side}/output/haptic"))?));
         }
         instance.suggest_interaction_profile_bindings(p("/interaction_profiles/valve/index_controller")?, &index)?;
@@ -177,13 +210,14 @@ impl Input {
             aim.create_space(session, hands[0], xr::Posef::IDENTITY)?,
             aim.create_space(session, hands[1], xr::Posef::IDENTITY)?,
         ];
-        Ok(Self { set, aim, paint, stick, undo, redo, toggle, haptic, hands, spaces })
+        Ok(Self { set, aim, paint, stick, undo, redo, toggle, grip, haptic, hands, spaces })
     }
 }
 
-/// Paints in VR. `save_to`: where the painting is saved, after changes (every half minute, in
-/// the background) and on the way out.
-pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
+/// Paints in VR, from `start`. This device's painting is saved where it came from, after
+/// changes (every half minute, in the background), on leaving it, and on the way out.
+/// `server`: the 2D app's server for shared canvases (else the one used last).
+pub fn run(start: Start, server: Option<String>) -> Result<()> {
     // Ctrl-C asks the runtime to end the session, so it can leave the headset cleanly.
     let quit = Arc::new(AtomicBool::new(false));
     let q = quit.clone();
@@ -263,6 +297,20 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
     let scale: f32 = std::env::var("VDRAW_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let mut swapchain: Option<Swapchain> = None;
+    let mut identity = Identity::load(Identity::default_path());
+    if let Some(s) = server {
+        identity.server = s.trim_end_matches('/').to_string();
+        identity.save();
+    }
+    let mut lobby = Lobby::new(identity);
+    let (mut mode, painting, mut save_to) = match start {
+        Start::Home => (Mode::Home, Painting::default(), None),
+        Start::Local(p, path) => (Mode::Local, p, path),
+        Start::Canvas(input) => {
+            lobby.join(input);
+            (Mode::Home, Painting::default(), None)
+        }
+    };
     let mut painter = Painter::new(painting);
     let mut saving: Option<std::thread::JoinHandle<()>> = None;
     let mut saved_at = Instant::now();
@@ -278,6 +326,8 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     let mut press = [Press::Off; 2];
     let mut click = false; // the trigger is clicked down on the panel
     let mut panel = Panel::new(&painter.tools.brush);
+    panel.screen = if matches!(mode, Mode::Local) { Screen::Paint } else { Screen::Home };
+    let mut grip_was = [false; 2];
     // Your palettes, beside the painting (or the default place, for a demo).
     let mut palettes = crate::palettes::Palettes::load(crate::palettes::path_beside(save_to.as_deref()).unwrap_or_else(|| crate::painting_path().with_file_name("palettes.json")));
     let mut presets = crate::presets::Presets::load(crate::painting_path().with_file_name("presets.json"));
@@ -361,6 +411,43 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             input.haptic.apply_feedback(&session, input.hands[h], &pulse)
         };
 
+        // A shared canvas: what came from the server, into the painting; how it opens.
+        let world_head = rig.mat() * head_pose;
+        if let Some(open) = lobby.poll() {
+            if let Mode::Canvas(c) = &mode {
+                c.session.close();
+            }
+            painter.reopen(Painting::default());
+            let id = &lobby.identity;
+            let session = Session::open(&lobby.server, &open.key, &id.name, &id.color, &id.anon, open.link.as_deref());
+            mode = Mode::Canvas(Box::new(Canvas::new(session)));
+            panel.screen = Screen::Home;
+            panel.opening = Some(Opening::Connecting(open.key.clone()));
+            log::info!("opening canvas {} on {}", open.key, lobby.server.base);
+        }
+        if let Mode::Canvas(c) = &mut mode {
+            c.update(&mut painter, world_head);
+            let key = c.session.key.clone();
+            match &c.session.state {
+                State::Open if panel.opening.is_some() => {
+                    panel.opening = None;
+                    panel.screen = Screen::Paint;
+                }
+                State::Password { wrong } => panel.opening = Some(Opening::Password { key, wrong: *wrong }),
+                State::Denied(reason) => panel.opening = Some(Opening::Denied { key, reason: reason.clone() }),
+                _ => {}
+            }
+        }
+        // The scene (the strokes' space) in the room: a shared canvas's view, or the room.
+        let (world_from_scene, scene_from_world) = match &mode {
+            Mode::Canvas(c) => (c.view, c.view.inverse()),
+            _ => (Mat4::IDENTITY, Mat4::IDENTITY),
+        };
+        // Scene units per meter: a brush's size is what it looks like, at any zoom.
+        painter.scale = 1.0 / world_from_scene.x_axis.truncate().length();
+        let to_scene = |p: Vec3| scene_from_world.transform_point3(p);
+        let dir_to_scene = |d: Vec3| scene_from_world.transform_vector3(d).normalize_or(Vec3::Y);
+
         // The panel floats above the hand that is not painting.
         let panel_hand = 1 - painting_hand;
         let placement = match aims[panel_hand] {
@@ -398,7 +485,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                 Press::Panel | Press::Paint if pull <= TRIGGER_DEAD => Press::Off,
                 p => p,
             };
-            painter.hand(h, t, rig.point(tip_of(aim)), rig.dir(up_of(aim)), if press[h] == Press::Paint { pull } else { 0.0 });
+            painter.hand(h, t, to_scene(rig.point(tip_of(aim))), dir_to_scene(rig.dir(up_of(aim))), if press[h] == Press::Paint { pull } else { 0.0 });
             if h == painting_hand {
                 if press[h] == Press::Panel {
                     let was = click;
@@ -444,19 +531,86 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
         let grabbing = painter.tools.tool == Tool::Transform && press[painting_hand] == Press::Paint;
         if grabbing || painter.grab.is_some() {
             if let Some(aim) = aims[painting_hand] {
-                painter.grab(painting_hand, rig.mat() * aim, grabbing, sticks[painting_hand].y, dt);
+                painter.grab(painting_hand, scene_from_world * rig.mat() * aim, grabbing, sticks[painting_hand].y, dt);
             }
             sticks[painting_hand] = Vec2::ZERO;
         }
         loco.update(&mut rig, head_pose, sticks[0], sticks[1], dt);
 
+        // The grips hold a shared canvas: one drags it, two move, turn and zoom it. The
+        // painting hand's ray tells the others where it points on the paper.
+        let mut grips = [false; 2];
+        for (h, g) in grips.iter_mut().enumerate() {
+            let pull = input.grip.state(&session, input.hands[h])?.current_state;
+            *g = if grip_was[h] { pull > GRIP_UP } else { pull > GRIP_DOWN };
+        }
+        grip_was = grips;
+        if let Mode::Canvas(c) = &mut mode {
+            let poses = aims.map(|a| a.map(|a| rig.mat() * a));
+            c.navigate(&mut painter, poses, grips);
+            let at = aims[painting_hand].filter(|_| pointer.at.is_none()).and_then(|aim| c.paper_point(rig.point(aim.w_axis.truncate()), rig.dir(aim.transform_vector3(Vec3::NEG_Z))));
+            let layer = c.doc_layer(painter.active_index()).map(str::to_string);
+            c.send_cursor(at, layer.as_deref());
+        }
+
         // The panel: laid out with this frame's pointer.
-        let panel_frame = placement.map(|_| panel.run(pointer, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets }));
+        let canvas_info = match &mode {
+            Mode::Canvas(c) => Some(CanvasInfo {
+                key: c.session.key.clone(),
+                role: c.session.role.clone(),
+                state: match &c.session.state {
+                    State::Open => "connected".into(),
+                    State::Connecting => "connecting".into(),
+                    State::Reconnecting(why) => format!("reconnecting ({why})"),
+                    other => format!("{other:?}"),
+                },
+                peers: c.session.peers.values().map(|p| (p.name.clone(), p.color.clone())).collect(),
+            }),
+            _ => None,
+        };
+        let panel_frame = placement.map(|_| panel.run(pointer, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets, lobby: &mut lobby, canvas: canvas_info }));
         if let Some(f) = &panel_frame {
             for action in &f.actions {
                 match action {
                     Action::Recenter => rig = Rig::default(),
                     Action::DebugSnapshot => capture = true,
+                    Action::PaintLocal => {
+                        // This device's painting: the one saved, or the demo shapes at first.
+                        let path = crate::painting_path();
+                        let painting = if path.exists() { vdraw_core::file::load(&path).unwrap_or_else(|e| {
+                            log::error!("{}: {e:#}", path.display());
+                            Painting::default()
+                        }) } else { crate::demo::painting() };
+                        log::info!("painting: {}", path.display());
+                        painter.reopen(painting);
+                        save_to = Some(path);
+                        mode = Mode::Local;
+                        panel.screen = Screen::Paint;
+                    }
+                    Action::Leave => {
+                        match &mode {
+                            Mode::Canvas(c) => c.session.close(),
+                            Mode::Local => {
+                                if let (Some(path), true) = (&save_to, painter.changed) {
+                                    if let Err(e) = vdraw_core::file::save(path, &painter.painting) {
+                                        log::error!("saving {}: {e:#}", path.display());
+                                    }
+                                }
+                                save_to = None;
+                            }
+                            Mode::Home => {}
+                        }
+                        painter.reopen(Painting::default());
+                        mode = Mode::Home;
+                        panel.screen = Screen::Home;
+                        panel.opening = None;
+                        lobby.refresh();
+                    }
+                    Action::Password(p) => {
+                        if let Mode::Canvas(c) = &mut mode {
+                            c.session.password(p);
+                        }
+                    }
                 }
             }
         }
@@ -470,12 +624,14 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             let from = aim.w_axis.truncate();
             laser = Some((rig.point(from), rig.point(from + aim.transform_vector3(Vec3::NEG_Z) * 4.0)));
         }
+        // The overlays are drawn in the scene.
+        let laser = laser.map(|(a, b)| (to_scene(a), to_scene(b)));
         let tip = aims[painting_hand].filter(|_| pointer.at.is_none() && !matches!(painter.tools.tool, Tool::Eyedropper | Tool::Transform)).map(|aim| {
-            let (pos, up) = (rig.point(tip_of(aim)), rig.dir(up_of(aim)));
+            let (pos, up) = (to_scene(rig.point(tip_of(aim))), dir_to_scene(rig.dir(up_of(aim))));
             match painter.tools.paint() {
                 Some(b) => BrushTip {
                     pos,
-                    radius: b.radius,
+                    radius: b.radius * painter.scale,
                     color: if b.erase { [1.0; 3] } else { b.color },
                     opacity: if b.erase { 0.0 } else { b.opacity },
                     hardness: b.hardness,
@@ -484,11 +640,15 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                 },
                 None => {
                     painter.eraser_lines(pos, &mut lines);
-                    BrushTip { pos, radius: painter.tools.sweep_size * 0.5, color: [1.0; 3], opacity: 0.0, hardness: 1.0, up, roundness: 1.0 }
+                    BrushTip { pos, radius: painter.tools.sweep_size * 0.5 * painter.scale, color: [1.0; 3], opacity: 0.0, hardness: 1.0, up, roundness: 1.0 }
                 }
             }
         });
         painter.update_drawing();
+        if let Mode::Canvas(c) = &mut mode {
+            c.draw_live(&mut painter);
+            c.cursor_lines(&mut lines);
+        }
         let steps = painter.scene_steps();
 
         let sc = match &mut swapchain {
@@ -530,7 +690,8 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
 
         // Views as late as possible, for the least latency.
         let (_, views) = session.locate_views(VIEW_TYPE, state.predicted_display_time, &stage)?;
-        let eyes: Vec<EyeView> = views
+        // The eyes in the room (the panel), and in the scene (the raymarch).
+        let world_eyes: Vec<EyeView> = views
             .iter()
             .map(|v| {
                 let f = v.fov;
@@ -538,6 +699,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                 EyeView { view_proj: proj * (rig.mat() * pose_mat(v.pose)).inverse(), pos: rig.point(vec3(v.pose.position)) }
             })
             .collect();
+        let eyes: Vec<EyeView> = world_eyes.iter().map(|e| EyeView { view_proj: e.view_proj * world_from_scene, pos: to_scene(e.pos) }).collect();
 
         let cmd = cmds[frame];
         let (w, h) = (sc.width, sc.height);
@@ -548,7 +710,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
         let picking = painter.tools.tool == Tool::Eyedropper && press[painting_hand] == Press::Paint;
         let pick = aims[painting_hand].filter(|_| picking).map(|aim| {
             let world = rig.mat() * aim;
-            EyeView { view_proj: crate::camera::pick_projection(w, h, NEAR, FAR) * world.inverse(), pos: world.w_axis.truncate() }
+            EyeView { view_proj: crate::camera::pick_projection(w, h, NEAR, FAR) * world.inverse() * world_from_scene, pos: to_scene(world.w_axis.truncate()) }
         });
         if picking_was && !picking {
             painter.add_recent(crate::panel::to_srgb(painter.tools.brush.color));
@@ -559,7 +721,12 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
-            rm.record(cmd, frame, &painter.scene(&steps), &eyes, &Overlays { tip, laser, lines: &lines, pick })?;
+            let (paper, paper_grid) = match &mode {
+                Mode::Canvas(c) if c.placed => (c.paper, if c.paper[3] < 1.0 { c.grid() } else { 0.0 }),
+                _ => ([0.0; 4], 0.0),
+            };
+            let scene = vdraw_render::Scene { world_from_scene, paper, paper_grid, ..painter.scene(&steps) };
+            rm.record(cmd, frame, &scene, &eyes, &Overlays { tip, laser, lines: &lines, pick })?;
             if pick.is_some() {
                 let region = vk::BufferImageCopy::default()
                     .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_array_layer(2).layer_count(1))
@@ -585,7 +752,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
             if let (Some(p), Some(f)) = (placement, &panel_frame) {
                 let model = rig.mat() * p.model();
-                let draw = PanelDraw { clip_from_point: [eyes[0].view_proj * model, eyes[1].view_proj * model], primitives: &f.primitives };
+                let draw = PanelDraw { clip_from_point: [world_eyes[0].view_proj * model, world_eyes[1].view_proj * model], primitives: &f.primitives };
                 ui.record(cmd, frame, dst, w, h, 2, &[draw])?;
             }
             // A debug snapshot: both eyes as shown, copied out.
@@ -683,7 +850,7 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
         frame = (frame + 1) % FRAMES;
 
         // Save in the background, at most every half minute, when something changed.
-        if let Some(path) = &save_to {
+        if let (Some(path), Mode::Local) = (&save_to, &mode) {
             if painter.changed && saved_at.elapsed() > Duration::from_secs(30) && saving.as_ref().is_none_or(|t| t.is_finished()) {
                 let (painting, path) = (painter.painting.clone(), path.clone());
                 saving = Some(std::thread::spawn(move || match vdraw_core::file::save(&path, &painting) {
@@ -698,9 +865,13 @@ pub fn run(painting: Painting, save_to: Option<PathBuf>) -> Result<()> {
     if let Some(t) = saving {
         let _ = t.join();
     }
-    if let Some(path) = &save_to {
-        vdraw_core::file::save(path, &painter.painting)?;
-        log::info!("saved {}", path.display());
+    match (&save_to, &mode) {
+        (Some(path), Mode::Local) => {
+            vdraw_core::file::save(path, &painter.painting)?;
+            log::info!("saved {}", path.display());
+        }
+        (_, Mode::Canvas(c)) => c.session.close(),
+        _ => {}
     }
 
     // OpenXR lets go of the swapchain images before Vulkan objects go away.

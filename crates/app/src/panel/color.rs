@@ -398,6 +398,6 @@ pub fn commit(painter: &mut Painter, palettes: &mut Palettes, state: &mut ColorS
             }
         }
         Target::Search => state.search = text.trim().to_string(),
-        Target::LayerName(_) | Target::PresetName => {}
+        _ => {}
     }
 }

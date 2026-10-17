@@ -17,6 +17,14 @@ pub enum Target {
     Search,
     /// A new brush preset's name.
     PresetName,
+    /// A canvas's code, name or link (the start screen's join box).
+    Join,
+    /// A new canvas's name.
+    CanvasName,
+    /// Your name, as others see it.
+    UserName,
+    /// A canvas's password (shown as dots).
+    Password,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +44,10 @@ impl Typing {
             Target::PaletteName(_) => 40,
             Target::Search => 40,
             Target::PresetName => 40,
+            Target::Join => 300,
+            Target::CanvasName => 40,
+            Target::UserName => 32,
+            Target::Password => 200,
         };
         Self { target, text: text.to_string(), shift: false, max }
     }
@@ -48,6 +60,8 @@ pub enum Done {
 }
 
 const ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm.'#"];
+/// More keys, for links and passwords.
+const SYMBOLS: &str = "/:?=&_@!$%";
 
 /// The text and the keys, at the bottom of the panel. Returns what was done, if anything.
 pub fn keyboard(ui: &mut egui::Ui, typing: &mut Typing) -> Option<Done> {
@@ -59,12 +73,16 @@ pub fn keyboard(ui: &mut egui::Ui, typing: &mut Typing) -> Option<Done> {
             Target::PaletteName(_) => "Palette name",
             Target::Search => "Search paints and pigments, e.g. PB29",
             Target::PresetName => "Name for the current brush",
+            Target::Join => "Code, name or link",
+            Target::CanvasName => "Canvas name (empty: a random code)",
+            Target::UserName => "Your name, as others see it",
+            Target::Password => "Password",
         };
         ui.label(RichText::new(label).color(TEXT_DIM).size(13.0));
         // The text, with a caret.
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
         ui.painter().rect(rect, 4.0, BG_3, stroke(1.0, ACCENT_DIM));
-        ui.painter().text(rect.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, format!("{}|", typing.text), egui::FontId::proportional(17.0), TEXT);
+        ui.painter().text(rect.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, format!("{}|", if typing.target == Target::Password { "*".repeat(typing.text.chars().count()) } else { typing.text.clone() }), egui::FontId::proportional(17.0), TEXT);
         let key_w = (ui.available_width() - 9.0 * 4.0) / 10.0;
         let key = |ui: &mut egui::Ui, text: &str, w: f32, on: bool| -> bool {
             let (rect, response) = ui.allocate_exact_size(vec2(w, 40.0), Sense::click());
@@ -73,7 +91,8 @@ pub fn keyboard(ui: &mut egui::Ui, typing: &mut Typing) -> Option<Done> {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(17.0), TEXT);
             response.clicked()
         };
-        for row in ROWS {
+        let symbols = matches!(typing.target, Target::Join | Target::Password);
+        for row in symbols.then_some(SYMBOLS).into_iter().chain(ROWS) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for c in row.chars() {

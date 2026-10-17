@@ -54,6 +54,9 @@ struct ParamsGpu {
     step_count: u32,
     pick_layer: u32,
     world_from_scene: [f32; 16],
+    paper: [f32; 4],
+    paper_grid: f32,
+    pad: [f32; 3],
 }
 
 /// A compositing step as the shader reads it (vdraw_core::Step): what it is (`STEP_*`), the
@@ -114,9 +117,10 @@ pub struct Scene<'a> {
     pub segments: &'a [GpuSegment],
     pub runs: &'a [LayerRun],
     pub version: u64,
+    /// Strokes being drawn (yours, and others' on a shared canvas), made every frame: their
+    /// segments, and the runs of them by step (`first` is a place in `active`).
     pub active: &'a [GpuSegment],
-    /// The step the stroke being drawn goes to (None: it is not drawn).
-    pub active_step: Option<usize>,
+    pub active_runs: &'a [LayerRun],
     /// The compositing steps (`LayerRun::step` is a place here).
     pub steps: &'a [SceneStep],
     /// Paint mixes as paint (vdraw_core::Mix::Pigment), not as light.
@@ -124,6 +128,11 @@ pub struct Scene<'a> {
     /// Where the scene (the strokes, and the eyes given to `record`) is in the room, where the
     /// sky and the floor are: identity for a painting in the room; a shared canvas's view.
     pub world_from_scene: Mat4,
+    /// A shared canvas's paper: the plane z = 0 of the scene, under every layer, in sRGB with
+    /// its alpha (alpha 0 and no grid: no paper). `paper_grid`: how much a grid on it shows
+    /// (where the paper is see-through, it shows the plane while the canvas moves).
+    pub paper: [f32; 4],
+    pub paper_grid: f32,
 }
 
 /// What is drawn over the painting: the brush tip, the pointer's laser, and lines.
@@ -539,15 +548,14 @@ impl Raymarcher {
             vdraw_core::clusters(&self.static_chunks, 0, &mut self.static_clusters);
             self.static_version = Some(scene.version);
         }
+        let n_static = scene.segments.len();
         let mut active_chunks = Vec::new();
-        if scene.active_step.is_some() {
-            vdraw_core::chunks(scene.active, &mut active_chunks);
+        let mut run_chunks = Vec::new();
+        for run in scene.active_runs {
+            vdraw_core::chunks(&scene.active[run.first..run.first + run.count], &mut run_chunks);
+            active_chunks.extend(run_chunks.iter().map(|c| GpuChunk { first: c.first + (n_static + run.first) as u32, layer: run.step as u32, ..*c }));
         }
-        let (n_static, n_static_chunks) = (scene.segments.len(), self.static_chunks.len());
-        for c in &mut active_chunks {
-            c.first += n_static as u32;
-            c.layer = scene.active_step.unwrap_or(0) as u32;
-        }
+        let n_static_chunks = self.static_chunks.len();
         let n_segments = n_static + scene.active.len();
         let n_chunks = n_static_chunks + active_chunks.len();
         let mut active_clusters = Vec::new();
@@ -609,6 +617,8 @@ impl Raymarcher {
         p.line_count = overlays.lines.len() as u32;
         p.step_count = scene.steps.len() as u32;
         p.world_from_scene = scene.world_from_scene.to_cols_array();
+        p.paper = scene.paper;
+        p.paper_grid = scene.paper_grid;
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {

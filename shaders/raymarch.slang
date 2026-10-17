@@ -54,6 +54,9 @@ struct Params
     // The scene (where the strokes are: a shared canvas's space) in the room, where the sky and
     // the floor are: a turn, one scale, a move. Identity when the painting is in the room.
     float4x4 worldFromScene;
+    float4 paper;     // a shared canvas's paper (the plane z = 0): sRGB, alpha
+    float paperGrid;  // how much a grid on the paper shows
+    float pad0, pad1, pad2;
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -511,6 +514,41 @@ float3 background(float3 o, float3 dir, float pix, out float tFloor)
     return sky;
 }
 
+// A shared canvas's paper, the plane z = 0 of the scene, under every layer (as the 2D app's
+// canvas starts as its paper): its color over the world behind, by its alpha, seen from
+// either side; where it is see-through, a grid shows it (while the canvas moves). `color`:
+// the world behind, linear. Returns the color the canvas starts as, linear.
+float3 paperOver(float3 o, float3 dir, float pix, float3 color)
+{
+    if ((params.paper.a <= 0.0 && params.paperGrid <= 0.0) || abs(dir.z) < 1e-6)
+        return color;
+    float t = -o.z / dir.z;
+    if (t <= 0.0)
+        return color;
+    float2 q = (o + dir * t).xy;
+    color = linearFromSrgb(lerp(srgbFromLinear(color), params.paper.rgb, params.paper.a)); // in sRGB, as the 2D app
+    if (params.paperGrid > 0.0)
+    {
+        // Lines at powers of ten of the scene's units, the finer fading out as they crowd.
+        float w = t * pix / max(abs(dir.z), 0.05); // one pixel on the paper
+        float level = log2(max(w, 1e-12) * 24.0) / log2(10.0);
+        float l0 = floor(level);
+        float fade = level - l0;
+        float line = 0.0;
+        for (int k = 0; k < 2; k++)
+        {
+            float spacing = pow(10.0, l0 + float(k));
+            float2 g = abs(frac(q / spacing - 0.5) - 0.5) * spacing / max(w, 1e-12);
+            float on = 1.0 - saturate(min(g.x, g.y));
+            line = max(line, on * (k == 0 ? 1.0 - fade : 1.0));
+        }
+        float3 ink = dot(params.paper.rgb, float3(0.3, 0.6, 0.1)) * params.paper.a > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
+        float fadeFar = exp(-t * 0.05);
+        color = lerp(color, ink, 0.35 * params.paperGrid * line * fadeFar);
+    }
+    return color;
+}
+
 // One layer's (or mask's) strokes along the ray: list positions j to end of the tile's list.
 // Premultiplied sRGB, and alpha (0 where it has no paint on this ray).
 float4 drawLayer(uint j, uint end, bool ordered, float3 o, float3 dir, float tFloor)
@@ -944,6 +982,8 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     // The eyedropper's view starts clear: it picks the paint alone, and nothing where there is
     // none (as the 2D app's, without its paper).
     bool picking = id.z == params.pickLayer;
+    if (!picking)
+        color = paperOver(o, dir, pix, color);
     float4 canvas = picking ? float4(0.0) : float4(srgbFromLinear(color), 1.0);
     float4 base = 0.0;
     uint baseBlend = 0;

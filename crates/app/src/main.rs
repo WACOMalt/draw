@@ -14,8 +14,10 @@
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
+mod canvas;
 mod debug;
 mod demo;
+mod lobby;
 mod painter;
 mod palettes;
 mod presets;
@@ -76,6 +78,26 @@ fn import(args: &[String]) -> Result<()> {
     vdraw_core::file::save(&to, &painting)?;
     log::info!("saved {}", to.display());
     Ok(())
+}
+
+/// A shared canvas's painting and place, as VR opens it: joined as a guest, the document
+/// waited for (10 s at most).
+fn canvas_snapshot(server: &str, input: &str) -> Result<(vdraw_core::Painting, snapshot::CanvasView)> {
+    let srv = vdraw_net::Server::new(server, None);
+    let (key, link) = srv.resolve(input)?.with_context(|| format!("no canvas {input:?} on {server}"))?;
+    let id = vdraw_net::identity::Identity::default();
+    let session = vdraw_net::session::Session::open(&srv, &key, "vdraw snapshot", &id.color, &id.anon, link.as_deref());
+    let mut c = canvas::Canvas::new(session);
+    let mut painter = painter::Painter::new(vdraw_core::Painting::default());
+    let head = glam::Mat4::from_translation(glam::Vec3::new(0.0, 1.6, 0.0));
+    let t0 = std::time::Instant::now();
+    while !c.update(&mut painter, head) {
+        anyhow::ensure!(t0.elapsed().as_secs() < 10, "{key}: no document after 10 s ({:?})", c.session.state);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    log::info!("{key}: {} layers, {} strokes; frame {:?}", c.session.doc.layers.len(), c.session.doc.strokes.len(), c.frame);
+    c.session.close();
+    Ok((painter.painting.clone(), snapshot::CanvasView { world_from_scene: c.view, paper: c.paper, grid: 0.0 }))
 }
 
 fn main() -> Result<()> {
@@ -146,21 +168,36 @@ fn main() -> Result<()> {
                 let eye = vdraw_render::EyeView { view_proj: e.view_proj, pos: e.world.pos };
                 let size = args.iter().any(|a| a == "--size").then_some(size).unwrap_or((info.size[0], info.size[1]));
                 log::info!("replay: {} eye, {}x{}; it took {:.2} ms per frame (both eyes) in VR", ["left", "right"][i], size.0, size.1, info.gpu_ms);
-                return snapshot::run(path, size.0, size.1, painting, snapshot::View::Eye(eye), tip, bench, None, None);
+                return snapshot::run(path, size.0, size.1, painting, snapshot::View::Eye(eye), tip, bench, None, None, None);
             }
-            snapshot::run(path, size.0, size.1, painting, snapshot::View::Orbit(cam), tip, bench, panel, sweep)
+            // --canvas KEY [--server URL] [--grid]: a shared canvas, as VR opens it (in front of
+            // a head at 1.6 m looking ahead), seen from the orbit camera (by default: the head).
+            if let Some(key) = args.iter().position(|a| a == "--canvas").and_then(|i| args.get(i + 1)) {
+                let server = args.iter().position(|a| a == "--server").and_then(|i| args.get(i + 1)).map_or(vdraw_net::identity::DEFAULT_SERVER, String::as_str);
+                let (painting, view) = canvas_snapshot(server, key)?;
+                let cam = if args.iter().any(|a| a == "--orbit") { cam } else { camera::Orbit { target: glam::Vec3::new(0.0, 1.6, -1.3), yaw: 0.0, pitch: 0.0, distance: 1.3 } };
+                let view = snapshot::CanvasView { grid: if args.iter().any(|a| a == "--grid") { 1.0 } else { 0.0 }, ..view };
+                return snapshot::run(path, size.0, size.1, painting, snapshot::View::Orbit(cam), tip, bench, panel, sweep, Some(view));
+            }
+            snapshot::run(path, size.0, size.1, painting, snapshot::View::Orbit(cam), tip, bench, panel, sweep, None)
         }
         Some("--import") => import(&args),
         Some("--xr") => {
-            // A demo is not saved; anything else opens and saves a painting file: --open's, or
-            // the default one (the demo shapes when it does not exist yet).
-            if args.iter().any(|a| a == "--demo") {
-                return xr::run(demo(&args)?.0, None);
-            }
-            let path = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from).unwrap_or_else(painting_path);
-            let painting = if path.exists() { vdraw_core::file::load(&path)? } else { demo::painting() };
-            log::info!("painting: {}", path.display());
-            xr::run(painting, Some(path))
+            // --demo X or --open file: paint on this device at once (a demo is not saved).
+            // --canvas KEY: open a shared canvas at once. Else the start screen. --server URL:
+            // the 2D app's server (the one you last used when not given).
+            let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+            let start = if args.iter().any(|a| a == "--demo") {
+                xr::Start::Local(demo(&args)?.0, None)
+            } else if let Some(path) = arg("--open").map(std::path::PathBuf::from) {
+                let painting = if path.exists() { vdraw_core::file::load(&path)? } else { demo::painting() };
+                xr::Start::Local(painting, Some(path))
+            } else if let Some(key) = arg("--canvas") {
+                xr::Start::Canvas(key)
+            } else {
+                xr::Start::Home
+            };
+            xr::run(start, arg("--server"))
         }
         _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),
     }

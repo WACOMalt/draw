@@ -414,6 +414,86 @@ impl Painting {
         Built { steps, runs, strokes }
     }
 
+    /// The first stroke number of a layer's run (its strokes, or its mask's), from `built`.
+    fn first_number(built: &Built, step: usize) -> u32 {
+        // Stroke numbers count on through the runs, in step order.
+        let mut n = 0;
+        for r in &built.runs {
+            if r.step == step {
+                break;
+            }
+            let (layer, mask) = match built.steps[r.step] {
+                Step::Layer(l) => (l, false),
+                Step::Mask(l) => (l, true),
+                _ => continue,
+            };
+            n += built.strokes.iter().filter(|s| s.layer == layer && s.mask == mask).count() as u32;
+        }
+        n
+    }
+
+    /// Puts a stroke into layer `layer` (by place), its strokes or its mask's, at `index`, and
+    /// keeps `built` and `out` as `build` would make them, without making them all again: its
+    /// segments go in among the others, and the stroke numbers after it count on by one.
+    pub fn insert_stroke(&mut self, built: &mut Built, out: &mut Vec<GpuSegment>, layer: usize, mask: bool, index: usize, stroke: Stroke) {
+        let l = &mut self.layers[layer];
+        let ordered = l.ordered;
+        let list = if mask { &mut l.mask.as_mut().expect("the layer has a mask").strokes } else { &mut l.strokes };
+        let index = index.min(list.len());
+        let Some(step) = built.step_of(layer, mask) else {
+            list.insert(index, stroke);
+            return;
+        };
+        let id = Self::first_number(built, step) + index as u32;
+        let mut segs = Vec::new();
+        stroke.segments_in(self.filter, id, ordered, &mut segs);
+        list.insert(index, stroke);
+        let run = built.runs.iter().position(|r| r.step == step).expect("a run per drawing step");
+        let r = built.runs[run];
+        let at = r.first + out[r.first..r.first + r.count].partition_point(|g| (g.style[1] as u32) < id);
+        for g in &mut out[at..] {
+            g.style[1] += 1.0;
+        }
+        let n = segs.len();
+        out.splice(at..at, segs);
+        built.runs[run].count += n;
+        for r in &mut built.runs[run + 1..] {
+            r.first += n;
+        }
+        for s in built.strokes.iter_mut().filter(|s| s.layer == layer && s.mask == mask && s.index >= index) {
+            s.index += 1;
+        }
+        built.strokes.insert(id as usize, StrokeRef { layer, mask, index });
+    }
+
+    /// Takes out the stroke at `index` of layer `layer` (by place), its strokes or its mask's,
+    /// keeping `built` and `out` as `build` would make them (see `insert_stroke`).
+    pub fn remove_stroke(&mut self, built: &mut Built, out: &mut Vec<GpuSegment>, layer: usize, mask: bool, index: usize) -> Stroke {
+        let l = &mut self.layers[layer];
+        let list = if mask { &mut l.mask.as_mut().expect("the layer has a mask").strokes } else { &mut l.strokes };
+        let stroke = list.remove(index);
+        let Some(step) = built.step_of(layer, mask) else { return stroke };
+        let id = Self::first_number(built, step) + index as u32;
+        let run = built.runs.iter().position(|r| r.step == step).expect("a run per drawing step");
+        let r = built.runs[run];
+        let range = &out[r.first..r.first + r.count];
+        let (from, to) = (r.first + range.partition_point(|g| (g.style[1] as u32) < id), r.first + range.partition_point(|g| (g.style[1] as u32) <= id));
+        let n = to - from;
+        out.drain(from..to);
+        for g in &mut out[from..] {
+            g.style[1] -= 1.0;
+        }
+        built.runs[run].count -= n;
+        for r in &mut built.runs[run + 1..] {
+            r.first -= n;
+        }
+        built.strokes.remove(id as usize);
+        for s in built.strokes.iter_mut().filter(|s| s.layer == layer && s.mask == mask && s.index > index) {
+            s.index -= 1;
+        }
+        stroke
+    }
+
     /// The box around every sample (None when there are none).
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
         let mut points = self.layers.iter().flat_map(|l| &l.strokes).flat_map(|s| &s.samples).map(|s| s.pos);
@@ -582,6 +662,34 @@ mod tests {
     /// Names, bottom first.
     fn names(p: &Painting) -> Vec<&str> {
         p.layers.iter().map(|l| l.name.as_str()).collect()
+    }
+
+    #[test]
+    fn strokes_go_in_and_out_as_a_build_would_make_them() {
+        let mut p = Painting::default();
+        p.layers[0].strokes = vec![stroke(0.0), stroke(1.0)];
+        let top = p.add_layer(Some(0));
+        p.layers[top].strokes = vec![stroke(2.0)];
+        p.layers[top].mask = Some(Mask { enabled: true, strokes: vec![stroke(3.0)] });
+        let mut out = Vec::new();
+        let mut built = p.build(&mut out);
+        let check = |p: &Painting, built: &Built, out: &Vec<GpuSegment>| {
+            let mut want = Vec::new();
+            let b = p.build(&mut want);
+            assert_eq!((built.steps.clone(), built.runs.clone(), built.strokes.clone()), (b.steps, b.runs, b.strokes));
+            assert_eq!(bytemuck::cast_slice::<_, u8>(out), bytemuck::cast_slice::<_, u8>(&want));
+        };
+        p.insert_stroke(&mut built, &mut out, 0, false, 1, stroke(4.0));
+        check(&p, &built, &out);
+        p.insert_stroke(&mut built, &mut out, top, true, 0, stroke(5.0));
+        check(&p, &built, &out);
+        p.insert_stroke(&mut built, &mut out, top, false, 1, stroke(6.0));
+        check(&p, &built, &out);
+        let gone = p.remove_stroke(&mut built, &mut out, 0, false, 0);
+        assert_eq!(gone.samples[0].pos.x, 0.0);
+        check(&p, &built, &out);
+        p.remove_stroke(&mut built, &mut out, top, true, 1);
+        check(&p, &built, &out);
     }
 
     #[test]

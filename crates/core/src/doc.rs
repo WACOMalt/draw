@@ -697,6 +697,12 @@ pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], frame: &Frame) -> crate::Stro
 }
 
 impl Doc {
+    /// The layers a painting of the document has, in paint order: the live ones but adjustment
+    /// and shape layers.
+    pub fn painted_layers(&self) -> Vec<&DocLayer> {
+        self.paint_order().into_iter().filter(|l| !matches!(l.kind.as_deref(), Some("adjust") | Some("shape"))).collect()
+    }
+
     /// The box (x0, y0, x1, y1) around every live stroke's points and brush (None: none).
     pub fn bounds(&self) -> Option<[f64; 4]> {
         let mut b: Option<[f64; 4]> = None;
@@ -718,11 +724,7 @@ impl Doc {
         let mut layers = Vec::new();
         let mut ids = Vec::new();
         let mut num: HashMap<&str, u32> = HashMap::new();
-        for l in self.paint_order() {
-            let kind = l.kind.as_deref();
-            if kind == Some("adjust") || kind == Some("shape") {
-                continue;
-            }
+        for l in self.painted_layers() {
             let id = layers.len() as u32 + 1;
             num.insert(&l.id, id);
             let group = l.is_group();
