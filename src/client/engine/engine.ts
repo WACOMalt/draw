@@ -1341,6 +1341,25 @@ export class Engine {
   }
 
   /** Shows or hides the 3D layers on this device only (ed.show3dLayers). */
+  /**
+   * Makes a paint layer a 3D layer (VR paints in it with depth, and the Select tool turns it in
+   * 3D) or a flat layer again (its strokes keep their depth, unused: it draws the same). One op;
+   * undo turns it back.
+   */
+  setThreeD(id: string, on: boolean): void {
+    if (!ed.canEdit) return;
+    const l = this.doc.layer(id);
+    if (!l || (l.kind ?? 'paint') !== 'paint' || !!l.threed === on) return;
+    if (on && !ed.threedOk) return showToast('3D layers need a newer server. Canvases on this device have them.');
+    // The transform box changes kind (2D or 3D): it closes, and the Select tool opens the other.
+    if (ed.transform?.id === id) {
+      if (!this.transformIdle()) return showToast('Apply or cancel the transform first');
+      this.cancelTransform();
+    }
+    this.updateLayer(id, { threed: on });
+    if (on && !ed.show3dLayers) this.setShow3dLayers(true);
+  }
+
   setShow3dLayers(on: boolean): void {
     ed.show3dLayers = on;
     this.refreshLayers();
@@ -2216,6 +2235,11 @@ export class Engine {
         const changes = this.doc.apply(m.seq, m.op, m.by);
         if (m.by === ed.clientId) this.doc.dropPending(m.opId);
         const op = m.op;
+        // Someone else made the layer in the transform box 3D or flat: the box is of the wrong kind.
+        if (op.type === 'layer.update' && op.props.threed !== undefined && m.by !== ed.clientId && ed.transform?.id === op.id) {
+          if (!this.transformIdle()) showToast('Someone changed the layer between 2D and 3D: the transform was cancelled');
+          this.cancelTransform();
+        }
         if (changes) {
           // A transform or a duplicate: strokes changed in place, or new copies.
           for (const st of changes.changed) {

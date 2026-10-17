@@ -253,6 +253,10 @@ class EditorState {
   get pigmentOk(): boolean {
     return this.serverSupports.includes('pigment');
   }
+  /** The server takes 3D layers (layer.threed, and 3D transforms of them). */
+  get threedOk(): boolean {
+    return this.serverSupports.includes('threed');
+  }
   activeLayerId = $state<string | null>(null);
   peers = $state<PeerView[]>([]);
   clientId = $state<string | null>(null);

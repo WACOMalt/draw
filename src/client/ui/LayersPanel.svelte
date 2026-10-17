@@ -53,6 +53,8 @@
   let editing = $state<string | null>(null);
   let adjustMenu = $state(false);
   const canFx = $derived(!!active && takesEffects(active.kind) && ed.effectsOk);
+  /** The active layer can be 3D: a paint layer. */
+  const canThreeD = $derived(!!active && (active.kind ?? 'paint') === 'paint');
   const fxShown = $derived(!!active && ed.effectsLayer === active.id);
   const EFFECT_LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow', kaleidoscope: 'Kaleidoscope' };
   /** Opens the effects window of a layer (or closes it when it is open). */
@@ -600,6 +602,21 @@
       disabled={!canFx}
       onclick={() => active && openEffects(active.id, true)}>fx</button
     >
+    <!-- 2D or 3D: a 3D layer keeps depth (VR paints in it) and the Select tool turns it in 3D. -->
+    <button
+      class="icon threedbtn"
+      title={!canThreeD
+        ? '3D layers are paint layers'
+        : active?.threed
+          ? 'A 3D layer: click to make it flat (2D) again. It draws the same.'
+          : ed.threedOk
+            ? 'Make it a 3D layer: the Select tool then turns it in 3D, and in VR it paints with depth'
+            : '3D layers need a newer server. Canvases on this device have them.'}
+      aria-pressed={!!active?.threed}
+      class:on={!!active?.threed}
+      disabled={!canThreeD || !ed.canEdit || (!active?.threed && !ed.threedOk)}
+      onclick={() => active && engine?.setThreeD(active.id, !active.threed)}>3D</button
+    >
     <button
       class="icon"
       title={active?.mask ? 'Delete the layer mask' : 'Add a layer mask'}
@@ -773,6 +790,10 @@
   .fxbtn {
     font-style: italic;
     font-weight: 600;
+  }
+  .threedbtn {
+    font-size: 11px;
+    font-weight: 700;
   }
   .tag.fx {
     color: var(--accent);

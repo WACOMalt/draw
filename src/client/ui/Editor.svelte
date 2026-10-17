@@ -223,7 +223,7 @@
       {#if ed.effectsLayer && engine}<KaleidoscopeGizmo {engine} /><EffectsWindow {engine} />{/if}
       {#if ed.transform && engine}
         <!-- A 3D layer turns in 3D (one m3 op); anything else gets the 2D transform. -->
-        {#key ed.transform.id}
+        {#key `${ed.transform.id}:${!!ed.layers.find((l) => l.id === ed.transform?.id)?.threed}`}
           {#if engine.takes3d(ed.transform.id)}<Transform3Overlay {engine} id={ed.transform.id} />{:else}<TransformOverlay {engine} id={ed.transform.id} />{/if}
         {/key}
       {/if}
