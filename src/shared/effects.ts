@@ -2,7 +2,7 @@
 
 import type { Adjust, Affine, Affine3, Layer, LayerEffect } from './types';
 import { LIMITS } from './types';
-import { flatAffine } from './layers';
+import { allThreeD, flatAffine } from './layers';
 import { applyM3, buildM3, quatAxisAngle, quatMul, quatNormalize, rotation3, type Quat } from './transform3';
 
 /** Layers that can have effects: paint and shape layers, and groups. */
@@ -188,4 +188,76 @@ export function transformLayerLengths<L extends Layer>(l: L, m: Affine): L {
     ...(l.effects?.length ? { effects: transformEffects(l.effects, m) } : {}),
     ...(l.adjust ? { adjust: transformAdjust(l.adjust, m) } : {}),
   };
+}
+
+/** The kaleidoscope's step is a 3D one: a turn in 3D, or depths. */
+export function isKaleidoscope3(e: LayerEffect): boolean {
+  return !!e.turn || e.cz !== undefined || e.dz !== undefined;
+}
+
+/**
+ * A kaleidoscope made a flat step: the turn in the paper and the scale nearest to what the 2D view
+ * shows of its step (straight on, at the pivot), the same move of the pivot; the tilt and the
+ * depths go. (A flat layer's kaleidoscope is always flat.)
+ */
+export function flattenKaleidoscope(e: LayerEffect): LayerEffect {
+  const [a, b, c, d, tx, ty] = kaleidoscopeCopies({ ...e, count: 1 })[0];
+  const cx = e.cx ?? 0, cy = e.cy ?? 0;
+  const out: LayerEffect = {
+    ...e,
+    angle: Math.round(((Math.atan2(b - c, a + d) * 180) / Math.PI) * 1000) / 1000,
+    scale: Math.min(100, Math.max(0.01, Math.sqrt(Math.abs(a * d - b * c)))),
+    dx: a * cx + c * cy + tx - cx,
+    dy: b * cx + d * cy + ty - cy,
+  };
+  delete out.turn;
+  delete out.cz;
+  delete out.dz;
+  return out;
+}
+
+/** A kaleidoscope made a 3D step: its angle as a turn about the axis out of the paper. (A 3D layer's is always 3D.) */
+export function liftKaleidoscope(e: LayerEffect): LayerEffect {
+  if (e.turn) return e;
+  return { ...e, angle: 0, turn: quatAxisAngle(0, 0, 1, ((e.angle ?? 0) * Math.PI) / 180) };
+}
+
+/**
+ * A 3D step's angle, degrees: how far it turns about its axis (minus when the axis points into the
+ * paper). The angle of a flat step.
+ */
+export function kaleidoscopeAngle(e: LayerEffect): number {
+  if (!e.turn) return e.angle ?? 0;
+  const [x, y, z, w] = quatNormalize(e.turn);
+  const s = Math.hypot(x, y, z);
+  const a = (2 * Math.atan2(s, w) * 180) / Math.PI;
+  return z < 0 ? -a : a;
+}
+
+/** The step turned `deg` degrees about its axis (a 3D step: the axis kept; out of the paper when it has none). */
+export function withKaleidoscopeAngle(e: LayerEffect, deg: number): Partial<LayerEffect> {
+  if (!e.turn) return { angle: deg };
+  const [x, y, z] = quatNormalize(e.turn);
+  const s = Math.hypot(x, y, z);
+  let axis: [number, number, number] = s > 1e-9 ? [x / s, y / s, z / s] : [0, 0, 1];
+  if (axis[2] < 0) axis = [-axis[0], -axis[1], -axis[2]];
+  return { turn: quatAxisAngle(axis[0], axis[1], axis[2], (deg * Math.PI) / 180) };
+}
+
+/**
+ * The effects to set so each kaleidoscope has its layer's kind: a 3D step on a layer or group whose
+ * paint layers are all 3D (when `ok3d`: the server takes 3D steps), a flat step elsewhere.
+ * `layers`: the live layers, as they will be.
+ */
+export function kaleidoscopeFixes(layers: Layer[], ok3d: boolean): { id: string; effects: LayerEffect[] }[] {
+  const out: { id: string; effects: LayerEffect[] }[] = [];
+  for (const l of layers) {
+    const i = l.effects?.findIndex((e) => e.type === 'kaleidoscope') ?? -1;
+    if (i < 0) continue;
+    const e = l.effects![i];
+    const three = ok3d && allThreeD(layers, l.id);
+    const fixed = three && !e.turn ? liftKaleidoscope(e) : !three && isKaleidoscope3(e) ? flattenKaleidoscope(e) : null;
+    if (fixed) out.push({ id: l.id, effects: l.effects!.map((x, j) => (j === i ? fixed : x)) });
+  }
+  return out;
 }

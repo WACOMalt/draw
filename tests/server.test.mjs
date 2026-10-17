@@ -1304,6 +1304,23 @@ try {
     const st2 = shared.kaleidoscopeStep(flatK);
     const flatOk = shared.kaleidoscopeCopies(flatK).every((c) => { mm = shared.compose(st2, mm); return c.every((v, i) => Math.abs(v - mm[i]) < 1e-9); });
     check(flatOk && !shared.kaleidoscopeTilts(flatK), 'kaleido3d: a flat step gives the same copies as before');
+    // A kaleidoscope has its layer's kind: lifted on a 3D layer (same copies), flattened on a flat
+    // one (the 2D view's nearest step); a 3D step's angle turns about its own axis.
+    const lifted = shared.liftKaleidoscope(flatK);
+    const sameCopies = (a, b) => shared.kaleidoscopeCopies3(a).every((c, i) => c.every((v, j) => Math.abs(v - shared.kaleidoscopeCopies3(b)[i][j]) < 1e-9));
+    check(lifted.turn && lifted.angle === 0 && sameCopies(lifted, flatK) && Math.abs(shared.kaleidoscopeAngle(lifted) - 37) < 1e-9, 'kaleido3d: a lifted step is a 3D one with the same copies');
+    const flatBack = shared.flattenKaleidoscope(lifted);
+    check(!flatBack.turn && Math.abs(flatBack.angle - 37) < 1e-6 && Math.abs(flatBack.scale - 1.1) < 1e-9 && Math.abs(flatBack.dx - 2) < 1e-9, 'kaleido3d: flattening a step in the paper gives it back');
+    const tilted = { ...lifted, turn: [Math.sin(0.3), 0, 0, Math.cos(0.3)], cz: 2 };
+    const t40 = { ...tilted, ...shared.withKaleidoscopeAngle(tilted, 40) };
+    check(Math.abs(shared.kaleidoscopeAngle(t40) - 40) < 1e-9 && Math.abs(t40.turn[1]) < 1e-12 && t40.turn[0] > 0, 'kaleido3d: a 3D step\'s angle turns about its axis');
+    const L3 = { ...layer('fx3', { threed: true }), effects: [flatK] }, LF = { ...layer('fxF'), effects: [tilted] };
+    const G = { ...layer('fxG', { kind: 'group', blend: 'pass' }), effects: [flatK] }, GK = { ...layer('fxK', { threed: true }), parent: 'fxG' };
+    const fixes = shared.kaleidoscopeFixes([L3, LF, G, GK], true);
+    const fixOf = (id) => fixes.find((f) => f.id === id)?.effects[0];
+    check(fixOf('fx3')?.turn && !shared.isKaleidoscope3(fixOf('fxF')) && fixOf('fxG')?.turn && fixes.length === 3, 'kaleido3d: fixes give each kaleidoscope its layer\'s kind');
+    check(shared.kaleidoscopeFixes([L3, LF], false).map((f) => f.id).join() === 'fxF', 'kaleido3d: without 3D steps on the server, only flattening');
+    check(shared.kaleidoscopeFixes([{ ...L3, effects: [lifted] }, { ...LF, effects: [flatK] }], true).length === 0, 'kaleido3d: no fix when the kinds agree');
     // A 3D layer transform carries the step along exactly: copy i of the moved layer is the
     // moved copy i (m3 · copy · m3⁻¹). Turning a flat step's layer out of the paper tilts it.
     await tryOp({ type: 'layer.add', layer: layer('vrKAL3D001', { threed: true, effects: [flatK] }) });
