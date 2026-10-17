@@ -34,6 +34,7 @@ import {
   type ShapeProps,
   type ShapeUpdate,
   type StrokeVector,
+  type StrokeVr,
   POINT_STRIDE,
   POINT_TYPES,
 } from './types';
@@ -240,6 +241,20 @@ export function validatePoints(v: unknown, minPoints = 1): number[] {
   return out;
 }
 
+/**
+ * The depth of a VR stroke's points `pts` (validated): `z`, one depth per point within
+ * ±LIMITS.maxCoord, and optionally `up`, a direction per point (three numbers, each -1 to 1).
+ */
+export function validateStrokeVr(v: unknown, pts: number[]): StrokeVr {
+  const o = obj(v, 'vr');
+  const n = pts.length / 3;
+  if (!Array.isArray(o.z) || o.z.length !== n) fail('bad vr.z length');
+  const z = o.z.map((x) => num(x, -LIMITS.maxCoord, LIMITS.maxCoord, 'vr.z'));
+  if (o.up === undefined) return { z };
+  if (!Array.isArray(o.up) || o.up.length !== pts.length) fail('bad vr.up length');
+  return { z, up: o.up.map((x) => num(x, -1, 1, 'vr.up')) };
+}
+
 function blend(v: unknown): LayerBlend {
   if (v === 'pass') return 'pass'; // groups only (checked where the layer kind is known)
   if (typeof v !== 'string' || !(BLEND_MODES as readonly string[]).includes(v)) fail('bad blend');
@@ -269,16 +284,20 @@ export function validateOp(v: unknown): Op {
   switch (o.type) {
     case 'stroke.add': {
       const s = obj(o.stroke, 'stroke');
+      const pts = validatePoints(s.pts);
+      // A VR stroke paints the layer itself, as a brush does: not a mask, not a vector.
+      if (s.vr !== undefined && (s.mask !== undefined || s.vector !== undefined)) fail('vr strokes take no mask or vector');
       return {
         type: 'stroke.add',
         stroke: {
           id: id(s.id),
           layerId: id(s.layerId, 'layerId'),
           brush: validateBrush(s.brush),
-          pts: validatePoints(s.pts),
+          pts,
           ...(s.mask !== undefined ? { mask: id(s.mask, 'mask') } : {}),
           // A vector stroke (from a .bdraw file; live clients make them with shapes.toPaint).
           ...(s.vector !== undefined && s.mask === undefined ? { vector: validateVector(s.vector) } : {}),
+          ...(s.vr !== undefined ? { vr: validateStrokeVr(s.vr, pts) } : {}),
         },
       };
     }
@@ -304,7 +323,10 @@ export function validateOp(v: unknown): Op {
         if (props.effects && !takesEffects(kind)) fail('adjustment layers take no effects');
         if (!props.effects) delete props.effects;
       }
-      return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
+      // Set at creation only (layer.update leaves it out, as `kind`); false is left out.
+      const vr = l.vr !== undefined && bool(l.vr, 'vr');
+      if (vr && kind !== undefined && kind !== 'paint') fail('vr layers are paint layers');
+      return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props, ...(vr ? { vr } : {}) } };
     }
     case 'layer.update':
       return { type: 'layer.update', id: id(o.id), props: layerProps(o.props, true) };

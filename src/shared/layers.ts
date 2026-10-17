@@ -10,7 +10,7 @@
 //   before the group itself. The panel shows the reverse: the group's row, then its layers.
 
 import { derivedId } from './ids';
-import type { Affine, Brush, Layer, Shape, Stroke } from './types';
+import type { Affine, Brush, Layer, Shape, Stroke, StrokeVr } from './types';
 
 export interface LayerNode {
   layer: Layer;
@@ -146,10 +146,11 @@ export const applyPoint = (m: Affine, x: number, y: number): [number, number] =>
 /**
  * A stroke after a transform: points mapped, the brush size scaled by √|det| (the average scale),
  * and a fixed tip angle turned with the rotation. A non-uniform scale or a skew keeps the tip
- * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). Null: a point would go
- * past `maxCoord` or the size out of range.
+ * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). The depth of a VR
+ * stroke follows (transformVr). Null: a point or a depth would go past `maxCoord` or the size out
+ * of range.
  */
-export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector'> | null {
+export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector' | 'vr'> | null {
   const pts = s.pts.slice();
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1];
@@ -176,7 +177,38 @@ export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRang
     if (!validAffine(vm)) return null;
     return { pts, brush, vector: { ...s.vector, m: vm } };
   }
+  if (s.vr) {
+    const vr = transformVr(s.vr, m, maxCoord);
+    if (!vr) return null;
+    return { pts, brush, vr };
+  }
   return { pts, brush };
+}
+
+/**
+ * The depth of a VR stroke after a transform of the paper: the 2D affine `m` as a 3D map that
+ * scales depth by √|det| (the average scale, as brush sizes). Depths scale; each up direction
+ * goes through the linear part of that map and is made unit again (rounded to 3 decimals, as
+ * clients send them; one that would vanish stays as it was). Null: a depth would go past `maxCoord`.
+ */
+export function transformVr(vr: StrokeVr, m: Affine, maxCoord: number): StrokeVr | null {
+  const [a, b, c, d] = m;
+  const k = Math.sqrt(Math.abs(a * d - b * c));
+  const z = vr.z.map((v) => v * k);
+  if (!z.every((v) => Math.abs(v) <= maxCoord)) return null;
+  if (!vr.up) return { z };
+  const up = vr.up.slice();
+  const round = (v: number) => Math.round(v * 1000) / 1000;
+  for (let i = 0; i < up.length; i += 3) {
+    const ux = up[i], uy = up[i + 1], uz = up[i + 2];
+    const nx = a * ux + c * uy, ny = b * ux + d * uy, nz = k * uz;
+    const len = Math.hypot(nx, ny, nz);
+    if (!(len > 1e-9 && Number.isFinite(len))) continue;
+    up[i] = round(nx / len);
+    up[i + 1] = round(ny / len);
+    up[i + 2] = round(nz / len);
+  }
+  return { z, up };
 }
 
 /** Checks a transform: finite, invertible, and not absurdly large or small. */

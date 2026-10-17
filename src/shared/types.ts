@@ -184,6 +184,11 @@ export interface Layer {
   mask?: LayerMask | null;
   /** Layer effects (paint and shape layers, groups). Absent: none. */
   effects?: LayerEffect[];
+  /**
+   * A VR layer: a paint layer made by the VR app (vdraw), whose strokes may carry depth
+   * (Stroke.vr). It draws as any paint layer here. Set at creation; layer.update does not change it.
+   */
+  vr?: boolean;
 }
 
 export interface Stroke {
@@ -202,6 +207,23 @@ export interface Stroke {
    * frame corners (for bounds, transforms and the stroke eraser); `brush` gives its main color.
    */
   vector?: StrokeVector;
+  /**
+   * A VR stroke (painted in 3D in vdraw): the depth of its points. 2D clients draw x, y and
+   * pressure only (the paper seen straight on), so it changes nothing they draw. Not on mask or
+   * vector strokes.
+   */
+  vr?: StrokeVr;
+}
+
+/**
+ * The 3D part of a VR stroke, per point of `pts`. `z`: one number per point, its depth in world
+ * units, positive toward the viewer of the 2D canvas (out of the paper), within ±LIMITS.maxCoord.
+ * `up` (optional): three numbers per point, the pen's up direction there in canvas axes (x right,
+ * y down, z toward the viewer), each -1 to 1 (clients round them to 3 decimals).
+ */
+export interface StrokeVr {
+  z: number[];
+  up?: number[];
 }
 
 /** The geometry and style of a shape, kept on a vector stroke. */
@@ -386,14 +408,14 @@ export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p
 export const MIX_MODES = ['normal', 'pigment'] as const;
 export type MixMode = (typeof MIX_MODES)[number];
 
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment'] as const;
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'vr'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =
-  | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts' | 'mask'> }
+  | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts' | 'mask' | 'vr'> }
   | { type: 'stroke.remove'; id: string }
   | { type: 'stroke.restore'; id: string }
-  | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind'> & LayerProps }
+  | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind' | 'vr'> & LayerProps }
   | { type: 'layer.update'; id: string; props: Partial<LayerProps> }
   | { type: 'layer.remove'; id: string }
   | { type: 'layer.restore'; id: string }
@@ -496,7 +518,8 @@ export type ClientMsg =
       embed?: boolean;
     }
   | { t: 'op'; opId: string; op: Op }
-  | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
+  /** A stroke being drawn: its new points since the last message (`vr`: their depth, as Stroke.vr). */
+  | { t: 'live'; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; vr?: StrokeVr; start: boolean }
   | { t: 'live.end'; id: string }
   /**
    * Shapes as this client shows them during a drag (not persisted): new ones, or changed copies
@@ -549,7 +572,7 @@ export type ServerMsg =
   | { t: 'denied'; reason: DeniedReason }
   | { t: 'op'; seq: number; by: string; opId: string; op: AppliedOp }
   | { t: 'reject'; opId: string; reason: string }
-  | { t: 'live'; by: string; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; start: boolean }
+  | { t: 'live'; by: string; id: string; layerId: string; mask?: string; brush: Brush; pts: number[]; vr?: StrokeVr; start: boolean }
   | { t: 'live.end'; by: string; id: string }
   | { t: 'shape.live'; by: string; shapes: ShapeInput[] }
   | { t: 'cursor'; by: string; x: number | null; y: number | null; layerId: string | null }

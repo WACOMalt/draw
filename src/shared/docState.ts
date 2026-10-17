@@ -92,7 +92,7 @@ export class DocState {
         const l = this.layers.get(op.id);
         if (!l || effectivelyDeleted(this.layers, l)) throw new OpError('no such layer');
         const ids = subtreeIds(this.layers.values(), l.id);
-        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'vector'>][] = [];
+        const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'vector' | 'vr'>][] = [];
         for (const st of this.strokes.values()) {
           if (!ids.has(st.layerId)) continue;
           const t = transformStroke(st, op.m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
