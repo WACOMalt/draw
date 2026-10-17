@@ -97,6 +97,16 @@ fn blend_name(b: Blend) -> Value {
     serde_json::to_value(b).unwrap_or_else(|_| "normal".into())
 }
 
+/// The opposite of an affine ([a, b, c, d, e, f], as the 2D app's).
+fn invert_affine(m: &[f64; 6]) -> Option<[f64; 6]> {
+    let det = m[0] * m[3] - m[1] * m[2];
+    if det.abs() < 1e-300 {
+        return None;
+    }
+    let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
+    Some([a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])])
+}
+
 /// One step of undo: the ops that take an action back, and those that do it again (the 2D
 /// app's undo entries).
 #[derive(Default)]
@@ -445,6 +455,21 @@ impl Canvas {
         (out, depth.then_some(StrokeVr { z, up: Some(up) }))
     }
 
+    /// A scene matrix held to the paper's plane as the 2D app's affine on canvas units
+    /// ([a, b, c, d, e, f]: x' = a x + c y + e, y' = b x + d y + f).
+    fn affine(&self, m: Mat4) -> [f64; 6] {
+        // Canvas to scene (2D): s = P c, with P = [k, 0, -ax k; 0, -k, ay k].
+        let (k, ax, ay) = (self.frame.k, self.frame.anchor[0], self.frame.anchor[1]);
+        let p = glam::DMat3::from_cols(glam::DVec3::new(k, 0.0, 0.0), glam::DVec3::new(0.0, -k, 0.0), glam::DVec3::new(-ax * k, ay * k, 1.0));
+        let g = glam::DMat3::from_cols(
+            glam::DVec3::new(m.x_axis.x as f64, m.x_axis.y as f64, 0.0),
+            glam::DVec3::new(m.y_axis.x as f64, m.y_axis.y as f64, 0.0),
+            glam::DVec3::new(m.w_axis.x as f64, m.w_axis.y as f64, 1.0),
+        );
+        let c = p.inverse() * g * p;
+        [c.x_axis.x, c.x_axis.y, c.y_axis.x, c.y_axis.y, c.z_axis.x, c.z_axis.y]
+    }
+
     /// Whether strokes on a painting layer (by id) are 3D (a VR layer).
     fn is_vr_layer(painter: &Painter, layer: u32) -> bool {
         painter.painting.index_of(layer).is_some_and(|i| !painter.painting.layers[i].ordered && !painter.painting.layers[i].group)
@@ -547,6 +572,14 @@ impl Canvas {
                     if !mask && !stroke.brush.erase {
                         painter.add_recent(crate::panel::to_srgb(stroke.brush.color));
                     }
+                }
+                Outgoing::Transform { layer, matrix } => {
+                    let Some(id) = self.doc_id(layer) else { continue };
+                    let m = self.affine(matrix);
+                    let Some(inv) = invert_affine(&m) else { continue };
+                    ops.push(json!({ "type": "layer.transform", "id": id, "m": m }));
+                    step.undo.push(json!({ "type": "layer.transform", "id": id, "m": inv }));
+                    step.redo.push(json!({ "type": "layer.transform", "id": id, "m": m }));
                 }
                 Outgoing::Remove(at) => {
                     for a in at {
@@ -1034,6 +1067,18 @@ mod tests {
         assert_eq!(painter.built.strokes.len(), 0);
         painter.redo();
         wait(&mut c, &mut painter, &mut other, "redo", &|o| live(o) == 1);
+        // The Move layer tool: the layer moved 10 cm along the paper, then back by undo.
+        let x0 = |o: &Session| o.doc.strokes.values().find(|s| !s.deleted).map(|s| s.pts[0]).unwrap();
+        let before = x0(&other);
+        painter.tools.tool = crate::tools::Tool::Transform;
+        let at = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.3));
+        painter.grab(1, at, true, 0.0, 0.01);
+        painter.grab(1, Mat4::from_translation(Vec3::new(0.1, 0.0, 0.3)), true, 0.0, 0.01);
+        painter.grab(1, Mat4::from_translation(Vec3::new(0.1, 0.0, 0.3)), false, 0.0, 0.01);
+        let k = c.frame.k;
+        wait(&mut c, &mut painter, &mut other, "the move", &|o| (x0(o) - before - 0.1 / k).abs() < 1e-3 / k);
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the move undone", &|o| (x0(o) - before).abs() < 1e-3 / k);
         // The stroke eraser, across it.
         painter.tools.tool = crate::tools::Tool::StrokeEraser;
         painter.tools.sweep_size = 0.02;

@@ -44,6 +44,18 @@ pub enum Outgoing {
     Add { layer: u32, mask: bool, id: String, stroke: Stroke },
     /// Strokes the stroke eraser took, by place.
     Remove(Vec<At>),
+    /// The layer (by id; a group: with what is in it) the Move layer tool moved, turned and
+    /// scaled in the paper's plane, by a matrix (the scene's).
+    Transform { layer: u32, matrix: glam::Mat4 },
+}
+
+/// A matrix with a uniform scale held to the paper's plane (z = 0): its turn about z, its
+/// scale, its move along x and y (the 2D app's layer transforms are 2D).
+pub fn planar(m: glam::Mat4) -> glam::Mat4 {
+    let s = scale_of(m);
+    let x = m.x_axis.truncate() / s.max(1e-12);
+    let turn = x.y.atan2(x.x);
+    glam::Mat4::from_translation(Vec3::new(m.w_axis.x, m.w_axis.y, 0.0)) * glam::Mat4::from_rotation_z(turn) * glam::Mat4::from_scale(Vec3::splat(s))
 }
 
 /// The Move layer tool's grab: the hand, its pose when it took hold (world), the scale the
@@ -419,10 +431,6 @@ impl Painter {
     /// scales), and the frame's time. Pressed: takes hold of the active layer (a group: all its
     /// layers); held: they follow the hand; let go: they stay there, one step of undo.
     pub fn grab(&mut self, hand: usize, pose: glam::Mat4, down: bool, stick: f32, dt: f32) {
-        if self.shared {
-            // Not on a shared canvas yet.
-            return;
-        }
         match (&mut self.grab, down) {
             (None, true) => {
                 let i = self.active_index();
@@ -441,6 +449,10 @@ impl Painter {
                     g.scale = (g.scale * (stick * dt * 1.2).exp()).clamp(0.01, 100.0);
                 }
                 g.matrix = pose * glam::Mat4::from_scale(Vec3::splat(g.scale)) * g.start.inverse();
+                if self.shared {
+                    // A shared canvas's layers move in the paper's plane.
+                    g.matrix = planar(g.matrix);
+                }
                 let mut k = 0;
                 for r in g.ranges.clone() {
                     for d in &mut self.done[r] {
@@ -454,6 +466,11 @@ impl Painter {
             }
             (Some(g), false) if g.hand == hand => {
                 let g = self.grab.take().unwrap();
+                if self.shared {
+                    // The canvas sends it; the document moves the strokes.
+                    self.outbox.push(Outgoing::Transform { layer: self.active_layer, matrix: g.matrix });
+                    return;
+                }
                 self.transform_layers(&g.layers, g.matrix);
                 self.undo.push(Edit::Transform { layers: g.layers, matrix: g.matrix.inverse() });
                 self.redo.clear();
