@@ -448,7 +448,17 @@ impl Canvas {
                     steps_changed = true;
                 }
             }
+            // A kaleidoscope changed: its copies are drawn again.
+            let copies = doc.kaleidoscope(l, &self.frame);
+            if painter.painting.layers[i].copies != copies {
+                painter.painting.layers[i].copies = copies;
+                steps_changed = true;
+            }
         }
+        // With copies drawn, each stroke in or out builds all again: so the strokes go in by
+        // hand, and it builds once.
+        let by_hand = steps_changed || painter.built.copied;
+        let mut changed = steps_changed;
         // The strokes: those gone or changed out, then those new in, by place.
         let mut edits = 0;
         let mut plans = Vec::new();
@@ -494,7 +504,7 @@ impl Canvas {
             let depth = layers[i].threed;
             let ordered_in = |painter: &mut Painter, j: usize, s: &DocStroke, frame: &Frame| {
                 let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.threed.as_ref().filter(|_| depth), frame);
-                if steps_changed {
+                if by_hand {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
                     list.insert(j.min(list.len()), stroke);
@@ -502,8 +512,9 @@ impl Canvas {
                     painter.insert_stroke(i, mask, j, stroke);
                 }
             };
+            changed |= by_hand && (!out.is_empty() || !ins.is_empty());
             for &k in out.iter().rev() {
-                if steps_changed {
+                if by_hand {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
                     list.remove(k);
@@ -520,7 +531,7 @@ impl Canvas {
                 self.shown[i].strokes = prints;
             }
         }
-        if steps_changed {
+        if changed {
             painter.rebuild();
         }
         if let Some(a) = self.want_active.take() {
@@ -1299,6 +1310,65 @@ mod tests {
 
     fn current(p: &Painter) -> (Vec<u8>, Vec<vdraw_core::StrokeRef>) {
         (bytemuck::cast_slice(&p.done).to_vec(), p.built.strokes.clone())
+    }
+
+    /// A kaleidoscope another client turns on: its copies are drawn (the strokes, those put in
+    /// after, and a stroke being drawn), and the painting stays as a fresh build would make it.
+    #[test]
+    fn a_kaleidoscope_on_a_live_canvas() {
+        let Ok(base) = std::env::var("VDRAW_TEST_SERVER") else { return };
+        let server = vdraw_net::Server::new(&base, None);
+        let anon = vdraw_net::identity::base64url(&[10u8; 32]);
+        let key = server.create(&anon, None, None).unwrap();
+        let mut c = Canvas::new(Session::open(&server, &key, "VR", "#ff6b6b", &anon, None));
+        let mut other = Session::open(&server, &key, "2D", "#4dabf7", &anon, None);
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        let head = Mat4::from_translation(Vec3::new(0.0, 1.6, 0.0));
+        let until = |c: &mut Canvas, painter: &mut Painter, other: &mut Session, what: &str, done: &dyn Fn(&Canvas, &Painter) -> bool| {
+            let t = Instant::now();
+            loop {
+                other.poll();
+                c.update(painter, head);
+                if done(c, painter) {
+                    break;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until(&mut c, &mut painter, &mut other, "the document", &|c, _| c.placed && c.session.state == State::Open);
+        while other.state != State::Open {
+            other.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let layer = other.doc.paint_order()[0].id.clone();
+        let brush = json!({"tool": "paint", "color": "#aa3311", "size": 12.0, "opacity": 1.0, "flow": 1.0, "hardness": 0.8, "spacing": 0.1, "pressureSize": true, "pressureFlow": false, "buildup": false});
+        let add = |other: &mut Session, k: usize| other.send_op(json!({"type": "stroke.add", "stroke": {"id": format!("S{k}dddddddddd"), "layerId": layer, "brush": brush, "pts": [k as f64 * 20.0, 0.0, 0.5, k as f64 * 20.0 + 15.0, 30.0, 0.7]}}));
+        add(&mut other, 0);
+        until(&mut c, &mut painter, &mut other, "a stroke", &|_, p| p.built.strokes.len() == 1);
+        let one = painter.done.len();
+        let e = json!([{"type": "kaleidoscope", "enabled": true, "radius": 0, "count": 5, "angle": 72, "scale": 1, "cx": 0, "cy": 0, "dx": 0, "dy": 0, "order": "front"}]);
+        other.send_op(json!({"type": "layer.update", "id": layer, "props": {"effects": e}}));
+        until(&mut c, &mut painter, &mut other, "the copies", &|_, p| p.built.copied);
+        assert_eq!(painter.painting.layers[0].copies.len(), 6);
+        assert_eq!(painter.done.len(), 6 * one);
+        assert_eq!(current(&painter), fresh(&painter));
+        add(&mut other, 1);
+        until(&mut c, &mut painter, &mut other, "a stroke with copies", &|_, p| p.built.strokes.len() == 2);
+        assert_eq!(current(&painter), fresh(&painter));
+        // Another's stroke being drawn: in every copy.
+        other.send_live("Slivedddddddd", &layer, None, &brush, &[0.0, 50.0, 0.5, 30.0, 60.0, 0.5], None, true);
+        until(&mut c, &mut painter, &mut other, "the live stroke", &|c, _| !c.session.lives.is_empty());
+        painter.update_drawing();
+        c.draw_live(&mut painter);
+        let live = painter.drawing.len();
+        assert!(live > 0);
+        assert_eq!(painter.drawing_runs.len(), 1);
+        assert_eq!(live % 6, 0, "six of each");
+        // Off: no copies.
+        other.send_op(json!({"type": "layer.update", "id": layer, "props": {"effects": null}}));
+        until(&mut c, &mut painter, &mut other, "no copies", &|_, p| !p.built.copied);
+        assert_eq!(current(&painter), fresh(&painter));
     }
 
     /// A canvas kept live while another client edits it, on a test server ($VDRAW_TEST_SERVER,

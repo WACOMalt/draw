@@ -546,7 +546,7 @@ impl Painter {
         let id = self.built.strokes.len() as u32;
         let index = self.list(layer, mask).map_or(0, |l| l.len());
         match self.built.runs.last_mut() {
-            Some(run) if run.step == step => {
+            Some(run) if run.step == step && !self.built.copied => {
                 stroke.segments_in(self.painting.filter, id, ordered, &mut self.done);
                 run.count = self.done.len() - run.first;
                 self.built.strokes.push(vdraw_core::StrokeRef { layer: i, mask, index });
@@ -709,14 +709,14 @@ impl Painter {
         tools::overlay(&self.done, &self.built.runs, only, tip, (r * 4.0).max(0.05 * self.scale), &hot, taken, out);
     }
 
-    /// The stroke being drawn, as segments, into `drawing` (and nothing else there yet).
+    /// The stroke being drawn, as segments, into `drawing` (and nothing else there yet), and
+    /// its copies where the layer has a kaleidoscope.
     pub fn update_drawing(&mut self) {
         self.drawing.clear();
         self.drawing_runs.clear();
-        if let (Some((_, s)), Some(step)) = (&self.active, self.target_step()) {
-            let ordered = self.painting.layers[self.active_index()].ordered;
-            s.segments_in(self.painting.filter, self.built.strokes.len() as u32, ordered, &mut self.drawing);
-            self.drawing_runs.push(vdraw_core::LayerRun { step, first: 0, count: self.drawing.len() });
+        if let (Some((_, s)), Some(_)) = (&self.active, self.target_step()) {
+            let (i, mask) = (self.active_index(), self.mask_target);
+            Self::copies_in(&self.painting, &self.built, i, mask, s, self.built.strokes.len() as u32, &mut self.drawing, &mut self.drawing_runs);
         }
     }
 
@@ -724,11 +724,25 @@ impl Painter {
     /// its mask: drawn over the finished strokes there. `n`: its place among them (it takes a
     /// stroke number of its own).
     pub fn add_drawing(&mut self, layer: usize, mask: bool, stroke: &Stroke, n: u32) {
-        let Some(step) = self.built.step_of(layer, mask) else { return };
-        let first = self.drawing.len();
-        let ordered = self.painting.layers[layer].ordered;
-        stroke.segments_in(self.painting.filter, self.built.strokes.len() as u32 + 1 + n, ordered, &mut self.drawing);
-        self.drawing_runs.push(vdraw_core::LayerRun { step, first, count: self.drawing.len() - first });
+        Self::copies_in(&self.painting, &self.built, layer, mask, stroke, self.built.strokes.len() as u32 + 1 + n, &mut self.drawing, &mut self.drawing_runs);
+    }
+
+    /// A stroke being drawn in a layer (or its mask), as segments: in each run that draws the
+    /// layer, once for each of the run's transforms (a kaleidoscope's copies).
+    #[allow(clippy::too_many_arguments)]
+    fn copies_in(painting: &Painting, built: &Built, layer: usize, mask: bool, stroke: &Stroke, id: u32, out: &mut Vec<GpuSegment>, runs: &mut Vec<vdraw_core::LayerRun>) {
+        let ordered = painting.layers[layer].ordered;
+        for (step, copies) in built.runs_of(layer, mask) {
+            let first = out.len();
+            for m in copies {
+                if *m == glam::Mat4::IDENTITY {
+                    stroke.segments_in(painting.filter, id, ordered, out);
+                } else if let Some(t) = stroke.transformed(m) {
+                    t.segments_in(painting.filter, id, ordered, out);
+                }
+            }
+            runs.push(vdraw_core::LayerRun { step, first, count: out.len() - first });
+        }
     }
 
     /// The steps as the renderer reads them.

@@ -841,7 +841,85 @@ pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], vr: Option<&StrokeThreeD>, fr
     out
 }
 
+/// A kaleidoscope's settings (types.ts LayerEffect) as its step: p' = pivot + move + s·R·(p −
+/// pivot) in canvas units (effects.ts kaleidoscopeStep3), the turn its 3D `turn` or `angle`
+/// degrees about the axis out of the paper.
+fn kaleidoscope_step(e: &Value) -> glam::DMat4 {
+    let num = |k: &str, d: f64| e.get(k).and_then(Value::as_f64).unwrap_or(d);
+    let turn = e
+        .get("turn")
+        .and_then(Value::as_array)
+        .filter(|t| t.len() == 4)
+        .map(|t| glam::DQuat::from_xyzw(t[0].as_f64().unwrap_or(0.0), t[1].as_f64().unwrap_or(0.0), t[2].as_f64().unwrap_or(0.0), t[3].as_f64().unwrap_or(1.0)).normalize())
+        .unwrap_or_else(|| glam::DQuat::from_rotation_z(num("angle", 0.0).to_radians()));
+    let pivot = glam::DVec3::new(num("cx", 0.0), num("cy", 0.0), num("cz", 0.0));
+    let step = glam::DVec3::new(num("dx", 0.0), num("dy", 0.0), num("dz", 0.0));
+    glam::DMat4::from_translation(pivot + step) * glam::DMat4::from_scale_rotation_translation(glam::DVec3::splat(num("scale", 1.0)), turn, glam::DVec3::ZERO) * glam::DMat4::from_translation(-pivot)
+}
+
+impl Frame {
+    /// The frame as a transform: canvas units to the painting's space.
+    pub fn matrix(&self) -> glam::DMat4 {
+        glam::DMat4::from_translation(self.offset.as_dvec3()) * glam::DMat4::from_scale(glam::DVec3::new(self.k, -self.k, self.k)) * glam::DMat4::from_translation(glam::DVec3::new(-self.anchor[0], -self.anchor[1], 0.0))
+    }
+}
+
 impl Doc {
+    /// Whether a layer's strokes all have depth (shared/layers.ts allThreeD): a 3D paint layer,
+    /// or a group whose paint layers (one at least) all are.
+    pub fn all_threed(&self, l: &DocLayer) -> bool {
+        if !l.is_group() {
+            return l.threed && l.kind.is_none();
+        }
+        let ids = self.subtree_ids(&l.id);
+        let mut paint = self.layers.values().filter(|x| ids.contains(&x.id) && !self.effectively_deleted(x) && !x.is_group() && x.kind.as_deref() != Some("adjust")).peekable();
+        paint.peek().is_some() && paint.all(|x| x.threed && x.kind.is_none())
+    }
+
+    /// A layer's kaleidoscope (its effect, when on) as `Layer::copies` in the frame's space:
+    /// copy i the step applied i times, behind the layer or in front of it. A layer whose
+    /// strokes all have depth copies them in 3D; else as the 2D app shows the copies (straight
+    /// on, effects.ts kaleidoscopeCopies: in the paper at the pivot's depth).
+    pub fn kaleidoscope(&self, l: &DocLayer, frame: &Frame) -> Vec<glam::Mat4> {
+        if l.kind.as_deref() == Some("adjust") {
+            return Vec::new();
+        }
+        let Some(e) = l.extra.get("effects").and_then(Value::as_array).and_then(|es| es.iter().find(|e| e.get("type").and_then(Value::as_str) == Some("kaleidoscope") && e.get("enabled").and_then(Value::as_bool) == Some(true))) else {
+            return Vec::new();
+        };
+        let count = e.get("count").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 64.0) as usize;
+        if count == 0 {
+            return Vec::new();
+        }
+        let step = kaleidoscope_step(e);
+        let depth = self.all_threed(l);
+        let cz = e.get("cz").and_then(Value::as_f64).unwrap_or(0.0);
+        let (f, inv) = (frame.matrix(), frame.matrix().inverse());
+        let mut m = glam::DMat4::IDENTITY;
+        let mut copies: Vec<glam::Mat4> = (0..count)
+            .map(|_| {
+                m = step * m;
+                let c = if depth {
+                    m
+                } else {
+                    // Seen straight on: x and y as at the pivot's depth; the depth scaled as the
+                    // paper is (so a stroke's size scales as its picture does).
+                    let (a, b, c, d) = (m.x_axis.x, m.x_axis.y, m.y_axis.x, m.y_axis.y);
+                    let t = m.z_axis.truncate() * cz + m.w_axis.truncate();
+                    glam::DMat4::from_cols(glam::DVec4::new(a, b, 0.0, 0.0), glam::DVec4::new(c, d, 0.0, 0.0), glam::DVec4::new(0.0, 0.0, (a * d - b * c).abs().sqrt(), 0.0), glam::DVec4::new(t.x, t.y, 0.0, 1.0))
+                };
+                (f * c * inv).as_mat4()
+            })
+            .collect();
+        if e.get("order").and_then(Value::as_str) == Some("behind") {
+            copies.reverse();
+            copies.push(glam::Mat4::IDENTITY);
+        } else {
+            copies.insert(0, glam::Mat4::IDENTITY);
+        }
+        copies
+    }
+
     /// The layers a painting of the document has, in paint order: the live ones but shape
     /// layers.
     pub fn painted_layers(&self) -> Vec<&DocLayer> {
@@ -897,6 +975,7 @@ impl Doc {
                 } else {
                     None
                 },
+                copies: self.kaleidoscope(l, frame),
             });
             ids.push(l.id.clone());
         }
@@ -1070,6 +1149,50 @@ mod tests {
         assert_eq!(point_decimals(0.001), -2);
         assert_eq!(round_to(1234.5678, 1), 1234.6);
         assert_eq!(round_to(1234.5678, -2), 1200.0);
+    }
+
+    #[test]
+    fn a_kaleidoscope_copies_as_the_2d_app() {
+        let mut d = Doc::default();
+        d.apply(&json!({"type": "layer.add", "layer": layer("G1aaaa", 1.0, None, Some("group"))}), "c", 1).unwrap();
+        let mut l3 = layer("L1aaaa", 1.0, Some("G1aaaa"), None);
+        l3["threed"] = true.into();
+        d.apply(&json!({"type": "layer.add", "layer": l3}), "c", 2).unwrap();
+        d.apply(&json!({"type": "layer.add", "layer": layer("L2aaaa", 2.0, None, None)}), "c", 3).unwrap();
+        // Turn 60 degrees about x, about the pivot (10, 20, 5); then move 1 along x.
+        let h = 30f64.to_radians();
+        let e = json!([{"type": "kaleidoscope", "enabled": true, "radius": 0, "count": 2, "angle": 0, "scale": 1, "cx": 10, "cy": 20, "cz": 5, "dx": 1, "dy": 0, "order": "front", "turn": [h.sin(), 0, 0, h.cos()]}]);
+        for id in ["L1aaaa", "L2aaaa", "G1aaaa"] {
+            d.apply(&json!({"type": "layer.update", "id": id, "props": {"effects": e}}), "c", 4).unwrap();
+        }
+        let frame = Frame { anchor: [3.0, 4.0], k: 0.5, offset: glam::Vec3::new(1.0, 2.0, 3.0) };
+        let near = |a: glam::Vec3, b: glam::Vec3| assert!((a - b).length() < 1e-4, "{a} {b}");
+        let at = |d: &Doc, id: &str| d.kaleidoscope(&d.layers[id], &frame);
+        // A 3D layer: the copies turn in 3D (the point 3 below the pivot turns toward the viewer).
+        let c = at(&d, "L1aaaa");
+        assert_eq!((c.len(), c[0]), (3, glam::Mat4::IDENTITY), "the layer, then its copies");
+        let s3 = 3f32.sqrt();
+        near(c[1].transform_point3(frame.point(10.0, 23.0, 5.0)), frame.point(11.0, 21.5, 5.0 + 1.5 * s3 as f64));
+        near(c[1].transform_point3(frame.point(12.0, 20.0, 5.0)), frame.point(13.0, 20.0, 5.0));
+        // A flat layer: as the 2D view shows them (squashed across the tilt, at the pivot's depth).
+        let c = at(&d, "L2aaaa");
+        near(c[1].transform_point3(frame.point(10.0, 23.0, 0.0)), frame.point(11.0, 21.5, 0.0));
+        near(c[2].transform_point3(frame.point(10.0, 20.0, 0.0)), frame.point(12.0, 20.0, 0.0));
+        // The group: its paint layers all 3D, so in 3D.
+        near(at(&d, "G1aaaa")[1].transform_point3(frame.point(10.0, 23.0, 5.0)), frame.point(11.0, 21.5, 5.0 + 1.5 * s3 as f64));
+        // Behind the layer: the last copy first, the layer last; off: none.
+        let mut b = e.clone();
+        b[0]["order"] = "behind".into();
+        d.apply(&json!({"type": "layer.update", "id": "L2aaaa", "props": {"effects": b}}), "c", 5).unwrap();
+        let c = at(&d, "L2aaaa");
+        near(c[0].transform_point3(frame.point(10.0, 20.0, 0.0)), frame.point(12.0, 20.0, 0.0));
+        assert_eq!(c[2], glam::Mat4::IDENTITY);
+        b[0]["enabled"] = false.into();
+        d.apply(&json!({"type": "layer.update", "id": "L2aaaa", "props": {"effects": b}}), "c", 6).unwrap();
+        assert!(at(&d, "L2aaaa").is_empty());
+        // In the painting, by place.
+        let p = d.painting(&frame).painting;
+        assert_eq!(p.layers.iter().map(|l| l.copies.len()).collect::<Vec<_>>(), vec![3, 3, 0]);
     }
 
     #[test]

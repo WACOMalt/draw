@@ -6,7 +6,7 @@
 use crate::filter::OneEuro3;
 use crate::segments::GpuSegment;
 use crate::stroke::Stroke;
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
@@ -130,6 +130,11 @@ pub struct Layer {
     /// what is below it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adjust: Option<Adjust>,
+    /// A shared canvas's kaleidoscope (the 2D app's effect): copies of the layer (a group's: of
+    /// what is in it), each moved by its transform, in the order they cover each other (the
+    /// identity is the layer itself). Empty: none. Only drawn: never saved, never sent.
+    #[serde(skip)]
+    pub copies: Vec<Mat4>,
 }
 
 /// An adjustment layer's settings, as the 2D app's (types.ts Adjust): all on 0..1 channels.
@@ -220,7 +225,7 @@ fn monotone_curve(points: &[[f32; 2]]) -> impl Fn(f32) -> f32 {
 
 impl Default for Layer {
     fn default() -> Self {
-        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false, adjust: None }
+        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false, adjust: None, copies: Vec::new() }
     }
 }
 
@@ -259,6 +264,9 @@ impl Default for Painting {
         Self { layers: vec![Layer { id: 1, name: "Layer 1".into(), ..Default::default() }], mix: Mix::Normal, filter: OneEuro3::default() }
     }
 }
+
+/// The most copies a layer is drawn with, its groups' kaleidoscopes' copies counted in.
+pub const MAX_COPIES: usize = 1024;
 
 /// A step of compositing, in order: what the renderer does for each pixel (see `steps`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,12 +309,23 @@ pub struct Built {
     pub steps: Vec<Step>,
     pub runs: Vec<LayerRun>,
     pub strokes: Vec<StrokeRef>,
+    /// By run: the transforms its strokes are drawn with (a kaleidoscope's copies), in order.
+    pub copies: Vec<Vec<Mat4>>,
+    /// Some run draws copies: a stroke put in or taken out makes all again.
+    pub copied: bool,
 }
 
 impl Built {
     /// The step that draws a layer (its strokes, or its mask's).
     pub fn step_of(&self, layer: usize, mask: bool) -> Option<usize> {
         self.steps.iter().position(|&s| s == if mask { Step::Mask(layer) } else { Step::Layer(layer) })
+    }
+
+    /// Every run that draws a layer (its strokes, or its mask's), with its transforms: one
+    /// without copies, more for a kaleidoscope's.
+    pub fn runs_of(&self, layer: usize, mask: bool) -> impl Iterator<Item = (usize, &[Mat4])> {
+        let want = if mask { Step::Mask(layer) } else { Step::Layer(layer) };
+        self.runs.iter().zip(&self.copies).filter(move |(r, _)| self.steps[r.step] == want).map(|(r, c)| (r.step, &c[..]))
     }
 }
 
@@ -495,27 +514,92 @@ impl Painting {
     /// layer's strokes in order; the steps; and where each stroke number points. Stroke numbers
     /// count on through the steps; the next one (for a stroke being drawn) is
     /// `built.strokes.len()`.
+    ///
+    /// A kaleidoscope's copies (`Layer::copies`) are drawn here only: a layer's go in its run,
+    /// after one another, with its strokes' numbers; a masked layer's each get a mask and a
+    /// layer step; a group's each get its layers' steps again (a pass through group: each in
+    /// an open and a close of its own; an isolated one: all in one picture).
     pub fn build(&self, out: &mut Vec<GpuSegment>) -> Built {
         out.clear();
-        let steps = self.steps();
-        let mut runs = Vec::new();
-        let mut strokes = Vec::new();
-        for (step, s) in steps.iter().enumerate() {
-            let (layer, mask) = match *s {
-                Step::Layer(l) => (l, false),
-                Step::Mask(l) => (l, true),
-                _ => continue,
-            };
-            let l = &self.layers[layer];
-            let list = if mask { l.mask.as_ref().map_or(&[][..], |m| &m.strokes[..]) } else { &l.strokes[..] };
-            let first = out.len();
-            for (index, s) in list.iter().enumerate() {
-                s.segments_in(self.filter, strokes.len() as u32, l.ordered, out);
-                strokes.push(StrokeRef { layer, mask, index });
+        let mut built = Built::default();
+        let mut numbers = std::collections::HashMap::new();
+        self.build_in(None, Mat4::IDENTITY, 1, out, &mut built, &mut numbers);
+        built.copied = built.copies.iter().any(|c| c.len() != 1 || c[0] != Mat4::IDENTITY);
+        built
+    }
+
+    /// `build` for the layers of a group (None: the top level), each moved by `outer` (a
+    /// group's copy); `mult`: how many copies of them there are so far.
+    fn build_in(&self, parent: Option<u32>, outer: Mat4, mult: usize, out: &mut Vec<GpuSegment>, built: &mut Built, numbers: &mut std::collections::HashMap<(usize, bool), u32>) {
+        for i in self.children(parent) {
+            let l = &self.layers[i];
+            if !l.visible {
+                continue;
             }
-            runs.push(LayerRun { step, first, count: out.len() - first });
+            // A cap on the copies of copies (nested kaleidoscopes), as the 2D app has.
+            let own: Vec<Mat4> = if l.copies.is_empty() { vec![Mat4::IDENTITY] } else { l.copies.iter().take((MAX_COPIES / mult).max(1)).copied().collect() };
+            let mult = mult * own.len();
+            if l.group {
+                let isolated = l.blend != Blend::Pass;
+                if isolated {
+                    built.steps.push(Step::Open(i));
+                }
+                for m in &own {
+                    if !isolated {
+                        built.steps.push(Step::Open(i));
+                    }
+                    self.build_in(Some(l.id), outer * *m, mult, out, built, numbers);
+                    if !isolated {
+                        built.steps.push(Step::Close(i));
+                    }
+                }
+                if isolated {
+                    built.steps.push(Step::Close(i));
+                }
+                continue;
+            }
+            let masked = l.mask.as_ref().is_some_and(|m| m.enabled);
+            if l.adjust.is_some() {
+                if masked {
+                    self.run(i, true, Step::Mask(i), vec![outer], out, built, numbers);
+                }
+                built.steps.push(Step::Adjust(i));
+            } else if masked {
+                // The mask moves with each copy: a mask and a layer step for each.
+                for m in &own {
+                    self.run(i, true, Step::Mask(i), vec![outer * *m], out, built, numbers);
+                    self.run(i, false, Step::Layer(i), vec![outer * *m], out, built, numbers);
+                }
+            } else {
+                self.run(i, false, Step::Layer(i), own.iter().map(|m| outer * *m).collect(), out, built, numbers);
+            }
         }
-        Built { steps, runs, strokes }
+    }
+
+    /// A step that draws layer `layer`'s strokes (or its mask's), once for each transform.
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, layer: usize, mask: bool, step: Step, copies: Vec<Mat4>, out: &mut Vec<GpuSegment>, built: &mut Built, numbers: &mut std::collections::HashMap<(usize, bool), u32>) {
+        let l = &self.layers[layer];
+        let list = if mask { l.mask.as_ref().map_or(&[][..], |m| &m.strokes[..]) } else { &l.strokes[..] };
+        // The strokes get their numbers the first time they are drawn; their copies share them.
+        let base = *numbers.entry((layer, mask)).or_insert_with(|| {
+            let n = built.strokes.len() as u32;
+            built.strokes.extend((0..list.len()).map(|index| StrokeRef { layer, mask, index }));
+            n
+        });
+        let first = out.len();
+        for m in &copies {
+            for (j, s) in list.iter().enumerate() {
+                if *m == Mat4::IDENTITY {
+                    s.segments_in(self.filter, base + j as u32, l.ordered, out);
+                } else if let Some(t) = s.transformed(m) {
+                    t.segments_in(self.filter, base + j as u32, l.ordered, out);
+                }
+            }
+        }
+        built.runs.push(LayerRun { step: built.steps.len(), first, count: out.len() - first });
+        built.copies.push(copies);
+        built.steps.push(step);
     }
 
     /// The first stroke number of a layer's run (its strokes, or its mask's), from `built`.
@@ -544,6 +628,11 @@ impl Painting {
         let ordered = l.ordered;
         let list = if mask { &mut l.mask.as_mut().expect("the layer has a mask").strokes } else { &mut l.strokes };
         let index = index.min(list.len());
+        if built.copied {
+            list.insert(index, stroke);
+            *built = self.build(out);
+            return;
+        }
         let Some(step) = built.step_of(layer, mask) else {
             list.insert(index, stroke);
             return;
@@ -576,6 +665,10 @@ impl Painting {
         let l = &mut self.layers[layer];
         let list = if mask { &mut l.mask.as_mut().expect("the layer has a mask").strokes } else { &mut l.strokes };
         let stroke = list.remove(index);
+        if built.copied {
+            *built = self.build(out);
+            return stroke;
+        }
         let Some(step) = built.step_of(layer, mask) else { return stroke };
         let id = Self::first_number(built, step) + index as u32;
         let run = built.runs.iter().position(|r| r.step == step).expect("a run per drawing step");
@@ -794,6 +887,69 @@ mod tests {
         check(&p, &built, &out);
         p.remove_stroke(&mut built, &mut out, top, true, 1);
         check(&p, &built, &out);
+    }
+
+    #[test]
+    fn a_kaleidoscope_draws_copies_at_build() {
+        let mut p = Painting::default();
+        p.layers[0].ordered = true;
+        p.layers[0].strokes = vec![stroke(0.0), stroke(1.0)];
+        let one = {
+            let mut out = Vec::new();
+            p.build(&mut out);
+            out.len()
+        };
+        let shift = Mat4::from_translation(Vec3::new(0.0, 5.0, 0.0));
+        p.layers[0].copies = vec![Mat4::IDENTITY, shift, Mat4::from_scale(Vec3::splat(2.0))];
+        let mut out = Vec::new();
+        let mut built = p.build(&mut out);
+        assert!(built.copied);
+        assert_eq!(built.steps, vec![Step::Layer(0)], "one step: the copies are in its run");
+        assert_eq!(out.len(), 3 * one);
+        assert_eq!(built.strokes.len(), 2, "the copies share their strokes' numbers");
+        // The copies in their order, each the whole layer, its strokes in order.
+        let nums: Vec<u32> = out.iter().map(|g| g.style[1] as u32).collect();
+        assert_eq!(nums.iter().filter(|&&n| n == 1).count(), nums.iter().filter(|&&n| n == 0).count());
+        assert_eq!(out[one].a[1], out[0].a[1] + 5.0, "copy 1 moved");
+        assert_eq!(out[2 * one].a[3], out[0].a[3] * 2.0, "copy 2 scaled: its size too");
+        // A stroke in or out: as a build makes it.
+        p.insert_stroke(&mut built, &mut out, 0, false, 1, stroke(4.0));
+        let mut want = Vec::new();
+        let b = p.build(&mut want);
+        assert_eq!((built.runs.clone(), built.strokes.len()), (b.runs, 3));
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&out), bytemuck::cast_slice::<_, u8>(&want));
+        p.remove_stroke(&mut built, &mut out, 0, false, 0);
+        assert_eq!(built.strokes.len(), 2);
+        assert_eq!(out.len(), 3 * one);
+        // A masked layer: a mask and a layer step for each copy (the mask moves with it).
+        p.layers[0].mask = Some(Mask { enabled: true, strokes: vec![stroke(9.0)] });
+        let built = p.build(&mut out);
+        assert_eq!(built.steps, [Step::Mask(0), Step::Layer(0)].repeat(3));
+        assert_eq!(built.runs_of(0, true).count(), 3);
+        assert_eq!(built.strokes.len(), 3);
+    }
+
+    #[test]
+    fn a_groups_kaleidoscope_repeats_its_steps() {
+        let mut p = Painting::default();
+        p.layers[0].strokes = vec![stroke(0.0)];
+        let g = p.group_layer(0);
+        let shift = Mat4::from_translation(Vec3::X);
+        p.layers[g].copies = vec![shift, Mat4::IDENTITY];
+        let mut out = Vec::new();
+        // Pass through: each copy opens and closes the group.
+        let built = p.build(&mut out);
+        assert_eq!(built.steps, [Step::Open(g), Step::Layer(0), Step::Close(g)].repeat(2));
+        assert_eq!(built.copies, vec![vec![shift], vec![Mat4::IDENTITY]]);
+        // Isolated: one picture, the copies in it.
+        p.layers[g].blend = Blend::Normal;
+        let built = p.build(&mut out);
+        assert_eq!(built.steps, vec![Step::Open(g), Step::Layer(0), Step::Layer(0), Step::Close(g)]);
+        // Copies of copies: the group's after the layer's.
+        p.layers[0].copies = vec![Mat4::IDENTITY, shift];
+        let built = p.build(&mut out);
+        assert_eq!(built.copies[0], vec![shift, shift * shift]);
+        assert_eq!(built.copies[1], vec![Mat4::IDENTITY, shift]);
     }
 
     #[test]
