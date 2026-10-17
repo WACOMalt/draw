@@ -87,12 +87,14 @@ struct Meta {
     /// A 3D layer (its strokes in 3D).
     threed: bool,
     adjust: Option<vdraw_core::Adjust>,
+    /// Its kaleidoscope (the effect as the document has it, edited).
+    kaleido: Option<serde_json::Map<String, Value>>,
 }
 
 fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
     p.layers
         .iter()
-        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d(), adjust: l.adjust.clone() })
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d(), adjust: l.adjust.clone(), kaleido: l.kaleido.as_ref().map(|k| k.effect.clone()) })
         .collect()
 }
 
@@ -420,6 +422,7 @@ impl Canvas {
             // It catches up when the rebuild is in.
             return;
         }
+        painter.frame = Some(self.frame);
         let doc = self.session.view().clone();
         let layers = doc.painted_layers();
         let forms: Vec<Form> = layers.iter().map(|l| form(l)).collect();
@@ -449,10 +452,15 @@ impl Canvas {
                 }
             }
             // A kaleidoscope changed: its copies are drawn again.
-            let copies = doc.kaleidoscope(l, &self.frame);
-            if painter.painting.layers[i].copies != copies {
-                painter.painting.layers[i].copies = copies;
-                steps_changed = true;
+            let k = doc.kaleido(l, &self.frame);
+            if painter.painting.layers[i].kaleido != k {
+                let p = &mut painter.painting.layers[i];
+                p.kaleido = k;
+                let copies = p.kaleido.as_ref().map_or(Vec::new(), |k| k.copies());
+                if p.copies != copies {
+                    p.copies = copies;
+                    steps_changed = true;
+                }
             }
         }
         // With copies drawn, each stroke in or out builds all again: so the strokes go in by
@@ -979,6 +987,22 @@ impl Canvas {
                     set("adjust", serde_json::to_value(a).unwrap_or(Value::Null), dl.extra.get("adjust").cloned().unwrap_or(Value::Null));
                 }
             }
+            if m.kaleido != b.kaleido {
+                // The layer's effects with its kaleidoscope in place of the one it had (the
+                // others as they are).
+                let was = dl.extra.get("effects").cloned().unwrap_or(Value::Null);
+                let mut list: Vec<Value> = was.as_array().cloned().unwrap_or_default();
+                let at = list.iter().position(|e| e["type"] == "kaleidoscope");
+                match (&m.kaleido, at) {
+                    (Some(k), Some(i)) => list[i] = Value::Object(k.clone()),
+                    (Some(k), None) => list.push(Value::Object(k.clone())),
+                    (None, Some(i)) => {
+                        list.remove(i);
+                    }
+                    (None, None) => {}
+                }
+                set("effects", if list.is_empty() { Value::Null } else { Value::Array(list) }, was);
+            }
             if m.threed != b.threed && !m.group && m.adjust.is_none() {
                 set("threed", m.threed.into(), dl.threed.into());
             }
@@ -1365,6 +1389,27 @@ mod tests {
         assert!(live > 0);
         assert_eq!(painter.drawing_runs.len(), 1);
         assert_eq!(live % 6, 0, "six of each");
+        // Set in VR: the others get it (the other effects kept).
+        {
+            let l = &mut painter.painting.layers[0];
+            let mut k = l.kaleido.clone().unwrap();
+            k.set("count", 3);
+            l.kaleido = Some(k);
+            l.update_copies();
+        }
+        painter.rebuild();
+        std::thread::sleep(Duration::from_millis(120));
+        c.commit(&mut painter);
+        let count = |o: &Session| o.doc.layers[&layer].extra["effects"][0]["count"].as_u64();
+        let t = Instant::now();
+        while count(&other) != Some(3) {
+            other.poll();
+            c.update(&mut painter, head);
+            assert!(t.elapsed() < Duration::from_secs(5), "the others never got the count");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(painter.painting.layers[0].copies.len(), 4);
+        assert_eq!(current(&painter), fresh(&painter));
         // Off: no copies.
         other.send_op(json!({"type": "layer.update", "id": layer, "props": {"effects": null}}));
         until(&mut c, &mut painter, &mut other, "no copies", &|_, p| !p.built.copied);

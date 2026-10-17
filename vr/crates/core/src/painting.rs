@@ -135,6 +135,10 @@ pub struct Layer {
     /// identity is the layer itself). Empty: none. Only drawn: never saved, never sent.
     #[serde(skip)]
     pub copies: Vec<Mat4>,
+    /// A shared canvas's kaleidoscope settings (what `copies` come from; edited by the
+    /// Kaleidoscope tool and the panel, sent as the layer's effects).
+    #[serde(skip)]
+    pub kaleido: Option<crate::doc::Kaleido>,
 }
 
 /// An adjustment layer's settings, as the 2D app's (types.ts Adjust): all on 0..1 channels.
@@ -225,7 +229,7 @@ fn monotone_curve(points: &[[f32; 2]]) -> impl Fn(f32) -> f32 {
 
 impl Default for Layer {
     fn default() -> Self {
-        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false, adjust: None, copies: Vec::new() }
+        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false, adjust: None, copies: Vec::new(), kaleido: None }
     }
 }
 
@@ -234,6 +238,11 @@ impl Layer {
     /// layer made in VR).
     pub fn is_3d(&self) -> bool {
         !self.group && self.adjust.is_none() && (self.threed || !self.ordered)
+    }
+
+    /// `copies` made again from `kaleido`.
+    pub fn update_copies(&mut self) {
+        self.copies = self.kaleido.as_ref().map_or(Vec::new(), |k| k.copies());
     }
 }
 

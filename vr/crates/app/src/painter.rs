@@ -125,6 +125,10 @@ pub struct Painter {
     pub active: Option<(usize, Stroke)>,
     pub sweep: Option<Sweep>,
     pub grab: Option<Grab>,
+    /// The Kaleidoscope tool's trigger, held (kaleido.rs).
+    pub kaleido_hold: Option<crate::kaleido::Hold>,
+    /// A shared canvas's frame (its canvas units in the scene), for a new kaleidoscope.
+    pub frame: Option<vdraw_core::doc::Frame>,
     pub tools: Tools,
     /// The layer strokes go to (by id), and whether to its mask (the 2D app's mask target).
     pub active_layer: u32,
@@ -182,6 +186,8 @@ impl Painter {
             active: None,
             sweep: None,
             grab: None,
+            kaleido_hold: None,
+            frame: None,
             tools: Tools::default(),
             active_layer,
             mask_target: false,
@@ -607,7 +613,7 @@ impl Painter {
             // The eyedropper picks where the pen points (the frame loop renders that).
             // The eyedropper picks where the pen points (the frame loop renders that); the
             // Move layer tool takes hold with `grab`.
-            None if matches!(self.tools.tool, crate::tools::Tool::Eyedropper | crate::tools::Tool::Transform) => {}
+            None if matches!(self.tools.tool, crate::tools::Tool::Eyedropper | crate::tools::Tool::Transform | crate::tools::Tool::Kaleido) => {}
             None if down && self.sweep.is_none() => match self.tools.paint() {
                 Some(mut brush) => {
                     // Not on a hidden layer, a group, or a mask that is not there.
