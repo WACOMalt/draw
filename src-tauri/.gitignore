@@ -1,2 +1,4 @@
 /target
 /gen/schemas
+# vdraw for the Windows bundle (externalBin): binaries/vdraw-x86_64-pc-windows-msvc.exe
+/binaries
