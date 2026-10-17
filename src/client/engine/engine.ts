@@ -2188,7 +2188,8 @@ export class Engine {
   /**
    * How each paint layer under `id` shows during its 3D transform (see preview3): as strokes while
    * their dabs fit in PREVIEW3_MAX_DABS, truly 3D layers first (a picture cannot show them right),
-   * then the smaller ones; the rest as pictures.
+   * then flat ones turned more than 60° from the paper (their picture is too thin to turn back
+   * toward the viewer), then the smaller ones; the rest as pictures.
    */
   private planPreview3(id: string, m3: Affine3): NonNullable<typeof this.preview3> {
     const layers = this.doc.layerView();
@@ -2200,8 +2201,13 @@ export class Engine {
       if (!list) byLayer.set(st.layerId, (list = []));
       list.push(st);
     }
-    const plans = [...byLayer].map(([lid, list]) => ({ lid, list, ...planeOf(list), dabs: this.comp.previewDabs?.(list) ?? Infinity }));
-    plans.sort((a, b) => Number(a.flat) - Number(b.flat) || a.dabs - b.dabs);
+    const plans = [...byLayer].map(([lid, list]) => {
+      const q = planeOf(list);
+      // 0: truly 3D, 1: steep (|grad z| > tan 60°), 2: facing the viewer enough.
+      const need = !q.flat ? 0 : Math.hypot(q.plane[0], q.plane[1]) > Math.sqrt(3) ? 1 : 2;
+      return { lid, list, plane: q.plane, need, dabs: this.comp.previewDabs?.(list) ?? Infinity };
+    });
+    plans.sort((a, b) => a.need - b.need || a.dabs - b.dabs);
     let budget = PREVIEW3_MAX_DABS;
     const strokes: Stroke[] = [];
     const pictures = new Map<string, [number, number, number]>();
