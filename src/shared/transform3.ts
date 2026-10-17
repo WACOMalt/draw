@@ -36,6 +36,13 @@ export function quatNormalize(q: Quat): Quat {
   return len > 0 ? [q[0] / len, q[1] / len, q[2] / len, q[3] / len] : [...QUAT_ID];
 }
 
+/** A part `g` of a turn (the same axis, g times the angle): g = 0 no turn, 1 the turn. */
+export function quatPow(q: Quat, g: number): Quat {
+  const [x, y, z, w] = quatNormalize(q);
+  const half = Math.acos(Math.max(-1, Math.min(1, w)));
+  return half < 1e-12 ? [...QUAT_ID] : quatAxisAngle(x, y, z, 2 * half * g);
+}
+
 /** The rotation matrix of a unit quaternion: 3×3, column-major (as the first nine numbers of an Affine3). */
 export function rotation3(q: Quat): number[] {
   const [x, y, z, w] = quatNormalize(q);

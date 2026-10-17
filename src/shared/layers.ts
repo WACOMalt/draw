@@ -55,6 +55,19 @@ export function paintOrder(layers: Iterable<Layer>): Layer[] {
   return out;
 }
 
+/**
+ * The layer is 3D for a 3D step (a kaleidoscope's, or a 3D transform's): a 3D paint layer, or a
+ * group whose paint layers (live ones) are all 3D paint layers. `layers`: the live layers.
+ */
+export function allThreeD(layers: Layer[], id: string): boolean {
+  const l = layers.find((x) => x.id === id);
+  if (!l) return false;
+  if (l.kind !== 'group') return !!l.threed && (l.kind ?? 'paint') === 'paint';
+  const ids = subtreeIds(layers, id);
+  const paint = layers.filter((x) => ids.has(x.id) && x.kind !== 'group' && x.kind !== 'adjust');
+  return paint.length > 0 && paint.every((x) => x.threed && (x.kind ?? 'paint') === 'paint');
+}
+
 /** The ids of the group `id` and everything in it at any depth (deleted layers too). */
 export function subtreeIds(layers: Iterable<Layer>, id: string): Set<string> {
   const kids = new Map<string, string[]>();

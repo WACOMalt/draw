@@ -257,6 +257,10 @@ class EditorState {
   get threedOk(): boolean {
     return this.serverSupports.includes('threed');
   }
+  /** The server takes 3D kaleidoscope steps (effect turn, cz, dz). */
+  get kaleido3dOk(): boolean {
+    return this.serverSupports.includes('kaleido3d');
+  }
   /** The server takes 3D transforms of groups (layer.transform with m3 on a group). */
   get threedGroupsOk(): boolean {
     return this.serverSupports.includes('threedGroups');
