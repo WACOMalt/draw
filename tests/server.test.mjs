@@ -1071,6 +1071,13 @@ try {
     const layer = (id, extra = {}) => ({ id, name: '3D', order: 5, blend: 'normal', opacity: 1, visible: true, ...extra });
     const stroke = (id, lid, extra = {}) => ({ ...strokeOp(lid).op.stroke, id, ...extra });
     const brush0 = strokeOp(L1).op.stroke.brush;
+    // Shared code the server does not run (the .bdraw writer, the 3D gizmo's math), bundled for the test.
+    const out = path.join(dir, 'shared.mjs');
+    buildSync({
+      stdin: { contents: "export * from './src/shared/bdraw'; export * from './src/shared/layers'; export * from './src/shared/transform3';", resolveDir: process.cwd(), loader: 'ts' },
+      bundle: true, format: 'esm', platform: 'node', outfile: out, logLevel: 'silent',
+    });
+    const shared = await import(pathToFileURL(out).href);
 
     // Layers: threed at creation, on paint layers only.
     let r = await tryOp({ type: 'layer.add', layer: layer('vrLAYER001', { threed: true }) });
@@ -1229,6 +1236,31 @@ try {
     check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.threed.z, [1, 2]) && a.threed.up.join() === up.join() && a.brush.size === 4 && a.brush.angle === 10, '3D transform: undo with the inverse brings the stroke back');
     check(near(b.pts, [5, 0, 1]) && near(b.threed.z, [0]), '3D transform: undo brings the flat stroke back (at depth 0)');
 
+    // The 2D app's 3D gizmo: m3 from a quaternion turn, one scale and a move about a pivot.
+    const close3 = (u, v, eps = 1e-9) => u.every((x, i) => Math.abs(x - v[i]) <= eps);
+    let gq = shared.QUAT_ID;
+    for (let i = 0; i < 2000; i++) gq = shared.quatMul(shared.trackball(Math.sin(i) * 7, Math.cos(i * 1.3) * 5, 50), gq);
+    gq = shared.quatMul(shared.quatAxisAngle(0, 0, 1, 0.7), gq);
+    const pivot = [5, 5, 1.5], gmove = [12, -3, 4];
+    const gm = shared.buildM3(gq, 1.3, pivot, gmove);
+    check(shared.validAffine3(gm) && Math.abs(shared.scale3(gm) - 1.3) < 1e-12, '3D gizmo: 2000 trackball turns and a scale make a valid m3');
+    check(close3(shared.applyM3(gm, ...pivot), [17, 2, 5.5]), '3D gizmo: the pivot moves by the move only');
+    const back = shared.invertM3(gm);
+    check(shared.validAffine3(back) && close3(shared.applyM3(back, ...shared.applyM3(gm, 3, -7, 2)), [3, -7, 2]), '3D gizmo: the inverse (undo) brings points back');
+    check(close3(shared.applyM3(shared.buildM3(shared.trackball(50 * Math.PI / 2, 0, 50), 1, [0, 0, 0], [0, 0, 0]), 0, 0, 1), [1, 0, 0]), '3D gizmo: a trackball drag right turns the side toward the viewer right');
+    check(close3(shared.applyM3(shared.buildM3(shared.trackball(0, 50 * Math.PI / 2, 50), 1, [0, 0, 0], [0, 0, 0]), 0, 0, 1), [0, 1, 0]), '3D gizmo: a drag down turns it down');
+    check(close3(shared.applyM3(shared.buildM3(shared.quatAxisAngle(0, 0, 1, Math.PI / 2), 1, [0, 0, 0], [0, 0, 0]), 1, 0, 0), [0, 1, 0]), '3D gizmo: a turn about the view axis turns as the 2D transform (x to y, clockwise on screen)');
+    check(shared.isIdentity3(shared.buildM3(shared.QUAT_ID, 1, pivot, [0, 0, 0])) && !shared.isIdentity3(gm), '3D gizmo: no change is the identity');
+    r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: gm });
+    vw = await welcome();
+    a = vw.strokes.find((x) => x.id === 'vr3DSTRK01');
+    const want = shared.applyM3(gm, 10, 10, 2);
+    check(r?.t === 'op' && close3([a.pts[3], a.pts[4], a.threed.z[1]], want, 1e-6) && Math.abs(a.brush.size - 5.2) < 1e-9, '3D gizmo: the server takes its m3 and moves the points as the gizmo does');
+    r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: back });
+    vw = await welcome();
+    a = vw.strokes.find((x) => x.id === 'vr3DSTRK01');
+    check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.threed.z, [1, 2]) && close3(a.threed.up, up, 2e-3), '3D gizmo: its undo op brings the layer back (up within rounding)');
+
     // Live strokes relay the depth of their points.
     const other = await new Browser().join(vc);
     await first(other);
@@ -1249,12 +1281,6 @@ try {
     check(!!seen && seen.threed === undefined, '3D: live data without depth as before');
 
     // .bdraw: version 11 keeps threed; a bad threed stroke is skipped. Shared code: the version of a saved file.
-    const out = path.join(dir, 'shared.mjs');
-    buildSync({
-      stdin: { contents: "export * from './src/shared/bdraw'; export * from './src/shared/layers';", resolveDir: process.cwd(), loader: 'ts' },
-      bundle: true, format: 'esm', platform: 'node', outfile: out, logLevel: 'silent',
-    });
-    const shared = await import(pathToFileURL(out).href);
     vw = await welcome();
     const plain = vw.layers.filter((l) => l.id === 'vrFALSE001');
     check(shared.makeBdraw(plain, [], 'test').version === 2 && shared.BDRAW_VERSION === 11, '3D: a file without threed keeps its old version');

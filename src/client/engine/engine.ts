@@ -9,6 +9,7 @@ import {
   PREVIEW_LIMITS,
   type Adjust,
   type Affine,
+  type Affine3,
   type AdjustType,
   type Brush,
   type Layer,
@@ -35,7 +36,8 @@ import { anonSecret, desktopToken, followRename, grants, links } from '../identi
 import { Net, type Channel } from './net';
 import { LocalNet } from '../local/localNet';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
-import { effectivelyVisible, invert, sortLayers, subtreeIds } from '../../shared/layers';
+import { effectivelyVisible, invert, scale3, sortLayers, subtreeIds } from '../../shared/layers';
+import { applyM3, invertM3, isIdentity3 } from '../../shared/transform3';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { ShapeTool } from './shapeTool';
 import { takeDismissed } from '../dismiss';
@@ -1290,7 +1292,10 @@ export class Engine {
    * 3D layers count as hidden. No op: they stay visible for everyone else.
    */
   private drawnLayers(layers: Layer[]): Layer[] {
-    return ed.show3dLayers ? layers : layers.map((l) => (l.threed && l.visible ? { ...l, visible: false } : l));
+    // The layer under a 3D transform shows as its preview (drawPreview3) instead.
+    const gone = this.preview3 && !this.preview3.settling ? this.preview3.id : null;
+    if (ed.show3dLayers && !gone) return layers;
+    return layers.map((l) => (l.visible && ((l.threed && !ed.show3dLayers) || l.id === gone) ? { ...l, visible: false } : l));
   }
 
   /** Shows or hides the 3D layers on this device only (ed.show3dLayers). */
@@ -1812,7 +1817,9 @@ export class Engine {
     const ctx = c.getContext('2d')!;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    c.style.display = on ? 'block' : 'none';
+    c.style.display = on || this.preview3 ? 'block' : 'none';
+    c.style.opacity = '';
+    if (this.preview3) return this.drawPreview3(c, ctx);
     if (!on) return;
     const v = this.comp.view;
     const ds = v.zoom * dpr;
@@ -1901,6 +1908,7 @@ export class Engine {
 
   /** The open transform has no change yet: closing it loses nothing. */
   private transformIdle(): boolean {
+    if (this.preview3) return isIdentity3(this.preview3.m3);
     const m = this.transformM;
     return !m || m.every((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) < 1e-12);
   }
@@ -1937,6 +1945,7 @@ export class Engine {
     ed.transform = null;
     this.transformM = null;
     this.comp.setTransformPreview(null);
+    this.clearPreview3();
   }
 
   /** Applies the transform: one op; undo applies the inverse. The preview stays until the tiles catch up. */
@@ -1958,6 +1967,158 @@ export class Engine {
 
   /** Layer of this client's transform op waiting for its echo (the preview shows until then). */
   private transformOp: string | null = null;
+
+  // --- 3D transform (3D layers) ----------------------------------------------------------------
+  //
+  // A 3D layer turns, scales and moves in 3D (Transform3Overlay): one layer.transform op with m3.
+  // This view sees the paper straight on, so the preview is the x, y of the moved points: the
+  // layer hides, and the paths canvas draws its strokes as lines (drawPreview3).
+
+  /**
+   * The 3D transform being previewed: the layer, the transform, its paint strokes (draw order)
+   * and their points moved (world x, y pairs). `settling`: applied, the layer shows again and the
+   * preview stays a moment over it while its tiles catch up.
+   */
+  private preview3: { id: string; m3: Affine3; strokes: Stroke[]; moved: Float64Array[]; settling: boolean } | null = null;
+  private settleTimer: number | undefined;
+
+  /** The 3D gizmo transforms this layer: a 3D layer without vector strokes or shapes (m3 cannot move them). */
+  takes3d(id: string): boolean {
+    const l = this.doc.layer(id);
+    if (!l?.threed || (l.kind ?? 'paint') !== 'paint') return false;
+    for (const st of this.doc.strokes.values()) if (st.layerId === id && st.vector) return false;
+    for (const sh of this.doc.shapes.values()) if (sh.layerId === id) return false;
+    return true;
+  }
+
+  /** The pivot of a 3D transform: the center of what the layer draws, at the middle of its depth. */
+  pivot3(id: string): [number, number, number] | null {
+    const b = this.contentOf(id);
+    if (!b) return null;
+    let z0 = Infinity, z1 = -Infinity;
+    for (const st of this.doc.strokes.values()) {
+      if (st.layerId !== id || st.mask) continue;
+      for (let i = 0; i < st.pts.length / 3; i++) {
+        const z = st.threed?.z[i] ?? 0;
+        if (z < z0) z0 = z;
+        if (z > z1) z1 = z;
+      }
+    }
+    return [(b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, z1 >= z0 ? (z0 + z1) / 2 : 0];
+  }
+
+  /**
+   * Live preview of a 3D transform of the open transform's layer (no op until apply). Returns
+   * the world bounds of what it would draw (null: nothing).
+   */
+  previewTransform3(m3: Affine3): Bounds | null {
+    const id = ed.transform?.id;
+    if (!id) return null;
+    // No change yet: the layer draws itself (the preview is lines only).
+    if (isIdentity3(m3)) {
+      if (this.preview3 && !this.preview3.settling) this.clearPreview3();
+      return this.contentOf(id);
+    }
+    let p = this.preview3;
+    if (!p || p.id !== id || p.settling) {
+      this.clearPreview3();
+      const strokes = [...this.doc.strokes.values()].filter((st) => st.layerId === id && !st.mask).sort((a, b) => a.seq - b.seq);
+      p = this.preview3 = { id, m3, strokes, moved: [], settling: false };
+      this.refreshLayers();
+    }
+    p.m3 = m3;
+    const k = scale3(m3);
+    let b: Bounds | null = null;
+    p.moved = p.strokes.map((st) => {
+      const out = new Float64Array((st.pts.length / 3) * 2);
+      const r = (st.brush.size * k) / 2;
+      for (let i = 0, j = 0; i < st.pts.length; i += 3, j += 2) {
+        const [x, y] = applyM3(m3, st.pts[i], st.pts[i + 1], st.threed?.z[i / 3] ?? 0);
+        out[j] = x;
+        out[j + 1] = y;
+        if (!b) b = { x0: x - r, y0: y - r, x1: x + r, y1: y + r };
+        else {
+          if (x - r < b.x0) b.x0 = x - r;
+          if (y - r < b.y0) b.y0 = y - r;
+          if (x + r > b.x1) b.x1 = x + r;
+          if (y + r > b.y1) b.y1 = y + r;
+        }
+      }
+      return out;
+    });
+    this.schedulePaths();
+    return b;
+  }
+
+  /** Applies a 3D transform: one op with m3; undo applies the inverse. The preview stays until the echo. */
+  applyTransform3(m3: Affine3): void {
+    const t = ed.transform;
+    ed.transform = null;
+    this.transformM = null;
+    if (!t || !this.preview3 || this.preview3.id !== t.id || isIdentity3(m3) || !ed.canEdit) {
+      this.clearPreview3();
+      return;
+    }
+    this.previewTransform3(m3);
+    this.transformOp = t.id;
+    this.sendOp({ type: 'layer.transform', id: t.id, m3 });
+    this.pushUndo({ undo: [{ type: 'layer.transform', id: t.id, m3: invertM3(m3) }], redo: [{ type: 'layer.transform', id: t.id, m3 }] });
+  }
+
+  /** The 3D transform is in the document: the layer shows again, the preview goes a moment later. */
+  private settlePreview3(): void {
+    const p = this.preview3;
+    if (!p) return;
+    p.settling = true;
+    this.refreshLayers();
+    window.clearTimeout(this.settleTimer);
+    this.settleTimer = window.setTimeout(() => this.clearPreview3(), 500);
+  }
+
+  private clearPreview3(): void {
+    window.clearTimeout(this.settleTimer);
+    if (!this.preview3) return;
+    this.preview3 = null;
+    this.refreshLayers();
+    this.schedulePaths();
+  }
+
+  /**
+   * The preview of a 3D transform: the layer's paint strokes as round lines of their brush size,
+   * color and opacity (erasers erase the preview), at the layer's opacity. Thinned as drawPaths.
+   */
+  private drawPreview3(c: HTMLCanvasElement, ctx: CanvasRenderingContext2D): void {
+    const p = this.preview3!;
+    const dpr = window.devicePixelRatio || 1;
+    const v = this.comp.view;
+    const ds = v.zoom * dpr;
+    const k = scale3(p.m3);
+    c.style.opacity = String(this.doc.layer(p.id)?.opacity ?? 1);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    p.strokes.forEach((st, n) => {
+      const q = p.moved[n];
+      if (!q?.length) return;
+      ctx.globalCompositeOperation = st.brush.tool === 'erase' ? 'destination-out' : 'source-over';
+      ctx.globalAlpha = st.brush.opacity;
+      ctx.strokeStyle = st.brush.color;
+      ctx.lineWidth = Math.max(1, st.brush.size * k * ds);
+      ctx.beginPath();
+      let lx = (q[0] - v.x) * ds, ly = (q[1] - v.y) * ds;
+      ctx.moveTo(lx, ly);
+      if (q.length === 2) ctx.lineTo(lx + 0.01, ly);
+      for (let i = 2; i < q.length; i += 2) {
+        const x = (q[i] - v.x) * ds, y = (q[i + 1] - v.y) * ds;
+        if (i + 2 < q.length && Math.abs(x - lx) < 1 && Math.abs(y - ly) < 1) continue;
+        ctx.lineTo(x, y);
+        lx = x;
+        ly = y;
+      }
+      ctx.stroke();
+    });
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+  }
 
   setActiveLayer(id: string): void {
     if (id !== ed.activeLayerId) this.setMaskTarget(false);
@@ -2015,6 +2176,7 @@ export class Engine {
           if (op.type === 'layer.transform' && m.by === ed.clientId && this.transformOp === op.id) {
             this.transformOp = null;
             this.comp.settleTransformPreview();
+            this.settlePreview3();
             this.syncSelect();
           }
           this.scheduleMarkers();
@@ -2044,6 +2206,7 @@ export class Engine {
         if (p?.op.type === 'layer.transform' && this.transformOp === p.op.id) {
           this.transformOp = null;
           this.comp.setTransformPreview(null);
+          this.clearPreview3();
           this.syncSelect();
         }
         if (!/duplicate|no such stroke|not deleted/.test(m.reason)) showToast(`Change rejected: ${m.reason}`);
