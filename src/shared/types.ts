@@ -502,6 +502,12 @@ export interface Peer {
   id: string;
   name: string;
   color: string;
+  /**
+   * This 2D window's person is in VR now (the desktop app opened the canvas in vdraw): the VR
+   * connection shows them, so others hide this one (no avatar in the list, no cursor). Absent
+   * from servers before it: false.
+   */
+  inVr?: boolean;
 }
 
 export type Role = 'owner' | 'editor' | 'viewer';
@@ -553,6 +559,8 @@ export type ClientMsg =
        * anonymous secret), at most view only, and not shown to other people.
        */
       embed?: boolean;
+      /** Already in VR (a reconnect while vdraw is open): as a status message right after the join. */
+      inVr?: boolean;
     }
   | { t: 'op'; opId: string; op: Op }
   /** A stroke being drawn: its new points since the last message (`threed`: their depth, as Stroke.threed). */
@@ -575,6 +583,8 @@ export type ClientMsg =
    * document at `seq`, framing the world rectangle `frame` (x, y, w, h).
    */
   | { t: 'preview'; png: string; seq: number; frame: [number, number, number, number] }
+  /** This person opened the canvas in VR from this window (true), or VR ended (false). See Peer.inVr. */
+  | { t: 'status'; inVr: boolean }
   | { t: 'ping' };
 
 export type ServerMsg =
@@ -623,6 +633,8 @@ export type ServerMsg =
   | { t: 'avatar'; by: string; off: true }
   | { t: 'peer.join'; peer: Peer }
   | { t: 'peer.leave'; id: string }
+  /** A peer went into VR or came back (Peer.inVr). */
+  | { t: 'peer.status'; id: string; inVr: boolean }
   | { t: 'error'; code: string; message: string }
   | { t: 'pong' };
 
