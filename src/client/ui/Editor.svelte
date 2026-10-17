@@ -28,6 +28,7 @@
   import Modal from './Modal.svelte';
   import NewCanvasForm from './NewCanvasForm.svelte';
   import { deleteLocal, getLocal } from '../local/store';
+  import { detachVr, stopVr, vr } from '../vrSession.svelte';
 
   /** `local`: a canvas on this device (code is its id): no server until it is put online. */
   let { code, onLeave, local = false }: { code: string; onLeave: () => void; local?: boolean } = $props();
@@ -121,6 +122,8 @@
     return () => {
       dead = true;
       window.removeEventListener('draw:auth', reauth);
+      // Leaving the canvas ends VR on it.
+      if (e) detachVr(e);
       e?.destroy();
       ed.role = null;
       ed.canvas = null;
@@ -210,6 +213,12 @@
         <div class="conn">{ed.status === 'connecting' ? 'Connecting…' : 'Offline, reconnecting…'}</div>
       {/if}
       <CanvasBanner {code} />
+      {#if vr.inVr || vr.starting}
+        <div class="vrbar" role="status">
+          <Icon name="headset" /><span>{vr.inVr ? 'This canvas is open in VR' : 'Opening this canvas in VR…'}</span>
+          <button onclick={stopVr}>{vr.inVr ? 'Close VR' : 'Cancel'}</button>
+        </div>
+      {/if}
       {#if ed.exportOpen && ed.exportPicking && engine}<ExportPick {engine} />{/if}
       {#if ed.effectsLayer && engine}<KaleidoscopeGizmo {engine} /><EffectsWindow {engine} />{/if}
       {#if ed.transform && engine}
@@ -486,6 +495,41 @@
     padding: 1px 6px;
     border-radius: 8px;
     white-space: nowrap;
+  }
+  /* While VR runs (vrSession.svelte.ts): bottom center, clear of the banner and the view controls. */
+  .vrbar {
+    position: absolute;
+    left: 50%;
+    bottom: 12px;
+    transform: translateX(-50%);
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: calc(100% - 120px);
+    padding: 4px 4px 4px 12px;
+    border-radius: 16px;
+    font-size: 12px;
+    white-space: nowrap;
+    color: #fff;
+    background: rgba(25, 113, 194, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+  .vrbar span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .vrbar button {
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.25);
+    border-color: rgba(255, 255, 255, 0.5);
+  }
+  .vrbar button:hover {
+    background: rgba(0, 0, 0, 0.4);
   }
   .conn {
     position: absolute;
