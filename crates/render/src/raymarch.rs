@@ -56,7 +56,8 @@ struct ParamsGpu {
     world_from_scene: [f32; 16],
     paper: [f32; 4],
     paper_grid: f32,
-    pad: [f32; 3],
+    unlit: u32,
+    pad: [f32; 2],
 }
 
 /// A compositing step as the shader reads it (vdraw_core::Step): what it is (`STEP_*`), the
@@ -133,6 +134,8 @@ pub struct Scene<'a> {
     /// (where the paper is see-through, it shows the plane while the canvas moves).
     pub paper: [f32; 4],
     pub paper_grid: f32,
+    /// Strokes in 3D lit by the scene's light (else their color as it is, as in the 2D app).
+    pub lit: bool,
 }
 
 /// What is drawn over the painting: the brush tip, the pointer's laser, and lines.
@@ -619,6 +622,7 @@ impl Raymarcher {
         p.world_from_scene = scene.world_from_scene.to_cols_array();
         p.paper = scene.paper;
         p.paper_grid = scene.paper_grid;
+        p.unlit = u32::from(!scene.lit);
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {

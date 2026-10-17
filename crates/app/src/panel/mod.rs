@@ -365,7 +365,7 @@ impl Panel {
                     Tab::Tool => tool_tab(ui, painter, presets, &mut self.dynamics_open, &mut self.typing),
                     Tab::Color => color::color_tab(ui, painter, palettes, &mut self.color, &mut self.typing),
                     Tab::Layers => layers::layers_tab(ui, painter, &mut self.layers, &mut self.typing),
-                    Tab::Settings => settings_tab(ui, canvas, actions),
+                    Tab::Settings => settings_tab(ui, painter, canvas, actions),
                 }
             });
         });
@@ -615,7 +615,7 @@ fn presets_section(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Prese
 }
 
 /// The Settings tab: moving back to the start, the debug snapshot, and the controls.
-fn settings_tab(ui: &mut egui::Ui, canvas: Option<&CanvasInfo>, actions: &mut Vec<Action>) {
+fn settings_tab(ui: &mut egui::Ui, painter: &mut Painter, canvas: Option<&CanvasInfo>, actions: &mut Vec<Action>) {
     match canvas {
         Some(c) => {
             section(ui, "CANVAS");
@@ -653,6 +653,12 @@ fn settings_tab(ui: &mut egui::Ui, canvas: Option<&CanvasInfo>, actions: &mut Ve
             actions.push(Action::DebugSnapshot);
         }
     });
+    ui.add_space(8.0);
+    section(ui, "VIEW");
+    if toggle(ui, "Light the strokes in 3D", painter.lit).clicked() {
+        painter.lit = !painter.lit;
+    }
+    ui.label(RichText::new("VR only: the 2D app shows paint without light.").color(TEXT_DIM).size(13.0));
     ui.add_space(8.0);
     section(ui, "CONTROLS");
     for line in [

@@ -154,6 +154,9 @@ pub struct Painter {
     pub history: (bool, bool),
     /// The stroke being drawn's id (a shared canvas's: it goes by it while it is drawn).
     pub stroke_id: String,
+    /// Strokes in 3D lit by the scene's light (VR only: the 2D app has none). Off on a shared
+    /// canvas to begin with, so they look as the 2D app shows them.
+    pub lit: bool,
 }
 
 impl Painter {
@@ -187,6 +190,7 @@ impl Painter {
             asked: Vec::new(),
             history: (false, false),
             stroke_id: String::new(),
+            lit: true,
         };
         p.rebuild();
         p
@@ -733,6 +737,7 @@ impl Painter {
             world_from_scene: glam::Mat4::IDENTITY,
             paper: [0.0; 4],
             paper_grid: 0.0,
+            lit: self.lit,
         }
     }
 }

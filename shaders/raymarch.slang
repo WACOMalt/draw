@@ -56,7 +56,8 @@ struct Params
     float4x4 worldFromScene;
     float4 paper;     // a shared canvas's paper (the plane z = 0): sRGB, alpha
     float paperGrid;  // how much a grid on the paper shows
-    float pad0, pad1, pad2;
+    uint unlit;       // 1: strokes in 3D show their color as it is (as the 2D app shows it), no light
+    float pad1, pad2;
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -282,6 +283,8 @@ static const float3 LIGHT = float3(0.39, 0.88, 0.29); // normalized (0.4, 0.9, 0
 
 float3 shadeSurface(float3 base, float3 n, float3 dir)
 {
+    if (params.unlit != 0)
+        return base;
     float diff = saturate(dot(n, LIGHT) * 0.5 + 0.5); // wrapped
     float3 h = normalize(LIGHT - dir);
     float spec = pow(saturate(dot(n, h)), 48.0) * 0.25;
@@ -322,6 +325,8 @@ void binAdd(uint k, float tau, float3 c)
 // radii (0 through the middle, so the light changes smoothly; the light is linear in n).
 float3 softLit(Segment g, float3 n)
 {
+    if (params.unlit != 0)
+        return g.color.rgb;
     float diff = saturate(dot(n, LIGHT) * 0.5 + 0.5);
     float hemi = lerp(0.5, 1.0, n.y * 0.5 + 0.5);
     // Softer strokes get flatter light: a haze has no clear surface to shade.

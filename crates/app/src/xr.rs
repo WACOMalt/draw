@@ -421,8 +421,10 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             let id = &lobby.identity;
             let session = Session::open(&lobby.server, &open.key, &id.name, &id.color, &id.anon, open.link.as_deref());
             mode = Mode::Canvas(Box::new(Canvas::new(session)));
-            // Edits go to the canvas from the first frame (none are kept locally).
+            // Edits go to the canvas from the first frame (none are kept locally); strokes look
+            // as the 2D app shows them, unlit.
             painter.shared = true;
+            painter.lit = false;
             panel.screen = Screen::Home;
             panel.opening = Some(Opening::Connecting(open.key.clone()));
             log::info!("opening canvas {} on {}", open.key, lobby.server.base);
