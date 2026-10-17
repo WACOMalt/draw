@@ -508,7 +508,8 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             };
             // The pull paints only a press that began off the panel (the panel's clicks read it
             // below).
-            let paint_pull = if press[h] == Press::Paint { pull } else { 0.0 };
+            // (Nothing paints on the start screen: there is no painting open.)
+            let paint_pull = if press[h] == Press::Paint && !matches!(mode, Mode::Home) { pull } else { 0.0 };
             match tool_at(&rig, aim) {
                 Some((at, up)) => painter.hand(h, t, at, up, paint_pull),
                 // The laser is off the paper: the stroke ends.
