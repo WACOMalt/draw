@@ -143,6 +143,9 @@
     };
   });
 
+  /** The transform box is 3D (engine.takes3d); reading ed.layers makes it follow layer changes. */
+  const box3d = $derived(!!ed.transform && !!engine && ed.layers.length >= 0 && engine.takes3d(ed.transform.id));
+
   // The Select tool on a paint layer or a group shows the layer transform (engine.syncSelect).
   $effect(() => {
     void [ed.tool, ed.activeLayerId, ed.transform, ed.layers, ed.role];
@@ -223,8 +226,8 @@
       {#if ed.effectsLayer && engine}<KaleidoscopeGizmo {engine} /><EffectsWindow {engine} />{/if}
       {#if ed.transform && engine}
         <!-- A 3D layer turns in 3D (one m3 op); anything else gets the 2D transform. -->
-        {#key `${ed.transform.id}:${!!ed.layers.find((l) => l.id === ed.transform?.id)?.threed}`}
-          {#if engine.takes3d(ed.transform.id)}<Transform3Overlay {engine} id={ed.transform.id} />{:else}<TransformOverlay {engine} id={ed.transform.id} />{/if}
+        {#key `${ed.transform.id}:${box3d}`}
+          {#if box3d}<Transform3Overlay {engine} id={ed.transform.id} />{:else}<TransformOverlay {engine} id={ed.transform.id} />{/if}
         {/key}
       {/if}
       {#if ed.denied}<AccessScreen {engine} {onLeave} {local} />{/if}

@@ -417,7 +417,8 @@ export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p
 export const MIX_MODES = ['normal', 'pigment'] as const;
 export type MixMode = (typeof MIX_MODES)[number];
 
-export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'threed'] as const;
+// 'threedGroups' is never in a document: it says the server takes 3D transforms of groups.
+export const DOC_FEATURES = ['adjust', 'clip', 'mask', 'tips', 'groups', 'shapes', 'paths', 'vectors', 'splines', 'compounds', 'arcs', 'custom', 'dashes', 'arrows', 'shapeAlpha', 'paper', 'effects', 'blur', 'pigment', 'threed', 'threedGroups'] as const;
 export type DocFeature = (typeof DOC_FEATURES)[number];
 
 export type Op =

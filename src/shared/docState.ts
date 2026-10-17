@@ -18,7 +18,7 @@ import {
 import { ValidationError, validateOp, validateShapeInput } from './validate';
 import { transformShapeMatrix } from './shapes';
 import { planFromPaint, planToPaint } from './flatten';
-import { depthOf, duplicateOf, effectivelyDeleted, flatAffine, subtreeHeight, subtreeIds, transformStroke, transformStroke3 } from './layers';
+import { depthOf, duplicateOf, effectivelyDeleted, flatAffine, subtreeHeight, subtreeIds, threeDTargets, transformStroke, transformStroke3 } from './layers';
 import { takesEffects, transformLayerLengths } from './effects';
 
 /** An op that does not make sense for the current state (the client is told why). */
@@ -207,24 +207,27 @@ export class DocState {
   }
 
   /**
-   * A 3D transform of the 3D layer `l` (layer.transform with m3): every stroke of it moves in
-   * 3D, masks and deleted ones too. Throws when the layer is not a 3D layer or holds vector
-   * strokes or shapes, or when the result goes out of range.
+   * A 3D transform (layer.transform with m3) of a 3D layer, or of a group whose paint layers are
+   * all 3D layers (threeDTargets): every stroke in it moves in 3D, masks and deleted ones too.
+   * Throws when it cannot move (vector strokes, shapes, flat layers), or when the result goes out
+   * of range.
    */
   private transform3(l: Layer, m3: Affine3): void {
-    if (!l.threed) throw new OpError('3D transforms are for 3D layers');
+    const ids = threeDTargets(this.layers, l, this.strokes.values(), this.shapes.values());
+    if (typeof ids === 'string') throw new OpError(ids);
     const changes: [Stroke, Pick<Stroke, 'pts' | 'brush' | 'threed'>][] = [];
     for (const st of this.strokes.values()) {
-      if (st.layerId !== l.id) continue;
-      if (st.vector) throw new OpError('a 3D transform cannot move vector strokes');
+      if (!ids.has(st.layerId)) continue;
       const t = transformStroke3(st, m3, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
       if (!t) throw new OpError('the transform goes out of range');
       changes.push([st, t]);
     }
-    for (const sh of this.shapes.values()) if (sh.layerId === l.id) throw new OpError('a 3D transform cannot move shapes');
     for (const [st, t] of changes) Object.assign(st, t);
-    // Effect lengths scale with the layer (as the paper sees the transform).
-    this.layers.set(l.id, transformLayerLengths(l, flatAffine(m3)));
+    // Effect lengths scale with the layers (as the paper sees the transform).
+    for (const id of ids) {
+      const x = this.layers.get(id);
+      if (x) this.layers.set(id, transformLayerLengths(x, flatAffine(m3)));
+    }
   }
 
   /** Throws unless `id` is a live shape layer. */
