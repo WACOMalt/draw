@@ -95,6 +95,16 @@ interface Live {
   started: number;
 }
 
+/** A layer or group drawn moved by a transform not applied yet: what it showed, and the view then. */
+interface Preview {
+  id: string;
+  m: Affine;
+  settle: boolean;
+  settleAt: number;
+  snap: OffscreenCanvas | null;
+  capture: { x: number; y: number; ds: number } | null;
+}
+
 export class Canvas2DRenderer implements Renderer {
   readonly kind = 'canvas2d';
   readonly profile = perfProfile(null);
@@ -111,8 +121,8 @@ export class Canvas2DRenderer implements Renderer {
   private layers: Layer[] = [];
   private tree: LayerNode[] = [];
   private byId = new Map<string, Layer>();
-  /** A layer or group drawn moved by a transform not applied yet (see the WebGL2 renderer). */
-  private preview: { id: string; m: Affine; settle: boolean; settleAt: number; snap: OffscreenCanvas | null; capture: { x: number; y: number; ds: number } | null } | null = null;
+  /** Layers or groups drawn moved by transforms not applied yet, by id (see the WebGL2 renderer). */
+  private previews = new Map<string, Preview>();
   private live = new Map<string, Live>();
   /** Committed shapes, kept here too: edited shape layers draw on the main thread. */
   private shapes = new ShapeIndex();
@@ -313,17 +323,27 @@ export class Canvas2DRenderer implements Renderer {
   }
 
   setTransformPreview(p: { id: string; m: Affine } | null): void {
-    const old = this.preview;
-    if (p && old && old.id === p.id && !old.settle) old.m = p.m;
-    else this.preview = p ? { id: p.id, m: p.m, settle: false, settleAt: 0, snap: null, capture: null } : null;
+    this.setTransformPreviews(p ? [p] : null);
+  }
+
+  setTransformPreviews(list: { id: string; m: Affine }[] | null): void {
+    const keep = new Set(list?.map((p) => p.id));
+    for (const [id, pv] of this.previews) if (!keep.has(id) || pv.settle) this.previews.delete(id);
+    for (const p of list ?? []) {
+      const old = this.previews.get(p.id);
+      if (old) old.m = p.m;
+      else this.previews.set(p.id, { id: p.id, m: p.m, settle: false, settleAt: 0, snap: null, capture: null });
+    }
     this.invalidate();
   }
 
-  /** Tiles render in a worker here: the preview simply stays a moment after the transform. */
+  /** Tiles render in a worker here: the previews simply stay a moment after the transform. */
   settleTransformPreview(): void {
-    if (!this.preview) return;
-    this.preview.settle = true;
-    this.preview.settleAt = performance.now();
+    if (!this.previews.size) return;
+    for (const pv of this.previews.values()) {
+      pv.settle = true;
+      pv.settleAt = performance.now();
+    }
     this.invalidate();
   }
 
@@ -558,11 +578,11 @@ export class Canvas2DRenderer implements Renderer {
     this.drawNodes(ctx, this.tree, grid, 0);
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
-    const pv = this.preview;
-    if (pv?.settle && performance.now() - pv.settleAt > 800) {
-      this.preview = null;
-      this.invalidate();
-    }
+    for (const [id, pv] of this.previews)
+      if (pv.settle && performance.now() - pv.settleAt > 800) {
+        this.previews.delete(id);
+        this.invalidate();
+      }
     this.onFrame?.();
     if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
@@ -590,7 +610,8 @@ export class Canvas2DRenderer implements Renderer {
 
   private drawNode(dst: Ctx, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
     const l = node.layer;
-    if (this.preview?.id === l.id) return this.drawPreview(dst, node, g, atop, depth);
+    const pv = this.previews.get(l.id);
+    if (pv) return this.drawPreview(dst, pv, node, g, atop, depth);
     if (l.kind !== 'group') return this.drawLayerOnto(dst, l, g, atop);
     // A group with effects draws its layers together first (as if isolated), then the effects.
     if (activeEffects2d(l).length) return this.put(dst, this.nodePixels(node, g, depth), l.opacity, atop ? 'source-atop' : op(l.blend));
@@ -622,11 +643,10 @@ export class Canvas2DRenderer implements Renderer {
     return fx.length ? this.applyEffects(fx, this.scratch) : this.scratch;
   }
 
-  private drawPreview(dst: Ctx, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
-    const pv = this.preview!;
+  private drawPreview(dst: Ctx, pv: Preview, node: LayerNode, g: Grid, atop: boolean, depth: number): void {
     if (!pv.snap || pv.snap.width !== this.canvas.width || pv.snap.height !== this.canvas.height) {
       if (pv.settle) {
-        this.preview = null;
+        this.previews.delete(pv.id);
         return this.drawNode(dst, node, g, atop, depth);
       }
       const src = this.nodePixels(node, g, depth);

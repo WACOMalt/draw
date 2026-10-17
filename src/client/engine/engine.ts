@@ -37,7 +37,7 @@ import { anonSecret, desktopToken, followRename, grants, links } from '../identi
 import { Net, type Channel } from './net';
 import { LocalNet } from '../local/localNet';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
-import { effectivelyDeleted, effectivelyVisible, invert, scale3, sortLayers, subtreeIds, threeDTargets } from '../../shared/layers';
+import { effectivelyDeleted, effectivelyVisible, invert, scale3, sortLayers, subtreeIds, threeDTargets, transformStroke3 } from '../../shared/layers';
 import { applyM3, invertM3, isIdentity3 } from '../../shared/transform3';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { ShapeTool } from './shapeTool';
@@ -154,6 +154,58 @@ function segDist2(ax: number, ay: number, bx: number, by: number, cx: number, cy
     return qx * qx + qy * qy;
   };
   return Math.min(pt(ax, ay, cx, cy, dx, dy), pt(bx, by, cx, cy, dx, dy), pt(cx, cy, ax, ay, bx, by), pt(dx, dy, ax, ay, bx, by));
+}
+
+/** Most dabs a 3D transform preview draws as strokes, every frame (about 0.3 µs each on a desktop). */
+const PREVIEW3_MAX_DABS = 120_000;
+
+/**
+ * The plane nearest to all the points of these strokes, as depth z = a x + b y + c (no depth is
+ * 0), by least squares; `flat`: they all lie in it, within 0.2% of their size (a flat drawing
+ * however it was turned, with the points' rounding).
+ */
+function planeOf(strokes: Stroke[]): { plane: [number, number, number]; flat: boolean } {
+  // Least squares about the mean (better conditioned): sums of products of the offsets.
+  let n = 0, mx = 0, my = 0, mz = 0;
+  for (const st of strokes)
+    for (let i = 0, j = 0; i < st.pts.length; i += 3, j++) {
+      n++;
+      mx += st.pts[i];
+      my += st.pts[i + 1];
+      mz += st.threed?.z[j] ?? 0;
+    }
+  if (!n) return { plane: [0, 0, 0], flat: true };
+  mx /= n;
+  my /= n;
+  mz /= n;
+  let xx = 0, xy = 0, yy = 0, xz = 0, yz = 0;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const st of strokes)
+    for (let i = 0, j = 0; i < st.pts.length; i += 3, j++) {
+      const x = st.pts[i] - mx, y = st.pts[i + 1] - my, z = (st.threed?.z[j] ?? 0) - mz;
+      xx += x * x;
+      xy += x * y;
+      yy += y * y;
+      xz += x * z;
+      yz += y * z;
+      x0 = Math.min(x0, x);
+      x1 = Math.max(x1, x);
+      y0 = Math.min(y0, y);
+      y1 = Math.max(y1, y);
+    }
+  const det = xx * yy - xy * xy, r2 = xx + yy;
+  // Points on a line (or one point): the plane through it that tilts along it only.
+  const line = !(det > 1e-12 * r2 * r2);
+  const a = line ? (r2 > 0 ? xz / r2 : 0) : (xz * yy - yz * xy) / det;
+  const b = line ? (r2 > 0 ? yz / r2 : 0) : (yz * xx - xz * xy) / det;
+  const plane: [number, number, number] = [a, b, mz - a * mx - b * my];
+  const tol = 0.002 * Math.max(x1 - x0, y1 - y0, 1e-9);
+  for (const st of strokes)
+    for (let i = 0, j = 0; i < st.pts.length; i += 3, j++) {
+      const z = (st.threed?.z[j] ?? 0) - mz;
+      if (Math.abs(z - a * (st.pts[i] - mx) - b * (st.pts[i + 1] - my)) > tol) return { plane, flat: false };
+    }
+  return { plane, flat: true };
 }
 
 export class Engine {
@@ -1334,10 +1386,8 @@ export class Engine {
    * 3D layers count as hidden. No op: they stay visible for everyone else.
    */
   private drawnLayers(layers: Layer[]): Layer[] {
-    // The layer under a 3D transform shows as its preview (drawPreview3) instead.
-    const gone = this.preview3 && !this.preview3.settling ? this.preview3.id : null;
-    if (ed.show3dLayers && !gone) return layers;
-    return layers.map((l) => (l.visible && ((l.threed && !ed.show3dLayers) || l.id === gone) ? { ...l, visible: false } : l));
+    if (ed.show3dLayers) return layers;
+    return layers.map((l) => (l.visible && l.threed ? { ...l, visible: false } : l));
   }
 
   /** Shows or hides the 3D layers on this device only (ed.show3dLayers). */
@@ -1887,9 +1937,7 @@ export class Engine {
     const ctx = c.getContext('2d')!;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    c.style.display = on || this.preview3 ? 'block' : 'none';
-    c.style.opacity = '';
-    if (this.preview3) return this.drawPreview3(c, ctx);
+    c.style.display = on ? 'block' : 'none';
     if (!on) return;
     const v = this.comp.view;
     const ds = v.zoom * dpr;
@@ -2040,17 +2088,20 @@ export class Engine {
 
   // --- 3D transform (3D layers) ----------------------------------------------------------------
   //
-  // A 3D layer turns, scales and moves in 3D (Transform3Overlay): one layer.transform op with m3.
-  // This view sees the paper straight on, so the preview is the x, y of the moved points: the
-  // layer hides, and the paths canvas draws its strokes as lines (drawPreview3).
+  // A 3D layer or group turns, scales and moves in 3D (Transform3Overlay): one layer.transform op
+  // with m3. This view sees the paper straight on. Until applied, each paint layer shows moved in
+  // its place in the layer stack, with its blend mode, mask and effects.
 
   /**
-   * The 3D transform being previewed: the layer, the transform, its paint strokes (draw order)
-   * and their points moved (world x, y pairs). `settling`: applied, the layer shows again and the
-   * preview stays a moment over it while its tiles catch up.
+   * The 3D transform being previewed: the layer or group, the transform, and how each paint layer
+   * in it shows. `strokes`: the strokes (masks too) of the layers drawn moved with their brushes
+   * (setStrokePreview: exact; layers with few dabs, truly 3D ones first). `pictures`: the other
+   * layers, each its picture moved by the 2D transform the 3D one makes on its plane
+   * (setTransformPreviews: exact for a flat layer however it was turned, but its dabs squash where
+   * it tilts until applied; a truly 3D layer gets the plane nearest to it). `shown`: the paint
+   * strokes of shown layers, for the bounds.
    */
-  private preview3: { id: string; m3: Affine3; strokes: Stroke[]; moved: Float64Array[]; settling: boolean } | null = null;
-  private settleTimer: number | undefined;
+  private preview3: { id: string; m3: Affine3; strokes: Stroke[]; pictures: Map<string, [number, number, number]>; shown: Stroke[] } | null = null;
 
   /**
    * The 3D gizmo transforms this layer: a 3D layer, or a group whose paint layers are all 3D
@@ -2087,33 +2138,41 @@ export class Engine {
   previewTransform3(m3: Affine3): Bounds | null {
     const id = ed.transform?.id;
     if (!id) return null;
-    // No change yet: the layer draws itself (the preview is lines only).
+    // No change yet: the layers draw themselves.
     if (isIdentity3(m3)) {
-      if (this.preview3 && !this.preview3.settling) this.clearPreview3();
+      this.clearPreview3();
       return this.contentOf(id);
     }
     let p = this.preview3;
-    if (!p || p.id !== id || p.settling) {
+    if (!p || p.id !== id) {
       this.clearPreview3();
-      // The paint strokes of the shown layers (of a group: all of them, in paint order).
-      const order = new Map(this.doc.displayLayers().filter((l) => l.visible).map((l, i) => [l.id, i]));
-      const ids = subtreeIds(this.doc.layerView().values(), id);
-      const strokes = [...this.doc.strokes.values()]
-        .filter((st) => ids.has(st.layerId) && order.has(st.layerId) && !st.mask)
-        .sort((a, b) => order.get(a.layerId)! - order.get(b.layerId)! || a.seq - b.seq);
-      p = this.preview3 = { id, m3, strokes, moved: [], settling: false };
-      this.refreshLayers();
+      p = this.preview3 = this.planPreview3(id, m3);
     }
     p.m3 = m3;
+    if (p.strokes.length) {
+      const range: [number, number] = [LIMITS.minBrushWorld, LIMITS.maxBrushWorld];
+      this.comp.setStrokePreview?.(
+        p.strokes.map((st) => {
+          const t = transformStroke3(st, m3, LIMITS.maxCoord, range);
+          return t ? { ...st, ...t } : st;
+        }),
+      );
+    }
+    if (p.pictures.size) {
+      // On the plane z = a x + b y + c the 3D transform moves the paper's points by a 2D one.
+      this.comp.setTransformPreviews(
+        [...p.pictures].map(([lid, [a, b, c]]) => ({
+          id: lid,
+          m: [m3[0] + m3[6] * a, m3[1] + m3[7] * a, m3[3] + m3[6] * b, m3[4] + m3[7] * b, m3[6] * c + m3[9], m3[7] * c + m3[10]] as Affine,
+        })),
+      );
+    }
     const k = scale3(m3);
     let b: Bounds | null = null;
-    p.moved = p.strokes.map((st) => {
-      const out = new Float64Array((st.pts.length / 3) * 2);
+    for (const st of p.shown) {
       const r = (st.brush.size * k) / 2;
-      for (let i = 0, j = 0; i < st.pts.length; i += 3, j += 2) {
+      for (let i = 0; i < st.pts.length; i += 3) {
         const [x, y] = applyM3(m3, st.pts[i], st.pts[i + 1], st.threed?.z[i / 3] ?? 0);
-        out[j] = x;
-        out[j + 1] = y;
         if (!b) b = { x0: x - r, y0: y - r, x1: x + r, y1: y + r };
         else {
           if (x - r < b.x0) b.x0 = x - r;
@@ -2122,10 +2181,38 @@ export class Engine {
           if (y + r > b.y1) b.y1 = y + r;
         }
       }
-      return out;
-    });
-    this.schedulePaths();
+    }
     return b;
+  }
+
+  /**
+   * How each paint layer under `id` shows during its 3D transform (see preview3): as strokes while
+   * their dabs fit in PREVIEW3_MAX_DABS, truly 3D layers first (a picture cannot show them right),
+   * then the smaller ones; the rest as pictures.
+   */
+  private planPreview3(id: string, m3: Affine3): NonNullable<typeof this.preview3> {
+    const layers = this.doc.layerView();
+    const ids = subtreeIds(layers.values(), id);
+    const byLayer = new Map<string, Stroke[]>();
+    for (const st of this.doc.strokes.values()) {
+      if (!ids.has(st.layerId)) continue;
+      let list = byLayer.get(st.layerId);
+      if (!list) byLayer.set(st.layerId, (list = []));
+      list.push(st);
+    }
+    const plans = [...byLayer].map(([lid, list]) => ({ lid, list, ...planeOf(list), dabs: this.comp.previewDabs?.(list) ?? Infinity }));
+    plans.sort((a, b) => Number(a.flat) - Number(b.flat) || a.dabs - b.dabs);
+    let budget = PREVIEW3_MAX_DABS;
+    const strokes: Stroke[] = [];
+    const pictures = new Map<string, [number, number, number]>();
+    for (const pl of plans) {
+      if (pl.dabs <= budget) {
+        budget -= pl.dabs;
+        strokes.push(...pl.list);
+      } else pictures.set(pl.lid, pl.plane);
+    }
+    const shown = [...this.doc.strokes.values()].filter((st) => ids.has(st.layerId) && !st.mask && effectivelyVisible(layers, layers.get(st.layerId)!));
+    return { id, m3, strokes, pictures, shown };
   }
 
   /** Applies a 3D transform: one op with m3; undo applies the inverse. The preview stays until the echo. */
@@ -2143,59 +2230,22 @@ export class Engine {
     this.pushUndo({ undo: [{ type: 'layer.transform', id: t.id, m3: invertM3(m3) }], redo: [{ type: 'layer.transform', id: t.id, m3 }] });
   }
 
-  /** The 3D transform is in the document: the layer shows again, the preview goes a moment later. */
+  /**
+   * The 3D transform is in the document: the renderer keeps drawing the preview until the tiles
+   * show the moved strokes (the echo settles the pictures: settleTransformPreview).
+   */
   private settlePreview3(): void {
-    const p = this.preview3;
-    if (!p) return;
-    p.settling = true;
-    this.refreshLayers();
-    window.clearTimeout(this.settleTimer);
-    this.settleTimer = window.setTimeout(() => this.clearPreview3(), 500);
+    if (!this.preview3) return;
+    if (this.preview3.strokes.length) this.comp.settleStrokePreview?.();
+    this.preview3 = null;
   }
 
   private clearPreview3(): void {
-    window.clearTimeout(this.settleTimer);
-    if (!this.preview3) return;
+    const p = this.preview3;
+    if (!p) return;
+    if (p.strokes.length) this.comp.setStrokePreview?.(null);
+    if (p.pictures.size) this.comp.setTransformPreview(null);
     this.preview3 = null;
-    this.refreshLayers();
-    this.schedulePaths();
-  }
-
-  /**
-   * The preview of a 3D transform: the layer's paint strokes as round lines of their brush size,
-   * color and opacity (erasers erase the preview), at the layer's opacity. Thinned as drawPaths.
-   */
-  private drawPreview3(c: HTMLCanvasElement, ctx: CanvasRenderingContext2D): void {
-    const p = this.preview3!;
-    const dpr = window.devicePixelRatio || 1;
-    const v = this.comp.view;
-    const ds = v.zoom * dpr;
-    const k = scale3(p.m3);
-    c.style.opacity = String(this.doc.layer(p.id)?.opacity ?? 1);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    p.strokes.forEach((st, n) => {
-      const q = p.moved[n];
-      if (!q?.length) return;
-      ctx.globalCompositeOperation = st.brush.tool === 'erase' ? 'destination-out' : 'source-over';
-      ctx.globalAlpha = st.brush.opacity;
-      ctx.strokeStyle = st.brush.color;
-      ctx.lineWidth = Math.max(1, st.brush.size * k * ds);
-      ctx.beginPath();
-      let lx = (q[0] - v.x) * ds, ly = (q[1] - v.y) * ds;
-      ctx.moveTo(lx, ly);
-      if (q.length === 2) ctx.lineTo(lx + 0.01, ly);
-      for (let i = 2; i < q.length; i += 2) {
-        const x = (q[i] - v.x) * ds, y = (q[i + 1] - v.y) * ds;
-        if (i + 2 < q.length && Math.abs(x - lx) < 1 && Math.abs(y - ly) < 1) continue;
-        ctx.lineTo(x, y);
-        lx = x;
-        ly = y;
-      }
-      ctx.stroke();
-    });
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.globalAlpha = 1;
   }
 
   setActiveLayer(id: string): void {
