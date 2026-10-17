@@ -476,6 +476,28 @@ export type AppliedOp =
   | { type: 'shape.add'; shape: Shape }
   | { type: 'shape.restore'; id: string; shape: Shape };
 
+/**
+ * Where a part of a VR user is (vdraw), in world units and canvas axes (x right, y down, z toward
+ * the viewer of the 2D canvas, as Stroke.threed). `p`: the position. `f`: the forward direction
+ * (the head: where it looks; a hand: where the controller points, its brush and laser). `u`: the
+ * up direction (the top of the head, or of the controller). `f` and `u` are unit vectors.
+ */
+export interface Pose {
+  p: [number, number, number];
+  f: [number, number, number];
+  u: [number, number, number];
+}
+
+/**
+ * A VR user's presence: the head and the hands (left, right; null: not tracked). `m`: world
+ * units per meter for that user now (they zoom the canvas): a head is about 0.2 m across.
+ */
+export interface Avatar {
+  m: number;
+  head: Pose;
+  hands: [Pose | null, Pose | null];
+}
+
 export interface Peer {
   id: string;
   name: string;
@@ -543,6 +565,12 @@ export type ClientMsg =
   | { t: 'shape.live'; shapes: ShapeInput[] }
   | { t: 'cursor'; x: number | null; y: number | null; layerId: string | null }
   /**
+   * A VR user's head and hands, like a cursor (not persisted; about 20 a second while they move).
+   * `off`: no longer shown (left canvas mode, or hidden).
+   */
+  | ({ t: 'avatar' } & Avatar)
+  | { t: 'avatar'; off: true }
+  /**
    * Link preview image from an editor's browser: a PNG (base64, at most PREVIEW_LIMITS) of the
    * document at `seq`, framing the world rectangle `frame` (x, y, w, h).
    */
@@ -591,6 +619,8 @@ export type ServerMsg =
   | { t: 'live.end'; by: string; id: string }
   | { t: 'shape.live'; by: string; shapes: ShapeInput[] }
   | { t: 'cursor'; by: string; x: number | null; y: number | null; layerId: string | null }
+  | ({ t: 'avatar'; by: string } & Avatar)
+  | { t: 'avatar'; by: string; off: true }
   | { t: 'peer.join'; peer: Peer }
   | { t: 'peer.leave'; id: string }
   | { t: 'error'; code: string; message: string }

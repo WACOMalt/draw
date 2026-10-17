@@ -23,6 +23,7 @@
   import KaleidoscopeGizmo from './KaleidoscopeGizmo.svelte';
   import TransformOverlay from './TransformOverlay.svelte';
   import Transform3Overlay from './Transform3Overlay.svelte';
+  import Avatars from './Avatars.svelte';
   import SelectOverlay from './SelectOverlay.svelte';
   import Modal from './Modal.svelte';
   import NewCanvasForm from './NewCanvasForm.svelte';
@@ -147,7 +148,7 @@
 
   // Keep preferences across visits.
   $effect(() => {
-    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.penStyle, ed.keepSelection, ed.addSelection, ed.show3dLayers]);
+    JSON.stringify([ed.brush, ed.eraser, ed.smoothing, ed.fg, ed.bg, ed.swatches, ed.name, ed.showMarkers, ed.touchPressure, ed.strokeEraserSize, ed.strokeEraserAll, ed.shapeKind, ed.shapeStyle, ed.penStyle, ed.keepSelection, ed.addSelection, ed.show3dLayers, ed.showAvatars]);
     const t = setTimeout(() => ed.persist(), 400);
     return () => clearTimeout(t);
   });
@@ -198,6 +199,7 @@
           <span>{m.count > 999 ? `${Math.round(m.count / 100) / 10}k` : m.count}</span>
         </button>
       {/each}
+      <Avatars />
       {#each peerCursors as p (p.id)}
         <div class="peer" style:transform="translate({p.sx}px, {p.sy}px)" style:--c={p.color}>
           <svg viewBox="0 0 12 12"><path d="M0 0L11 4.5 6 6 4.5 11z" /></svg>
@@ -218,6 +220,15 @@
       {/if}
       {#if ed.denied}<AccessScreen {engine} {onLeave} {local} />{/if}
       <div class="viewctl">
+        {#if ed.avatars.length}
+          <!-- VR people (vdraw) are here: their ghosts can hide on this device. -->
+          <button
+            class:on={ed.showAvatars}
+            title="Show VR people"
+            aria-label="Show VR people"
+            aria-pressed={ed.showAvatars}
+            onclick={() => (ed.showAvatars = !ed.showAvatars)}><Icon name="headset" /></button>
+        {/if}
         <button
           class:on={ed.showMarkers}
           title={ed.showMarkers ? 'Hide markers (M)' : 'Show markers for small and off-screen drawings (M)'}

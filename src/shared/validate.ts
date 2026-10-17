@@ -34,6 +34,8 @@ import {
   type ShapeInput,
   type ShapeProps,
   type ShapeUpdate,
+  type Avatar,
+  type Pose,
   type StrokeVector,
   type StrokeThreeD,
   POINT_STRIDE,
@@ -563,6 +565,40 @@ export function validateShapeInput(v: unknown): ShapeInput {
 export function validateVector(v: unknown): StrokeVector {
   const { id: _i, layerId: _l, name: _n, z: _z, ...rest } = validateShapeInput({ ...obj(v, 'vector'), id: 'vector0000', layerId: 'vector0000', name: '', z: 0 });
   return rest;
+}
+
+// --- presence --------------------------------------------------------------------------------
+
+/** A position in range. */
+function point3(v: unknown, what: string): [number, number, number] {
+  if (!Array.isArray(v) || v.length !== 3) fail(`bad ${what}`);
+  return [coord(v[0], what), coord(v[1], what), coord(v[2], what)];
+}
+
+/** A direction, made unit; a zero (or absurd) one is refused. */
+function unit3(v: unknown, what: string): [number, number, number] {
+  if (!Array.isArray(v) || v.length !== 3) fail(`bad ${what}`);
+  const [x, y, z] = v.map((c) => num(c, -1e6, 1e6, what));
+  const len = Math.hypot(x, y, z);
+  if (!(len > 1e-9)) fail(`bad ${what}`);
+  return [x / len, y / len, z / len];
+}
+
+function pose(v: unknown, what: string): Pose {
+  const o = obj(v, what);
+  return { p: point3(o.p, `${what}.p`), f: unit3(o.f, `${what}.f`), u: unit3(o.u, `${what}.u`) };
+}
+
+/** A VR user's head and hands (an avatar message without `t`): positions in range, unit directions. */
+export function validateAvatar(v: unknown): Avatar {
+  const o = obj(v, 'avatar');
+  if (!Array.isArray(o.hands) || o.hands.length !== 2) fail('bad hands');
+  const hand = (h: unknown, what: string) => (h === null ? null : pose(h, what));
+  return {
+    m: num(o.m, LIMITS.minBrushWorld, LIMITS.maxBrushWorld, 'm'),
+    head: pose(o.head, 'head'),
+    hands: [hand(o.hands[0], 'left hand'), hand(o.hands[1], 'right hand')],
+  };
 }
 
 export { id as validateId, num as validateNumber, str as validateString };

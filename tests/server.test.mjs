@@ -1297,6 +1297,49 @@ try {
     check(shared.transformThreeD({ z: [1] }, [1, 0, 0, 1, 7, 7], 1e15).z[0] === 1, '3D: a move keeps the depth');
   }
 
+  // --- VR presence (avatars): head and hands, relayed like cursors -------------------------------
+  {
+    const vb = new Browser();
+    await account(vb, 'avatars@example.com', 'Avatar Tester');
+    const ac = (await vb.api('POST', '/api/sessions', { name: 'avatar-test' })).data.key;
+    const a1 = await vb.join(ac);
+    const w1 = await first(a1);
+    const v1 = await new Browser().join(ac);
+    const vw1 = await first(v1);
+    const pose = (x, extra = {}) => ({ p: [x, 20, 30], f: [0, 0, -2], u: [0, -1, 0], ...extra });
+    const avatar = (m, extra = {}) => ({ t: 'avatar', m, head: pose(100), hands: [pose(80), null], ...extra });
+    const seen = (conn, m, ms = 500) => conn.next((x) => x.t === 'avatar' && x.m === m, ms);
+    a1.send(avatar(1000));
+    let got = await seen(v1, 1000, 2000);
+    check(got?.by === w1.clientId && got.head.p.join() === '100,20,30' && got.head.f.join() === '0,0,-1' && got.hands[0].p[0] === 80 && got.hands[1] === null, 'avatars: relayed with by; directions made unit');
+    check(vw1.role === 'viewer', 'avatars: (the other side is a viewer)');
+    v1.send(avatar(1001));
+    got = await seen(a1, 1001, 2000);
+    check(got?.by === vw1.clientId, 'avatars: a viewer may show their own');
+    const bad = [
+      [avatar(1002, { head: pose(2e15) }), 'a position out of range'],
+      [avatar(1003, { head: pose(1, { f: [0, 0, 0] }) }), 'a zero direction'],
+      [avatar(1004, { hands: [pose(1)] }), 'not two hands'],
+      [avatar(0), 'm above 0'],
+      [avatar(1005, { head: undefined }), 'no head'],
+      [avatar(1006, { hands: [pose(1, { u: [0, 'x', 1] }), null] }), 'numbers'],
+    ];
+    for (const [msg, label] of bad) {
+      a1.send(msg);
+      check(!(await seen(v1, msg.m)), `avatars: dropped: ${label}`);
+    }
+    a1.send({ t: 'avatar', off: true });
+    got = await v1.next((x) => x.t === 'avatar' && x.off === true, 2000);
+    check(got?.by === w1.clientId && got.head === undefined, 'avatars: off is relayed');
+    for (let i = 0; i < 80; i++) a1.send(avatar(2000 + i));
+    await sleep(500);
+    const n = v1.msgs.filter((x) => x.t === 'avatar' && x.m >= 2000).length;
+    check(n >= 30 && n <= 50, `avatars: rate limited like cursors (${n} of 80 relayed)`);
+    a1.ws.close();
+    got = await v1.next((x) => x.t === 'peer.leave' && x.id === w1.clientId, 2000);
+    check(!!got, 'avatars: a leave is relayed (clients drop the ghost)');
+  }
+
   // --- admins manage every owned canvas like its owner ------------------------------------------
   const adm = (await funky.api('POST', '/api/sessions', { name: 'admin-test' })).data.key;
   await funky.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'none' });

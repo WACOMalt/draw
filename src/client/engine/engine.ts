@@ -2144,6 +2144,7 @@ export class Engine {
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);
         ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
+        ed.avatars = [];
         ed.strokeCount = this.doc.strokes.size;
         // Ops from before a reconnect have no echo yet. The server drops duplicates.
         for (const p of this.doc.pending) this.net.send({ t: 'op', opId: p.opId, op: p.op });
@@ -2238,11 +2239,23 @@ export class Engine {
         }
         break;
       }
+      case 'avatar': {
+        // A VR user's head and hands: the newest replaces the last; `off` removes it.
+        if ('off' in m) {
+          ed.avatars = ed.avatars.filter((a) => a.id !== m.by);
+          break;
+        }
+        const next = { id: m.by, m: m.m, head: m.head, hands: m.hands, at: performance.now() };
+        const i = ed.avatars.findIndex((a) => a.id === m.by);
+        ed.avatars = i < 0 ? [...ed.avatars, next] : ed.avatars.map((a, j) => (j === i ? next : a));
+        break;
+      }
       case 'peer.join':
         ed.peers = [...ed.peers.filter((p) => p.id !== m.peer.id), { ...m.peer, x: null, y: null, layerId: null }];
         break;
       case 'peer.leave':
         ed.peers = ed.peers.filter((p) => p.id !== m.id);
+        if (ed.avatars.some((a) => a.id === m.id)) ed.avatars = ed.avatars.filter((a) => a.id !== m.id);
         for (const id of this.livesByPeer.get(m.id) ?? []) this.comp.liveEnd(id);
         this.livesByPeer.delete(m.id);
         this.shapes.dropRemote(m.id);
