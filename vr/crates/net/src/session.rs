@@ -48,7 +48,10 @@ fn run_socket(url: String, mut hello: Value, out: Receiver<Out>, events: Sender<
     use tungstenite::{Message, stream::MaybeTlsStream};
     let mut retry = 0u32;
     loop {
-        let (mut ws, _) = match tungstenite::connect(&url) {
+        // The welcome holds the whole document: a busy canvas's is far over the library's
+        // limits (16 MB a frame, 64 MB a message), which would end every connection.
+        let config = tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+        let (mut ws, _) = match tungstenite::client::connect_with_config(url.as_str(), Some(config), 3) {
             Ok(c) => c,
             Err(e) => {
                 // A missing canvas: the upgrade is answered 404; that is final.
@@ -139,6 +142,9 @@ fn run_socket(url: String, mut hello: Value, out: Receiver<Out>, events: Sender<
         }
     }
 }
+
+/// The largest message taken (a canvas's welcome holds all of it).
+const MAX_MESSAGE: usize = 1 << 30;
 
 /// Waits before connecting again (500 ms doubling to 8 s); true when told to close meanwhile.
 fn wait_backoff(out: &Receiver<Out>, retry: &mut u32, hello: &mut Value) -> bool {
@@ -311,6 +317,11 @@ impl Session {
             match ev {
                 Event::Open => self.state = State::Connecting,
                 Event::Closed { reason, fin } => {
+                    if fin {
+                        log::warn!("{}: the connection ended: {reason}", self.key);
+                    } else {
+                        log::warn!("{}: the connection dropped ({reason}); connecting again", self.key);
+                    }
                     if !matches!(self.state, State::Denied(_)) {
                         self.state = if fin { State::Denied(reason) } else { State::Reconnecting(reason) };
                     }
@@ -365,6 +376,7 @@ impl Session {
                     self.hello["grant"] = g.into();
                 }
                 self.state = State::Open;
+                log::info!("{}: in, as {} ({} layers, {} strokes)", self.key, self.role, self.doc.layers.len(), self.doc.strokes.len());
                 // Ops sent before (the connection dropped): again, with the same ids.
                 for (id, op) in &self.pending {
                     let _ = self.socket.tx.send(Out::Send(json!({ "t": "op", "opId": id, "op": op })));
@@ -374,6 +386,7 @@ impl Session {
             }
             "denied" => {
                 let reason = s("reason");
+                log::info!("{}: turned away: {reason}", self.key);
                 self.state = match reason.as_str() {
                     "password_required" => State::Password { wrong: false },
                     "password_wrong" => State::Password { wrong: true },
