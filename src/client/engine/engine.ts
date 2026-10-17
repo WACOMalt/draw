@@ -545,10 +545,11 @@ export class Engine {
 
   // --- finding content ---------------------------------------------------------------------
 
-  /** Paint and shape layers that show (visible, in groups that are all visible). */
+  /** Paint and shape layers that show (visible, in groups that are all visible, as drawnLayers). */
   private visibleLayerIds(): Set<string> {
-    const byId = new Map(ed.layers.map((l) => [l.id, l]));
-    return new Set(ed.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(byId, l)).map((l) => l.id));
+    const layers = this.drawnLayers(ed.layers);
+    const byId = new Map(layers.map((l) => [l.id, l]));
+    return new Set(layers.filter((l) => l.kind !== 'group' && effectivelyVisible(byId, l)).map((l) => l.id));
   }
 
   /**
@@ -1078,6 +1079,7 @@ export class Engine {
       return showToast('A shape layer holds shapes, not paint. Select a paint layer, or add one, to paint.');
     }
     if (!effectivelyVisible(new Map(ed.layers.map((l) => [l.id, l])), layer)) return showToast('The active layer is hidden');
+    if (layer.vr && !ed.showVrLayers) return showToast('VR layers are hidden on this device (Show VR layers, in the layers panel)');
     const mask = ed.maskTarget && layer.mask ? layer.mask : null;
     if (layer.kind === 'adjust' && !mask) {
       return showToast(layer.mask ? 'Select the mask to paint on an adjustment layer' : 'An adjustment layer has no paint. Add a mask to paint where it applies.');
@@ -1283,10 +1285,24 @@ export class Engine {
     return ed.layers.find((l) => l.id === ed.activeLayerId);
   }
 
+  /**
+   * The layers as this client draws them: with "Show VR layers" off (a setting of this device),
+   * VR layers count as hidden. No op: they stay visible for everyone else.
+   */
+  private drawnLayers(layers: Layer[]): Layer[] {
+    return ed.showVrLayers ? layers : layers.map((l) => (l.vr && l.visible ? { ...l, visible: false } : l));
+  }
+
+  /** Shows or hides the VR layers on this device only (ed.showVrLayers). */
+  setShowVrLayers(on: boolean): void {
+    ed.showVrLayers = on;
+    this.refreshLayers();
+  }
+
   private refreshLayers(): void {
     const layers = this.doc.displayLayers();
     ed.layers = layers;
-    this.comp.setLayers(layers);
+    this.comp.setLayers(this.drawnLayers(layers));
     ed.paper = this.doc.paperView();
     this.comp.setPaper(ed.paper);
     ed.mix = this.doc.mixView();
@@ -1962,7 +1978,7 @@ export class Engine {
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
         // A server from before effects sends no list: it refuses effects and blur layers.
         // A server from before `supports` takes none of the features that came with it or later.
-        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment');
+        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment' && f !== 'vr');
         this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper, m.mix);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);

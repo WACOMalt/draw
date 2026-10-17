@@ -176,6 +176,8 @@ const prefs = load('draw.prefs', {
   keepSelection: false,
   /** Taps and drags add to the selection or remove from it, as with Shift (for touch screens). */
   addSelection: false,
+  /** VR layers (painted in vdraw) are drawn. Off: this device draws them as hidden. */
+  showVrLayers: true,
 });
 
 export interface ExportRegion {
@@ -214,6 +216,8 @@ class EditorState {
   penStyle = $state<PenStyle>({ ...PEN_STYLE, ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);
   addSelection = $state(prefs.addSelection);
+  /** Draw VR layers (this device only; Engine.setShowVrLayers applies a change). */
+  showVrLayers = $state(prefs.showVrLayers);
   /** Height of the floating options bar over the canvas (CSS px from the canvas top; 0: none). */
   optsHeight = $state(0);
   /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
@@ -329,6 +333,7 @@ class EditorState {
       penStyle: $state.snapshot(this.penStyle),
       keepSelection: this.keepSelection,
       addSelection: this.addSelection,
+      showVrLayers: this.showVrLayers,
     });
   }
 }
