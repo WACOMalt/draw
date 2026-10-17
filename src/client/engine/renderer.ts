@@ -66,8 +66,20 @@ export interface Renderer {
    * of its tiles: the live preview of a transform. Null clears it.
    */
   setTransformPreview(p: { id: string; m: Affine } | null): void;
-  /** The transform is applied: keep the preview until the layer's tiles show it, then drop it. */
+  /** As setTransformPreview, for several layers or groups at once, each with its own transform. */
+  setTransformPreviews(list: { id: string; m: Affine }[] | null): void;
+  /** The transforms are applied: keep the previews until the layers' tiles show them, then drop them. */
   settleTransformPreview(): void;
+  /**
+   * Draws these strokes instead of the strokes of their layers and layer masks: the live preview
+   * of a 3D transform, with real brushes, blend modes and masks. They draw again every frame:
+   * keep their dabs (previewDabs) few. Null clears it. Only the WebGL2 renderer has it.
+   */
+  setStrokePreview?(strokes: Stroke[] | null): void;
+  /** How many dabs these strokes (as the renderer has them) draw: the cost of a stroke preview. */
+  previewDabs?(strokes: Stroke[]): number;
+  /** The 3D transform is applied: keep the stroke preview until the tiles show it, then drop it. */
+  settleStrokePreview?(): void;
 
   /** The bottom of the stack. Where its alpha is below 1, the screen shows a checkerboard. */
   setPaper(p: Paper): void;

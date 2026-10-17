@@ -83,6 +83,17 @@ const INST = 17;
 /** Most dabs in one batched draw call. */
 const MAX_BATCH = 65536;
 
+/**
+ * A 3D transform not applied yet (setStrokePreview): the strokes of these keys (layers and layer
+ * masks) draw from these records, moved, instead of from their tiles. `settle`: applied, shown
+ * until the tiles show the moved strokes.
+ */
+interface StrokePreview {
+  byKey: Map<string, StrokeRec[]>;
+  settle: boolean;
+  settleAt: number;
+}
+
 interface Target {
   tex: WebGLTexture;
   fbo: WebGLFramebuffer;
@@ -101,6 +112,8 @@ interface TransformPreview {
   /** What the layer showed on screen at the start, and the view then. */
   snap: Target | null;
   capture: { x: number; y: number; ds: number } | null;
+  /** Its tiles were not all drawn yet at the capture: capture again next frame. */
+  partial?: boolean;
 }
 
 /** The blend mode a shader knows: pass through draws like normal once a group is isolated. */
@@ -271,7 +284,9 @@ export class GLRenderer implements Renderer {
   private tree: LayerNode[] = [];
   private byId = new Map<string, Layer>();
   /** A layer or group drawn moved by a transform that is not applied yet (see setTransformPreview). */
-  private preview: TransformPreview | null = null;
+  /** Transform previews, by layer or group (setTransformPreviews). */
+  private previews = new Map<string, TransformPreview>();
+  private strokePreview: StrokePreview | null = null;
   private live = new Map<string, Live>();
   private appliedSeq = 0;
 
@@ -405,7 +420,8 @@ export class GLRenderer implements Renderer {
     this.livePool = [];
     // Old textures died with the context: forget every tile, redraw live strokes.
     this.tiles.clear();
-    this.preview = null;
+    this.previews.clear();
+    this.strokePreview = null;
     for (const l of this.live.values()) {
       l.target = null;
       l.viewVersion = -1;
@@ -885,6 +901,8 @@ export class GLRenderer implements Renderer {
    * buffer of a shape layer being edited.
    */
   private drawLayerContent(layer: string, g: Grid, target: Target, opacity: number): void {
+    const pv = this.strokePreview?.byKey.get(layer);
+    if (pv) return this.drawPreviewStrokes(pv, g, target);
     const h = this.hot.get(layer);
     if (h) {
       if (h.rect) {
@@ -1673,6 +1691,7 @@ export class GLRenderer implements Renderer {
     this.compA = main.a;
     this.compB = main.b;
     this.settlePreview(grid);
+    this.settleStrokes(grid);
 
     // 4. Present with dither.
     if (this.pickPass) return;
@@ -1737,7 +1756,8 @@ export class GLRenderer implements Renderer {
   private compositeNode(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
     const l = node.layer;
     // The transform preview shows on screen only (an effect frame draws the tiles as they are).
-    if (this.preview?.id === l.id && g.ns === '') return this.drawPreview(node, pair, g, atop, depth);
+    const pv = g.ns === '' ? this.previews.get(l.id) : undefined;
+    if (pv) return this.drawPreview(pv, node, pair, g, atop, depth);
     if (l.kind !== 'group') return this.compositeLayer(l, pair, g, atop);
     // A group with effects draws its layers together first (as if isolated), then the effects.
     if (activeEffects(l).length) return this.blendOnto(this.groupPixels(node, g, depth), modeOf(l.blend), l.opacity, pair, atop);
@@ -1839,42 +1859,49 @@ export class GLRenderer implements Renderer {
    * Null clears it.
    */
   setTransformPreview(p: { id: string; m: Affine } | null): void {
-    const old = this.preview;
-    if (p && old && old.id === p.id && !old.settle) old.m = p.m;
-    else {
-      this.dropPreview();
-      if (p) this.preview = { id: p.id, m: p.m, settle: false, settleAt: 0, snap: null, capture: null };
+    this.setTransformPreviews(p ? [p] : null);
+  }
+
+  setTransformPreviews(list: { id: string; m: Affine }[] | null): void {
+    const keep = new Set(list?.map((p) => p.id));
+    for (const [id, pv] of this.previews) if (!keep.has(id) || pv.settle) this.dropPreview(id);
+    for (const p of list ?? []) {
+      const old = this.previews.get(p.id);
+      if (old) old.m = p.m;
+      else this.previews.set(p.id, { id: p.id, m: p.m, settle: false, settleAt: 0, snap: null, capture: null });
     }
     this.invalidate();
   }
 
   /**
-   * The transform is applied (its strokes changed): keep the preview until the tiles of the
-   * layer show the new strokes, so the layer does not flash back to where it was.
+   * The transforms are applied (their strokes changed): keep the previews until the tiles of the
+   * layers show the new strokes, so the layers do not flash back to where they were.
    */
   settleTransformPreview(): void {
-    if (!this.preview) return;
-    this.preview.settle = true;
-    this.preview.settleAt = performance.now();
+    if (!this.previews.size) return;
+    for (const pv of this.previews.values()) {
+      pv.settle = true;
+      pv.settleAt = performance.now();
+    }
     this.invalidate();
   }
 
-  private dropPreview(): void {
-    if (this.preview?.snap) this.freeTarget(this.preview.snap);
-    this.preview = null;
+  private dropPreview(id: string): void {
+    const pv = this.previews.get(id);
+    if (pv?.snap) this.freeTarget(pv.snap);
+    this.previews.delete(id);
   }
 
-  private drawPreview(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
-    const pv = this.preview!;
+  private drawPreview(pv: TransformPreview, node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
     const gl = this.gl;
-    if (pv.snap && (pv.snap.w !== this.canvas.width || pv.snap.h !== this.canvas.height)) {
+    if (pv.snap && ((pv.partial && !pv.settle) || pv.snap.w !== this.canvas.width || pv.snap.h !== this.canvas.height)) {
       this.freeTarget(pv.snap);
       pv.snap = null;
     }
     if (!pv.snap) {
       if (pv.settle) {
         // The screen changed size after the transform was applied: the tiles are right now.
-        this.dropPreview();
+        this.dropPreview(pv.id);
         return this.compositeNode(node, pair, g, atop, depth);
       }
       const src = this.nodePixels(node, g, depth);
@@ -1883,6 +1910,8 @@ export class GLRenderer implements Renderer {
       gl.disable(gl.BLEND);
       this.copy(src.tex, pv.snap, [0, 0, src.w, src.h]);
       pv.capture = { x: this.view.x, y: this.view.y, ds: this.view.zoom * this.dpr };
+      pv.partial = !this.tilesCurrent(this.previewKeys(pv.id), g);
+      if (pv.partial) this.invalidate();
     }
     // Device pixels now ← world ← device pixels at capture time.
     const c = pv.capture!;
@@ -1909,34 +1938,114 @@ export class GLRenderer implements Renderer {
     return this.blendOnto(t, blend, node.layer.kind === 'adjust' ? 1 : node.layer.opacity, pair, atop);
   }
 
-  /** After a frame: a settling preview ends once every tile of the layer in view is current. */
+  /** After a frame: a settling preview ends once every tile of its layers in view is current. */
   private settlePreview(g: Grid): void {
-    const pv = this.preview;
-    if (!pv?.settle) return;
-    let done = performance.now() - pv.settleAt > 4000;
-    if (!done) {
-      const ids = subtreeIds(this.layers, pv.id);
-      const keys: string[] = [];
-      for (const l of this.layers) {
-        if (!ids.has(l.id)) continue;
-        if (l.kind === 'paint' || l.kind === undefined || l.kind === 'shape') keys.push(l.id);
-        if (l.mask?.enabled) keys.push(maskKey(l.id, l.mask.id));
-      }
-      done = true;
-      outer: for (const key of keys)
-        for (let ty = g.ty0; ty <= g.ty1; ty++)
-          for (let tx = g.tx0; tx <= g.tx1; tx++) {
-            const t = this.tiles.get(tileKey(key, g.lod, tx, ty));
-            const content = this.shapeLayers.has(key) ? this.shapes.layer(key).length : this.index.byLayer.get(key)?.length;
-            if (t ? !t.rendered || this.needsWork(t) : content) {
-              done = false;
-              break outer;
-            }
-          }
-    }
+    for (const pv of [...this.previews.values()]) if (pv.settle) this.settleOne(pv, g);
+  }
+
+  private settleOne(pv: TransformPreview, g: Grid): void {
+    const done = performance.now() - pv.settleAt > 4000 || this.tilesCurrent(this.previewKeys(pv.id), g);
     if (done) {
-      this.dropPreview();
+      this.dropPreview(pv.id);
       this.invalidate();
+    }
+  }
+
+  /** The tile keys of a layer or group: its paint and shape layers, and their enabled masks. */
+  private previewKeys(id: string): string[] {
+    const ids = subtreeIds(this.layers, id);
+    const keys: string[] = [];
+    for (const l of this.layers) {
+      if (!ids.has(l.id)) continue;
+      if (l.kind === 'paint' || l.kind === undefined || l.kind === 'shape') keys.push(l.id);
+      if (l.mask?.enabled) keys.push(maskKey(l.id, l.mask.id));
+    }
+    return keys;
+  }
+
+  /** Every tile of these keys in view shows their strokes now. */
+  private tilesCurrent(keys: Iterable<string>, g: Grid): boolean {
+    for (const key of keys)
+      for (let ty = g.ty0; ty <= g.ty1; ty++)
+        for (let tx = g.tx0; tx <= g.tx1; tx++) {
+          const t = this.tiles.get(tileKey(key, g.lod, tx, ty));
+          const content = this.shapeLayers.has(key) ? this.shapes.layer(key).length : this.index.byLayer.get(key)?.length;
+          if (t ? !t.rendered || this.needsWork(t) : content) return false;
+        }
+    return true;
+  }
+
+  // --- stroke preview (3D transforms) -----------------------------------------------------------
+
+  /**
+   * Draws `strokes` instead of the strokes of their layers and layer masks (by strokeKey), with
+   * their brushes, in their layers' blend modes, masks and effects: the live preview of a 3D
+   * transform, whose strokes move each in its own way (a picture of the layer cannot show that).
+   * Every key of the list draws only from the list, again every frame at the resolution of the
+   * frame. Null clears it.
+   */
+  setStrokePreview(strokes: Stroke[] | null): void {
+    if (!strokes) {
+      if (this.strokePreview) {
+        this.strokePreview = null;
+        this.invalidate();
+      }
+      return;
+    }
+    const byKey = new Map<string, StrokeRec[]>();
+    for (const st of strokes) {
+      const key = strokeKey(st);
+      let list = byKey.get(key);
+      if (!list) byKey.set(key, (list = []));
+      list.push(StrokeIndex.makeRec(st));
+    }
+    for (const list of byKey.values()) list.sort((a, b) => a.stroke.seq - b.stroke.seq);
+    this.strokePreview = { byKey, settle: false, settleAt: 0 };
+    this.invalidate();
+  }
+
+  /** The dabs of these strokes as this renderer has them (cached with their tiles). */
+  previewDabs(strokes: Stroke[]): number {
+    let n = 0;
+    for (const st of strokes) {
+      const rec = this.index.recs.get(st.id);
+      if (rec && !rec.stroke.vector) n += strokeDabs(rec).count;
+    }
+    return n;
+  }
+
+  /** The transform is applied: keep the preview until the tiles show the moved strokes. */
+  settleStrokePreview(): void {
+    if (!this.strokePreview) return;
+    this.strokePreview.settle = true;
+    this.strokePreview.settleAt = performance.now();
+    this.invalidate();
+  }
+
+  private settleStrokes(g: Grid): void {
+    const pv = this.strokePreview;
+    if (!pv?.settle) return;
+    if (performance.now() - pv.settleAt > 4000 || this.tilesCurrent(pv.byKey.keys(), g)) {
+      this.strokePreview = null;
+      this.invalidate();
+    }
+  }
+
+  /**
+   * Preview strokes into an empty layer or mask buffer of the frame `g`, as tiles draw them. A
+   * stroke that builds up in a buffer (viaBuffer) uses one the size of the frame here.
+   */
+  private drawPreviewStrokes(list: StrokeRec[], g: Grid, target: Target): void {
+    const x1 = g.wx + target.w / g.s, y1 = g.wy + target.h / g.s;
+    const shown = list.filter((r) => intersects(r, g.wx, g.wy, x1, y1));
+    if (!shown.length) return;
+    const tile = [this.strokeT, this.mixT];
+    this.strokeT = this.buf(g, 'pvStroke');
+    this.mixT = this.buf(g, 'pvMix');
+    try {
+      this.drawStrokes(target, shown, 0, g.wx, g.wy, g.s, Infinity);
+    } finally {
+      [this.strokeT, this.mixT] = tile;
     }
   }
 
@@ -1945,7 +2054,7 @@ export class GLRenderer implements Renderer {
     if (layer.kind === 'adjust') return this.applyAdjust(layer, pair, g);
     if (activeEffects(layer).length) return this.blendOnto(this.layerPixels(layer, g), layer.blend, layer.opacity, pair, atop);
     const mode = BLEND_MODES.indexOf(modeOf(layer.blend));
-    if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0) {
+    if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0 && !this.strokePreview?.byKey.has(layer.id)) {
       // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
       this.bindTarget(pair.a);
       this.blendFor(false);
@@ -2030,7 +2139,7 @@ export class GLRenderer implements Renderer {
     this.bindTarget(t);
     this.clear();
     gl.disable(gl.BLEND);
-    this.drawLayerTiles(key, g.lod, g.tx0, g.ty0, g.tx1, g.ty1, g.X, g.Y, t, 1);
+    this.drawLayerContent(key, g, t, 1);
     const scr = this.screenRect(g);
     for (const l of this.livesFor(key)) {
       this.blendFor(l.brush.tool === 'erase');
