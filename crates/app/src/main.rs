@@ -14,6 +14,7 @@
 //!                               render a demo painting to a PNG (no window, no headset)
 
 mod camera;
+mod bot;
 mod canvas;
 mod debug;
 mod demo;
@@ -24,6 +25,7 @@ mod presets;
 mod panel;
 mod rig;
 mod snapshot;
+mod tags;
 mod tools;
 mod xr;
 
@@ -186,6 +188,13 @@ fn main() -> Result<()> {
             snapshot::run(path, size.0, size.1, painting, snapshot::View::Orbit(cam), tip, bench, panel, sweep, None)
         }
         Some("--import") => import(&args),
+        // --bot --canvas KEY [--server URL] [--name NAME]: a pretend VR user painting there.
+        Some("--bot") => {
+            let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+            let server = arg("--server").unwrap_or_else(|| vdraw_net::identity::DEFAULT_SERVER.into());
+            let canvas = arg("--canvas").context("usage: vdraw --bot --canvas KEY [--server URL] [--name NAME]")?;
+            bot::run(&server, &canvas, &arg("--name").unwrap_or_else(|| "Painter Bot".into()))
+        }
         Some("--xr") => {
             // --demo X or --open file: paint on this device at once (a demo is not saved).
             // --canvas KEY: open a shared canvas at once. Else the start screen. --server URL:

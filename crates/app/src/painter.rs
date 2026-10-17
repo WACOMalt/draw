@@ -162,6 +162,8 @@ pub struct Painter {
     /// 3D layers (by id) painted with the laser on the paper, as a flat layer is (a flat
     /// layer made a 3D layer, to begin with); the others are painted in the air.
     pub on_paper: HashSet<u32>,
+    /// Other VR users shown (their heads, hands and names).
+    pub show_people: bool,
 }
 
 impl Painter {
@@ -198,6 +200,7 @@ impl Painter {
             lit: true,
             paper: [1.0; 4],
             on_paper: HashSet::new(),
+            show_people: true,
         };
         p.rebuild();
         p

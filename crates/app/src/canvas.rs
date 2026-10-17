@@ -234,6 +234,8 @@ pub struct Canvas {
     paper_sent: Instant,
     /// Why the server refused edits, and when (the panel shows the last a while).
     pub refused: Vec<(String, Instant)>,
+    /// This user's head and hands as last sent, and when.
+    avatar: (Option<vdraw_net::session::Avatar>, Instant),
 }
 
 impl Canvas {
@@ -261,6 +263,7 @@ impl Canvas {
             ready: false,
             paper_sent: Instant::now(),
             refused: Vec::new(),
+            avatar: (None, Instant::now()),
         }
     }
 
@@ -1017,6 +1020,86 @@ impl Canvas {
                 out.push(OverlayLine { a: [p0.x, p0.y, p0.z, 3.0], b: [p1.x, p1.y, p1.z, 6.0], color: [c[0], c[1], c[2], 1.0], halo: [0.0, 0.0, 0.0, 0.6] });
             }
         }
+    }
+
+    /// A pose of the room (world) in canvas units and axes (x right, y down, z toward the 2D
+    /// viewer): where it is, and which way its -z (forward) and +y (up) face.
+    fn canvas_pose(&self, m: Mat4) -> vdraw_net::session::Pose {
+        let inv = self.view.inverse();
+        let c = self.frame.canvas(inv.transform_point3(m.w_axis.truncate()));
+        let dir = |v: Vec3| {
+            let d = inv.transform_vector3(v).normalize_or(Vec3::Z);
+            [d.x, -d.y, d.z].map(|x| (x as f64 * 1000.0).round() / 1000.0)
+        };
+        let d = doc::point_decimals(self.frame.k * self.scale() as f64 / 0.0005);
+        vdraw_net::session::Pose { p: c.map(|x| doc::round_to(x, d)), f: dir(-m.z_axis.truncate()), u: dir(m.y_axis.truncate()) }
+    }
+
+    /// Tells the others where this user's head and hands are (world poses; None: hidden): at
+    /// most 20 times a second, when they moved, and once a second while still.
+    pub fn send_avatar(&mut self, head: Option<Mat4>, hands: [Option<Mat4>; 2]) {
+        if self.session.state != State::Open || !self.placed {
+            return;
+        }
+        let since = self.avatar.1.elapsed().as_millis();
+        let now = head.map(|h| vdraw_net::session::Avatar {
+            m: 1.0 / (self.frame.k * self.scale() as f64),
+            head: self.canvas_pose(h),
+            hands: hands.map(|h| h.map(|h| self.canvas_pose(h))),
+        });
+        let changed = now != self.avatar.0;
+        if (changed && since >= 50) || (now.is_some() && since >= 1000) || (now.is_none() && self.avatar.0.is_some()) {
+            self.session.send_avatar(now.as_ref());
+            self.avatar = (now, Instant::now());
+        }
+    }
+
+    /// Other VR users as basic shapes in their colors (lines, in the scene): the head a ball
+    /// of three rings with a short line where it looks, each hand a ring with a line where it
+    /// points, faint lines from the chin to the hands. They fade out when they stop coming.
+    /// Returns their name tags too: the name, its color, and where it goes (above the head,
+    /// in the scene) with its height (scene units).
+    pub fn avatar_lines(&self, out: &mut Vec<OverlayLine>) -> Vec<(String, [f32; 3], Vec3, f32)> {
+        let mut tags = Vec::new();
+        for p in self.session.peers.values() {
+            let Some((a, at)) = &p.avatar else { continue };
+            let fade = (1.0 - (at.elapsed().as_secs_f32() - 2.0).max(0.0)).clamp(0.0, 1.0);
+            if fade <= 0.0 {
+                continue;
+            }
+            let c = crate::panel::to_linear(doc::hex_rgb(&p.color));
+            let alpha = 0.75 * fade;
+            let size = (a.m * self.frame.k) as f32; // scene units per meter of theirs
+            let point = |q: &vdraw_net::session::Pose| self.frame.point(q.p[0], q.p[1], q.p[2]);
+            let dir = |v: [f64; 3]| Vec3::new(v[0] as f32, -v[1] as f32, v[2] as f32).normalize_or(Vec3::Z);
+            let line = |out: &mut Vec<OverlayLine>, a: Vec3, b: Vec3, w: f32, alpha: f32| out.push(OverlayLine { a: [a.x, a.y, a.z, w], b: [b.x, b.y, b.z, 0.0], color: [c[0], c[1], c[2], alpha], halo: [0.0; 4] });
+            let ring = |out: &mut Vec<OverlayLine>, center: Vec3, x: Vec3, y: Vec3, r: f32, w: f32| {
+                const N: usize = 16;
+                for k in 0..N {
+                    let at = |k: usize| {
+                        let t = k as f32 / N as f32 * std::f32::consts::TAU;
+                        center + (x * t.cos() + y * t.sin()) * r
+                    };
+                    line(out, at(k), at(k + 1), w, alpha);
+                }
+            };
+            let (hc, hf, hu) = (point(&a.head), dir(a.head.f), dir(a.head.u));
+            let side = hf.cross(hu).normalize_or(Vec3::X);
+            let r = 0.1 * size;
+            ring(out, hc, side, hu, r, 2.0);
+            ring(out, hc, side, hf, r, 1.5);
+            ring(out, hc, hf, hu, r, 1.5);
+            line(out, hc + hf * r, hc + hf * r * 1.6, 2.5, alpha);
+            for hand in a.hands.iter().flatten() {
+                let (pc, pf, pu) = (point(hand), dir(hand.f), dir(hand.u));
+                let ps = pf.cross(pu).normalize_or(Vec3::X);
+                ring(out, pc, ps, pu, 0.03 * size, 2.0);
+                line(out, pc, pc + pf * 0.15 * size, 2.0, alpha);
+                line(out, hc - hu * r, pc, 1.0, alpha * 0.4);
+            }
+            tags.push((p.name.clone(), c, hc + hu * r * 1.8, 0.06 * size));
+        }
+        tags
     }
 
     /// Where a ray (world) meets the paper, in canvas units (None: it does not, in front).

@@ -168,6 +168,26 @@ pub struct Peer {
     pub color: String,
     pub cursor: Option<(f64, f64)>,
     pub layer: Option<String>,
+    /// A VR peer's head and hands, and when they last came.
+    pub avatar: Option<(Avatar, Instant)>,
+}
+
+/// Where a thing is and which way it faces, in canvas units and axes (x right, y down, z
+/// toward the 2D viewer): its position, forward and up directions.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Pose {
+    pub p: [f64; 3],
+    pub f: [f64; 3],
+    pub u: [f64; 3],
+}
+
+/// A VR user on the canvas: their head and hands (left, right; None: not tracked), and their
+/// size: canvas units per meter (they zoom the canvas, so they are big or small on it).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Avatar {
+    pub m: f64,
+    pub head: Pose,
+    pub hands: [Option<Pose>; 2],
 }
 
 /// A stroke someone is drawing: its layer (and mask), brush and points so far.
@@ -425,6 +445,12 @@ impl Session {
                     ch.peers = true;
                 }
             }
+            "avatar" => {
+                if let Some(p) = self.peers.get_mut(&s("by")) {
+                    p.avatar = if m.get("off").and_then(Value::as_bool) == Some(true) { None } else { serde_json::from_value::<Avatar>(m.clone()).ok().map(|a| (a, Instant::now())) };
+                    ch.peers = true;
+                }
+            }
             "peer.join" => {
                 if let Some(p) = m.get("peer").and_then(peer) {
                     self.peers.insert(p.id.clone(), p);
@@ -476,6 +502,19 @@ impl Session {
         let _ = self.socket.tx.send(Out::Send(json!({ "t": "cursor", "x": x, "y": y, "layerId": layer })));
     }
 
+    /// Where this VR user's head and hands are (None: not shown any more).
+    pub fn send_avatar(&self, avatar: Option<&Avatar>) {
+        let m = match avatar {
+            Some(a) => {
+                let mut v = serde_json::to_value(a).unwrap_or(Value::Null);
+                v["t"] = "avatar".into();
+                v
+            }
+            None => json!({ "t": "avatar", "off": true }),
+        };
+        let _ = self.socket.tx.send(Out::Send(m));
+    }
+
     /// The document with the pending ops over it (what this user sees).
     pub fn view(&mut self) -> &Doc {
         if self.pending.is_empty() {
@@ -509,6 +548,7 @@ fn peer(p: &Value) -> Option<Peer> {
         color: p.get("color").and_then(Value::as_str).unwrap_or("#31a8ff").to_string(),
         cursor: None,
         layer: None,
+        avatar: None,
     })
 }
 

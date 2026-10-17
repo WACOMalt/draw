@@ -279,7 +279,7 @@ fn layer_row(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState, 
     }
     // On a shared canvas, a 3D layer (its strokes in 3D) says so, as the 2D app's badge.
     let vr = painter.shared && p.layers[i].is_3d();
-    for (t, color) in tags.into_iter().map(|t| (t, TEXT_DIM)).chain(vr.then(|| (("3D".to_string(), ACCENT)))) {
+    for (t, color) in tags.into_iter().map(|t| (t, TEXT_DIM)).chain(vr.then(|| ("3D".to_string(), ACCENT))) {
         let galley = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), color);
         let w = galley.size().x + 10.0;
         let r = Rect::from_center_size(pos2(right - w * 0.5, rect.center().y), vec2(w, 20.0));

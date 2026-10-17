@@ -333,6 +333,9 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
     let mut presets = crate::presets::Presets::load(crate::painting_path().with_file_name("presets.json"));
     let mut panel_shown = true;
     let mut ui: Option<UiRenderer> = None;
+    // Other VR users' name tags: laid out as the panel is, drawn by a renderer of their own.
+    let mut tags = crate::tags::Tags::new();
+    let mut tags_ui: Option<UiRenderer> = None;
     // A debug snapshot this frame (the panel's button), and the buffer it is copied into.
     let mut capture = false;
     let mut shot_buffer: Option<Buffer> = None;
@@ -683,6 +686,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             }
         });
         painter.update_drawing();
+        let mut tag_list: Vec<(String, [f32; 3], Vec3)> = Vec::new();
         if let Mode::Canvas(c) = &mut mode {
             // What this user did, out as ops; their stroke being drawn, out for the others.
             c.commit(&mut painter);
@@ -690,6 +694,12 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             painter.update_drawing();
             c.draw_live(&mut painter);
             c.cursor_lines(&mut lines);
+            // Where this user is, for the others; the others, and their names.
+            c.send_avatar(Some(world_head), aims.map(|a| a.map(|a| rig.mat() * a)));
+            if painter.show_people {
+                let names = c.avatar_lines(&mut lines);
+                tag_list = names.into_iter().map(|(name, color, at, _)| (name, color, c.view.transform_point3(at))).collect();
+            }
         }
         let steps = painter.scene_steps();
 
@@ -704,6 +714,12 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
         if let Some(f) = &panel_frame {
             ui.update_textures(&f.textures)?;
         }
+        let tags_ui = match &mut tags_ui {
+            Some(u) => u,
+            None => tags_ui.insert(UiRenderer::new(gpu.clone(), sc.format)?),
+        };
+        let (tag_textures, tag_draws) = tags.run(&tag_list, world_head.w_axis.truncate());
+        tags_ui.update_textures(&tag_textures)?;
         let image_index = sc.handle.acquire_image()? as usize;
 
         // This slot's last submission must be done before its buffers are reused.
@@ -792,6 +808,10 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             barrier(d, cmd, dst, 2, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::PipelineStageFlags2::BLIT, vk::AccessFlags2::TRANSFER_WRITE,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+            if !tag_draws.is_empty() {
+                let draws: Vec<PanelDraw> = tag_draws.iter().map(|t| PanelDraw { clip_from_point: [world_eyes[0].view_proj * t.model, world_eyes[1].view_proj * t.model], primitives: &t.primitives }).collect();
+                tags_ui.record(cmd, frame, dst, w, h, 2, &draws)?;
+            }
             if let (Some(p), Some(f)) = (placement, &panel_frame) {
                 let model = rig.mat() * p.model();
                 let draw = PanelDraw { clip_from_point: [world_eyes[0].view_proj * model, world_eyes[1].view_proj * model], primitives: &f.primitives };
@@ -925,6 +945,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
         b.destroy(&gpu);
     }
     drop(ui);
+    drop(tags_ui);
     drop(swapchain);
     drop((input, head, stage, stream, waiter, session));
     unsafe {
