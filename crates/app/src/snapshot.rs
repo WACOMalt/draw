@@ -24,11 +24,13 @@ pub enum View {
 /// VR draws it (orbit views only). `sweep`: the stroke eraser's overlay, its ball (that radius)
 /// at the orbit target.
 /// A shared canvas's place and paper (the painting is in its scene).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CanvasView {
     pub world_from_scene: glam::Mat4,
     pub paper: [f32; 4],
     pub grid: f32,
+    /// Lines over it (others' heads and hands), in the scene.
+    pub lines: Vec<vdraw_render::OverlayLine>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -45,7 +47,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let built = painting.build(&mut segs);
     let runs = &built.runs;
     let (steps, adjust) = vdraw_render::scene_steps(&painting, &built.steps);
-    let cv = canvas.unwrap_or(CanvasView { world_from_scene: glam::Mat4::IDENTITY, paper: [0.0; 4], grid: 0.0 });
+    let cv = canvas.clone().unwrap_or(CanvasView { world_from_scene: glam::Mat4::IDENTITY, paper: [0.0; 4], grid: 0.0, lines: Vec::new() });
     let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_runs: &[], steps: &steps, adjust: &adjust, pigment: painting.mix == vdraw_core::Mix::Pigment, world_from_scene: cv.world_from_scene, paper: cv.paper, paper_grid: cv.grid, lit: canvas.is_none(), canvas: canvas.is_some() };
     let (eye, cam) = match view {
         View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
@@ -54,7 +56,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     // The eye in the scene.
     let eye = EyeView { view_proj: eye.view_proj * cv.world_from_scene, pos: cv.world_from_scene.inverse().transform_point3(eye.pos) };
     // The stroke eraser's overlay, its ball (radius `sweep`) at the orbit target.
-    let mut lines = Vec::new();
+    let mut lines = cv.lines.clone();
     if let (Some(r), Some(cam)) = (sweep, cam) {
         let hot = crate::tools::swept(&segs, runs, None, cam.target, cam.target, r, &[]);
         crate::tools::overlay(&segs, runs, None, cam.target, (r * 4.0).max(0.05), &hot, &[], &mut lines);

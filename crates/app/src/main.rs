@@ -102,8 +102,18 @@ fn canvas_snapshot(server: &str, input: &str) -> Result<(vdraw_core::Painting, s
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     log::info!("{key}: {} layers, {} strokes; frame {:?}", c.session.doc.layers.len(), c.session.doc.strokes.len(), c.frame);
+    // A moment for others' heads and hands to come.
+    let t = std::time::Instant::now();
+    while t.elapsed().as_millis() < 600 {
+        c.update(&mut painter, head);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut lines = Vec::new();
+    for (name, ..) in c.avatar_lines(&mut lines) {
+        log::info!("{name} is here (VR)");
+    }
     c.session.close();
-    Ok((painter.painting.clone(), snapshot::CanvasView { world_from_scene: c.view, paper: c.paper, grid: 0.0 }))
+    Ok((painter.painting.clone(), snapshot::CanvasView { world_from_scene: c.view, paper: c.paper, grid: 0.0, lines }))
 }
 
 fn main() -> Result<()> {
