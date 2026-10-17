@@ -230,6 +230,8 @@ pub struct Canvas {
     rebuild: Option<Rebuild>,
     /// A painting of the document is in (what this user does can be sent).
     ready: bool,
+    /// When the paper was last sent.
+    paper_sent: Instant,
 }
 
 impl Canvas {
@@ -255,6 +257,7 @@ impl Canvas {
             want_active: None,
             rebuild: None,
             ready: false,
+            paper_sent: Instant::now(),
         }
     }
 
@@ -400,10 +403,10 @@ impl Canvas {
         let forms: Vec<Form> = layers.iter().map(|l| form(l)).collect();
         if forms != self.forms || self.shown.len() != painter.painting.layers.len() || layers.is_empty() {
             self.rebuild_all(&doc);
-            self.paper = paper_of(&doc);
+            self.take_paper(painter, &doc);
             return;
         }
-        self.paper = paper_of(&doc);
+        self.take_paper(painter, &doc);
         painter.painting.mix = if doc.mix == "pigment" { vdraw_core::Mix::Pigment } else { vdraw_core::Mix::Normal };
         // The layers' settings, in place. Showing or hiding one (or its mask) changes the
         // steps: then the strokes go in by hand, and the painting builds again.
@@ -505,6 +508,15 @@ impl Canvas {
             }
         }
         self.synced = metas(&painter.painting);
+    }
+
+    /// The document's paper, when it changed: the panel's too.
+    fn take_paper(&mut self, painter: &mut Painter, doc: &Doc) {
+        let paper = paper_of(doc);
+        if paper != self.paper {
+            self.paper = paper;
+            painter.paper = paper;
+        }
     }
 
     // ---- What this user does, as ops (as the 2D app sends them). ----
@@ -632,7 +644,12 @@ impl Canvas {
         let outbox = std::mem::take(&mut painter.outbox);
         let asked = std::mem::take(&mut painter.asked);
         let edited = metas(&painter.painting) != self.synced;
-        if outbox.is_empty() && asked.is_empty() && !edited {
+        // The canvas's settings: its paint mixing, and its paper (sent at most every 150 ms
+        // while a slider drags it).
+        let doc_mix = if self.session.view().mix == "pigment" { vdraw_core::Mix::Pigment } else { vdraw_core::Mix::Normal };
+        let mix = (painter.painting.mix != doc_mix).then_some((painter.painting.mix, doc_mix));
+        let paper = (painter.paper != self.paper && self.paper_sent.elapsed().as_millis() >= 150).then_some((painter.paper, self.paper));
+        if outbox.is_empty() && asked.is_empty() && !edited && mix.is_none() && paper.is_none() {
             return;
         }
         if !self.session.can_edit() {
@@ -645,6 +662,25 @@ impl Canvas {
         }
         let mut step = UndoStep::default();
         let mut ops = Vec::new();
+        let mix_name = |m: vdraw_core::Mix| if m == vdraw_core::Mix::Pigment { "pigment" } else { "normal" };
+        if let Some((new, old)) = mix {
+            ops.push(json!({ "type": "mix.set", "mix": mix_name(new) }));
+            step.undo.push(json!({ "type": "mix.set", "mix": mix_name(old) }));
+            step.redo.push(json!({ "type": "mix.set", "mix": mix_name(new) }));
+        }
+        if let Some((new, old)) = paper {
+            let p = |c: [f32; 4]| json!({ "type": "paper.set", "paper": { "color": crate::palettes::to_hex([c[0], c[1], c[2]]), "alpha": r4(c[3]).clamp(0.0, 1.0) } });
+            ops.push(p(new));
+            // One drag of the slider is one step of undo.
+            let merge = self.paper_sent.elapsed().as_secs_f32() < 2.0 && self.undo.last().is_some_and(|s| s.redo.len() == 1 && s.redo[0]["type"] == "paper.set");
+            if merge {
+                self.undo.last_mut().unwrap().redo = vec![p(new)];
+            } else {
+                step.undo.push(p(old));
+                step.redo.push(p(new));
+            }
+            self.paper_sent = Instant::now();
+        }
         for out in outbox {
             match out {
                 Outgoing::Add { layer, mask, id, stroke } => {
@@ -1239,6 +1275,15 @@ mod tests {
         painter.undo();
         wait(&mut c, &mut painter, &mut other, "the delete undone", &|o| o.doc.paint_order().len() == 2);
         assert_eq!(painter.painting.layers.len(), 2);
+        // The paper, see-through and red; the paint mixing; undo takes the paper back.
+        painter.paper = [1.0, 0.0, 0.0, 0.5];
+        wait(&mut c, &mut painter, &mut other, "the paper", &|o| o.doc.paper.color == "#ff0000" && o.doc.paper.alpha == 0.5);
+        painter.set_mix(vdraw_core::Mix::Pigment);
+        wait(&mut c, &mut painter, &mut other, "the mixing", &|o| o.doc.mix == "pigment");
+        painter.undo();
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the paper undone", &|o| o.doc.paper.color == "#ffffff" && o.doc.paper.alpha == 1.0 && o.doc.mix == "normal");
+        assert_eq!(painter.paper, [1.0; 4]);
         c.session.close();
         other.close();
     }

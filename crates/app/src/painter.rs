@@ -157,6 +157,8 @@ pub struct Painter {
     /// Strokes in 3D lit by the scene's light (VR only: the 2D app has none). Off on a shared
     /// canvas to begin with, so they look as the 2D app shows them.
     pub lit: bool,
+    /// A shared canvas's paper as the panel sets it (sRGB, alpha; alpha 0: none).
+    pub paper: [f32; 4],
 }
 
 impl Painter {
@@ -191,6 +193,7 @@ impl Painter {
             history: (false, false),
             stroke_id: String::new(),
             lit: true,
+            paper: [1.0; 4],
         };
         p.rebuild();
         p

@@ -136,6 +136,35 @@ pub fn layers_tab(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersSt
     }
 
     ui.add_space(4.0);
+    // A shared canvas's paper (the 2D app's row here): its color (the brush's color, or none:
+    // see-through) and how much it covers.
+    if painter.shared {
+        ui.horizontal(|ui| {
+            let (label, _) = ui.allocate_exact_size(vec2(110.0, 32.0), Sense::hover());
+            ui.painter().text(label.left_center(), egui::Align2::LEFT_CENTER, "Paper", egui::FontId::proportional(15.0), TEXT_DIM);
+            let [r, g, b, a] = painter.paper;
+            let (sw, _) = ui.allocate_exact_size(vec2(32.0, 28.0), Sense::hover());
+            if a > 0.0 {
+                let c = [r, g, b].map(|v| (v * 255.0).round() as u8);
+                ui.painter().rect(sw, 3.0, Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (a * 255.0).round() as u8), stroke(1.0, BORDER));
+            } else {
+                // None: a slash.
+                ui.painter().rect_stroke(sw, 3.0, stroke(1.0, BORDER));
+                ui.painter().line_segment([sw.left_bottom(), sw.right_top()], stroke(1.5, Color32::from_rgb(0xff, 0x6b, 0x6b)));
+            }
+            if ui.button(RichText::new("Brush color").size(14.0)).clicked() {
+                let c = to_srgb(painter.tools.brush.color);
+                painter.paper = [c[0], c[1], c[2], if a > 0.0 { a } else { 1.0 }];
+            }
+            if toggle(ui, "None", a <= 0.0).clicked() {
+                painter.paper[3] = if a > 0.0 { 0.0 } else { 1.0 };
+            }
+        });
+        let mut alpha = painter.paper[3];
+        if slider(ui, "Paper", &mut alpha, (0.0, 1.0), false, percent) {
+            painter.paper[3] = alpha;
+        }
+    }
     // Paint mixing (the canvas's, as the 2D app's row here).
     ui.horizontal(|ui| {
         let (label, _) = ui.allocate_exact_size(vec2(110.0, 32.0), Sense::hover());

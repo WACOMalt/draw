@@ -763,7 +763,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             d.cmd_reset_query_pool(cmd, queries, 2 * frame as u32, 2);
             d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::TOP_OF_PIPE, queries, 2 * frame as u32);
             let (paper, paper_grid) = match &mode {
-                Mode::Canvas(c) if c.placed => (c.paper, if c.paper[3] < 1.0 { c.grid() } else { 0.0 }),
+                Mode::Canvas(c) if c.placed => (painter.paper, if painter.paper[3] < 1.0 { c.grid() } else { 0.0 }),
                 _ => ([0.0; 4], 0.0),
             };
             let scene = vdraw_render::Scene { world_from_scene, paper, paper_grid, ..painter.scene(&steps) };
