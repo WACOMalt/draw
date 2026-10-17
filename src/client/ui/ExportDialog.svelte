@@ -75,6 +75,8 @@
   let progress = $state(0);
   let piece = $state(0);
   let pieces = $state(0);
+  /** Tiles drawn for the piece in progress: before the first piece is done, the preparation. */
+  let tiles = $state(0);
   /** Result of the last export: shown until the next one. */
   let result = $state<{ name: string; bytes: number; seconds: number; width: number; height: number } | null>(null);
   /** The browser claimed to save but the file was wrong: offer a plain download. */
@@ -170,7 +172,7 @@
       return;
     }
     phase = 'rendering';
-    progress = piece = pieces = 0;
+    progress = piece = pieces = tiles = 0;
     controller = new AbortController();
     const started = (startedAt = now = performance.now());
     const size = { width, height };
@@ -183,6 +185,7 @@
         transparent,
         sink,
         onProgress: (p, i, n) => ((progress = p), (piece = i), (pieces = n)),
+        onTiles: (n) => (tiles = n),
         onFinishing: () => (phase = 'finishing'),
         signal: controller.signal,
       });
@@ -305,10 +308,15 @@
   {#if phase === 'choosing'}
     <div class="status"><b>Choose where to save…</b><span>Draw renders the image after you pick the file.</span></div>
   {:else if phase === 'rendering' || phase === 'finishing'}
-    <div class="bar"><div style:width="{Math.round(progress * 100)}%"></div></div>
+    <!-- Until the first piece is in, the renderer takes in the drawing and draws its tiles: a moving bar. -->
+    <div class="bar" class:busy={phase === 'rendering' && piece === 0}><div style:width="{Math.round(progress * 100)}%"></div></div>
     <div class="actions">
       <span class="muted"
-        >{phase === 'finishing' ? 'Finishing and checking the file…' : `Rendering piece ${piece} of ${pieces || '…'} · ${Math.floor(progress * 100)}%`} · {fmtTime(elapsed)}{phase ===
+        >{phase === 'finishing'
+          ? 'Finishing and checking the file…'
+          : piece === 0
+            ? `Preparing the canvas for export${tiles ? ` · ${tiles} tiles drawn` : '…'}`
+            : `Rendering piece ${piece} of about ${pieces} · ${Math.floor(progress * 100)}%`} · {fmtTime(elapsed)}{phase ===
           'rendering' && Number.isFinite(left)
           ? ` · about ${fmtTime(left)} left`
           : ''}</span
@@ -435,6 +443,26 @@
     height: 100%;
     background: var(--accent);
     transition: width 0.2s;
+  }
+  /* Work with no measure yet: a segment sweeping across. */
+  .bar.busy div {
+    width: 30% !important;
+    animation: sweep 1.2s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bar.busy div {
+      animation: none;
+      width: 100% !important;
+      opacity: 0.4;
+    }
   }
   .actions {
     align-items: center;
