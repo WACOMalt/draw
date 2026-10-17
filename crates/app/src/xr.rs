@@ -455,7 +455,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
         // where the controller's ray meets it, turned by the tool's angle as the 2D app turns
         // its tip (in the paper's plane).
         // (A VR layer is painted in 3D, with the pen's tip.)
-        let laser_mode = matches!(mode, Mode::Canvas(_)) && painter.painting.layers.get(painter.active_index()).is_some_and(|l| l.ordered);
+        let laser_mode = matches!(mode, Mode::Canvas(_)) && painter.painting.layers.get(painter.active_index()).is_some_and(|l| l.ordered || painter.on_paper.contains(&l.id));
         let laser_at = |rig: &Rig, aim: Mat4| -> Option<Vec3> {
             let o = to_scene(rig.point(aim.w_axis.truncate()));
             let d = scene_from_world.transform_vector3(rig.dir(aim.transform_vector3(Vec3::NEG_Z)));

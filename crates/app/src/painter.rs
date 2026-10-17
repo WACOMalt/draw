@@ -4,7 +4,7 @@
 use crate::panel;
 use crate::tools::{self, Tools};
 use glam::Vec3;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use vdraw_core::{Built, GpuSegment, Layer, Mask, Mix, Painting, Sample, Stroke};
 use vdraw_render::{OverlayLine, Scene, SceneStep};
 
@@ -45,7 +45,7 @@ pub enum Outgoing {
     /// Strokes the stroke eraser took, by place.
     Remove(Vec<At>),
     /// The layer (by id; a group: with what is in it) the Move layer tool moved, turned and
-    /// scaled in the paper's plane, by a matrix (the scene's).
+    /// scaled, by a matrix (the scene's): in the paper's plane, or freely (a VR layer).
     Transform { layer: u32, matrix: glam::Mat4 },
 }
 
@@ -159,6 +159,9 @@ pub struct Painter {
     pub lit: bool,
     /// A shared canvas's paper as the panel sets it (sRGB, alpha; alpha 0: none).
     pub paper: [f32; 4],
+    /// VR layers (by id) painted with the laser on the paper, as a flat layer is (a flat
+    /// layer made a VR layer, to begin with); the others are painted in the air.
+    pub on_paper: HashSet<u32>,
 }
 
 impl Painter {
@@ -194,6 +197,7 @@ impl Painter {
             stroke_id: String::new(),
             lit: true,
             paper: [1.0; 4],
+            on_paper: HashSet::new(),
         };
         p.rebuild();
         p
@@ -472,8 +476,10 @@ impl Painter {
                     g.scale = (g.scale * (stick * dt * 1.2).exp()).clamp(0.01, 100.0);
                 }
                 g.matrix = pose * glam::Mat4::from_scale(Vec3::splat(g.scale)) * g.start.inverse();
-                if self.shared {
-                    // A shared canvas's layers move in the paper's plane.
+                // A shared canvas's flat layers (and groups) move in the paper's plane; its VR
+                // layers move freely.
+                let free = self.painting.index_of(self.active_layer).is_some_and(|i| !self.painting.layers[i].ordered && !self.painting.layers[i].group);
+                if self.shared && !free {
                     g.matrix = planar(g.matrix);
                 }
                 let mut k = 0;

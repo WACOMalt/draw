@@ -118,6 +118,8 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         if std::env::var("VDRAW_PALETTES").is_ok() {
             p.show_palettes();
         }
+        // VDRAW_SHARED: as on a shared canvas (the panel's rows for one).
+        painter.shared = std::env::var("VDRAW_SHARED").is_ok();
         // VDRAW_HOME: the start screen (no server asked: no account).
         p.screen = if std::env::var("VDRAW_HOME").is_ok() { crate::panel::Screen::Home } else { crate::panel::Screen::Paint };
         let mut lobby = crate::lobby::Lobby::new(vdraw_net::identity::Identity::default());

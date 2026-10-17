@@ -574,6 +574,23 @@ impl Canvas {
         [c.x_axis.x, c.x_axis.y, c.y_axis.x, c.y_axis.y, c.z_axis.x, c.z_axis.y]
     }
 
+    /// A scene matrix (a similarity) as the 2D app's 3D affine on canvas units, column-major
+    /// 3x4 (x' = m[0] x + m[3] y + m[6] z + m[9], ...), and its opposite.
+    fn affine_3d(&self, m: Mat4) -> ([f64; 12], [f64; 12]) {
+        // Canvas to scene: s = offset + diag(k, -k, k) (c - (ax, ay, 0)).
+        let (k, ax, ay, o) = (self.frame.k, self.frame.anchor[0], self.frame.anchor[1], self.frame.offset.as_dvec3());
+        let p = glam::DMat4::from_translation(o + glam::DVec3::new(-ax * k, ay * k, 0.0)) * glam::DMat4::from_scale(glam::DVec3::new(k, -k, k));
+        let c = p.inverse() * m.as_dmat4() * p;
+        let cols = |c: glam::DMat4| {
+            let mut out = [0.0; 12];
+            for (j, col) in [c.x_axis, c.y_axis, c.z_axis, c.w_axis].iter().enumerate() {
+                out[3 * j..3 * j + 3].copy_from_slice(&[col.x, col.y, col.z]);
+            }
+            out
+        };
+        (cols(c), cols(c.inverse()))
+    }
+
     /// Whether strokes on a painting layer (by id) are 3D (a VR layer).
     fn is_vr_layer(painter: &Painter, layer: u32) -> bool {
         painter.painting.index_of(layer).is_some_and(|i| !painter.painting.layers[i].ordered && !painter.painting.layers[i].group)
@@ -706,6 +723,14 @@ impl Canvas {
                     if !mask && !stroke.brush.erase {
                         painter.add_recent(crate::panel::to_srgb(stroke.brush.color));
                     }
+                }
+                // A VR layer moves freely (m3); a flat one, or a group, in the paper's plane (m).
+                Outgoing::Transform { layer, matrix } if Self::is_vr_layer(painter, layer) => {
+                    let Some(id) = self.doc_id(layer) else { continue };
+                    let (m3, inv) = self.affine_3d(matrix);
+                    ops.push(json!({ "type": "layer.transform", "id": id, "m3": m3 }));
+                    step.undo.push(json!({ "type": "layer.transform", "id": id, "m3": inv }));
+                    step.redo.push(json!({ "type": "layer.transform", "id": id, "m3": m3 }));
                 }
                 Outgoing::Transform { layer, matrix } => {
                     let Some(id) = self.doc_id(layer) else { continue };

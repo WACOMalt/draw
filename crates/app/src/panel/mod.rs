@@ -465,6 +465,23 @@ impl Panel {
 fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, dynamics_open: &mut bool, typing: &mut Option<Typing>) {
     let height = ui.available_height();
     egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+        // A shared canvas's VR layer: painted in the air with the pen, or on the paper with
+        // the laser (as a flat layer is).
+        let active = &painter.painting.layers[painter.active_index()];
+        if painter.shared && !active.ordered && !active.group {
+            let id = active.id;
+            let on = painter.on_paper.contains(&id);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("VR layer: paint").color(TEXT_DIM).size(14.0));
+                if toggle(ui, "In the air", !on).clicked() {
+                    painter.on_paper.remove(&id);
+                }
+                if toggle(ui, "On the paper", on).clicked() {
+                    painter.on_paper.insert(id);
+                }
+            });
+            ui.add_space(4.0);
+        }
         let tools = &mut painter.tools;
         match tools.tool {
             Tool::Brush | Tool::Eraser => {

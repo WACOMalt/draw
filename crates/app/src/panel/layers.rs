@@ -161,7 +161,7 @@ pub fn layers_tab(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersSt
             }
         });
         let mut alpha = painter.paper[3];
-        if slider(ui, "Paper", &mut alpha, (0.0, 1.0), false, percent) {
+        if slider(ui, "Opacity", &mut alpha, (0.0, 1.0), false, percent) {
             painter.paper[3] = alpha;
         }
     }
@@ -329,7 +329,9 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
     let i = painter.active_index();
     let p = &painter.painting;
     let (group, has_mask, clip, can_clip) = (p.layers[i].group, p.layers[i].mask.is_some(), p.layers[i].clip, p.can_clip(i));
-    let size = vec2(44.0, 40.0);
+    let (vr, id) = (!group && !p.layers[i].ordered, p.layers[i].id);
+    // (A shared canvas's row has a button more.)
+    let size = vec2(if painter.shared { 38.0 } else { 44.0 }, 40.0);
     let mut hint = String::new();
     let mut note = |r: &egui::Response, text: &str| {
         if r.hovered() {
@@ -378,6 +380,26 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
                 p.layers[i].clip = !p.layers[i].clip;
                 (Some(i), Removed::default())
             });
+        }
+        if painter.shared {
+            // A flat layer made a VR layer (drawn in 3D here, still flat for the 2D app; painted
+            // on the paper still), and back.
+            let (rect, r) = ui.allocate_exact_size(size, Sense::click());
+            let fill = if vr { TOGGLE_ON } else if r.hovered() { BG_4 } else { BG_3 };
+            ui.painter().rect(rect, 4.0, fill, stroke(1.0, if vr { ACCENT } else { LINE }));
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "VR", egui::FontId::proportional(14.0), if group { TEXT_FAINT } else if vr { ACCENT } else { TEXT });
+            note(&r, if vr { "Make it a flat layer (drawn as in 2D)" } else { "Make it a VR layer: moved and drawn in 3D here, flat for 2D" });
+            if r.clicked() && !group {
+                painter.edit_layers(|p| {
+                    p.layers[i].ordered = !p.layers[i].ordered;
+                    (Some(i), Removed::default())
+                });
+                if vr {
+                    painter.on_paper.remove(&id);
+                } else {
+                    painter.on_paper.insert(id);
+                }
+            }
         }
         let r = icon_button(ui, "copy", size, false, true);
         note(&r, "Duplicate");
