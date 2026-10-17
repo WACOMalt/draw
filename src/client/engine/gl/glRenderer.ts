@@ -80,6 +80,10 @@ function effectSigma(e: LayerEffect, fx: LayerEffect[]): number {
  * Color and hardness per dab let a run of strokes share one draw call (drawStrokes).
  */
 const INST = 17;
+/** Most kaleidoscope frames shared by the copies at one level of detail, per kaleidoscope. */
+const LEVEL_FRAMES = 4;
+/** Most frame buffers kept for reuse (see putSpare). */
+const SPARE = 24;
 /** Most dabs in one batched draw call. */
 const MAX_BATCH = 65536;
 
@@ -256,6 +260,13 @@ export class GLRenderer implements Renderer {
   /** Screen buffers made only when a frame needs them: layer masks and clipping groups. */
   /** Screen-sized buffers some frames need (masks, clipping and group buffers per depth). */
   private extra = new Map<string, Target>();
+  /** Screen-frame buffers no longer in use, by size, for the next buffer of that size (see screen). */
+  private spare = new Map<string, Target[]>();
+  /**
+   * Tiles a frame drew that were missing or out of date and that no range covers (kaleidoscope
+   * frames): the next frame renders them (render, step 1), coarse ones first.
+   */
+  private wanted = new Map<string, { layer: string; lod: number; tx: number; ty: number }>();
   private tipTex!: WebGLTexture;
   private grainTex!: WebGLTexture;
   private tipsReady = new Set<number>();
@@ -304,6 +315,8 @@ export class GLRenderer implements Renderer {
   private fillBudget: number;
   private fillMoving: number;
   private lastFrameAt = 0;
+  /** How long the last frame's compositing took (ms; JavaScript time, the GPU may add to it). */
+  private compositeMs = 0;
   private lastViewChange = 0;
   /** The previous frame drew tiles: its interval says how much GPU work fits. */
   private tileWorkLastFrame = false;
@@ -499,11 +512,29 @@ export class GLRenderer implements Renderer {
   private screen(name: string, w = this.canvas.width || 1, h = this.canvas.height || 1): Target {
     let t = this.extra.get(name);
     if (t && (t.w !== w || t.h !== h)) {
-      this.freeTarget(t);
+      // Frames one after the other change size (kaleidoscope copies): keep it for the next one.
+      this.putSpare(t);
       t = undefined;
     }
-    if (!t) this.extra.set(name, (t = this.makeTarget(w, h)));
+    if (!t) this.extra.set(name, (t = this.spare.get(`${w}x${h}`)?.pop() ?? this.makeTarget(w, h)));
     return t;
+  }
+
+  /** At most SPARE buffers wait in `spare`; past that the oldest kind goes. */
+  private putSpare(t: Target): void {
+    const key = `${t.w}x${t.h}`;
+    const list = this.spare.get(key) ?? [];
+    this.spare.delete(key);
+    list.push(t);
+    this.spare.set(key, list);
+    let n = 0;
+    for (const l of this.spare.values()) n += l.length;
+    for (const [k, l] of this.spare) {
+      if (n <= SPARE) break;
+      for (const x of l) this.freeTarget(x);
+      n -= l.length;
+      this.spare.delete(k);
+    }
   }
 
   /** A buffer of a frame (the screen, or an effect frame). */
@@ -535,6 +566,8 @@ export class GLRenderer implements Renderer {
     for (const t of [this.compA, this.compB]) if (t) this.freeTarget(t);
     for (const t of this.extra.values()) this.freeTarget(t);
     this.extra.clear();
+    for (const l of this.spare.values()) for (const t of l) this.freeTarget(t);
+    this.spare.clear();
     for (const t of this.livePool) this.freeTarget(t);
     this.livePool = [];
     this.compA = this.makeTarget(w, h);
@@ -1488,9 +1521,13 @@ export class GLRenderer implements Renderer {
    */
   private evictTiles(ranges: TileRange[], needed: number): void {
     const inView = (t: Tile) => ranges.some((r) => t.lod === r.lod && t.tx >= r.tx0 && t.tx <= r.tx1 && t.ty >= r.ty0 && t.ty <= r.ty1);
-    const max = Math.min(this.hardMaxTiles, Math.max(this.maxTiles, Math.ceil(needed * 1.25)));
-    let count = 0;
-    for (const t of this.tiles.values()) count += (t.target ? 1 : 0) + (t.job ? 1 : 0);
+    let count = 0, used = 0;
+    for (const t of this.tiles.values()) {
+      count += (t.target ? 1 : 0) + (t.job ? 1 : 0);
+      if (t.used === this.frame) used++;
+    }
+    // The tiles this frame drew stay too (kaleidoscope frames need them again next frame).
+    const max = Math.min(this.hardMaxTiles, Math.max(this.maxTiles, Math.ceil(Math.max(needed, used) * 1.25)));
     if (count <= max && this.tiles.size <= 20000) return;
     const old = [...this.tiles.entries()].filter(([, t]) => t.used < this.frame && !inView(t)).sort((a, b) => a[1].used - b[1].used);
     for (const [key, t] of old) {
@@ -1591,14 +1628,19 @@ export class GLRenderer implements Renderer {
     for (const l of this.live.values()) if (!l.remote && !l.ended) drawing = true;
     const moving = start - this.lastViewChange < MOVING_MS || drawing;
     const target = moving ? MOVING_TARGET_MS : STILL_TARGET_MS;
-    if (this.tileWorkLastFrame && interval < 150 && !this.outOfBand) {
+    // The frame's own compositing is not the tiles' doing: a heavy composite (many kaleidoscope
+    // copies) would else cut their budget to a tile a frame, and they would take minutes.
+    const tileTime = interval - this.compositeMs;
+    if (this.tileWorkLastFrame && tileTime < 150 && !this.outOfBand) {
       const b = moving ? this.fillMoving : this.fillBudget;
-      const next = interval > target * 1.15 ? Math.max(FILL_MIN, b * 0.75) : interval < target * 0.85 ? Math.min(FILL_MAX, b * 1.1) : b;
+      const next = tileTime > target * 1.15 ? Math.max(FILL_MIN, b * 0.75) : tileTime < target * 0.85 ? Math.min(FILL_MAX, b * 1.1) : b;
       if (moving) this.fillMoving = next;
       else this.fillBudget = next;
     }
-    const fill = moving ? this.fillMoving : this.fillBudget;
-    const jsBudget = moving ? TILE_BUDGET_MS : TILE_BUDGET_STILL_MS;
+    // A slow composite: the tiles get at least half as much time again.
+    const slow = Math.max(1, this.compositeMs / 2 / target);
+    const fill = (moving ? this.fillMoving : this.fillBudget) * slow;
+    const jsBudget = Math.max(moving ? TILE_BUDGET_MS : TILE_BUDGET_STILL_MS, this.compositeMs / 2);
     let spent = 0;
     let pending = false;
     /** Work left in the view and its prefetch ring (not just in the coarser levels). */
@@ -1654,7 +1696,28 @@ export class GLRenderer implements Renderer {
         }
       }
     }
+    // Then the tiles the last frame drew missing or out of date (kaleidoscope frames), coarse first.
+    if (this.wanted.size) {
+      const list = [...this.wanted.values()].sort((a, b) => b.lod - a.lod);
+      this.wanted.clear();
+      for (const w of list) {
+        const key = tileKey(w.layer, w.lod, w.tx, w.ty);
+        let t = this.tiles.get(key);
+        if (!this.needsWork(t)) continue;
+        if (!this.offline && (spent >= fill || performance.now() - start > jsBudget)) {
+          pending = true;
+          break;
+        }
+        if (!t) {
+          t = { layer: w.layer, lod: w.lod, tx: w.tx, ty: w.ty, target: null, stale: true, append: [], maxSeq: -1, rendered: false, used: this.frame, job: null };
+          this.tiles.set(key, t);
+        }
+        t.used = this.frame;
+        spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+      }
+    }
     this.tileWorkLastFrame = spent > 0;
+    const c0 = performance.now();
     this.lastPendingWork = pending;
     this.lastViewPending = viewPending;
     // A committed stroke's buffer can go once the tiles show it.
@@ -1707,6 +1770,9 @@ export class GLRenderer implements Renderer {
     this.quad(p, null, [0, 0, this.canvas.width, this.canvas.height]);
 
     gl.flush();
+    this.compositeMs = performance.now() - c0;
+    // Tiles drawn missing or out of date: another frame renders them.
+    if (this.wanted.size) pending = true;
     this.evictTiles(ranges, ranges.reduce((n, r) => n + area(r), 0));
     this.lastPending = pending;
     if (pending) this.invalidate();
@@ -1821,6 +1887,9 @@ export class GLRenderer implements Renderer {
     this.renderLayer(layer, g);
     const fx = activeEffects(layer).filter((e) => kaleidoscope || e.type !== 'kaleidoscope');
     if (!fx.length) return this.buf(g, 'layer');
+    // Only a kaleidoscope, and the layer is its tiles (no mask, nothing in progress or edited):
+    // its copies can draw the tiles themselves (kaleidoscope, drawThrough).
+    const plain = fx.length === 1 && !layer.mask?.enabled && !this.hot.has(layer.id) && !this.strokePreview?.byKey.has(layer.id) && this.livesFor(layer.id).length === 0;
     return this.applyEffects(
       fx,
       g,
@@ -1831,6 +1900,7 @@ export class GLRenderer implements Renderer {
       },
       (kg) => this.layerPixels(layer, kg, false),
       () => this.nodeBounds(layer, false),
+      plain ? layer.id : null,
     );
   }
 
@@ -2219,8 +2289,6 @@ export class GLRenderer implements Renderer {
   /** The tiles the effect frames of this frame read (render keeps them current). */
   private effectRanges(): TileRange[] {
     const out: TileRange[] = [];
-    /** Kaleidoscope frames at their own detail: after every other range (see below). */
-    const fine: TileRange[] = [];
     const add = (sigma: number, dx = 0, dy = 0) => {
       const { g } = this.fxGrid(sigma, dx, dy);
       out.push({ lod: g.lod, tx0: g.tx0, ty0: g.ty0, tx1: g.tx1, ty1: g.ty1 });
@@ -2228,24 +2296,11 @@ export class GLRenderer implements Renderer {
     for (const l of this.layers) {
       if (!effectivelyVisible(this.byId, l)) continue;
       if (l.kind === 'adjust' && l.adjust?.type === 'blur' && l.adjust.radius > 0 && l.opacity > 0) add(l.adjust.radius);
+      // (Kaleidoscope frames ask for their tiles as they draw: drawTile, wanted.)
       const fx = activeEffects(l);
-      for (const e of fx) {
-        if (e.type !== 'kaleidoscope') {
-          add(effectSigma(e, fx), e.dx, e.dy);
-          continue;
-        }
-        // The other effects of the layer, inside the kaleidoscope frames: the same tiles.
-        // A frame can lie far from the view, where no tile was ever made, and copies that grow
-        // need fine tiles: many. First the same area 4× coarser (a few tiles, ready soon), so
-        // drawTile has a parent to stretch, instead of blank parts until the fine tiles are in.
-        for (const kg of this.kaleidoscopeFrames(this.kaleidoscopeSteps(e), this.nodeBounds(l, false)).frames) {
-          fine.push({ lod: kg.lod, tx0: kg.tx0, ty0: kg.ty0, tx1: kg.tx1, ty1: kg.ty1 });
-          const lod = Math.min(MAX_LOD, kg.lod + 2), tw = tileWorld(lod);
-          out.push({ lod, tx0: Math.floor(kg.wx / tw), ty0: Math.floor(kg.wy / tw), tx1: Math.floor((kg.wx + kg.w / kg.s) / tw), ty1: Math.floor((kg.wy + kg.h / kg.s) / tw) });
-        }
-      }
+      for (const e of fx) if (e.type !== 'kaleidoscope') add(effectSigma(e, fx), e.dx, e.dy);
     }
-    return out.concat(fine);
+    return out;
   }
 
   /**
@@ -2296,7 +2351,7 @@ export class GLRenderer implements Renderer {
    * pixels before effects; glows and the shadow with the blur of a blur effect added) and draws
    * onto the result so far. Returns the result.
    */
-  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target, content: () => Box | null): Target {
+  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target, content: () => Box | null, plain: string | null = null): Target {
     const gl = this.gl;
     let cur = own;
     let flip = false;
@@ -2341,7 +2396,11 @@ export class GLRenderer implements Renderer {
       cur = out;
     }
     const kal = fx.find((e) => e.type === 'kaleidoscope');
-    return kal ? this.kaleidoscope(kal, g, cur, whole, content) : cur;
+    if (!kal) return cur;
+    // What the other effects add around the layer: a copy's frame takes that much more.
+    let pad = 0;
+    for (const e of fx) if (e.type !== 'kaleidoscope') pad = Math.max(pad, 3 * effectSigma(e, fx) + Math.hypot(e.dx ?? 0, e.dy ?? 0));
+    return this.kaleidoscope(kal, g, cur, whole, content, pad, plain);
   }
 
   /** Copy i of a kaleidoscope: the step transform applied i times (world to world), i = 1..count. */
@@ -2409,66 +2468,6 @@ export class GLRenderer implements Renderer {
     return acc.b;
   }
 
-  /**
-   * The kaleidoscope frames: where the copies on screen come from. A frame covers the layer's
-   * content (`content`) where its copies show it on screen (the view, each copy's transform
-   * undone), at the detail its largest copy needs: copies that grow get finer frames, and a copy
-   * that grows 10× shows a tenth of the view, so its frame stays near the screen's size.
-   * Copies share a frame when they grow by about the same (the nearest power of 2) and the
-   * frame stays within 2.5 screens of pixels; else they get frames of their own (24 at most).
-   * A frame is at most 4096 px per side and 8 megapixels. `of[i]`: the frame of copy i (−1:
-   * off screen).
-   */
-  private kaleidoscopeFrames(steps: Affine[], content: Box | null): { frames: Grid[]; of: number[] } {
-    const ds = this.view.zoom * this.dpr;
-    const vw = (this.canvas.width || 1) / ds, vh = (this.canvas.height || 1) / ds;
-    const v = this.view;
-    const of = steps.map(() => -1);
-    if (!content) return { frames: [], of };
-    const groups: { key: number; box: Box; grow: number; copies: number[] }[] = [];
-    const budget = 2.5 * (this.canvas.width || 1) * (this.canvas.height || 1);
-    const cost = (b: Box, grow: number) => (b.x1 - b.x0) * (b.y1 - b.y0) * (ds * grow) ** 2;
-    const union = (a: Box, b: Box): Box => ({ x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) });
-    steps.forEach((m, i) => {
-      const inv = invert(m);
-      if (!inv) return;
-      const pts = [apply(inv, v.x, v.y), apply(inv, v.x + vw, v.y), apply(inv, v.x, v.y + vh), apply(inv, v.x + vw, v.y + vh)];
-      // The part of the content this copy shows on screen.
-      const x0 = Math.max(content.x0, Math.min(...pts.map((p) => p[0]))), y0 = Math.max(content.y0, Math.min(...pts.map((p) => p[1])));
-      const x1 = Math.min(content.x1, Math.max(...pts.map((p) => p[0]))), y1 = Math.min(content.y1, Math.max(...pts.map((p) => p[1])));
-      if (!(x1 > x0 && y1 > y0)) return;
-      const grow = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
-      const key = Math.round(Math.log2(Math.max(grow, 1e-9)));
-      const box = { x0, y0, x1, y1 };
-      // Join a frame of the same size group that stays within the budget; else a new one (or,
-      // past 24 frames, the frame that grows least).
-      const same = groups.filter((g) => g.key === key);
-      let g = same.find((x) => cost(union(x.box, box), Math.max(x.grow, grow)) <= budget);
-      if (!g && groups.length >= 24) {
-        const pick = same.length ? same : groups;
-        g = pick.reduce((a, b) => (cost(union(a.box, box), Math.max(a.grow, grow)) - cost(a.box, a.grow) <= cost(union(b.box, box), Math.max(b.grow, grow)) - cost(b.box, b.grow) ? a : b));
-      }
-      if (g) {
-        g.box = union(g.box, box);
-        g.grow = Math.max(g.grow, grow);
-        g.copies.push(i);
-      } else groups.push({ key, box, grow, copies: [i] });
-    });
-    const frames: Grid[] = [];
-    for (const g of groups) {
-      const { x0, y0, x1, y1 } = g.box;
-      // A pixel of margin, so the edge of the content is not cut by the filter.
-      let s = ds * Math.max(g.grow, 1e-9);
-      s = Math.min(s, 4096 / (x1 - x0), 4096 / (y1 - y0), Math.sqrt(8e6 / ((x1 - x0) * (y1 - y0))));
-      const m = 2 / s;
-      // Sizes in steps of 64 px, so the buffers are not made again at every small move.
-      const w = Math.max(64, Math.ceil(((x1 - x0 + 2 * m) * s) / 64) * 64), h = Math.max(64, Math.ceil(((y1 - y0 + 2 * m) * s) / 64) * 64);
-      for (const i of g.copies) of[i] = frames.length;
-      frames.push(this.frameGrid(x0 - m, y0 - m, w, h, s, `kal${frames.length}:`));
-    }
-    return { frames, of };
-  }
-
   /** A frame of w × h px whose top left is world (wx, wy), at s px per world unit. */
   private frameGrid(wx: number, wy: number, w: number, h: number, s: number, ns: string): Grid {
     const lod = lodFor(s);
@@ -2491,39 +2490,165 @@ export class GLRenderer implements Renderer {
   }
 
   /**
-   * Kaleidoscope: `cur` (the layer with its other effects) and its copies, in front of it or
-   * behind it, into one buffer. On the screen the copies come from the kaleidoscope frame
-   * (`whole` renders the layer there), so what a copy turns into view from off screen shows;
-   * inside another frame they come from `cur` itself.
+   * Kaleidoscope: `cur` (the layer with its other effects, in frame g) and its copies, behind it
+   * or in front of it, into one buffer. Copy i is the layer moved by steps[i]: what it shows in g
+   * is the part of the layer that g undone by the copy's move covers (within `content`). A copy
+   * whose part lies in g and that does not grow comes from `cur`; any other from a frame of its
+   * own, at the detail the copy needs (`whole` renders the layer there, with the kaleidoscopes of
+   * its layers: copies of copies have frames of their own too). The frames render one after the
+   * other into the same buffers (`${g.ns}k:`), so memory does not grow with the copies, and a
+   * frame never has to be coarser than g because other copies share it. Copies at one level of
+   * detail share a frame when it is small enough (see below). `plain`: the layer is only its
+   * tiles; its copies draw them (drawThrough), with no frame at all.
    */
-  private kaleidoscope(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target, content: () => Box | null): Target {
+  private kaleidoscope(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target, content: () => Box | null, pad: number, plain: string | null): Target {
     const steps = this.kaleidoscopeSteps(e);
-    // Each copy's source: a kaleidoscope frame on the screen, else this frame's buffer.
-    const own = { t: cur, from: [1 / g.s, 0, 0, 1 / g.s, g.wx, g.wy] as Affine }; // source px → world
-    let srcOf: ({ t: Target; from: Affine } | null)[] = steps.map(() => own);
-    if (g.ns === '') {
-      const { frames, of } = this.kaleidoscopeFrames(steps, content());
-      // Render every frame first: each has its own buffers, so they all stay until drawn.
-      const srcs = frames.map((kg) => ({ t: whole(kg), from: [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy] as Affine }));
-      srcOf = of.map((f) => (f < 0 ? null : srcs[f]));
-    }
     const to: Affine = [g.s, 0, 0, g.s, -g.wx * g.s, -g.wy * g.s]; // world → frame px
+    const fromG: Affine = [1 / g.s, 0, 0, 1 / g.s, g.wx, g.wy]; // frame px → world
+    const gx1 = g.wx + g.w / g.s, gy1 = g.wy + g.h / g.s;
+    const c = content();
     const out = this.buf(g, 'kalOut');
+    // Where each copy comes from: `cur` (its part lies in g and it does not grow), the tiles
+    // (plain), a frame shared by the copies at its level of detail, or a frame of its own.
+    type Plan = { m: Affine; box: Box; grow: number; via: 'cur' | 'tiles' | 'level' | 'own'; level: number };
+    const plans: (Plan | null)[] = steps.map((m) => {
+      const inv = c && invert(m);
+      if (!inv) return null;
+      const pts = [apply(inv, g.wx, g.wy), apply(inv, gx1, g.wy), apply(inv, g.wx, gy1), apply(inv, gx1, gy1)];
+      const box = {
+        x0: Math.max(c.x0, Math.min(...pts.map((p) => p[0]))),
+        y0: Math.max(c.y0, Math.min(...pts.map((p) => p[1]))),
+        x1: Math.min(c.x1, Math.max(...pts.map((p) => p[0]))),
+        y1: Math.min(c.y1, Math.max(...pts.map((p) => p[1]))),
+      };
+      if (!(box.x1 > box.x0 && box.y1 > box.y0)) return null;
+      const grow = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
+      const inG = box.x0 >= g.wx && box.y0 >= g.wy && box.x1 <= gx1 && box.y1 <= gy1;
+      const via = grow <= 1.01 && inG ? 'cur' : plain ? 'tiles' : 'level';
+      return { m, box, grow, via, level: Math.ceil(Math.log2(g.s * grow)) };
+    });
+    // Copies at the same level of detail (the detail they need rounded up to a power of 2) mostly
+    // show the same parts of the layer: one frame over the union of their parts, rendered once
+    // (with the layer's effects), when it stays within the pixels of a copy's own frame (2.5× g)
+    // and 4096 px a side. At most LEVEL_FRAMES of them, the levels with the most copies; the
+    // other copies get frames of their own.
+    const unions = new Map<number, { box: Box; n: number }>();
+    for (const p of plans) {
+      if (p?.via !== 'level') continue;
+      const u = unions.get(p.level);
+      if (u) {
+        u.box = { x0: Math.min(u.box.x0, p.box.x0), y0: Math.min(u.box.y0, p.box.y0), x1: Math.max(u.box.x1, p.box.x1), y1: Math.max(u.box.y1, p.box.y1) };
+        u.n++;
+      } else unions.set(p.level, { box: { ...p.box }, n: 1 });
+    }
+    const fits = (b: Box, sl: number) => {
+      const bw = b.x1 - b.x0 + 2 * pad, bh = b.y1 - b.y0 + 2 * pad;
+      return bw * sl <= 4096 && bh * sl <= 4096 && bw * bh * sl * sl <= 2.5 * g.w * g.h;
+    };
+    const levels = [...unions].filter(([l, u]) => u.n > 1 && fits(u.box, 2 ** l)).sort((a, b) => b[1].n - a[1].n).slice(0, LEVEL_FRAMES);
+    const frames = new Map<number, { kg: Grid; src: Target }>();
+    for (const [l, u] of levels) {
+      const kg = this.copyFrame({ x0: u.box.x0 - pad, y0: u.box.y0 - pad, x1: u.box.x1 + pad, y1: u.box.y1 + pad }, 2 ** l, g, `${g.ns}k${l}:`);
+      frames.set(l, { kg, src: whole(kg) });
+    }
     this.bindTarget(out);
     this.clear();
-    const copies = () => {
-      const order = steps.map((_, i) => i);
-      if (e.order === 'behind') order.reverse(); // copy 1 nearest the layer
-      for (const i of order) {
-        const src = srcOf[i];
-        if (src) this.drawXform(src.t, out, compose(to, compose(steps[i], src.from)));
-      }
+    const copy = (p: Plan | null) => {
+      if (!p) return;
+      const { m, box } = p;
+      if (p.via === 'cur') return this.drawXform(cur, out, compose(to, compose(m, fromG)));
+      if (p.via === 'tiles') return this.drawThrough(plain!, box, g.s * p.grow, out, compose(to, m));
+      const f = frames.get(p.level);
+      const kg = f?.kg ?? this.copyFrame({ x0: box.x0 - pad, y0: box.y0 - pad, x1: box.x1 + pad, y1: box.y1 + pad }, g.s * p.grow, g, `${g.ns}k:`);
+      const src = f?.src ?? whole(kg);
+      this.drawXform(src, out, compose(to, compose(m, [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy])));
+      // Hand the GPU its work frame by frame: hundreds of frames with effects in one go can run
+      // long enough for the browser to reset the GPU (a lost context).
+      if (!f) this.gl.flush();
     };
-    if (e.order === 'behind') copies();
+    // Behind: copy 1 nearest the layer, so the last copy goes down first.
+    if (e.order === 'behind') for (let i = plans.length - 1; i >= 0; i--) copy(plans[i]);
+    this.bindTarget(out);
     this.blendFor(false);
     this.copy(cur.tex, out, [0, 0, out.w, out.h]);
-    if (e.order !== 'behind') copies();
+    if (e.order !== 'behind') for (const p of plans) copy(p);
     return out;
+  }
+
+  /**
+   * The tiles of `key` over world box `b`, at the level for `s` px per world unit, onto `out`
+   * through M (world → out px, source-over): a kaleidoscope copy of a layer that is only its
+   * tiles. All from one level, so they do not overlap: the finest whose tiles are all drawn (up to
+   * 4× coarser while they render; the missing ones are asked for: wanted).
+   */
+  private drawThrough(key: string, b: Box, s: number, out: Target, M: Affine): void {
+    let lod = lodFor(s);
+    // At most about 256 tiles: coarser past that (a copy that shrinks to a few pixels).
+    while (lod < MAX_LOD && ((b.x1 - b.x0) / tileWorld(lod) + 1) * ((b.y1 - b.y0) / tileWorld(lod) + 1) > 256) lod++;
+    const range = (l: number) => {
+      const tw = tileWorld(l);
+      return { tw, tx0: Math.floor(b.x0 / tw), ty0: Math.floor(b.y0 / tw), tx1: Math.floor(b.x1 / tw), ty1: Math.floor(b.y1 / tw) };
+    };
+    const has = this.shapeLayers.has(key) ? this.shapes.layer(key).length > 0 : (this.index.byLayer.get(key)?.length ?? 0) > 0;
+    if (!has) return;
+    // The finest level whose tiles are all drawn; the tiles of the wanted level and, while it is
+    // not ready, of the level 4× coarser are asked for (all of them at once).
+    let use: number | null = null;
+    for (let l = lod; l <= Math.min(MAX_LOD, lod + 2) && use === null; l++) {
+      const r = range(l);
+      const ask = l === lod || l === lod + 2;
+      let ready = true;
+      for (let ty = r.ty0; ty <= r.ty1; ty++)
+        for (let tx = r.tx0; tx <= r.tx1; tx++) {
+          const t = this.tiles.get(tileKey(key, l, tx, ty));
+          if (ask && this.needsWork(t)) this.wanted.set(tileKey(key, l, tx, ty), { layer: key, lod: l, tx, ty });
+          // Kept while the level fills in (else the cache frees them as unused, again and again).
+          if (t && ask) t.used = this.frame;
+          if (!t?.rendered) ready = false;
+        }
+      if (ready) use = l;
+    }
+    if (use === null) return;
+    const r = range(use);
+    const k = r.tw / TILE; // tile px → world
+    // As drawXform, with the state set once: a copy can draw a few hundred tiles.
+    const gl = this.gl;
+    this.bindTarget(out);
+    this.blendFor(false);
+    const p = this.progs.xform;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1i(p.u.uTex, 0);
+    gl.uniform1f(p.u.uOpacity, 1);
+    gl.uniform2f(p.u.uSrcSize, TILE, TILE);
+    gl.uniform2f(p.u.uTarget, out.w, out.h);
+    gl.bindVertexArray(this.quadVao);
+    for (let ty = r.ty0; ty <= r.ty1; ty++)
+      for (let tx = r.tx0; tx <= r.tx1; tx++) {
+        const t = this.tiles.get(tileKey(key, use, tx, ty))!;
+        t.used = this.frame;
+        if (!t.target) continue;
+        const S = compose(M, [k, 0, 0, k, tx * r.tw, ty * r.tw]);
+        gl.bindTexture(gl.TEXTURE_2D, t.target.tex);
+        gl.uniformMatrix3fv(p.u.uM, false, [S[0], S[1], 0, S[2], S[3], 0, S[4], S[5], 1]);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+  }
+
+  /**
+   * The frame of a kaleidoscope copy: world box `b` at `s` px per unit (the detail the copy
+   * needs), at most 2.5 times the pixels of the frame `g` it shows in (its part of g, turned, fits
+   * in twice its area) and 4096 px per side: coarser when that is too much. Sizes go up in steps,
+   * so the buffers of frames one after the other can be the same ones.
+   */
+  private copyFrame(b: Box, s: number, g: Grid, ns: string): Grid {
+    const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+    s = Math.min(s, 4096 / bw, 4096 / bh, Math.sqrt((2.5 * g.w * g.h) / (bw * bh)));
+    // A pixel of margin, so the edge of the content is not cut by the filter.
+    const m = 2 / s;
+    const step = (v: number) => Math.max(128, Math.ceil(v / 128) * 128);
+    const w = Math.min(4096, step((bw + 2 * m) * s)), h = Math.min(4096, step((bh + 2 * m) * s));
+    return this.frameGrid(b.x0 - m, b.y0 - m, w, h, s, ns);
   }
 
   /** `src` onto `dst` through S (source px → target px), source-over. */
@@ -2639,7 +2764,11 @@ export class GLRenderer implements Renderer {
   }
 
   private drawTile(layer: string, lod: number, tx: number, ty: number, target: Target, dst: [number, number, number, number], opacity: number): void {
-    const own = this.tiles.get(tileKey(layer, lod, tx, ty));
+    const key = tileKey(layer, lod, tx, ty);
+    const own = this.tiles.get(key);
+    // Missing or out of date: the next frame renders it (a range may cover it too). Kept meanwhile.
+    if (this.needsWork(own)) this.wanted.set(key, { layer, lod, tx, ty });
+    if (own) own.used = this.frame;
     // A tile that has rendered once is drawn even while stale: no flash during updates.
     if (own?.rendered) {
       own.used = this.frame;
@@ -2661,13 +2790,20 @@ export class GLRenderer implements Renderer {
     }
     // Or the four finer children (after a zoom out).
     const hw = dst[2] / 2, hh = dst[3] / 2;
+    let found = false;
     for (let j = 0; j < 2; j++) {
       for (let i = 0; i < 2; i++) {
         const child = this.tiles.get(tileKey(layer, lod - 1, tx * 2 + i, ty * 2 + j));
         if (!child?.rendered) continue;
+        found = true;
         child.used = this.frame;
         if (child.target) this.copy(child.target.tex, target, [dst[0] + i * hw, dst[1] + j * hh, hw, hh], opacity);
       }
+    }
+    // Nothing to stretch: ask for the tile 4× coarser too (one for 16, ready first).
+    if (!found && lod + 2 <= MAX_LOD) {
+      const ptx = Math.floor(tx / 4), pty = Math.floor(ty / 4);
+      this.wanted.set(tileKey(layer, lod + 2, ptx, pty), { layer, lod: lod + 2, tx: ptx, ty: pty });
     }
   }
 

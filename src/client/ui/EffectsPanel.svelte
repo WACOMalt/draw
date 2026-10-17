@@ -129,12 +129,13 @@
           /></label
         >
         <div class="field">
-          <Slider label="Angle" value={e.angle ?? 0} min={-180} max={180} step={0.1} width={80} title="Degrees each copy turns past the one before" oninput={(v) => set(t, { angle: v })} />
+          <!-- Copies compound the step (copy n turns n times as far): fine steps near 0, a full turn either way at the ends. -->
+          <Slider label="Angle" value={e.angle ?? 0} min={-360} max={360} step={0.01} least={0.1} log width={80} title="Degrees each copy turns past the one before (fine near 0°)" oninput={(v) => set(t, { angle: v })} />
           <button class="small" title="Even around a full turn: 360° ÷ (count + 1)" onclick={() => set(t, { angle: Math.round((360 / (n + 1)) * 1000) / 1000 })}>Even</button>
         </div>
-        <Slider label="Scale" value={e.scale ?? 1} min={0.05} max={4} step={0.001} percent log width={100} title="Each copy's size, from the one before" oninput={(v) => set(t, { scale: v })} />
-        <Slider label="Move X" value={px(e.dx ?? 0)} min={-500} max={500} step={0.1} width={100} title="Screen pixels now: each copy moves this far from the one before" oninput={(v) => set(t, { dx: world(v) })} />
-        <Slider label="Move Y" value={px(e.dy ?? 0)} min={-500} max={500} step={0.1} width={100} title="Screen pixels now" oninput={(v) => set(t, { dy: world(v) })} />
+        <Slider label="Scale" value={e.scale ?? 1} min={0.05} max={4} center={1} least={0.0001} step={0.0001} percent log width={100} title="Each copy's size, from the one before (fine near 100%: the copies multiply it)" oninput={(v) => set(t, { scale: v })} />
+        <Slider label="Move X" value={px(e.dx ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now: each copy moves this far from the one before (fine near 0)" oninput={(v) => set(t, { dx: world(v) })} />
+        <Slider label="Move Y" value={px(e.dy ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now (fine near 0)" oninput={(v) => set(t, { dy: world(v) })} />
         <div class="field">
           <span>Copies</span>
           <div class="seg">
@@ -143,7 +144,7 @@
           </div>
         </div>
         <button class="small" title="The pivot to the middle of the view" onclick={() => { const [cx, cy] = viewCenter(); set(t, { cx, cy }); }}>Pivot to the middle</button>
-        <p class="hint">On the canvas: drag the round pivot, the square to move each step, and the arrow tip to turn and scale (Shift: 15° steps).</p>
+        <p class="hint">On the canvas: drag the round pivot, the square to move each step, and the arrow tip to turn and scale. The last copy follows the pointer (Alt: finer; Shift: 15° steps).</p>
       </div>
     {:else if e?.enabled}
       <div class="params">
