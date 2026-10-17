@@ -168,6 +168,22 @@ impl Stroke {
         }
         self.samples.push(s);
     }
+
+    /// The stroke moved by `m` (a kaleidoscope's copy): its points, the pen's up side, and its
+    /// size by m's scale (the cube root of its volume change). None when m flattens it.
+    pub fn transformed(&self, m: &glam::Mat4) -> Option<Stroke> {
+        let k = m.determinant().abs().cbrt();
+        if !(k > 1e-6 && k.is_finite()) {
+            return None;
+        }
+        let mut out = self.clone();
+        out.brush.radius *= k;
+        for p in &mut out.samples {
+            p.pos = m.transform_point3(p.pos);
+            p.up = m.transform_vector3(p.up).normalize_or(p.up);
+        }
+        Some(out)
+    }
 }
 
 #[cfg(test)]

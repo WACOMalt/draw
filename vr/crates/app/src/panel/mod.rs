@@ -474,6 +474,10 @@ impl Panel {
         if icon_button(ui, "transform", size, painter.tools.tool == Tool::Transform, true).clicked() {
             painter.tools.tool = Tool::Transform;
         }
+        ui.add_space(6.0);
+        if icon_button(ui, "kaleido", size, painter.tools.tool == Tool::Kaleido, true).clicked() {
+            painter.tools.tool = Tool::Kaleido;
+        }
     }
 }
 
@@ -498,8 +502,13 @@ fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, dyn
             });
             ui.add_space(4.0);
         }
+        if painter.tools.tool == Tool::Kaleido {
+            kaleido_settings(ui, painter);
+            return;
+        }
         let tools = &mut painter.tools;
         match tools.tool {
+            Tool::Kaleido => {}
             Tool::Brush | Tool::Eraser => {
                 let mut smoothing = tools.smoothing;
                 let (brush, angle) = tools.current().unwrap();
@@ -531,6 +540,106 @@ fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, dyn
             }
         }
     });
+}
+
+/// The Kaleidoscope tool's settings: the active layer's kaleidoscope (the 2D app's Effects
+/// panel): on or off, the count, the scale, the turn (in the paper), the copies behind the
+/// layer or in front of it. A change goes to the layer (the canvas sends it).
+fn kaleido_settings(ui: &mut egui::Ui, painter: &mut Painter) {
+    let dim = |ui: &mut egui::Ui, t: &str| {
+        ui.label(RichText::new(t).color(TEXT_DIM).size(14.0));
+    };
+    let i = painter.active_index();
+    if !painter.shared {
+        dim(ui, "A kaleidoscope is a layer effect of a shared canvas: open one to set it.");
+        return;
+    }
+    if painter.painting.layers[i].adjust.is_some() {
+        dim(ui, "An adjustment layer takes no effects.");
+        return;
+    }
+    let Some(mut k) = painter.painting.layers[i].kaleido.clone() else {
+        if ui.button(RichText::new("Add a kaleidoscope").size(15.0)).clicked() {
+            if let Some(k) = painter.new_kaleido(i) {
+                let l = &mut painter.painting.layers[i];
+                l.kaleido = Some(k);
+                l.update_copies();
+                painter.rebuild();
+            }
+        }
+        dim(ui, "Copies of the layer, each turned, scaled and moved by the step once more.");
+        return;
+    };
+    let was = k.clone();
+    ui.horizontal(|ui| {
+        ui.add_space(94.0);
+        if toggle(ui, "On", k.on()).clicked() {
+            k.set("enabled", true);
+        }
+        if toggle(ui, "Off", !k.on()).clicked() {
+            k.set("enabled", false);
+        }
+    });
+    if k.on() {
+        let mut n = k.count().max(1) as f32;
+        if slider(ui, "Count", &mut n, (1.0, 64.0), true, |v| format!("{:.0}", v.round())) {
+            k.set("count", n.round().clamp(1.0, 64.0) as u32);
+        }
+        let mut s = k.num("scale", 1.0) as f32;
+        if slider(ui, "Scale", &mut s, (0.05, 4.0), true, percent) {
+            k.set("scale", ((s as f64) * 1e4).round() / 1e4);
+        }
+        let mut a = k.angle() as f32;
+        if slider(ui, "Angle", &mut a, (-360.0, 360.0), false, |v| format!("{v:.1}°")) {
+            k.set_angle(((a as f64) * 100.0).round() / 100.0);
+        }
+        let mut flatten = false;
+        ui.horizontal(|ui| {
+            ui.add_space(94.0);
+            if toggle(ui, "Even", false).clicked() {
+                k.set_angle((360.0 / (k.count() as f64 + 1.0) * 1000.0).round() / 1000.0);
+            }
+            // A 3D layer's step is a 3D one: a flat one needs the layer flat too.
+            if k.depth && toggle(ui, "Flatten (makes the layer flat)", false).clicked() {
+                flatten = true;
+            }
+        });
+        if flatten {
+            let block = painter.painting.block(i);
+            painter.edit_layers(|p| {
+                for j in block {
+                    if !p.layers[j].group && p.layers[j].adjust.is_none() {
+                        p.layers[j].threed = false;
+                    }
+                }
+                (None, crate::painter::Removed::default())
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(94.0);
+            if toggle(ui, "Behind", k.behind()).clicked() {
+                k.set("order", "behind");
+            }
+            if toggle(ui, "In front", !k.behind()).clicked() {
+                k.set("order", "front");
+            }
+        });
+        dim(
+            ui,
+            if k.depth {
+                "Hold a ball with the trigger. The yellow pivot follows your hand. The blue ball is the step: move and turn your hand to move and turn it, push the stick to scale it. The other trigger makes it finer."
+            } else {
+                "Hold a ball with the trigger. The yellow pivot follows your hand. The blue ball is the step: move your hand to move it, turn your wrist to turn it in the paper, push the stick to scale it. The other trigger makes it finer."
+            },
+        );
+    }
+    if k != was {
+        let l = &mut painter.painting.layers[i];
+        l.kaleido = Some(k);
+        l.update_copies();
+        painter.rebuild();
+    }
 }
 
 /// The brush's or the eraser's settings, as the 2D app's options bar: size (logarithmic),

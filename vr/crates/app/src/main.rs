@@ -19,6 +19,7 @@ mod bridge;
 mod canvas;
 mod debug;
 mod demo;
+mod kaleido;
 mod lobby;
 mod painter;
 mod palettes;

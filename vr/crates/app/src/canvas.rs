@@ -87,12 +87,14 @@ struct Meta {
     /// A 3D layer (its strokes in 3D).
     threed: bool,
     adjust: Option<vdraw_core::Adjust>,
+    /// Its kaleidoscope (the effect as the document has it, edited).
+    kaleido: Option<serde_json::Map<String, Value>>,
 }
 
 fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
     p.layers
         .iter()
-        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d(), adjust: l.adjust.clone() })
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d(), adjust: l.adjust.clone(), kaleido: l.kaleido.as_ref().map(|k| k.effect.clone()) })
         .collect()
 }
 
@@ -420,6 +422,7 @@ impl Canvas {
             // It catches up when the rebuild is in.
             return;
         }
+        painter.frame = Some(self.frame);
         let doc = self.session.view().clone();
         let layers = doc.painted_layers();
         let forms: Vec<Form> = layers.iter().map(|l| form(l)).collect();
@@ -448,7 +451,22 @@ impl Canvas {
                     steps_changed = true;
                 }
             }
+            // A kaleidoscope changed: its copies are drawn again.
+            let k = doc.kaleido(l, &self.frame);
+            if painter.painting.layers[i].kaleido != k {
+                let p = &mut painter.painting.layers[i];
+                p.kaleido = k;
+                let copies = p.kaleido.as_ref().map_or(Vec::new(), |k| k.copies());
+                if p.copies != copies {
+                    p.copies = copies;
+                    steps_changed = true;
+                }
+            }
         }
+        // With copies drawn, each stroke in or out builds all again: so the strokes go in by
+        // hand, and it builds once.
+        let by_hand = steps_changed || painter.built.copied;
+        let mut changed = steps_changed;
         // The strokes: those gone or changed out, then those new in, by place.
         let mut edits = 0;
         let mut plans = Vec::new();
@@ -494,7 +512,7 @@ impl Canvas {
             let depth = layers[i].threed;
             let ordered_in = |painter: &mut Painter, j: usize, s: &DocStroke, frame: &Frame| {
                 let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.threed.as_ref().filter(|_| depth), frame);
-                if steps_changed {
+                if by_hand {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
                     list.insert(j.min(list.len()), stroke);
@@ -502,8 +520,9 @@ impl Canvas {
                     painter.insert_stroke(i, mask, j, stroke);
                 }
             };
+            changed |= by_hand && (!out.is_empty() || !ins.is_empty());
             for &k in out.iter().rev() {
-                if steps_changed {
+                if by_hand {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
                     list.remove(k);
@@ -520,7 +539,7 @@ impl Canvas {
                 self.shown[i].strokes = prints;
             }
         }
-        if steps_changed {
+        if changed {
             painter.rebuild();
         }
         if let Some(a) = self.want_active.take() {
@@ -968,6 +987,22 @@ impl Canvas {
                     set("adjust", serde_json::to_value(a).unwrap_or(Value::Null), dl.extra.get("adjust").cloned().unwrap_or(Value::Null));
                 }
             }
+            if m.kaleido != b.kaleido {
+                // The layer's effects with its kaleidoscope in place of the one it had (the
+                // others as they are).
+                let was = dl.extra.get("effects").cloned().unwrap_or(Value::Null);
+                let mut list: Vec<Value> = was.as_array().cloned().unwrap_or_default();
+                let at = list.iter().position(|e| e["type"] == "kaleidoscope");
+                match (&m.kaleido, at) {
+                    (Some(k), Some(i)) => list[i] = Value::Object(k.clone()),
+                    (Some(k), None) => list.push(Value::Object(k.clone())),
+                    (None, Some(i)) => {
+                        list.remove(i);
+                    }
+                    (None, None) => {}
+                }
+                set("effects", if list.is_empty() { Value::Null } else { Value::Array(list) }, was);
+            }
             if m.threed != b.threed && !m.group && m.adjust.is_none() {
                 set("threed", m.threed.into(), dl.threed.into());
             }
@@ -1299,6 +1334,86 @@ mod tests {
 
     fn current(p: &Painter) -> (Vec<u8>, Vec<vdraw_core::StrokeRef>) {
         (bytemuck::cast_slice(&p.done).to_vec(), p.built.strokes.clone())
+    }
+
+    /// A kaleidoscope another client turns on: its copies are drawn (the strokes, those put in
+    /// after, and a stroke being drawn), and the painting stays as a fresh build would make it.
+    #[test]
+    fn a_kaleidoscope_on_a_live_canvas() {
+        let Ok(base) = std::env::var("VDRAW_TEST_SERVER") else { return };
+        let server = vdraw_net::Server::new(&base, None);
+        let anon = vdraw_net::identity::base64url(&[10u8; 32]);
+        let key = server.create(&anon, None, None).unwrap();
+        let mut c = Canvas::new(Session::open(&server, &key, "VR", "#ff6b6b", &anon, None));
+        let mut other = Session::open(&server, &key, "2D", "#4dabf7", &anon, None);
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        let head = Mat4::from_translation(Vec3::new(0.0, 1.6, 0.0));
+        let until = |c: &mut Canvas, painter: &mut Painter, other: &mut Session, what: &str, done: &dyn Fn(&Canvas, &Painter) -> bool| {
+            let t = Instant::now();
+            loop {
+                other.poll();
+                c.update(painter, head);
+                if done(c, painter) {
+                    break;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until(&mut c, &mut painter, &mut other, "the document", &|c, _| c.placed && c.session.state == State::Open);
+        while other.state != State::Open {
+            other.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let layer = other.doc.paint_order()[0].id.clone();
+        let brush = json!({"tool": "paint", "color": "#aa3311", "size": 12.0, "opacity": 1.0, "flow": 1.0, "hardness": 0.8, "spacing": 0.1, "pressureSize": true, "pressureFlow": false, "buildup": false});
+        let add = |other: &mut Session, k: usize| other.send_op(json!({"type": "stroke.add", "stroke": {"id": format!("S{k}dddddddddd"), "layerId": layer, "brush": brush, "pts": [k as f64 * 20.0, 0.0, 0.5, k as f64 * 20.0 + 15.0, 30.0, 0.7]}}));
+        add(&mut other, 0);
+        until(&mut c, &mut painter, &mut other, "a stroke", &|_, p| p.built.strokes.len() == 1);
+        let one = painter.done.len();
+        let e = json!([{"type": "kaleidoscope", "enabled": true, "radius": 0, "count": 5, "angle": 72, "scale": 1, "cx": 0, "cy": 0, "dx": 0, "dy": 0, "order": "front"}]);
+        other.send_op(json!({"type": "layer.update", "id": layer, "props": {"effects": e}}));
+        until(&mut c, &mut painter, &mut other, "the copies", &|_, p| p.built.copied);
+        assert_eq!(painter.painting.layers[0].copies.len(), 6);
+        assert_eq!(painter.done.len(), 6 * one);
+        assert_eq!(current(&painter), fresh(&painter));
+        add(&mut other, 1);
+        until(&mut c, &mut painter, &mut other, "a stroke with copies", &|_, p| p.built.strokes.len() == 2);
+        assert_eq!(current(&painter), fresh(&painter));
+        // Another's stroke being drawn: in every copy.
+        other.send_live("Slivedddddddd", &layer, None, &brush, &[0.0, 50.0, 0.5, 30.0, 60.0, 0.5], None, true);
+        until(&mut c, &mut painter, &mut other, "the live stroke", &|c, _| !c.session.lives.is_empty());
+        painter.update_drawing();
+        c.draw_live(&mut painter);
+        let live = painter.drawing.len();
+        assert!(live > 0);
+        assert_eq!(painter.drawing_runs.len(), 1);
+        assert_eq!(live % 6, 0, "six of each");
+        // Set in VR: the others get it (the other effects kept).
+        {
+            let l = &mut painter.painting.layers[0];
+            let mut k = l.kaleido.clone().unwrap();
+            k.set("count", 3);
+            l.kaleido = Some(k);
+            l.update_copies();
+        }
+        painter.rebuild();
+        std::thread::sleep(Duration::from_millis(120));
+        c.commit(&mut painter);
+        let count = |o: &Session| o.doc.layers[&layer].extra["effects"][0]["count"].as_u64();
+        let t = Instant::now();
+        while count(&other) != Some(3) {
+            other.poll();
+            c.update(&mut painter, head);
+            assert!(t.elapsed() < Duration::from_secs(5), "the others never got the count");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(painter.painting.layers[0].copies.len(), 4);
+        assert_eq!(current(&painter), fresh(&painter));
+        // Off: no copies.
+        other.send_op(json!({"type": "layer.update", "id": layer, "props": {"effects": null}}));
+        until(&mut c, &mut painter, &mut other, "no copies", &|_, p| !p.built.copied);
+        assert_eq!(current(&painter), fresh(&painter));
     }
 
     /// A canvas kept live while another client edits it, on a test server ($VDRAW_TEST_SERVER,

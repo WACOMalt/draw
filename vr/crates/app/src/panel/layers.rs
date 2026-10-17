@@ -291,6 +291,21 @@ fn layer_row(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState, 
         } else {
             p.layers[i].is_3d()
         };
+    // A kaleidoscope that is on: the 2D app's fx badge. A click takes the Kaleidoscope tool to it.
+    if p.layers[i].kaleido.as_ref().is_some_and(|k| k.on()) {
+        let r = Rect::from_center_size(pos2(right - 14.0, rect.center().y), vec2(26.0, 20.0));
+        right -= 30.0;
+        let fx = ui.interact(r, egui::Id::new(("fx", id)), Sense::click());
+        let on = painter.tools.tool == crate::tools::Tool::Kaleido && active;
+        ui.painter().rect_filled(r, 3.0, if fx.hovered() { BG_3 } else { BG_1 });
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "fx", egui::FontId::proportional(13.0), if on { ACCENT } else { TEXT });
+        if fx.clicked() {
+            painter.active_layer = id;
+            painter.mask_target = false;
+            painter.tools.tool = crate::tools::Tool::Kaleido;
+            return Some(rect);
+        }
+    }
     for (t, color) in tags.into_iter().map(|t| (t, TEXT_DIM)).chain(vr.then(|| ("3D".to_string(), ACCENT))) {
         let galley = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), color);
         let w = galley.size().x + 10.0;
