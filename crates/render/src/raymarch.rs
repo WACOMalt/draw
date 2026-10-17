@@ -53,6 +53,7 @@ struct ParamsGpu {
     line_count: u32,
     step_count: u32,
     pick_layer: u32,
+    world_from_scene: [f32; 16],
 }
 
 /// A compositing step as the shader reads it (vdraw_core::Step): what it is (`STEP_*`), the
@@ -120,6 +121,9 @@ pub struct Scene<'a> {
     pub steps: &'a [SceneStep],
     /// Paint mixes as paint (vdraw_core::Mix::Pigment), not as light.
     pub pigment: bool,
+    /// Where the scene (the strokes, and the eyes given to `record`) is in the room, where the
+    /// sky and the floor are: identity for a painting in the room; a shared canvas's view.
+    pub world_from_scene: Mat4,
 }
 
 /// What is drawn over the painting: the brush tip, the pointer's laser, and lines.
@@ -604,6 +608,7 @@ impl Raymarcher {
         p.cluster_count = n_clusters as u32;
         p.line_count = overlays.lines.len() as u32;
         p.step_count = scene.steps.len() as u32;
+        p.world_from_scene = scene.world_from_scene.to_cols_array();
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {

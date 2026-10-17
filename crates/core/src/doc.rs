@@ -19,8 +19,9 @@ pub const MAX_COORD: f64 = 1e15;
 pub const BRUSH_WORLD: (f64, f64) = (1e-12, 1e15);
 
 /// A 2D brush (types.ts Brush). The optional dynamics stay in `extra` under their own names.
+/// What an older file leaves out takes the 2D app's defaults.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct DocBrush {
     /// "paint" or "erase".
     pub tool: String,
@@ -37,6 +38,24 @@ pub struct DocBrush {
     pub buildup: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Default for DocBrush {
+    fn default() -> Self {
+        Self {
+            tool: "paint".into(),
+            color: "#000000".into(),
+            size: 1.0,
+            opacity: 1.0,
+            flow: 1.0,
+            hardness: 0.8,
+            spacing: 0.1,
+            pressure_size: true,
+            pressure_flow: false,
+            buildup: false,
+            extra: Map::new(),
+        }
+    }
 }
 
 impl DocBrush {
@@ -91,12 +110,17 @@ pub struct LayerMask {
 #[serde(rename_all = "camelCase")]
 pub struct DocLayer {
     pub id: String,
+    #[serde(default)]
     pub name: String,
     /// Sorts the layers of one parent, bottom to top.
+    #[serde(default)]
     pub order: f64,
     /// A blend mode's name ("normal", "color-burn", ...; "pass" for a group).
+    #[serde(default = "normal")]
     pub blend: String,
+    #[serde(default = "one")]
     pub opacity: f64,
+    #[serde(default = "yes")]
     pub visible: bool,
     #[serde(default)]
     pub deleted: bool,
@@ -110,6 +134,18 @@ pub struct DocLayer {
     pub mask: Option<LayerMask>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn normal() -> String {
+    "normal".into()
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl DocLayer {
@@ -571,6 +607,153 @@ pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBru
         brush.extra.insert("angle".into(), angle.into());
     }
     Some((pts, brush))
+}
+
+/// How the document's canvas units map into a painting's space: a point (x, y) (2D: y down)
+/// at depth z goes to `offset + ((x - anchor.x) k, -(y - anchor.y) k, z k)` (y up, z out of the
+/// paper toward a 2D viewer).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    pub anchor: [f64; 2],
+    pub k: f64,
+    pub offset: glam::Vec3,
+}
+
+impl Frame {
+    pub fn point(&self, x: f64, y: f64, z: f64) -> glam::Vec3 {
+        self.offset + glam::Vec3::new(((x - self.anchor[0]) * self.k) as f32, (-(y - self.anchor[1]) * self.k) as f32, (z * self.k) as f32)
+    }
+
+    /// A painting point back in canvas units (x, y, z).
+    pub fn canvas(&self, p: glam::Vec3) -> [f64; 3] {
+        let d = (p - self.offset).as_dvec3() / self.k;
+        [self.anchor[0] + d.x, self.anchor[1] - d.y, d.z]
+    }
+}
+
+/// A painting made of a document: its layers (adjustment and shape layers left out) and, by
+/// place, the document layer each came from.
+pub struct Converted {
+    pub painting: crate::Painting,
+    pub layer_ids: Vec<String>,
+}
+
+/// "#rrggbb" to sRGB 0..1.
+pub fn hex_rgb(s: &str) -> [f32; 3] {
+    let s = s.trim_start_matches('#');
+    let c = |i: usize| u8::from_str_radix(s.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0) as f32 / 255.0;
+    if s.len() >= 6 { [c(0), c(2), c(4)] } else { [0.0; 3] }
+}
+
+/// A 2D brush as vdraw's (radius by the frame's scale): it comes along whole: the dabs (flow,
+/// spacing), its opacity capping each stroke, hardness, the tip's roundness, the eraser, and the
+/// dynamics with the 2D app's random numbers (seeded by the stroke's id).
+pub fn brush(b: &DocBrush, k: f64, stroke_id: &str) -> crate::Brush {
+    let num = |key: &str, d: f64| b.num(key).unwrap_or(d);
+    let (flow, spacing) = (b.flow as f32, (b.spacing as f32).max(0.005));
+    crate::Brush {
+        radius: (b.size * 0.5 * k) as f32,
+        color: crate::segments::to_linear(hex_rgb(&b.color)),
+        pressure_size: b.pressure_size,
+        min_ratio: 0.02,
+        opacity: b.opacity as f32,
+        hardness: b.hardness as f32,
+        roundness: num("roundness", 1.0).clamp(0.05, 1.0) as f32,
+        erase: b.tool == "erase",
+        dabs: Some(crate::stroke::Dabs { flow, spacing, pressure_flow: b.pressure_flow }),
+        flow,
+        spacing,
+        pressure_flow: b.pressure_flow,
+        buildup: b.buildup,
+        size_jitter: num("sizeJitter", 0.0).clamp(0.0, 1.0) as f32,
+        angle_jitter: num("angleJitter", 0.0).clamp(0.0, 1.0) as f32,
+        scatter: num("scatter", 0.0).clamp(0.0, 4.0) as f32,
+        flow_jitter: num("opacityJitter", 0.0).clamp(0.0, 1.0) as f32,
+        seed: crate::stroke::stroke_seed(stroke_id),
+    }
+}
+
+/// A document stroke as vdraw's, in the frame's space: its points (depth 0: on the paper), and
+/// the tip's turn as the 2D app's dabs (brush.ts DabWalker): its angle (degrees, clockwise on
+/// the canvas, whose y runs down), plus the direction of travel when it follows it. Its width
+/// lies along the turned x; it is squashed along the turned y, which is the pen's up direction.
+pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], frame: &Frame) -> crate::Stroke {
+    let mut out = crate::Stroke::new(brush(b, frame.k, id));
+    let angle = b.num("angle").unwrap_or(0.0).to_radians();
+    let follow = b.flag("followDirection");
+    let pts: Vec<[f64; 3]> = pts.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect();
+    let mut dir = 0.0f64;
+    for (i, p) in pts.iter().enumerate() {
+        // The direction of the last piece (the first point: of the first piece).
+        let (from, to) = if i == 0 { (pts[0], *pts.get(1).unwrap_or(&pts[0])) } else { (pts[i - 1], pts[i]) };
+        if (to[0] - from[0]).hypot(to[1] - from[1]) > 0.0 {
+            dir = (to[1] - from[1]).atan2(to[0] - from[0]);
+        }
+        let rot = angle + if follow { dir } else { 0.0 };
+        let up = glam::Vec3::new(-rot.sin() as f32, -rot.cos() as f32, 0.0);
+        out.push(crate::Sample { up, ..crate::Sample::new(frame.point(p[0], p[1], 0.0), p[2] as f32, i as f64) });
+    }
+    out
+}
+
+impl Doc {
+    /// The box (x0, y0, x1, y1) around every live stroke's points and brush (None: none).
+    pub fn bounds(&self) -> Option<[f64; 4]> {
+        let mut b: Option<[f64; 4]> = None;
+        for s in self.strokes.values().filter(|s| !s.deleted) {
+            let r = s.brush.size * 0.5;
+            for p in s.pts.chunks_exact(3) {
+                let e = b.get_or_insert([p[0] - r, p[1] - r, p[0] + r, p[1] + r]);
+                *e = [e[0].min(p[0] - r), e[1].min(p[1] - r), e[2].max(p[0] + r), e[3].max(p[1] + r)];
+            }
+        }
+        b
+    }
+
+    /// The document as a painting in a frame's space: its live layers in paint order (groups,
+    /// blend modes, opacity, visibility, clipping, masks; adjustment and shape layers left
+    /// out), their strokes in order, the paint mixing. 2D layers are ordered (their strokes
+    /// cover each other in order, as in the 2D app).
+    pub fn painting(&self, frame: &Frame) -> Converted {
+        let mut layers = Vec::new();
+        let mut ids = Vec::new();
+        let mut num: HashMap<&str, u32> = HashMap::new();
+        for l in self.paint_order() {
+            let kind = l.kind.as_deref();
+            if kind == Some("adjust") || kind == Some("shape") {
+                continue;
+            }
+            let id = layers.len() as u32 + 1;
+            num.insert(&l.id, id);
+            let group = l.is_group();
+            let strokes = |mask: Option<&str>| self.strokes_of(&l.id, mask).into_iter().map(|s| stroke(&s.id, &s.brush, &s.pts, frame)).collect::<Vec<_>>();
+            layers.push(crate::Layer {
+                id,
+                name: l.name.clone(),
+                blend: crate::Blend::from_name(&l.blend),
+                opacity: l.opacity as f32,
+                visible: l.visible,
+                ordered: !group,
+                group,
+                parent: None,
+                clip: l.clip.unwrap_or(false),
+                mask: l.mask.as_ref().filter(|_| !group).map(|m| crate::Mask { enabled: m.enabled, strokes: strokes(Some(&m.id)) }),
+                strokes: if group { Vec::new() } else { strokes(None) },
+            });
+            ids.push(l.id.clone());
+        }
+        // Parents, now that every layer has its number.
+        for (layer, id) in layers.iter_mut().zip(&ids) {
+            layer.parent = self.layers[id].parent.as_deref().and_then(|p| num.get(p).copied());
+        }
+        let mix = if self.mix == "pigment" { crate::Mix::Pigment } else { crate::Mix::Normal };
+        let mut painting = crate::Painting { layers, mix, ..Default::default() };
+        if painting.layers.is_empty() {
+            painting.layers.push(crate::Layer { id: 1, name: "Layer 1".into(), ordered: true, ..Default::default() });
+            ids.push(String::new());
+        }
+        Converted { painting, layer_ids: ids }
+    }
 }
 
 const ID_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";

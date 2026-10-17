@@ -569,6 +569,7 @@ impl Painter {
             active_step: self.target_step(),
             steps,
             pigment: self.painting.mix == Mix::Pigment,
+            world_from_scene: glam::Mat4::IDENTITY,
         }
     }
 }

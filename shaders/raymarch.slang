@@ -51,6 +51,9 @@ struct Params
     uint lineCount;
     uint stepCount;
     uint pickLayer; // the image layer of the eyedropper's view (0xffffffff: none)
+    // The scene (where the strokes are: a shared canvas's space) in the room, where the sky and
+    // the floor are: a turn, one scale, a move. Identity when the painting is in the room.
+    float4x4 worldFromScene;
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -925,7 +928,13 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     float pix = length(rayDir(eye, float2(id.xy) + float2(1.5, 0.5)) - dir);
 
     float tFloor;
-    float3 color = background(o, dir, pix, tFloor);
+    // The sky and the floor are the room's: the ray there, and the floor's distance back in
+    // the scene's units.
+    float3 wo = mul(params.worldFromScene, float4(o, 1.0)).xyz;
+    float3 wd = mul(params.worldFromScene, float4(dir, 0.0)).xyz;
+    float worldPerScene = length(wd);
+    float3 color = background(wo, wd / worldPerScene, pix, tFloor);
+    tFloor /= worldPerScene;
     // 2. The layers, bottom to top, by the compositing steps (as the 2D app composites, in
     //    sRGB). A canvas per group level (premultiplied, with alpha); the bottom one starts as
     //    the world behind (opaque). Each layer is drawn on its own (drawLayer), then waits as

@@ -37,7 +37,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let built = painting.build(&mut segs);
     let runs = &built.runs;
     let steps = vdraw_render::scene_steps(&painting, &built.steps);
-    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_step: None, steps: &steps, pigment: painting.mix == vdraw_core::Mix::Pigment };
+    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_step: None, steps: &steps, pigment: painting.mix == vdraw_core::Mix::Pigment, world_from_scene: glam::Mat4::IDENTITY };
     let (eye, cam) = match view {
         View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
         View::Eye(eye) => (eye, None),

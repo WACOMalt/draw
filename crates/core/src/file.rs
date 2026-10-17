@@ -1,11 +1,10 @@
 //! Files: vdraw's own (.vdraw: gzip-compressed JSON of the painting), and the 2D app's
 //! (.bdraw), brought in as 3D strokes on a wall.
 
-use crate::painting::{Blend, Layer, Mask, Mix, Painting};
-use crate::segments::to_linear;
-use crate::stroke::{Brush, Dabs, Sample, Stroke};
+use crate::doc::{Doc, DocLayer, DocStroke, Frame, Paper};
+use crate::painting::{Layer, Painting};
 use anyhow::{Result, bail};
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -68,20 +67,6 @@ pub const WALL_CENTER: Vec3 = Vec3::new(0.0, 1.45, -1.3);
 /// The drawing's longer side, meters.
 pub const WALL_SIZE: f32 = 1.1;
 
-fn num(v: &Value, key: &str, default: f32) -> f32 {
-    v.get(key).and_then(Value::as_f64).map_or(default, |x| x as f32)
-}
-
-fn flag(v: &Value, key: &str, default: bool) -> bool {
-    v.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-
-fn hex(s: &str) -> [f32; 3] {
-    let s = s.trim_start_matches('#');
-    let c = |i: usize| u8::from_str_radix(s.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0) as f32 / 255.0;
-    if s.len() >= 6 { [c(0), c(2), c(4)] } else { [0.0; 3] }
-}
-
 /// Brings in a .bdraw (the 2D app's canvas) as 3D strokes on a wall: every stroke keeps its
 /// path and pressure and its 2D brush (flow, spacing, hardness, opacity, eraser, the tip's
 /// roundness and angle), all its points at one depth (a vertical plane in front of the
@@ -93,149 +78,38 @@ fn hex(s: &str) -> [f32; 3] {
 /// and shape layers, layer effects, brush tips other than round (square, chalk, ...), and
 /// grain.
 pub fn import_bdraw(path: &Path) -> Result<Painting> {
-    let doc: Value = serde_json::from_slice(&read_maybe_gzip(path)?)?;
-    if doc.get("format").and_then(Value::as_str) != Some("bdraw") {
-        bail!("{}: not a .bdraw file", path.display());
-    }
-    let empty = Vec::new();
-    let layers = doc.get("layers").and_then(Value::as_array).unwrap_or(&empty);
-    let strokes = doc.get("strokes").and_then(Value::as_array).unwrap_or(&empty);
-
-    // The layers in paint order (top-level items by `order`, a group's layers right before
-    // it, by theirs), with their groups, clipping and masks. Adjustment and shape layers are
-    // left out.
-    let live: Vec<&Value> = layers.iter().filter(|l| !flag(l, "deleted", false)).collect();
-    let mut out: Vec<Layer> = Vec::new();
-    // The 2D app's layer id, and its mask's id, by place in `out`.
-    let mut ids: Vec<(String, Option<String>)> = Vec::new();
-    fn walk(live: &[&Value], under: Option<&str>, parent: Option<u32>, next: &mut u32, out: &mut Vec<Layer>, ids: &mut Vec<(String, Option<String>)>) {
-        let mut items: Vec<&&Value> = live.iter().filter(|l| l.get("parent").and_then(Value::as_str) == under).collect();
-        items.sort_by(|a, b| num(a, "order", 0.0).total_cmp(&num(b, "order", 0.0)));
-        for l in items {
-            let lid = l.get("id").and_then(Value::as_str).unwrap_or("");
-            let kind = l.get("kind").and_then(Value::as_str).unwrap_or("paint");
-            if kind != "group" && kind != "paint" {
-                continue;
-            }
-            // The id first: a group's layers (before it in paint order) name it as parent.
-            *next += 1;
-            let id = *next;
-            let group = kind == "group";
-            if group {
-                walk(live, Some(lid), Some(id), next, out, ids);
-            }
-            let mask = l.get("mask").filter(|m| m.is_object());
-            out.push(Layer {
-                id,
-                name: l.get("name").and_then(Value::as_str).unwrap_or("Layer").to_string(),
-                blend: Blend::from_name(l.get("blend").and_then(Value::as_str).unwrap_or(if group { "pass" } else { "normal" })),
-                opacity: num(l, "opacity", 1.0),
-                visible: flag(l, "visible", true),
-                ordered: !group,
-                group,
-                parent,
-                clip: flag(l, "clip", false),
-                mask: mask.map(|m| Mask { enabled: flag(m, "enabled", true), strokes: Vec::new() }),
-                strokes: Vec::new(),
-            });
-            ids.push((lid.to_string(), mask.and_then(|m| m.get("id")).and_then(Value::as_str).map(str::to_string)));
-        }
-    }
-    walk(&live, None, None, &mut 0, &mut out, &mut ids);
-
-    // The drawing's extent, with a margin, scaled to the wall.
-    let mut lo = Vec2::splat(f32::MAX);
-    let mut hi = Vec2::splat(f32::MIN);
-    for s in strokes {
-        let r = num(&s["brush"], "size", 1.0) * 0.5;
-        if let Some(pts) = s.get("pts").and_then(Value::as_array) {
-            for p in pts.chunks_exact(3) {
-                let q = Vec2::new(p[0].as_f64().unwrap_or(0.0) as f32, p[1].as_f64().unwrap_or(0.0) as f32);
-                lo = lo.min(q - r);
-                hi = hi.max(q + r);
-            }
-        }
-    }
-    if lo.x > hi.x {
-        lo = Vec2::ZERO;
-        hi = Vec2::splat(1000.0);
-    }
-    let margin = (hi - lo).max_element() * 0.04;
-    let (lo, hi) = (lo - margin, hi + margin);
-    let scale = WALL_SIZE / (hi - lo).max_element(); // meters per 2D unit
-    let center2d = (lo + hi) * 0.5;
-    // 2D y runs down; the wall's runs up.
-    let to_wall = |x: f32, y: f32| WALL_CENTER + Vec3::new(x - center2d.x, center2d.y - y, 0.0) * scale;
-
-    let index: std::collections::HashMap<&str, usize> = ids.iter().enumerate().filter(|(i, _)| !out[*i].group).map(|(i, l)| (l.0.as_str(), i)).collect();
-    let mut sorted: Vec<&Value> = strokes.iter().filter(|s| !flag(s, "deleted", false)).collect();
-    sorted.sort_by(|a, b| num(a, "seq", 0.0).total_cmp(&num(b, "seq", 0.0)));
-    for s in sorted {
-        let Some(&li) = s.get("layerId").and_then(Value::as_str).and_then(|l| index.get(l)) else { continue };
-        // A mask stroke (its mask's id) goes to the layer's mask, if it is that mask's.
-        let mask = s.get("mask").and_then(Value::as_str);
-        if mask.is_some() && mask != ids[li].1.as_deref() {
-            continue;
-        }
-        let b = &s["brush"];
-        // The 2D brush comes along whole: the stamps' strengths follow its dabs (flow and
-        // spacing), and its opacity caps each stroke (see stamp_strengths).
-        let (flow, spacing, hardness) = (num(b, "flow", 1.0), num(b, "spacing", 0.1).max(0.005), num(b, "hardness", 0.8));
-        let brush = Brush {
-            radius: num(b, "size", 1.0) * 0.5 * scale,
-            color: to_linear(hex(b.get("color").and_then(Value::as_str).unwrap_or("#000000"))),
-            pressure_size: flag(b, "pressureSize", true),
-            min_ratio: 0.02,
-            opacity: num(b, "opacity", 1.0),
-            hardness,
-            roundness: num(b, "roundness", 1.0).clamp(0.05, 1.0),
-            erase: b.get("tool").and_then(Value::as_str) == Some("erase"),
-            dabs: Some(Dabs { flow, spacing, pressure_flow: flag(b, "pressureFlow", false) }),
-            flow,
-            spacing,
-            pressure_flow: flag(b, "pressureFlow", false),
-            buildup: flag(b, "buildup", false),
-            // The dynamics, with the 2D app's random numbers (seeded by the stroke's id).
-            size_jitter: num(b, "sizeJitter", 0.0).clamp(0.0, 1.0),
-            angle_jitter: num(b, "angleJitter", 0.0).clamp(0.0, 1.0),
-            scatter: num(b, "scatter", 0.0).clamp(0.0, 4.0),
-            flow_jitter: num(b, "opacityJitter", 0.0).clamp(0.0, 1.0),
-            seed: crate::stroke::stroke_seed(s.get("id").and_then(Value::as_str).unwrap_or("")),
-        };
-        // The tip's turn, as the 2D app's dabs (brush.ts DabWalker): its angle (degrees,
-        // clockwise on the canvas, whose y runs down), plus the direction of travel when it
-        // follows it. Its width lies along the turned x; it is squashed along the turned y,
-        // which on the wall (y up) is the pen's up direction.
-        let angle = num(b, "angle", 0.0).to_radians();
-        let follow = flag(b, "followDirection", false);
-        let mut stroke = Stroke::new(brush);
-        if let Some(pts) = s.get("pts").and_then(Value::as_array) {
-            let f = |v: &Value| v.as_f64().unwrap_or(0.0) as f32;
-            let pts: Vec<(f32, f32, f32)> = pts.chunks_exact(3).map(|p| (f(&p[0]), f(&p[1]), f(&p[2]))).collect();
-            let mut dir = 0.0f32;
-            for (i, &(x, y, pressure)) in pts.iter().enumerate() {
-                // The direction of the last piece (the first point: of the first piece).
-                let (from, to) = if i == 0 { (pts[0], pts.get(1).copied().unwrap_or(pts[0])) } else { (pts[i - 1], pts[i]) };
-                if (to.0 - from.0).hypot(to.1 - from.1) > 0.0 {
-                    dir = (to.1 - from.1).atan2(to.0 - from.0);
-                }
-                let rot = angle + if follow { dir } else { 0.0 };
-                let up = Vec3::new(-rot.sin(), -rot.cos(), 0.0);
-                stroke.push(Sample { up, ..Sample::new(to_wall(x, y), pressure, i as f64) });
-            }
-        }
-        if !stroke.samples.is_empty() {
-            match (mask, &mut out[li].mask) {
-                (Some(_), Some(m)) => m.strokes.push(stroke),
-                _ => out[li].strokes.push(stroke),
-            }
-        }
-    }
-    let id = out.iter().map(|l| l.id).max().unwrap_or(0) + 1;
-    out.push(Layer { id, name: "VR".into(), ..Default::default() });
-    // The canvas's paint mixing (version 10 on; older files mix as normal).
-    let mix = if doc.get("mix").and_then(Value::as_str) == Some("pigment") { Mix::Pigment } else { Mix::Normal };
-    let mut painting = Painting { layers: out, mix, ..Default::default() };
+    let doc = read_bdraw(&read_maybe_gzip(path)?).map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
+    // The drawing's extent, with a margin, fits the wall.
+    let b = doc.bounds().unwrap_or([0.0, 0.0, 1000.0, 1000.0]);
+    let margin = (b[2] - b[0]).max(b[3] - b[1]) * 0.04;
+    let side = (b[2] - b[0]).max(b[3] - b[1]) + 2.0 * margin;
+    let frame = Frame { anchor: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5], k: WALL_SIZE as f64 / side.max(1e-30), offset: WALL_CENTER };
+    let mut painting = doc.painting(&frame).painting;
+    let id = painting.layers.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+    painting.layers.push(Layer { id, name: "VR".into(), ..Default::default() });
     painting.normalize();
     Ok(painting)
+}
+
+/// A .bdraw file's document (its layers, strokes, shapes, paper and paint mixing).
+pub fn read_bdraw(bytes: &[u8]) -> Result<Doc> {
+    #[derive(Deserialize)]
+    struct File {
+        format: String,
+        #[serde(default)]
+        layers: Vec<DocLayer>,
+        #[serde(default)]
+        strokes: Vec<DocStroke>,
+        #[serde(default)]
+        shapes: Vec<Value>,
+        #[serde(default)]
+        paper: Option<Paper>,
+        #[serde(default)]
+        mix: Option<String>,
+    }
+    let f: File = serde_json::from_slice(bytes)?;
+    if f.format != "bdraw" {
+        bail!("not a .bdraw file");
+    }
+    Ok(Doc::from_parts(f.layers, f.strokes, f.shapes, f.paper, f.mix))
 }
