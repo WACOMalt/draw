@@ -235,6 +235,8 @@ pub struct Canvas {
     paper_sent: Instant,
     /// Why the server refused edits, and when (the panel shows the last a while).
     pub refused: Vec<(String, Instant)>,
+    /// The area to open on (the 2D app's view, when it opened VR).
+    pub start_view: Option<crate::bridge::View>,
     /// When layer edits were last sent, and the last step of undo made.
     layers_sent: Instant,
     stepped: Instant,
@@ -268,6 +270,7 @@ impl Canvas {
             paper_sent: Instant::now(),
             refused: Vec::new(),
             avatar: (None, Instant::now()),
+            start_view: None,
             layers_sent: Instant::now(),
             stepped: Instant::now(),
         }
@@ -313,10 +316,16 @@ impl Canvas {
     /// Fits the drawing in front of the head: the frame anchored at its middle, a scale that
     /// makes its longer side `FIT_SIZE`, upright, facing the head.
     fn place(&mut self, head: Mat4) {
-        let doc = self.session.view();
-        let b = doc.bounds().unwrap_or([0.0, 0.0, 1000.0, 1000.0]);
-        let side = ((b[2] - b[0]).max(b[3] - b[1]) * 1.08).max(1e-30);
-        self.frame = Frame { anchor: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5], k: FIT_SIZE / side, offset: Vec3::ZERO };
+        // What the 2D app showed (opened from it), else the whole drawing.
+        self.frame = match self.start_view.filter(|v| v.width > 0.0 && v.width.is_finite()) {
+            Some(v) => Frame { anchor: [v.x, v.y], k: FIT_SIZE / v.width, offset: Vec3::ZERO },
+            None => {
+                let doc = self.session.view();
+                let b = doc.bounds().unwrap_or([0.0, 0.0, 1000.0, 1000.0]);
+                let side = ((b[2] - b[0]).max(b[3] - b[1]) * 1.08).max(1e-30);
+                Frame { anchor: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5], k: FIT_SIZE / side, offset: Vec3::ZERO }
+            }
+        };
         let eye = head.w_axis.truncate();
         let forward = (-head.z_axis.truncate()).with_y(0.0).try_normalize().unwrap_or(Vec3::NEG_Z);
         let center = eye + forward * FIT_DISTANCE;
@@ -1055,7 +1064,7 @@ impl Canvas {
     /// Others' pointers on the paper: a ring each, in their color (lines, in the scene).
     pub fn cursor_lines(&self, out: &mut Vec<OverlayLine>) {
         let r = 0.012 / self.scale();
-        for p in self.session.peers.values() {
+        for p in self.session.peers.values().filter(|p| !p.in_vr) {
             let Some((x, y)) = p.cursor else { continue };
             let c = crate::panel::to_linear(doc::hex_rgb(&p.color));
             let center = self.frame.point(x, y, 0.0);
@@ -1082,6 +1091,21 @@ impl Canvas {
         };
         let d = doc::point_decimals(self.frame.k * self.scale() as f64 / 0.0005);
         vdraw_net::session::Pose { p: c.map(|x| doc::round_to(x, d)), f: dir(-m.z_axis.truncate()), u: dir(m.y_axis.truncate()) }
+    }
+
+    /// Where the head (a world pose) looks on the paper, and about how wide an area it sees there
+    /// (canvas units): for the 2D app to show the same when VR ends.
+    pub fn looked_at(&self, head: Mat4) -> Option<crate::bridge::View> {
+        if !self.placed {
+            return None;
+        }
+        let pose = self.canvas_pose(head);
+        let (p, f) = (pose.p, pose.f);
+        // Along the gaze to the paper; looking away from it, straight down onto it.
+        let t = if f[2].abs() > 1e-6 { -p[2] / f[2] } else { -1.0 };
+        let (x, y, dist) = if t > 0.0 { (p[0] + f[0] * t, p[1] + f[1] * t, t) } else { (p[0], p[1], p[2].abs()) };
+        let width = (dist * 1.2).max(1e-9);
+        (x.is_finite() && y.is_finite()).then_some(crate::bridge::View { x, y, width })
     }
 
     /// Tells the others where this user's head and hands are (world poses; None: hidden): at

@@ -170,6 +170,9 @@ pub struct Peer {
     pub layer: Option<String>,
     /// A VR peer's head and hands, and when they last came.
     pub avatar: Option<(Avatar, Instant)>,
+    /// A 2D window whose user is in VR now (their VR connection shows them; this one is not
+    /// shown as a person of its own).
+    pub in_vr: bool,
 }
 
 /// Where a thing is and which way it faces, in canvas units and axes (x right, y down, z
@@ -451,6 +454,12 @@ impl Session {
                     ch.peers = true;
                 }
             }
+            "peer.status" => {
+                if let Some(p) = self.peers.get_mut(&s("id")) {
+                    p.in_vr = m.get("inVr").and_then(Value::as_bool).unwrap_or(false);
+                    ch.peers = true;
+                }
+            }
             "peer.join" => {
                 if let Some(p) = m.get("peer").and_then(peer) {
                     self.peers.insert(p.id.clone(), p);
@@ -549,6 +558,7 @@ fn peer(p: &Value) -> Option<Peer> {
         cursor: None,
         layer: None,
         avatar: None,
+        in_vr: p.get("inVr").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 

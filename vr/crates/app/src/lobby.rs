@@ -209,6 +209,11 @@ impl Lobby {
         let _ = self.tx.send(Msg::Open(Open { key: key.into(), link }));
     }
 
+    /// A canvas by its key, and a link's token if it came by one (opened from the 2D app).
+    pub fn open_link(&mut self, key: &str, link: Option<String>) {
+        let _ = self.tx.send(Msg::Open(Open { key: key.into(), link }));
+    }
+
     /// A .bdraw file, brought in as a new canvas.
     pub fn import(&mut self, path: PathBuf) {
         let anon = self.identity.anon.clone();

@@ -53,6 +53,9 @@ pub enum Start {
     Local(Painting, Option<PathBuf>),
     /// A shared canvas, by its code, name or link.
     Canvas(String),
+    /// A shared canvas opened from the 2D desktop app (`vdraw --bridge`): who the user is, and
+    /// what the 2D view shows. Leaving it goes back to 2D (vdraw ends).
+    Bridge(crate::bridge::Hello),
 }
 
 /// What is open.
@@ -223,9 +226,9 @@ impl Input {
 /// Paints in VR, from `start`. This device's painting is saved where it came from, after
 /// changes (every half minute, in the background), on leaving it, and on the way out.
 /// `server`: the 2D app's server for shared canvases (else the one used last).
-pub fn run(start: Start, server: Option<String>) -> Result<()> {
+/// `quit`: set to end (Ctrl-C sets it too; so does the 2D app, through the bridge).
+pub fn run(start: Start, server: Option<String>, quit: Arc<AtomicBool>) -> Result<()> {
     // Ctrl-C asks the runtime to end the session, so it can leave the headset cleanly.
-    let quit = Arc::new(AtomicBool::new(false));
     let q = quit.clone();
     ctrlc::set_handler(move || q.store(true, Ordering::Relaxed))?;
 
@@ -303,11 +306,22 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
 
     let scale: f32 = std::env::var("VDRAW_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let mut swapchain: Option<Swapchain> = None;
-    let mut identity = Identity::load(Identity::default_path());
-    if let Some(s) = server {
-        identity.server = s.trim_end_matches('/').to_string();
-        identity.save();
-    }
+    // Who the user is: opened from the 2D app, as it says (kept nowhere); else this device's.
+    let bridged = match &start {
+        Start::Bridge(h) => Some(h.clone()),
+        _ => None,
+    };
+    let identity = match &bridged {
+        Some(h) => Identity { server: h.server.trim_end_matches('/').to_string(), anon: h.anon.clone(), token: h.token.clone(), name: h.name.clone(), color: h.color.clone(), ..Identity::default() },
+        None => {
+            let mut identity = Identity::load(Identity::default_path());
+            if let Some(s) = server {
+                identity.server = s.trim_end_matches('/').to_string();
+                identity.save();
+            }
+            identity
+        }
+    };
     let mut lobby = Lobby::new(identity);
     let (mut mode, painting, mut save_to) = match start {
         Start::Home => (Mode::Home, Painting::default(), None),
@@ -316,7 +330,13 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             lobby.join(input);
             (Mode::Home, Painting::default(), None)
         }
+        Start::Bridge(h) => {
+            lobby.open_link(&h.canvas, h.link.clone());
+            (Mode::Home, Painting::default(), None)
+        }
     };
+    // Where the user last looked on the canvas (told to the 2D app at the end).
+    let mut last_view: Option<crate::bridge::View> = None;
     let mut painter = Painter::new(painting);
     let mut saving: Option<std::thread::JoinHandle<()>> = None;
     let mut saved_at = Instant::now();
@@ -429,7 +449,10 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             painter.reopen(Painting::default());
             let id = &lobby.identity;
             let session = Session::open(&lobby.server, &open.key, &id.name, &id.color, &id.anon, open.link.as_deref());
-            mode = Mode::Canvas(Box::new(Canvas::new(session)));
+            let mut canvas = Canvas::new(session);
+            // Opened from the 2D app: on what its view showed.
+            canvas.start_view = bridged.as_ref().and_then(|h| h.view);
+            mode = Mode::Canvas(Box::new(canvas));
             // Edits go to the canvas from the first frame (none are kept locally); strokes look
             // as the 2D app shows them, unlit.
             painter.shared = true;
@@ -445,8 +468,15 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                 State::Open if panel.opening.is_some() => {
                     panel.opening = None;
                     panel.screen = Screen::Paint;
+                    if bridged.is_some() {
+                        crate::bridge::ready();
+                    }
                 }
                 State::Password { wrong } => panel.opening = Some(Opening::Password { key, wrong: *wrong }),
+                State::Denied(reason) if bridged.is_some() => {
+                    crate::bridge::error(&format!("the canvas turned VR away: {reason}"));
+                    quit.store(true, Ordering::Relaxed);
+                }
                 State::Denied(reason) => panel.opening = Some(Opening::Denied { key, reason: reason.clone() }),
                 _ => {}
             }
@@ -604,9 +634,10 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                     State::Reconnecting(why) => format!("reconnecting ({why})"),
                     other => format!("{other:?}"),
                 },
-                peers: c.session.peers.values().map(|p| (p.name.clone(), p.color.clone())).collect(),
+                peers: c.session.peers.values().filter(|p| !p.in_vr).map(|p| (p.name.clone(), p.color.clone())).collect(),
                 not_drawn: c.session.not_drawn().into_iter().map(str::to_string).collect(),
                 refused: c.refused.last().filter(|(_, t)| t.elapsed().as_secs() < 5).map(|(why, _)| why.clone()),
+                bridged: bridged.is_some(),
             }),
             _ => None,
         };
@@ -629,6 +660,8 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                         mode = Mode::Local;
                         panel.screen = Screen::Paint;
                     }
+                    // Opened from the 2D app: back to 2D (vdraw ends).
+                    Action::Leave if bridged.is_some() => quit.store(true, Ordering::Relaxed),
                     Action::Leave => {
                         match &mode {
                             Mode::Canvas(c) => c.session.close(),
@@ -702,6 +735,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
             c.cursor_lines(&mut lines);
             // Where this user is, for the others; the others, and their names.
             c.send_avatar(Some(world_head), aims.map(|a| a.map(|a| rig.mat() * a)));
+            last_view = c.looked_at(world_head).or(last_view);
             if painter.show_people {
                 let names = c.avatar_lines(&mut lines);
                 tag_list = names.into_iter().map(|(name, color, at, _)| (name, color, c.view.transform_point3(at))).collect();
@@ -932,6 +966,9 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
     }
     if let Some(t) = saving {
         let _ = t.join();
+    }
+    if bridged.is_some() {
+        crate::bridge::closed(last_view);
     }
     match (&save_to, &mode) {
         (Some(path), Mode::Local) => {

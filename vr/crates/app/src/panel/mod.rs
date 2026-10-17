@@ -156,6 +156,8 @@ pub struct CanvasInfo {
     pub not_drawn: Vec<String>,
     /// Why the server refused the last edit, a few seconds after.
     pub refused: Option<String>,
+    /// Opened from the 2D desktop app: leaving goes back to it.
+    pub bridged: bool,
 }
 
 /// One frame of the panel: what to draw, egui's texture changes, and what was asked.
@@ -340,8 +342,9 @@ impl Panel {
                     painter.undo();
                 }
                 // Out of the canvas, back to the start screen.
-                if canvas.is_some() {
-                    let exit = egui::Button::new(RichText::new("Exit").size(14.0).color(TEXT)).fill(BG_2).stroke(stroke(1.0, LINE)).min_size(vec2(0.0, 36.0));
+                if let Some(c) = canvas {
+                    let text = if c.bridged { "Back to 2D" } else { "Exit" };
+                    let exit = egui::Button::new(RichText::new(text).size(14.0).color(TEXT)).fill(BG_2).stroke(stroke(1.0, LINE)).min_size(vec2(0.0, 36.0));
                     if ui.add(exit).on_hover_text("Leave the canvas").clicked() {
                         actions.push(Action::Leave);
                     }

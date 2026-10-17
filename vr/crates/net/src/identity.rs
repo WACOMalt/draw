@@ -63,13 +63,9 @@ impl Default for Identity {
 }
 
 impl Identity {
-    /// ~/.config/vdraw/identity.json (or $XDG_CONFIG_HOME).
+    /// ~/.config/vdraw/identity.json (or $XDG_CONFIG_HOME; on Windows %APPDATA%).
     pub fn default_path() -> PathBuf {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .unwrap_or_else(|| ".".into())
-            .join("vdraw/identity.json")
+        config_dir().join("vdraw/identity.json")
     }
 
     /// The identity at `path`, or a new one (saved there).
@@ -113,6 +109,24 @@ impl Identity {
         self.recent.truncate(MAX_RECENT);
         self.save();
     }
+}
+
+/// Where settings go: $XDG_CONFIG_HOME, ~/.config, or on Windows %APPDATA%.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .unwrap_or_else(|| ".".into())
+}
+
+/// Where data goes: $XDG_DATA_HOME, ~/.local/share, or on Windows %LOCALAPPDATA%.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .unwrap_or_else(|| ".".into())
 }
 
 /// Base64url without padding (the 2D app's anon secret's form).

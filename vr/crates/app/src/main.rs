@@ -15,6 +15,7 @@
 
 mod camera;
 mod bot;
+mod bridge;
 mod canvas;
 mod debug;
 mod demo;
@@ -57,13 +58,9 @@ fn demo(args: &[String]) -> Result<(vdraw_core::Painting, camera::Orbit)> {
 }
 
 /// The painting `vdraw --xr` opens and saves: $XDG_DATA_HOME/vdraw/painting.vdraw (or
-/// ~/.local/share/vdraw/painting.vdraw).
+/// ~/.local/share/vdraw/painting.vdraw; on Windows in %LOCALAPPDATA%).
 fn painting_path() -> std::path::PathBuf {
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/share")))
-        .unwrap_or_else(|| ".".into());
-    data.join("vdraw/painting.vdraw")
+    vdraw_net::identity::data_dir().join("vdraw/painting.vdraw")
 }
 
 /// `--import in.bdraw [out.vdraw]`: brings a 2D app canvas in as 3D strokes on a plane ahead.
@@ -229,8 +226,28 @@ fn main() -> Result<()> {
             } else {
                 xr::Start::Home
             };
-            xr::run(start, arg("--server"))
+            xr::run(start, arg("--server"), Default::default())
         }
-        _ => anyhow::bail!("usage: vdraw --xr | vdraw --snapshot out.png"),
+        // --probe: whether VR can run here (one line of JSON; see bridge.rs).
+        Some("--probe") => {
+            println!("{}", bridge::probe());
+            Ok(())
+        }
+        // --bridge: opened from the 2D desktop app, which talks to it over stdin and stdout.
+        Some("--bridge") => {
+            let quit: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+            let hello = match bridge::start(quit.clone()) {
+                Ok(h) => h,
+                Err(e) => {
+                    bridge::error(&format!("{e:#}"));
+                    return Err(e);
+                }
+            };
+            xr::run(xr::Start::Bridge(hello), None, quit).inspect_err(|e| {
+                bridge::error(&format!("{e:#}"));
+                bridge::closed(None);
+            })
+        }
+        _ => anyhow::bail!("usage: vdraw --xr | --bridge | --probe | --snapshot out.png | --bot --canvas KEY | --import in.bdraw"),
     }
 }
