@@ -20,6 +20,7 @@ import {
   type CompoundPart,
   type Adjust,
   type Affine,
+  type Affine3,
   type BlendMode,
   type Brush,
   type BrushSettings,
@@ -38,7 +39,7 @@ import {
   POINT_STRIDE,
   POINT_TYPES,
 } from './types';
-import { validAffine } from './layers';
+import { validAffine, validAffine3 } from './layers';
 import { takesEffects } from './effects';
 import { cornersWithin, stripForKind } from './shapes';
 
@@ -275,6 +276,8 @@ function layerProps(v: unknown, partial: boolean): Partial<LayerProps> {
   if (p.mask !== undefined) out.mask = layerMask(p.mask);
   if (p.parent !== undefined) out.parent = p.parent === null ? null : id(p.parent, 'parent');
   if (p.effects !== undefined) out.effects = validateEffects(p.effects);
+  // A VR layer (paint layers only: checked where the kind is known).
+  if (p.vr !== undefined) out.vr = bool(p.vr, 'vr');
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -285,8 +288,9 @@ export function validateOp(v: unknown): Op {
     case 'stroke.add': {
       const s = obj(o.stroke, 'stroke');
       const pts = validatePoints(s.pts);
-      // A VR stroke paints the layer itself, as a brush does: not a mask, not a vector.
-      if (s.vr !== undefined && (s.mask !== undefined || s.vector !== undefined)) fail('vr strokes take no mask or vector');
+      // A vector stroke draws its shape, flat: no depth. (A mask stroke may have one: a 3D
+      // transform of a VR layer moves its mask too.)
+      if (s.vr !== undefined && s.vector !== undefined) fail('vector strokes take no vr');
       return {
         type: 'stroke.add',
         stroke: {
@@ -323,14 +327,19 @@ export function validateOp(v: unknown): Op {
         if (props.effects && !takesEffects(kind)) fail('adjustment layers take no effects');
         if (!props.effects) delete props.effects;
       }
-      // Set at creation only (layer.update leaves it out, as `kind`); false is left out.
-      const vr = l.vr !== undefined && bool(l.vr, 'vr');
-      if (vr && kind !== undefined && kind !== 'paint') fail('vr layers are paint layers');
-      return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props, ...(vr ? { vr } : {}) } };
+      if (props.vr && kind !== undefined && kind !== 'paint') fail('vr layers are paint layers');
+      if (props.vr === false) delete props.vr;
+      return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
     }
     case 'layer.update':
       return { type: 'layer.update', id: id(o.id), props: layerProps(o.props, true) };
     case 'layer.transform':
+      // A 2D transform `m`, or a 3D one `m3` (VR layers): exactly one.
+      if ((o.m === undefined) === (o.m3 === undefined)) fail('bad transform');
+      if (o.m3 !== undefined) {
+        if (!validAffine3(o.m3)) fail('bad transform');
+        return { type: 'layer.transform', id: id(o.id), m3: [...o.m3] as Affine3 };
+      }
       if (!validAffine(o.m)) fail('bad transform');
       return { type: 'layer.transform', id: id(o.id), m: [...(o.m as Affine)] as Affine };
     case 'shape.add':

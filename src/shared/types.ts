@@ -185,8 +185,9 @@ export interface Layer {
   /** Layer effects (paint and shape layers, groups). Absent: none. */
   effects?: LayerEffect[];
   /**
-   * A VR layer: a paint layer made by the VR app (vdraw), whose strokes may carry depth
-   * (Stroke.vr). It draws as any paint layer here. Set at creation; layer.update does not change it.
+   * A VR layer: a paint layer whose strokes may carry depth (Stroke.vr), made by the VR app
+   * (vdraw) or turned into one there (layer.update; strokes stay as they are). It draws as any
+   * paint layer here. Paint layers only.
    */
   vr?: boolean;
 }
@@ -208,9 +209,9 @@ export interface Stroke {
    */
   vector?: StrokeVector;
   /**
-   * A VR stroke (painted in 3D in vdraw): the depth of its points. 2D clients draw x, y and
-   * pressure only (the paper seen straight on), so it changes nothing they draw. Not on mask or
-   * vector strokes.
+   * A VR stroke (painted in 3D in vdraw, or moved by a 3D layer transform): the depth of its
+   * points. 2D clients draw x, y and pressure only (the paper seen straight on), so it changes
+   * nothing they draw. Not on vector strokes.
    */
   vr?: StrokeVr;
 }
@@ -381,13 +382,21 @@ export interface Shape extends ShapeInput {
   deleted?: boolean;
 }
 
-export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent'> & {
+export type LayerProps = Pick<Layer, 'name' | 'blend' | 'opacity' | 'visible' | 'order' | 'adjust' | 'clip' | 'mask' | 'parent' | 'vr'> & {
   /** null or [] removes the effects. */
   effects?: LayerEffect[] | null;
 };
 
 /** A 2D affine transform [a, b, c, d, e, f]: x' = a·x + c·y + e, y' = b·x + d·y + f. */
 export type Affine = [number, number, number, number, number, number];
+
+/**
+ * A 3D affine transform in world units, column-major 3×4 (axes as Stroke.vr: x right, y down,
+ * z toward the viewer of the 2D canvas):
+ * x' = m[0]·x + m[3]·y + m[6]·z + m[9], y' = m[1]·x + m[4]·y + m[7]·z + m[10],
+ * z' = m[2]·x + m[5]·y + m[8]·z + m[11].
+ */
+export type Affine3 = [number, number, number, number, number, number, number, number, number, number, number, number];
 
 /** Document features a client must know to draw a canvas right. The server lists them in welcome. */
 /** The paper under all layers of a canvas. */
@@ -415,7 +424,7 @@ export type Op =
   | { type: 'stroke.add'; stroke: Pick<Stroke, 'id' | 'layerId' | 'brush' | 'pts' | 'mask' | 'vr'> }
   | { type: 'stroke.remove'; id: string }
   | { type: 'stroke.restore'; id: string }
-  | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind' | 'vr'> & LayerProps }
+  | { type: 'layer.add'; layer: Pick<Layer, 'id' | 'kind'> & LayerProps }
   | { type: 'layer.update'; id: string; props: Partial<LayerProps> }
   | { type: 'layer.remove'; id: string }
   | { type: 'layer.restore'; id: string }
@@ -425,6 +434,12 @@ export type Op =
    * in place).
    */
   | { type: 'layer.transform'; id: string; m: Affine }
+  /**
+   * A 3D transform of a VR layer (from vdraw): a turn, a uniform scale and a move in 3D. Every
+   * stroke of the layer (masks included, deleted ones too) moves in 3D: a stroke without depth
+   * gets it. Not for groups, other layers, or layers with vector strokes.
+   */
+  | { type: 'layer.transform'; id: string; m3: Affine3 }
   /** Adds a shape to a shape layer. */
   | { type: 'shape.add'; shape: ShapeInput }
   /**

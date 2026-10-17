@@ -159,8 +159,6 @@ export class Session {
         if (!atLeast(client.role, 'editor') || !client.live.take()) return;
         try {
           const pts = validatePoints(msg.pts, 0);
-          // The depth of these points (a VR stroke); as on strokes, not with a mask.
-          if (msg.vr !== undefined && msg.mask !== undefined) return;
           this.broadcast(
             {
               t: 'live',
@@ -170,6 +168,7 @@ export class Session {
               ...(msg.mask !== undefined ? { mask: validateId(msg.mask, 'mask') } : {}),
               brush: validateBrush(msg.brush),
               pts,
+              // The depth of these points (a VR stroke).
               ...(msg.vr !== undefined ? { vr: validateStrokeVr(msg.vr, pts) } : {}),
               start: msg.start === true,
             },

@@ -116,6 +116,8 @@ export function planFromPaint(
     for (const st of strokes.values()) {
       if (st.layerId === target.id && !st.deleted && !st.mask && !removed.has(st.id)) return { error: 'the layer has other paint now' };
     }
+    // A VR layer stays a paint layer (it was made one after the shapes became paint).
+    if (target.vr) return { error: 'a VR layer holds no shapes' };
     kind = 'shape';
   }
   return { strokes: gone, shapes: [...op.ids], kind };

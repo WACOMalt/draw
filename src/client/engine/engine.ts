@@ -135,7 +135,7 @@ function greyOf(hex: string): string {
 }
 
 /** What a layer property is when it is not set: undo must send a value, not undefined. */
-const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null, effects: null };
+const PROP_DEFAULTS: Partial<LayerProps> = { clip: false, mask: null, effects: null, vr: false };
 
 /** Squared distance between the segments a–b and c–d (zero when they cross). */
 function segDist2(ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number): number {
