@@ -35,6 +35,8 @@ struct Print {
     id: String,
     n: usize,
     ends: [u64; 4],
+    /// The depth at the ends (a VR layer's stroke moved toward or away from the paper).
+    depth: [u64; 2],
     size: u64,
 }
 
@@ -42,7 +44,8 @@ fn print(s: &DocStroke) -> Print {
     let p = &s.pts;
     let at = |i: usize| p.get(i).copied().unwrap_or(0.0).to_bits();
     let last = p.len().saturating_sub(3);
-    Print { id: s.id.clone(), n: p.len(), ends: [at(0), at(1), at(last), at(last + 1)], size: s.brush.size.to_bits() }
+    let z = |i: usize| s.vr.as_ref().and_then(|v| v.z.get(i)).copied().unwrap_or(0.0).to_bits();
+    Print { id: s.id.clone(), n: p.len(), ends: [at(0), at(1), at(last), at(last + 1)], depth: [z(0), z((p.len() / 3).saturating_sub(1))], size: s.brush.size.to_bits() }
 }
 
 /// A painting layer's document layer, and its strokes and its mask's as shown, in order.
@@ -462,8 +465,10 @@ impl Canvas {
             return;
         }
         for (i, mask, out, ins, want, prints) in plans {
+            // (A flat layer's strokes lie on the paper.)
+            let depth = layers[i].vr;
             let ordered_in = |painter: &mut Painter, j: usize, s: &DocStroke, frame: &Frame| {
-                let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref(), frame);
+                let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref().filter(|_| depth), frame);
                 if steps_changed {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
@@ -908,7 +913,8 @@ impl Canvas {
                     continue;
                 }
                 let Ok(brush) = serde_json::from_value::<DocBrush>(l.brush.clone()) else { continue };
-                let stroke = doc::stroke(&l.id, &brush, &l.pts, l.vr.as_ref(), &self.frame);
+                let depth = !painter.painting.layers[layer].ordered;
+                let stroke = doc::stroke(&l.id, &brush, &l.pts, l.vr.as_ref().filter(|_| depth), &self.frame);
                 self.lives.insert(key.clone(), Live { points: l.pts.len(), layer, mask, stroke });
             }
             if let Some(c) = self.lives.get(key) {
@@ -962,23 +968,37 @@ impl Canvas {
         self.cursor = (at, Instant::now());
     }
 
-    /// The hands' grips, each frame: one hand holding drags the canvas; two hands move, turn
-    /// and scale it (the two points under the hands stay under them). `poses`: the hands
-    /// (world); `held`: their grips. Returns whether it is held.
+    /// The hands' grips, each frame: one hand holding carries the canvas (it moves and turns
+    /// with the hand); two hands move, turn and scale it: the two points under the hands stay
+    /// under them, it scales as they part, and it rolls about the line between them by the
+    /// wrists' turns, averaged. `poses`: the hands (world); `held`: their grips. Returns
+    /// whether it is held.
     pub fn navigate(&mut self, painter: &mut Painter, poses: [Option<Mat4>; 2], held: [bool; 2]) -> bool {
         let now: [Option<Mat4>; 2] = [0, 1].map(|h| poses[h].filter(|_| held[h]));
         let was = self.held;
+        let rot = |m: Mat4| Quat::from_mat4(&m).normalize();
         let delta = match (was, now) {
             ([Some(a0), Some(b0)], [Some(a1), Some(b1)]) => {
-                let (a0, b0, a1, b1) = (a0.w_axis.truncate(), b0.w_axis.truncate(), a1.w_axis.truncate(), b1.w_axis.truncate());
-                let (v0, v1) = (b0 - a0, b1 - a1);
+                let (pa0, pb0, pa1, pb1) = (a0.w_axis.truncate(), b0.w_axis.truncate(), a1.w_axis.truncate(), b1.w_axis.truncate());
+                let (v0, v1) = (pb0 - pa0, pb1 - pa1);
                 let s = (v1.length() / v0.length().max(1e-4)).clamp(0.5, 2.0);
-                let turn = Quat::from_rotation_arc(v0.normalize_or(Vec3::X), v1.normalize_or(Vec3::X));
-                let (m0, m1) = ((a0 + b0) * 0.5, (a1 + b1) * 0.5);
-                Some(Mat4::from_translation(m1) * Mat4::from_quat(turn) * Mat4::from_scale(Vec3::splat(s)) * Mat4::from_translation(-m0))
+                let axis = v1.normalize_or(Vec3::X);
+                let swing = Quat::from_rotation_arc(v0.normalize_or(Vec3::X), axis);
+                // The wrists' turns, averaged; of that, the part about the hands' line (the
+                // rest is the line's own turn, above).
+                let wrists = (rot(a1) * rot(a0).inverse()).slerp(rot(b1) * rot(b0).inverse(), 0.5);
+                let along = Vec3::new(wrists.x, wrists.y, wrists.z).dot(axis) * axis;
+                let twist = Quat::from_xyzw(along.x, along.y, along.z, wrists.w);
+                let twist = if twist.length_squared() > 1e-12 { twist.normalize() } else { Quat::IDENTITY };
+                let (m0, m1) = ((pa0 + pb0) * 0.5, (pa1 + pb1) * 0.5);
+                Some(Mat4::from_translation(m1) * Mat4::from_quat(twist * swing) * Mat4::from_scale(Vec3::splat(s)) * Mat4::from_translation(-m0))
             }
-            ([Some(a0), _], [Some(a1), None]) | ([_, Some(a0)], [None, Some(a1)]) if was.iter().flatten().count() == 1 || now.iter().flatten().count() == 1 => {
-                Some(Mat4::from_translation(a1.w_axis.truncate() - a0.w_axis.truncate()))
+            // One hand (also the one left holding when the other lets go): the canvas goes
+            // with it, as if held.
+            ([Some(p0), _], [Some(p1), None]) | ([_, Some(p0)], [None, Some(p1)]) => {
+                let (q0, q1) = (rot(p0), rot(p1));
+                let (t0, t1) = (p0.w_axis.truncate(), p1.w_axis.truncate());
+                Some(Mat4::from_translation(t1) * Mat4::from_quat(q1 * q0.inverse()) * Mat4::from_translation(-t0))
             }
             _ => None,
         };
@@ -1297,5 +1317,39 @@ mod tests {
         assert!((shown.strokes[0].samples[0].pos.z - 0.1).abs() < 1e-3);
         c.session.close();
         other.close();
+    }
+
+    /// The grips: a point of the canvas under a hand stays under it, with one hand (moving and
+    /// turning) and with two (parting, rolling about the line between them).
+    #[test]
+    fn the_canvas_stays_in_the_hands() {
+        let server = vdraw_net::Server::new("http://127.0.0.1:9", None);
+        let mut c = Canvas::new(Session::open(&server, "none", "VR", "#ff6b6b", "x", None));
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        let world = |c: &Canvas, scene: Vec3| c.view.transform_point3(scene);
+        let pose = |q: Quat, t: Vec3| Mat4::from_rotation_translation(q, t);
+        // One hand at (0, 1, -0.5): a point 10 cm in front of it, in the scene.
+        let a0 = pose(Quat::IDENTITY, Vec3::new(0.0, 1.0, -0.5));
+        let local = Vec3::new(0.0, 0.0, -0.1);
+        let p = c.view.inverse().transform_point3(a0.transform_point3(local));
+        c.navigate(&mut painter, [Some(a0), None], [true, false]);
+        let a1 = pose(Quat::from_rotation_y(1.0) * Quat::from_rotation_x(0.3), Vec3::new(0.2, 1.1, -0.4));
+        c.navigate(&mut painter, [Some(a1), None], [true, false]);
+        assert!(world(&c, p).abs_diff_eq(a1.transform_point3(local), 1e-5), "one hand carries it, turning");
+        c.navigate(&mut painter, [Some(a1), None], [false, false]);
+        // Two hands 40 cm apart; they part to 80 cm and both wrists roll 30 degrees about the
+        // line between them: the points under them stay, and so does one beside the line.
+        let (l0, r0) = (pose(Quat::IDENTITY, Vec3::new(-0.2, 1.0, -0.5)), pose(Quat::IDENTITY, Vec3::new(0.2, 1.0, -0.5)));
+        let under = [l0.w_axis.truncate(), r0.w_axis.truncate()].map(|w| c.view.inverse().transform_point3(w));
+        let beside = c.view.inverse().transform_point3(Vec3::new(0.0, 1.1, -0.5));
+        c.navigate(&mut painter, [Some(l0), Some(r0)], [true, true]);
+        let roll = Quat::from_rotation_x(0.5);
+        let (l1, r1) = (pose(roll, Vec3::new(-0.4, 1.0, -0.5)), pose(roll, Vec3::new(0.4, 1.0, -0.5)));
+        c.navigate(&mut painter, [Some(l1), Some(r1)], [true, true]);
+        assert!(world(&c, under[0]).abs_diff_eq(l1.w_axis.truncate(), 1e-5));
+        assert!(world(&c, under[1]).abs_diff_eq(r1.w_axis.truncate(), 1e-5));
+        assert!((c.scale() - 2.0).abs() < 1e-5);
+        let want = Vec3::new(0.0, 1.0, -0.5) + roll * Vec3::new(0.0, 0.2, 0.0);
+        assert!(world(&c, beside).abs_diff_eq(want, 1e-4), "{} {want}", world(&c, beside));
     }
 }

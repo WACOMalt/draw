@@ -394,9 +394,8 @@ impl Doc {
                 let id = id();
                 let Some(l) = self.layers.get(&id) else { return refused("no such layer") };
                 let mut props = field("props").and_then(Value::as_object).cloned().unwrap_or_default();
-                // A layer's kind and whether it is a VR layer are set when it is made.
+                // A layer's kind is set when it is made (whether it is a VR layer can change).
                 props.remove("kind");
-                props.remove("vr");
                 if props.get("blend").and_then(Value::as_str) == Some("pass") && !l.is_group() {
                     return refused("pass through is for groups");
                 }
@@ -439,6 +438,30 @@ impl Doc {
                 let Some(l) = self.layers.get(&id) else { return refused("no such layer") };
                 if self.effectively_deleted(l) {
                     return refused("no such layer");
+                }
+                // A VR layer moved in 3D (m3), its strokes' depth with it.
+                if let Some(m3) = field("m3") {
+                    let m3: [f64; 12] = serde_json::from_value(m3.clone()).map_err(|_| OpError::Refused("bad transform".into()))?;
+                    if !l.vr || l.is_group() {
+                        return refused("a 3D transform is for VR layers");
+                    }
+                    let mut changes = Vec::new();
+                    for s in self.strokes.values().filter(|s| s.layer_id == id) {
+                        if s.extra.contains_key("vector") {
+                            return refused("vector strokes do not move in 3D");
+                        }
+                        match transform_stroke_3d(s, &m3) {
+                            Some(t) => changes.push((s.id.clone(), t)),
+                            None => return refused("the transform goes out of range"),
+                        }
+                    }
+                    for (sid, (pts, brush, vr)) in changes {
+                        let s = self.strokes.get_mut(&sid).unwrap();
+                        s.pts = pts;
+                        s.brush = brush;
+                        s.vr = vr;
+                    }
+                    return Ok(());
                 }
                 let m: [f64; 6] = serde_json::from_value(field("m").cloned().unwrap_or(Value::Null)).map_err(|_| OpError::Refused("bad transform".into()))?;
                 let ids = self.subtree_ids(&id);
@@ -653,6 +676,51 @@ pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBru
     Some((pts, brush, vr))
 }
 
+/// A stroke moved by a 3D similarity in canvas units (column-major 3x4: x' = m[0] x + m[3] y +
+/// m[6] z + m[9], ...), as the 2D app's layer.transform with `m3`: its points and their depth
+/// (a stroke without depth gets it), its up sides turned, its size scaled, its tip turned by
+/// the turn in the paper's plane.
+pub fn transform_stroke_3d(s: &DocStroke, m: &[f64; 12]) -> Option<(Vec<f64>, DocBrush, Option<StrokeVr>)> {
+    let det = m[0] * (m[4] * m[8] - m[7] * m[5]) - m[3] * (m[1] * m[8] - m[7] * m[2]) + m[6] * (m[1] * m[5] - m[4] * m[2]);
+    let scale = det.abs().cbrt();
+    let n = s.pts.len() / 3;
+    let mut pts = s.pts.clone();
+    let mut z = Vec::with_capacity(n);
+    for i in 0..n {
+        let (x, y, d) = (pts[3 * i], pts[3 * i + 1], s.vr.as_ref().and_then(|v| v.z.get(i)).copied().unwrap_or(0.0));
+        let p = [m[0] * x + m[3] * y + m[6] * d + m[9], m[1] * x + m[4] * y + m[7] * d + m[10], m[2] * x + m[5] * y + m[8] * d + m[11]];
+        if p.iter().any(|c| !(c.abs() <= MAX_COORD)) {
+            return None;
+        }
+        pts[3 * i] = p[0];
+        pts[3 * i + 1] = p[1];
+        z.push(p[2]);
+    }
+    let size = s.brush.size * scale;
+    if !(size >= BRUSH_WORLD.0 && size <= BRUSH_WORLD.1) {
+        return None;
+    }
+    let mut brush = DocBrush { size, ..s.brush.clone() };
+    let shaped = brush.extra.contains_key("angle") || brush.text("tip").is_some_and(|t| t != "round") || brush.num("roundness").unwrap_or(1.0) < 1.0;
+    if shaped && !brush.flag("followDirection") {
+        let deg = m[1].atan2(m[0]).to_degrees();
+        let angle = ((brush.num("angle").unwrap_or(0.0) + deg) % 360.0 + 360.0) % 360.0;
+        brush.extra.insert("angle".into(), angle.into());
+    }
+    let up = s.vr.as_ref().and_then(|v| v.up.as_ref()).map(|up| {
+        let mut out = up.clone();
+        for u in out.chunks_exact_mut(3) {
+            let t = [m[0] * u[0] + m[3] * u[1] + m[6] * u[2], m[1] * u[0] + m[4] * u[1] + m[7] * u[2], m[2] * u[0] + m[5] * u[1] + m[8] * u[2]];
+            let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+            if len > 1e-12 {
+                u.copy_from_slice(&t.map(|c| (c / len * 1000.0).round() / 1000.0));
+            }
+        }
+        out
+    });
+    Some((pts, brush, Some(StrokeVr { z, up })))
+}
+
 /// How the document's canvas units map into a painting's space: a point (x, y) (2D: y down)
 /// at depth z goes to `offset + ((x - anchor.x) k, -(y - anchor.y) k, z k)` (y up, z out of the
 /// paper toward a 2D viewer).
@@ -777,7 +845,9 @@ impl Doc {
             let id = layers.len() as u32 + 1;
             num.insert(&l.id, id);
             let group = l.is_group();
-            let strokes = |mask: Option<&str>| self.strokes_of(&l.id, mask).into_iter().map(|s| stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref(), frame)).collect::<Vec<_>>();
+            // A flat layer's strokes lie on the paper (a VR layer made flat keeps their depth
+            // for when it is made a VR layer again).
+            let strokes = |mask: Option<&str>| self.strokes_of(&l.id, mask).into_iter().map(|s| stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref().filter(|_| l.vr), frame)).collect::<Vec<_>>();
             layers.push(crate::Layer {
                 id,
                 name: l.name.clone(),
