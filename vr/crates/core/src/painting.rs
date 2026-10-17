@@ -493,6 +493,24 @@ impl Painting {
         }
     }
 
+    /// Gives each kaleidoscope its layer's kind (doc.rs `Kaleido::fit`): a 3D step where the
+    /// layer's paint layers (a group's: all of them, one at least) are 3D layers, a flat one
+    /// elsewhere; their copies made again.
+    pub fn fit_kaleidos(&mut self) {
+        for i in 0..self.layers.len() {
+            if self.layers[i].kaleido.is_none() {
+                continue;
+            }
+            let block = self.block(i);
+            let mut paint = self.layers[block].iter().filter(|l| !l.group && l.adjust.is_none()).peekable();
+            let depth = paint.peek().is_some() && paint.all(|l| l.threed);
+            let l = &mut self.layers[i];
+            if l.kaleido.as_mut().is_some_and(|k| k.fit(depth)) {
+                l.update_copies();
+            }
+        }
+    }
+
     /// The compositing steps of the shown layers, bottom first: a group opens, its layers, it
     /// closes; a layer's mask (when enabled) right before the layer.
     pub fn steps(&self) -> Vec<Step> {

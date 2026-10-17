@@ -879,7 +879,58 @@ impl Kaleido {
     /// behind the layer.
     pub fn new(cx: f64, cy: f64, depth: bool, frame: Frame) -> Self {
         let effect = json!({"type": "kaleidoscope", "enabled": true, "radius": 0, "count": 5, "angle": 60, "scale": 1, "cx": cx, "cy": cy, "dx": 0, "dy": 0, "order": "behind"});
-        Self { effect: effect.as_object().cloned().unwrap_or_default(), depth, frame }
+        let mut k = Self { effect: effect.as_object().cloned().unwrap_or_default(), depth, frame };
+        k.fit(depth);
+        k
+    }
+
+    /// The step is a 3D one: a turn in 3D, or depths.
+    pub fn is_3d(&self) -> bool {
+        ["turn", "cz", "dz"].iter().any(|k| self.effect.contains_key(*k))
+    }
+
+    /// Gives it its layer's kind (effects.ts kaleidoscopeFixes): a 3D step where the layer's
+    /// strokes all have depth (its angle as a turn about the axis out of the paper), a flat one
+    /// elsewhere (`flatten`). True when it changed.
+    pub fn fit(&mut self, depth: bool) -> bool {
+        let was = self.clone();
+        self.depth = depth;
+        if depth && !self.effect.contains_key("turn") {
+            let q = glam::DQuat::from_rotation_z(self.num("angle", 0.0).to_radians());
+            self.set("turn", json!([q.x, q.y, q.z, q.w]));
+            self.set("angle", 0);
+        } else if !depth && self.is_3d() {
+            self.flatten();
+        }
+        *self != was
+    }
+
+    /// How far the step turns, degrees: a 3D step about its own axis (minus when the axis
+    /// points into the paper; effects.ts kaleidoscopeAngle).
+    pub fn angle(&self) -> f64 {
+        let Some(q) = self.turn() else { return self.num("angle", 0.0) };
+        let a = (2.0 * q.xyz().length().atan2(q.w)).to_degrees();
+        if q.z < 0.0 { -a } else { a }
+    }
+
+    /// Turns the step `deg` degrees (a 3D step about its own axis, kept; effects.ts
+    /// withKaleidoscopeAngle).
+    pub fn set_angle(&mut self, deg: f64) {
+        let Some(q) = self.turn() else {
+            self.set("angle", deg);
+            return;
+        };
+        let mut axis = q.xyz().try_normalize().unwrap_or(glam::DVec3::Z);
+        if axis.z < 0.0 {
+            axis = -axis;
+        }
+        let q = glam::DQuat::from_axis_angle(axis, deg.to_radians());
+        self.set("turn", json!([q.x, q.y, q.z, q.w]));
+    }
+
+    fn turn(&self) -> Option<glam::DQuat> {
+        let t = self.effect.get("turn")?.as_array()?;
+        (t.len() == 4).then(|| glam::DQuat::from_xyzw(t[0].as_f64().unwrap_or(0.0), t[1].as_f64().unwrap_or(0.0), t[2].as_f64().unwrap_or(0.0), t[3].as_f64().unwrap_or(1.0)).normalize())
     }
 
     pub fn num(&self, key: &str, default: f64) -> f64 {
@@ -984,8 +1035,9 @@ impl Kaleido {
         self.set("scale", r(k.clamp(0.01, 100.0), 1e9));
         self.set("dx", r(d.x, 1e6));
         self.set("dy", r(d.y, 1e6));
-        if self.depth && q.x.hypot(q.y) > 1e-6 {
-            // Same sign as before when it can (q and -q are one turn).
+        if self.depth {
+            // A 3D layer's step is a 3D one. Same sign as before when it can (q and -q are
+            // one turn).
             let q = if q.w < 0.0 { -q } else { q };
             self.set("turn", json!([q.x, q.y, q.z, q.w]));
             self.set("angle", 0);

@@ -429,6 +429,9 @@ impl Painter {
         let before = layout(&self.painting);
         let was = self.active_layer;
         let (active, removed) = f(&mut self.painting);
+        // A layer made 3D or flat (or moved into or out of a group): its kaleidoscopes take
+        // its kind (the canvas sends them with the edit).
+        self.painting.fit_kaleidos();
         if let Some(a) = active.and_then(|a| self.painting.layers.get(a)) {
             self.active_layer = a.id;
         }

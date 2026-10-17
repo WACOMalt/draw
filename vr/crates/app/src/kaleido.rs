@@ -278,3 +278,36 @@ mod tests {
         assert!(lines.len() > 100 && lines.len() <= vdraw_render::MAX_LINES);
     }
 }
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use vdraw_core::doc::{Frame, Kaleido};
+
+    /// A kaleidoscope has its layer's kind: a new one on a 3D layer is a 3D step; making the
+    /// layer flat flattens it (the same copies, as it turned in the paper); 3D again lifts it.
+    #[test]
+    fn a_kaleidoscope_takes_its_layers_kind() {
+        let frame = Frame { anchor: [0.0, 0.0], k: 0.01, offset: Vec3::ZERO };
+        let k = Kaleido::new(10.0, 20.0, true, frame);
+        assert!(k.effect.contains_key("turn") && (k.angle() - 60.0).abs() < 1e-9, "{:?}", k.effect);
+        let mut p = Painter::new(vdraw_core::Painting::default());
+        p.painting.layers[0].threed = true;
+        p.painting.layers[0].kaleido = Some(k);
+        p.painting.layers[0].update_copies();
+        let copies = p.painting.layers[0].copies.clone();
+        p.edit_layers(|pt| {
+            pt.layers[0].threed = false;
+            (None, crate::painter::Removed::default())
+        });
+        let k = p.painting.layers[0].kaleido.clone().unwrap();
+        assert!(!k.is_3d() && !k.depth && (k.num("angle", 0.0) - 60.0).abs() < 1e-6, "{:?}", k.effect);
+        let near = |a: &[Mat4], b: &[Mat4]| a.iter().zip(b).all(|(x, y)| x.abs_diff_eq(*y, 1e-4));
+        assert!(near(&p.painting.layers[0].copies, &copies), "a step in the paper looks the same flat");
+        p.edit_layers(|pt| {
+            pt.layers[0].threed = true;
+            (None, crate::painter::Removed::default())
+        });
+        assert!(p.painting.layers[0].kaleido.as_ref().unwrap().effect.contains_key("turn"));
+    }
+}

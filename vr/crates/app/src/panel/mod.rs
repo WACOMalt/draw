@@ -589,22 +589,32 @@ fn kaleido_settings(ui: &mut egui::Ui, painter: &mut Painter) {
         if slider(ui, "Scale", &mut s, (0.05, 4.0), true, percent) {
             k.set("scale", ((s as f64) * 1e4).round() / 1e4);
         }
-        if k.tilts() {
-            dim(ui, if k.depth { "3D step: the copies turn in 3D." } else { "3D step: seen straight on (this layer is flat)." });
-            if ui.button(RichText::new("Flatten the step").size(14.0)).clicked() {
-                k.flatten();
+        let mut a = k.angle() as f32;
+        if slider(ui, "Angle", &mut a, (-360.0, 360.0), false, |v| format!("{v:.1}°")) {
+            k.set_angle(((a as f64) * 100.0).round() / 100.0);
+        }
+        let mut flatten = false;
+        ui.horizontal(|ui| {
+            ui.add_space(94.0);
+            if toggle(ui, "Even", false).clicked() {
+                k.set_angle((360.0 / (k.count() as f64 + 1.0) * 1000.0).round() / 1000.0);
             }
-        } else {
-            let mut a = k.num("angle", 0.0) as f32;
-            if slider(ui, "Angle", &mut a, (-360.0, 360.0), false, |v| format!("{v:.1}°")) {
-                k.set("angle", ((a as f64) * 100.0).round() / 100.0);
+            // A 3D layer's step is a 3D one: a flat one needs the layer flat too.
+            if k.depth && toggle(ui, "Flatten (makes the layer flat)", false).clicked() {
+                flatten = true;
             }
-            ui.horizontal(|ui| {
-                ui.add_space(94.0);
-                if toggle(ui, "Even", false).clicked() {
-                    k.set("angle", (360.0 / (k.count() as f64 + 1.0) * 1000.0).round() / 1000.0);
+        });
+        if flatten {
+            let block = painter.painting.block(i);
+            painter.edit_layers(|p| {
+                for j in block {
+                    if !p.layers[j].group && p.layers[j].adjust.is_none() {
+                        p.layers[j].threed = false;
+                    }
                 }
+                (None, crate::painter::Removed::default())
             });
+            return;
         }
         ui.horizontal(|ui| {
             ui.add_space(94.0);
