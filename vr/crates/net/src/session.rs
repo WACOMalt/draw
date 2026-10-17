@@ -44,11 +44,17 @@ impl Socket {
     }
 }
 
+/// The largest message the server may send (a canvas's welcome holds the whole document).
+const MAX_MESSAGE: usize = 1 << 30;
+
 fn run_socket(url: String, mut hello: Value, out: Receiver<Out>, events: Sender<Event>) {
     use tungstenite::{Message, stream::MaybeTlsStream};
     let mut retry = 0u32;
     loop {
-        let (mut ws, _) = match tungstenite::connect(&url) {
+        // A big canvas's welcome comes as one message of many megabytes (tungstenite's limits
+        // are 16 MB a frame, 64 MB a message).
+        let config = tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+        let (mut ws, _) = match tungstenite::client::connect_with_config(&url, Some(config), 3) {
             Ok(c) => c,
             Err(e) => {
                 // A missing canvas: the upgrade is answered 404; that is final.
