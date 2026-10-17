@@ -3,11 +3,11 @@
 // shader. Tiles render on the main thread in small time slices; the GPU does the pixel work.
 
 import { DAB_CHUNK, DAB_STRIDE, DabWalker, brushShape, lowFlow, strokeSeed } from '../../../shared/brush';
-import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, LIMITS, type Affine, type Brush, type Layer, type LayerBlend, type LayerEffect, type MixMode, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
-import { kaleidoscopeStep, takesEffects } from '../../../shared/effects';
+import { BLEND_MODES, BRUSH_TIPS, EFFECT_TYPES, GRAINS, LIMITS, type Affine, type Affine3, type Brush, type Layer, type LayerBlend, type LayerEffect, type MixMode, type Paper, type Shape, type Stroke, DEFAULT_PAPER } from '../../../shared/types';
+import { kaleidoscopeCopies, kaleidoscopeCopies3, kaleidoscopeTilts, takesEffects } from '../../../shared/effects';
 import { MARGIN, blurLevel, kernel } from '../blur';
 import { byZ } from '../../../shared/shapes';
-import { compose, effectivelyVisible, invert, layerTree, subtreeIds, type LayerNode } from '../../../shared/layers';
+import { compose, effectivelyVisible, invert, layerTree, subtreeIds, transformStroke3, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
@@ -56,6 +56,11 @@ interface Box {
 }
 
 const apply = (m: Affine, x: number, y: number): [number, number] => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+
+/** A stroke's copy i for the tilted kaleidoscope of `node` (GLRenderer.tilted). */
+const copyId = (id: string, node: string, i: number) => `${id}@${node}:${i}`;
+/** The layer of such copies: the layer's id with the node and the copy. */
+const copyKey = (layer: string, node: string, i: number) => `${layer}@${node}:${i}`;
 
 /** Thrown to end the backdrop render of a blur adjustment layer when it reaches that layer. */
 const STOP = Symbol('stop');
@@ -267,6 +272,16 @@ export class GLRenderer implements Renderer {
    * frames): the next frame renders them (render, step 1), coarse ones first.
    */
   private wanted = new Map<string, { layer: string; lod: number; tx: number; ty: number }>();
+  /**
+   * Kaleidoscopes whose step tilts (kaleidoscopeTilts) on a 3D layer, or on a group whose paint
+   * layers are all 3D: a picture moved in the paper cannot show a tilt, so their copies come from
+   * the strokes, moved in 3D and seen straight on. By the layer or group: the copies' 3D
+   * transforms, the 3D layers whose strokes it copies, and the step's signature. The copied
+   * strokes live in the index like any (copyId, copyKey), and keep up with their originals.
+   */
+  private tilted = new Map<string, { sig: string; copies: Affine3[]; members: Set<string> }>();
+  /** While a tilted kaleidoscope copy renders: its members' layer and mask keys → the copy's. */
+  private keyMap: ((key: string) => string) | null = null;
   private tipTex!: WebGLTexture;
   private grainTex!: WebGLTexture;
   private tipsReady = new Set<number>();
@@ -719,6 +734,7 @@ export class GLRenderer implements Renderer {
       t.append = [];
     }
     this.shapeLayers = next;
+    this.updateTilted();
     for (const [id, l] of this.luts) {
       if (!layers.some((x) => x.id === id && x.kind === 'adjust')) {
         this.gl.deleteTexture(l.tex);
@@ -735,11 +751,22 @@ export class GLRenderer implements Renderer {
       t.stale = true;
       t.append = [];
     }
+    // The copies of tilted kaleidoscopes went with the index: made again.
+    this.tilted.clear();
+    this.updateTilted();
     this.appliedSeq = seq;
     this.invalidate();
   }
 
   addStroke(stroke: Stroke, seq: number): void {
+    this.addRec(stroke);
+    for (const [node, k] of this.tilted) if (k.members.has(stroke.layerId)) k.copies.forEach((m, i) => this.addCopy(stroke, node, i, m));
+    this.appliedSeq = seq;
+    this.invalidate();
+  }
+
+  /** Puts a stroke in the index; the tiles it touches draw it (on top) or render again. */
+  private addRec(stroke: Stroke): void {
     const rec = this.index.add(stroke);
     const key = strokeKey(stroke);
     for (const t of this.tiles.values()) {
@@ -756,11 +783,17 @@ export class GLRenderer implements Renderer {
         t.append = [];
       }
     }
+  }
+
+  removeStroke(id: string, seq: number): void {
+    const rec = this.removeRec(id);
+    if (rec) for (const [node, k] of this.tilted) if (k.members.has(rec.stroke.layerId)) k.copies.forEach((_, i) => this.removeRec(copyId(id, node, i)));
     this.appliedSeq = seq;
     this.invalidate();
   }
 
-  removeStroke(id: string, seq: number): void {
+  /** Takes a stroke out of the index; the tiles it touched render again. */
+  private removeRec(id: string): StrokeRec | null {
     const rec = this.index.remove(id);
     if (rec) {
       const key = strokeKey(rec.stroke);
@@ -774,8 +807,54 @@ export class GLRenderer implements Renderer {
         }
       }
     }
-    this.appliedSeq = seq;
-    this.invalidate();
+    return rec;
+  }
+
+  // --- tilted kaleidoscopes: copies from the strokes -----------------------------------------------
+
+  /** Brings `tilted` up to date with the layers: copies made, or dropped, where a step changed. */
+  private updateTilted(): void {
+    const next = new Map<string, { sig: string; copies: Affine3[]; members: Set<string> }>();
+    for (const l of this.layers) {
+      const e = activeEffects(l).find((x) => x.type === 'kaleidoscope');
+      if (!e || !kaleidoscopeTilts(e)) continue;
+      // The paint layers whose strokes it copies; all must be 3D (else the copies are a picture,
+      // seen straight on: kaleidoscopeCopies).
+      const ids = l.kind === 'group' ? subtreeIds(this.layers, l.id) : new Set([l.id]);
+      const members = this.layers.filter((x) => ids.has(x.id) && x.kind !== 'group' && x.kind !== 'adjust');
+      if (!members.length || members.some((x) => !x.threed || (x.kind ?? 'paint') !== 'paint')) continue;
+      const ms = new Set(members.map((x) => x.id));
+      const sig = JSON.stringify([e.count, e.turn, e.angle, e.scale, e.cx, e.cy, e.cz, e.dx, e.dy, e.dz, [...ms].sort()]);
+      next.set(l.id, { sig, copies: kaleidoscopeCopies3(e), members: ms });
+    }
+    for (const [node, k] of this.tilted) if (next.get(node)?.sig !== k.sig) this.dropCopies(node, k);
+    for (const [node, k] of next) {
+      if (this.tilted.get(node)?.sig === k.sig) continue;
+      for (const id of k.members)
+        for (const [key, list] of [...this.index.byLayer]) {
+          if (key !== id && !key.startsWith(`${id}#`)) continue;
+          for (const r of list) k.copies.forEach((m, i) => this.addCopy(r.stroke, node, i, m));
+        }
+    }
+    this.tilted = next;
+  }
+
+  /** Copy i of a stroke for a tilted kaleidoscope of `node`: moved in 3D (none if it cannot be). */
+  private addCopy(st: Stroke, node: string, i: number, m: Affine3): void {
+    const t = transformStroke3(st, m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
+    if (t) this.addRec({ ...st, ...t, id: copyId(st.id, node, i), layerId: copyKey(st.layerId, node, i) });
+  }
+
+  /** Drops the copied strokes of a tilted kaleidoscope, and their tiles. */
+  private dropCopies(node: string, k: { members: Set<string> }): void {
+    const of = (key: string) => [...k.members].some((id) => key.startsWith(`${id}@${node}:`));
+    for (const [key, list] of [...this.index.byLayer]) if (of(key)) for (const r of [...list]) this.index.remove(r.stroke.id);
+    for (const [key, t] of [...this.tiles]) {
+      if (!of(t.layer)) continue;
+      if (t.job) this.dropJob(t);
+      if (t.target) this.tilePool.push(t.target);
+      this.tiles.delete(key);
+    }
   }
 
   advanceSeq(seq: number): void {
@@ -952,6 +1031,7 @@ export class GLRenderer implements Renderer {
    * buffer of a shape layer being edited.
    */
   private drawLayerContent(layer: string, g: Grid, target: Target, opacity: number): void {
+    if (this.keyMap) layer = this.keyMap(layer);
     const pv = this.strokePreview?.byKey.get(layer);
     if (pv) return this.drawPreviewStrokes(pv, g, target);
     const h = this.hot.get(layer);
@@ -1932,6 +2012,7 @@ export class GLRenderer implements Renderer {
       (kg) => this.layerPixels(layer, kg, false),
       () => this.nodeBounds(layer, false),
       plain ? layer.id : null,
+      layer.id,
     );
   }
 
@@ -1947,6 +2028,8 @@ export class GLRenderer implements Renderer {
       (fg) => this.renderGroup(node, fg, depth),
       (kg) => this.groupPixels(node, kg, depth, false),
       () => this.nodeBounds(node.layer, false),
+      null,
+      node.layer.id,
     );
   }
 
@@ -2206,7 +2289,8 @@ export class GLRenderer implements Renderer {
     gl.disable(gl.BLEND);
     this.drawLayerContent(layer.id, g, t, 1);
     const scr = this.screenRect(g);
-    for (const l of this.livesFor(layer.id)) {
+    // (Strokes in progress are not in a tilted kaleidoscope's copies: keyMap.)
+    for (const l of this.keyMap ? [] : this.livesFor(layer.id)) {
       if (this.pigmentFor(l.brush)) {
         // Only where the stroke is: the mix is a heavy shader.
         const r = this.liveRect(l, g);
@@ -2242,7 +2326,7 @@ export class GLRenderer implements Renderer {
     gl.disable(gl.BLEND);
     this.drawLayerContent(key, g, t, 1);
     const scr = this.screenRect(g);
-    for (const l of this.livesFor(key)) {
+    for (const l of this.keyMap ? [] : this.livesFor(key)) {
       this.blendFor(l.brush.tool === 'erase');
       this.copy(l.target!.tex, t, scr, l.brush.opacity);
     }
@@ -2382,7 +2466,7 @@ export class GLRenderer implements Renderer {
    * pixels before effects; glows and the shadow with the blur of a blur effect added) and draws
    * onto the result so far. Returns the result.
    */
-  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target, content: () => Box | null, plain: string | null = null): Target {
+  private applyEffects(fx: LayerEffect[], g: Grid, own: Target, source: (fg: Grid) => Target, whole: (kg: Grid) => Target, content: () => Box | null, plain: string | null, id: string): Target {
     const gl = this.gl;
     let cur = own;
     let flip = false;
@@ -2431,16 +2515,19 @@ export class GLRenderer implements Renderer {
     // What the other effects add around the layer: a copy's frame takes that much more.
     let pad = 0;
     for (const e of fx) if (e.type !== 'kaleidoscope') pad = Math.max(pad, 3 * effectSigma(e, fx) + Math.hypot(e.dx ?? 0, e.dy ?? 0));
+    // A tilt on 3D layers: the copies from the strokes (not inside such a copy: there they are
+    // seen straight on, as a picture).
+    const geo = this.keyMap ? undefined : this.tilted.get(id);
+    if (geo) return this.kaleidoscope3(kal, g, cur, whole, id, geo);
     return this.kaleidoscope(kal, g, cur, whole, content, pad, plain);
   }
 
-  /** Copy i of a kaleidoscope: the step transform applied i times (world to world), i = 1..count. */
+  /**
+   * Copy i of a kaleidoscope as the paper sees it (world to world), i = 1..count: the step
+   * applied i times; a 3D step seen straight on (kaleidoscopeCopies).
+   */
   private kaleidoscopeSteps(e: LayerEffect): Affine[] {
-    const step = kaleidoscopeStep(e);
-    const out: Affine[] = [];
-    let m: Affine = [1, 0, 0, 1, 0, 0];
-    for (let i = 0; i < Math.min(LIMITS.maxKaleidoscope, e.count ?? 0); i++) out.push((m = compose(step, m)));
-    return out;
+    return kaleidoscopeCopies(e);
   }
 
   /**
@@ -2489,7 +2576,12 @@ export class GLRenderer implements Renderer {
       add(own.x0 + dx - p, own.y0 + dy - p, own.x1 + dx + p, own.y1 + dy + p);
     }
     const kal = kaleidoscope ? fx.find((e) => e.type === 'kaleidoscope') : undefined;
-    if (kal) {
+    const geo = kal && !this.keyMap ? this.tilted.get(l.id) : undefined;
+    if (geo) {
+      // The copied strokes themselves (their boxes, moved in 3D, seen straight on).
+      for (const id of geo.members)
+        for (const [key, list] of this.index.byLayer) if (key.startsWith(`${id}@${l.id}:`) && !key.includes('#')) for (const r of list) add(r.x0, r.y0, r.x1, r.y1);
+    } else if (kal) {
       const one: Box = acc.b!;
       for (const m of this.kaleidoscopeSteps(kal)) {
         const pts = [apply(m, one.x0, one.y0), apply(m, one.x1, one.y0), apply(m, one.x0, one.y1), apply(m, one.x1, one.y1)];
@@ -2518,6 +2610,42 @@ export class GLRenderer implements Renderer {
       wy,
       s,
     };
+  }
+
+  /**
+   * A kaleidoscope whose step tilts, on 3D layers (see `tilted`): copy i is the layer (or group)
+   * rendered from its strokes' copy i (moved in 3D, seen straight on), with its mask and other
+   * effects, in frame g itself; the copies and `cur` go into one buffer, in the order as the
+   * flat kaleidoscope's.
+   */
+  private kaleidoscope3(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target, id: string, geo: { copies: Affine3[]; members: Set<string> }): Target {
+    const out = this.buf(g, 'kalOut');
+    const kg: Grid = { ...g, ns: `${g.ns}k3:` };
+    const copy = (i: number) => {
+      this.keyMap = (key) => {
+        const [l, mask] = key.split('#');
+        return geo.members.has(l) ? copyKey(l, id, i) + (mask ? `#${mask}` : '') : key;
+      };
+      let src: Target;
+      try {
+        src = whole(kg);
+      } finally {
+        this.keyMap = null;
+      }
+      this.bindTarget(out);
+      this.blendFor(false);
+      this.copy(src.tex, out, [0, 0, out.w, out.h]);
+    };
+    this.bindTarget(out);
+    this.clear();
+    const n = geo.copies.length;
+    // Behind: copy 1 nearest the layer, so the last copy goes down first.
+    if (e.order === 'behind') for (let i = n - 1; i >= 0; i--) copy(i);
+    this.bindTarget(out);
+    this.blendFor(false);
+    this.copy(cur.tex, out, [0, 0, out.w, out.h]);
+    if (e.order !== 'behind') for (let i = 0; i < n; i++) copy(i);
+    return out;
   }
 
   /**
@@ -2613,6 +2741,7 @@ export class GLRenderer implements Renderer {
    * 4× coarser while they render; the missing ones are asked for: wanted).
    */
   private drawThrough(key: string, b: Box, s: number, out: Target, M: Affine): void {
+    if (this.keyMap) key = this.keyMap(key);
     let lod = lodFor(s);
     // At most about 256 tiles: coarser past that (a copy that shrinks to a few pixels).
     while (lod < MAX_LOD && ((b.x1 - b.x0) / tileWorld(lod) + 1) * ((b.y1 - b.y0) / tileWorld(lod) + 1) > 256) lod++;

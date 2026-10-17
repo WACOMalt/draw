@@ -12,9 +12,9 @@
 // as missing coverage. Colors can differ a little (brush dabs scale instead of pixels).
 
 import { RegionRenderer, PIECE } from '../export/region';
-import { kaleidoscopeStep, transformLayerLengths } from '../../shared/effects';
-import { compose, transformStroke } from '../../shared/layers';
-import { LIMITS, type Affine, type Layer, type MixMode, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { kaleidoscopeCopies, kaleidoscopeCopies3, kaleidoscopeTilts, transformLayerLengths } from '../../shared/effects';
+import { transformStroke, transformStroke3 } from '../../shared/layers';
+import { LIMITS, type Affine, type Affine3, type Layer, type MixMode, type Paper, type Shape, type Stroke } from '../../shared/types';
 import { GLRenderer } from '../engine/gl/glRenderer';
 import { FULL_PROFILE, type PerfProfile } from '../engine/perf';
 
@@ -50,15 +50,34 @@ async function load(url: string): Promise<Doc> {
   return { layers: f.layers, strokes: f.strokes, shapes: f.shapes ?? [], paper: f.paper, mix: f.mix };
 }
 
-/** The kaleidoscope copies of a layer: their transforms, copy 1 first. */
-function steps(l: Layer): Affine[] {
+const ID3: Affine3 = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+/** A 2D transform as a 3D one (depth scaled as transformThreeD scales it). */
+const lift = (m: Affine): Affine3 => [m[0], m[1], 0, m[2], m[3], 0, 0, 0, Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])), m[4], m[5], 0];
+/** a after b. */
+function compose3(a: Affine3, b: Affine3): Affine3 {
+  const o = new Array<number>(12);
+  for (let c = 0; c < 3; c++) for (let r = 0; r < 3; r++) o[c * 3 + r] = a[r] * b[c * 3] + a[3 + r] * b[c * 3 + 1] + a[6 + r] * b[c * 3 + 2];
+  for (let r = 0; r < 3; r++) o[9 + r] = a[r] * b[9] + a[3 + r] * b[10] + a[6 + r] * b[11] + a[9 + r];
+  return o as Affine3;
+}
+
+/**
+ * The kaleidoscope copies of a layer as 3D transforms, copy 1 first: in 3D when its step tilts
+ * and the layer (or every paint layer of the group) is 3D, as the renderer draws them; else as
+ * the paper sees them (kaleidoscopeCopies).
+ */
+function steps(l: Layer, d?: Doc): Affine3[] {
   const e = l.effects?.find((x) => x.type === 'kaleidoscope' && x.enabled && (x.count ?? 0) >= 1);
   if (!e) return [];
-  const step = kaleidoscopeStep(e);
-  const list: Affine[] = [];
-  let m = ID;
-  for (let i = 0; i < Math.min(LIMITS.maxKaleidoscope, e.count ?? 0); i++) list.push((m = compose(step, m)));
-  return list;
+  const paint = d ? d.layers.filter((x) => (x.id === l.id || isIn(d, x, l.id)) && x.kind !== 'group' && x.kind !== 'adjust') : [];
+  if (kaleidoscopeTilts(e) && paint.length && paint.every((x) => x.threed)) return kaleidoscopeCopies3(e);
+  return kaleidoscopeCopies(e).map(lift);
+}
+
+/** Whether `x` is inside the group `g`, at any depth. */
+function isIn(d: Doc, x: Layer, g: string): boolean {
+  for (let p = x.parent; p; p = d.layers.find((l) => l.id === p)?.parent) if (p === g) return true;
+  return false;
 }
 
 /** The document with every kaleidoscope copy made of strokes (see the top). */
@@ -83,25 +102,27 @@ function expand(d: Doc): Doc {
   const range: [number, number] = [LIMITS.minBrushWorld, LIMITS.maxBrushWorld];
   const noKal = (l: Layer) => l.effects?.filter((e) => e.type !== 'kaleidoscope');
   // One instance of `l` (and what it holds) moved by M, as a child of `parent` at `order`.
-  const instance = (l: Layer, M: Affine, id: string, parent: string | undefined, order: number, plain: boolean) => {
+  // A 3D layer's strokes move in 3D; a flat layer's as the paper sees M (depth dropped).
+  const flat = (M: Affine3): Affine => [M[0], M[1], M[3], M[4], M[9], M[10]];
+  const instance = (l: Layer, M: Affine3, id: string, parent: string | undefined, order: number, plain: boolean) => {
     const fx = noKal(l);
     const base = { ...l, id, order, parent, effects: fx?.length ? fx : undefined } as Layer;
     if (!parent) delete base.parent;
-    const copy = transformLayerLengths(base, M);
+    const copy = transformLayerLengths(base, flat(M));
     if (plain) Object.assign(copy, { blend: l.kind === 'group' ? 'pass' : 'normal', opacity: 1, clip: false });
     layers.push(copy);
     for (const s of byLayer.get(l.id) ?? []) {
-      const t = transformStroke(s, M, LIMITS.maxCoord, range);
+      const t = l.threed ? transformStroke3(s, M, LIMITS.maxCoord, range) : transformStroke(s, flat(M), LIMITS.maxCoord, range);
       if (t) strokes.push({ ...s, ...t, id: `${s.id}${id.slice(l.id.length)}`, layerId: id });
     }
     children(l.id, id, M);
   };
   // The children of `from`, moved by M, under `to`.
-  const children = (from: string | undefined, to: string | undefined, M: Affine) => {
+  const children = (from: string | undefined, to: string | undefined, M: Affine3) => {
     let order = 0;
     for (const l of kids.get(from) ?? []) {
       const id = to === from ? l.id : `${l.id}${to!.slice(from!.length)}`;
-      const s = steps(l);
+      const s = steps(l, d);
       if (!s.length) {
         instance(l, M, id, to, ++order, false);
         continue;
@@ -110,13 +131,13 @@ function expand(d: Doc): Doc {
       const g = `${id}~K`;
       layers.push({ id: g, name: `${l.name} (kaleidoscope)`, kind: 'group', order: ++order, blend: l.blend === 'pass' ? 'normal' : l.blend, opacity: l.opacity, visible: l.visible, ...(to ? { parent: to } : {}) } as Layer);
       const e = l.effects!.find((x) => x.type === 'kaleidoscope')!;
-      const list = [{ k: 0, m: ID }, ...s.map((m, i) => ({ k: i + 1, m }))];
+      const list = [{ k: 0, m: ID3 }, ...s.map((m, i) => ({ k: i + 1, m }))];
       // Bottom first: behind puts copy 1 nearest the layer, the last copy at the bottom.
       if (e.order === 'behind') list.reverse();
-      list.forEach(({ k, m }, j) => instance(l, compose(M, m), `${id}~${k}`, g, j + 1, true));
+      list.forEach(({ k, m }, j) => instance(l, compose3(M, m), `${id}~${k}`, g, j + 1, true));
     }
   };
-  children(undefined, undefined, ID);
+  children(undefined, undefined, ID3);
   strokes.sort((a, b) => a.seq - b.seq);
   return { ...d, layers, strokes };
 }

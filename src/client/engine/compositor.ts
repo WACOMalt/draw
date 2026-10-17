@@ -3,7 +3,7 @@
 
 import { DabWalker, strokeSeed } from '../../shared/brush';
 import { DEFAULT_PAPER, EFFECT_TYPES, LIMITS, type Affine, type BlendMode, type Brush, type Layer, type LayerBlend, type LayerEffect, type MixMode, type Paper, type Shape, type Stroke } from '../../shared/types';
-import { kaleidoscopeStep, takesEffects } from '../../shared/effects';
+import { kaleidoscopeCopies, takesEffects } from '../../shared/effects';
 import { byZ } from '../../shared/shapes';
 import { ShapeIndex, shapeRec } from './shapeIndex';
 import { drawShapes } from './shapeRaster';
@@ -843,10 +843,8 @@ export class Canvas2DRenderer implements Renderer {
     const ds = this.view.zoom * this.dpr, v = this.view;
     const to: Affine = [ds, 0, 0, ds, -v.x * ds, -v.y * ds];
     const from: Affine = [1 / ds, 0, 0, 1 / ds, v.x, v.y];
-    const step = kaleidoscopeStep(e);
-    const steps: Affine[] = [];
-    let m: Affine = [1, 0, 0, 1, 0, 0];
-    for (let i = 0; i < Math.min(LIMITS.maxKaleidoscope, e.count ?? 0); i++) steps.push((m = compose(step, m)));
+    // (A 3D step seen straight on: kaleidoscopeCopies.)
+    const steps = kaleidoscopeCopies(e);
     const r = this.clearBuffer('kalOut');
     const copies = () => {
       for (const s of e.order === 'behind' ? [...steps].reverse() : steps) {

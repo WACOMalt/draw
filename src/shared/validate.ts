@@ -211,6 +211,10 @@ export function validateEffects(v: unknown): LayerEffect[] | null {
         dx: num(e.dx, -c, c, 'effect.dx'),
         dy: num(e.dy, -c, c, 'effect.dy'),
         order: oneOf(e.order, ['front', 'behind'] as const, 'effect.order'),
+        // A 3D step (feature 'kaleido3d'): a unit quaternion (made unit again), and depths.
+        ...(e.turn !== undefined ? { turn: unitQuat(e.turn) } : {}),
+        ...(e.cz !== undefined ? { cz: num(e.cz, -c, c, 'effect.cz') } : {}),
+        ...(e.dz !== undefined ? { dz: num(e.dz, -c, c, 'effect.dz') } : {}),
       };
     }
     fx.color = validateColor(e.color);
@@ -223,6 +227,15 @@ export function validateEffects(v: unknown): LayerEffect[] | null {
     return fx;
   });
   return out.length ? out : null;
+}
+
+/** A unit quaternion (x, y, z, w): four numbers whose length is 1 within 1e-3; made exactly unit. */
+function unitQuat(v: unknown): [number, number, number, number] {
+  if (!Array.isArray(v) || v.length !== 4) fail('bad effect.turn');
+  const q = v.map((x) => num(x, -1.001, 1.001, 'effect.turn')) as [number, number, number, number];
+  const len = Math.hypot(...q);
+  if (!(Math.abs(len - 1) < 1e-3)) fail('bad effect.turn');
+  return q.map((x) => x / len) as [number, number, number, number];
 }
 
 function layerMask(v: unknown): LayerMask | null {

@@ -4,6 +4,7 @@
   // sliders show them in screen pixels at the current zoom, as the brush size. Changes go out at
   // most every 60 ms, and the engine merges changes within 2 s into one undo step.
   import { EFFECT_TYPES, type EffectType, type Layer, type LayerEffect } from '../../shared/types';
+  import { kaleidoscopeCopies } from '../../shared/effects';
   import type { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
   import ShapeColor from './ShapeColor.svelte';
@@ -74,6 +75,25 @@
     send();
   }
 
+  /**
+   * A 3D kaleidoscope step made a flat one: the turn in the paper and the scale nearest to what the
+   * 2D view shows of the step (its view straight on, at the pivot), the same move of the pivot; the
+   * tilt goes. The copies then no longer squash where they tilted.
+   */
+  function flatten(e: LayerEffect) {
+    const [a, b, c, d, tx, ty] = kaleidoscopeCopies({ ...e, count: 1 })[0];
+    const cx = e.cx ?? 0, cy = e.cy ?? 0;
+    const angle = Math.round(((Math.atan2(b - c, a + d) * 180) / Math.PI) * 1000) / 1000;
+    const scale = Math.min(100, Math.max(0.01, Math.sqrt(Math.abs(a * d - b * c))));
+    const patch: Partial<LayerEffect> = { angle, scale, dx: a * cx + c * cy + tx - cx, dy: b * cx + d * cy + ty - cy };
+    const x = find('kaleidoscope');
+    if (!x) return;
+    delete x.turn;
+    delete x.cz;
+    delete x.dz;
+    set('kaleidoscope', patch);
+  }
+
   /** The world point in the middle of the view. */
   function viewCenter(): [number, number] {
     const r = engine?.viewRect().bounds;
@@ -128,11 +148,19 @@
             }}
           /></label
         >
+        {#if e.turn}
+          <!-- A 3D step (from a 3D layer, or one turned out of the paper): its turn is in 3D. -->
+          <div class="field note">
+            <span>3D step: the copies turn in 3D{layer.threed ? '' : ' (seen straight on, as this layer is flat)'}.</span>
+            <button class="small" title="Make it a flat step: the nearest turn in the paper and scale; the tilt goes" disabled={!ed.canEdit} onclick={() => flatten(e)}>Flatten the step</button>
+          </div>
+        {:else}
         <div class="field">
           <!-- Copies compound the step (copy n turns n times as far): fine steps near 0, a full turn either way at the ends. -->
           <Slider label="Angle" value={e.angle ?? 0} min={-360} max={360} step={0.01} least={0.1} log width={80} title="Degrees each copy turns past the one before (fine near 0°)" oninput={(v) => set(t, { angle: v })} />
           <button class="small" title="Even around a full turn: 360° ÷ (count + 1)" onclick={() => set(t, { angle: Math.round((360 / (n + 1)) * 1000) / 1000 })}>Even</button>
         </div>
+        {/if}
         <Slider label="Scale" value={e.scale ?? 1} min={0.05} max={4} center={1} least={0.0001} step={0.0001} percent log width={100} title="Each copy's size, from the one before (fine near 100%: the copies multiply it)" oninput={(v) => set(t, { scale: v })} />
         <Slider label="Move X" value={px(e.dx ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now: each copy moves this far from the one before (fine near 0)" oninput={(v) => set(t, { dx: world(v) })} />
         <Slider label="Move Y" value={px(e.dy ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now (fine near 0)" oninput={(v) => set(t, { dy: world(v) })} />

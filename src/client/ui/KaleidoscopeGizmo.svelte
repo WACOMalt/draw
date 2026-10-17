@@ -10,8 +10,7 @@
   // copy follows the pointer (turned as far, grown as much, moved about as far), and a small
   // change no longer throws the far copies across the canvas. Alt: 10× finer still.
   // Dots show where each copy takes the reference point and the pivot.
-  import { kaleidoscopeStep } from '../../shared/effects';
-  import { compose } from '../../shared/layers';
+  import { kaleidoscopeCopies, kaleidoscopeStep } from '../../shared/effects';
   import type { Affine, LayerEffect } from '../../shared/types';
   import type { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
@@ -37,12 +36,8 @@
     const arm = ARM / z;
     const step = kaleidoscopeStep(fx);
     const tip = apply(step, cx + arm, cy);
-    const dots: { ref: [number, number]; piv: [number, number] }[] = [];
-    let m: Affine = step;
-    for (let i = 0; i < Math.min(64, fx.count ?? 0); i++) {
-      dots.push({ ref: apply(m, cx + arm, cy), piv: apply(m, cx, cy) });
-      m = compose(step, m);
-    }
+    // Where the copies go, as the paper shows them (a 3D step seen straight on).
+    const dots = kaleidoscopeCopies(fx).map((m) => ({ ref: apply(m, cx + arm, cy), piv: apply(m, cx, cy) }));
     return { cx, cy, arm, tip, move: [cx + (fx.dx ?? 0), cy + (fx.dy ?? 0)] as [number, number], dots };
   });
 
@@ -143,7 +138,7 @@
       <!-- The reference arm, and the step: pivot + move, then the tip. -->
       <line class="arm" x1={sx(geo.cx)} y1={sy(geo.cy)} x2={sx(geo.cx) + ARM} y2={sy(geo.cy)} />
       <line class="link" x1={sx(geo.cx)} y1={sy(geo.cy)} x2={sx(geo.move[0])} y2={sy(geo.move[1])} />
-      <line class="step" x1={sx(geo.move[0])} y1={sy(geo.move[1])} x2={sx(geo.tip[0])} y2={sy(geo.tip[1])} />
+      {#if !fx?.turn}<line class="step" x1={sx(geo.move[0])} y1={sy(geo.move[1])} x2={sx(geo.tip[0])} y2={sy(geo.tip[1])} />{/if}
       <rect
         class="handle"
         x={sx(geo.move[0]) - 6}
@@ -153,9 +148,10 @@
         role="presentation"
         onpointerdown={(e) => down(e, 'move')}><title>Move each step (Alt: finer)</title></rect
       >
-      <circle class="handle tip" cx={sx(geo.tip[0])} cy={sy(geo.tip[1])} r="8" role="presentation" onpointerdown={(e) => down(e, 'tip')}
+      <!-- A 3D step turns in 3D: not from this flat tip (the effects window can flatten it). -->
+      {#if !fx?.turn}<circle class="handle tip" cx={sx(geo.tip[0])} cy={sy(geo.tip[1])} r="8" role="presentation" onpointerdown={(e) => down(e, 'tip')}
         ><title>Turn and scale each step (Alt: finer; Shift: 15° steps)</title></circle
-      >
+      >{/if}
       <circle class="handle pivot" cx={sx(geo.cx)} cy={sy(geo.cy)} r="9" role="presentation" onpointerdown={(e) => down(e, 'pivot')}><title>The pivot</title></circle>
       <circle class="pivdot" cx={sx(geo.cx)} cy={sy(geo.cy)} r="2.5" />
     </svg>

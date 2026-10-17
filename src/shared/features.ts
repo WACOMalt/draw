@@ -40,6 +40,7 @@ export function docFeatures(layers: Iterable<Layer>, strokes: Iterable<Stroke>, 
     if (l.kind === 'shape') f.add('shapes');
     if (l.effects?.length) f.add('effects');
     if (l.adjust?.type === 'blur') f.add('blur');
+    if (l.effects?.some((e) => e.type === 'kaleidoscope' && (e.turn || e.cz || e.dz))) f.add('kaleido3d');
     if (l.threed) f.add('threed');
   }
   for (const s of strokes) {

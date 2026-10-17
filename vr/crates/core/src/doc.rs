@@ -484,6 +484,11 @@ impl Doc {
                         s.brush = brush;
                         s.threed = vr;
                     }
+                    // Effects move with the layers (a kaleidoscope's step in 3D too): a reload
+                    // has them right.
+                    if ids.iter().any(|lid| self.layers.get(lid).is_some_and(|l| l.extra.contains_key("effects"))) {
+                        return Err(OpError::Reload);
+                    }
                     return Ok(());
                 }
                 let m: [f64; 6] = serde_json::from_value(field("m").cloned().unwrap_or(Value::Null)).map_err(|_| OpError::Refused("bad transform".into()))?;
