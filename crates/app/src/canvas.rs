@@ -580,7 +580,14 @@ impl Canvas {
         // Canvas to scene: s = offset + diag(k, -k, k) (c - (ax, ay, 0)).
         let (k, ax, ay, o) = (self.frame.k, self.frame.anchor[0], self.frame.anchor[1], self.frame.offset.as_dvec3());
         let p = glam::DMat4::from_translation(o + glam::DVec3::new(-ax * k, ay * k, 0.0)) * glam::DMat4::from_scale(glam::DVec3::new(k, -k, k));
-        let c = p.inverse() * m.as_dmat4() * p;
+        // In f64, its turn made exactly a turn and its scale one scale (the server checks them
+        // to a millionth; an f32 matrix may be off by more).
+        let g = m.as_dmat4();
+        let lin = glam::DMat3::from_mat4(g);
+        let scale = lin.determinant().abs().cbrt();
+        let turn = glam::DQuat::from_mat3(&(lin * (1.0 / scale.max(1e-300)))).normalize();
+        let g = glam::DMat4::from_scale_rotation_translation(glam::DVec3::splat(scale), turn, g.w_axis.truncate());
+        let c = p.inverse() * g * p;
         let cols = |c: glam::DMat4| {
             let mut out = [0.0; 12];
             for (j, col) in [c.x_axis, c.y_axis, c.z_axis, c.w_axis].iter().enumerate() {
@@ -895,6 +902,9 @@ impl Canvas {
             }
             if m.clip != b.clip {
                 set("clip", m.clip.into(), dl.clip.unwrap_or(false).into());
+            }
+            if m.vr != b.vr && !m.group {
+                set("vr", m.vr.into(), dl.vr.into());
             }
             if m.parent != b.parent {
                 let par = m.parent.and_then(|x| doc_of(x, &new_ids)).map_or(Value::Null, Value::from);
@@ -1385,6 +1395,25 @@ mod tests {
         let shown = painter.painting.layers.iter().find(|l| !l.ordered && !l.group).unwrap();
         assert_eq!(shown.strokes.len(), 1);
         assert!((shown.strokes[0].samples[0].pos.z - 0.1).abs() < 1e-3);
+        // The Move layer tool turns the VR layer a quarter turn about the vertical: the stroke
+        // along x at 10 cm in front of the paper ends up across it (depth 0 down to -10 cm).
+        painter.tools.tool = crate::tools::Tool::Transform;
+        painter.grab(1, Mat4::IDENTITY, true, 0.0, 0.01);
+        painter.grab(1, Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2), true, 0.0, 0.01);
+        painter.grab(1, Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2), false, 0.0, 0.01);
+        let ends = |o: &Session| o.doc.strokes.values().find_map(|s| s.vr.as_ref().filter(|_| !s.deleted).map(|v| (v.z[0], *v.z.last().unwrap())));
+        wait(&mut c, &mut painter, &mut other, "the turn", &|o| ends(o).is_some_and(|(a, b)| a.abs() < 1e-3 / k && (b + 0.1 / k).abs() < 1e-3 / k));
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the turn undone", &|o| ends(o).is_some_and(|(a, b)| (a - 0.1 / k).abs() < 1e-3 / k && (b - 0.1 / k).abs() < 1e-3 / k));
+        // The flat layer made a VR layer, and back by undo.
+        let flat = painter.painting.layers.iter().position(|l| l.ordered).unwrap();
+        painter.edit_layers(|p| {
+            p.layers[flat].ordered = false;
+            (Some(flat), crate::painter::Removed::default())
+        });
+        wait(&mut c, &mut painter, &mut other, "a VR layer more", &|o| o.doc.layers.values().filter(|l| l.vr && !l.deleted).count() == 2);
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "flat again", &|o| o.doc.layers.values().filter(|l| l.vr && !l.deleted).count() == 1);
         c.session.close();
         other.close();
     }
