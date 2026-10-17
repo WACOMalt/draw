@@ -506,9 +506,11 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                 Press::Panel | Press::Paint if pull <= TRIGGER_DEAD => Press::Off,
                 p => p,
             };
-            let pull = if press[h] == Press::Paint { pull } else { 0.0 };
+            // The pull paints only a press that began off the panel (the panel's clicks read it
+            // below).
+            let paint_pull = if press[h] == Press::Paint { pull } else { 0.0 };
             match tool_at(&rig, aim) {
-                Some((at, up)) => painter.hand(h, t, at, up, pull),
+                Some((at, up)) => painter.hand(h, t, at, up, paint_pull),
                 // The laser is off the paper: the stroke ends.
                 None => painter.hand(h, t, Vec3::ZERO, Vec3::Y, 0.0),
             }

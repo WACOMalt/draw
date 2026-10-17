@@ -53,6 +53,18 @@ impl Typing {
     }
 }
 
+/// The text on the computer's clipboard (Wayland or X11), its first line, if any: what is
+/// copied on the PC can be pasted in VR.
+pub fn clipboard() -> Option<String> {
+    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+        Ok(t) => t.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string),
+        Err(e) => {
+            log::warn!("the clipboard: {e}");
+            None
+        }
+    }
+}
+
 /// What the keyboard did this frame.
 pub enum Done {
     Commit(Target, String),
@@ -109,13 +121,19 @@ pub fn keyboard(ui: &mut egui::Ui, typing: &mut Typing) -> Option<Done> {
             if key(ui, "Shift", key_w * 1.6, typing.shift) {
                 typing.shift = !typing.shift;
             }
-            if key(ui, "Space", key_w * 3.2, false) && typing.text.chars().count() < typing.max {
+            if key(ui, "Space", key_w * 2.0, false) && typing.text.chars().count() < typing.max {
                 typing.text.push(' ');
+            }
+            if key(ui, "Paste", key_w * 1.5, false) {
+                if let Some(t) = clipboard() {
+                    let room = typing.max.saturating_sub(typing.text.chars().count());
+                    typing.text.extend(t.chars().take(room));
+                }
             }
             if key(ui, "Del", key_w * 1.4, false) {
                 typing.text.pop();
             }
-            if key(ui, "Cancel", key_w * 1.8, false) {
+            if key(ui, "Cancel", key_w * 1.5, false) {
                 done = Some(Done::Cancel);
             }
             let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
@@ -127,4 +145,14 @@ pub fn keyboard(ui: &mut egui::Ui, typing: &mut Typing) -> Option<Done> {
         });
     });
     done
+}
+
+#[cfg(test)]
+mod tests {
+    /// Reads the desktop's clipboard (run by hand: it needs a desktop session).
+    #[test]
+    #[ignore]
+    fn reads_the_clipboard() {
+        println!("clipboard: {:?}", super::clipboard());
+    }
 }

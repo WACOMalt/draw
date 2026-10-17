@@ -680,6 +680,30 @@ fn length(d: f32) -> String {
 mod tests {
     use super::*;
 
+    /// The start screen's join box, clicked as a VR pointer clicks (pointing, the trigger
+    /// pulled and let go, the hand moving a little meanwhile), opens the keyboard.
+    #[test]
+    fn the_join_box_opens_the_keyboard() {
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        let mut palettes = Palettes::default();
+        let mut presets = Presets::default();
+        let mut lobby = crate::lobby::Lobby::new(vdraw_net::identity::Identity::default());
+        let mut panel = Panel::new(&painter.tools.brush);
+        let mut frame = |panel: &mut Panel, at: Pos2, pressed: bool| {
+            panel.run(Pointer { at: Some(at), pressed, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets, lobby: &mut lobby, canvas: None });
+        };
+        let at = pos2(200.0, 354.0);
+        for _ in 0..3 {
+            frame(&mut panel, at, false);
+        }
+        for k in 0..6 {
+            frame(&mut panel, at + vec2(k as f32, k as f32 * 0.5), true);
+        }
+        frame(&mut panel, at + vec2(6.0, 3.0), false);
+        frame(&mut panel, at + vec2(6.0, 3.0), false);
+        assert!(panel.typing.as_ref().is_some_and(|t| t.target == Target::Join), "{:?}", panel.typing.as_ref().map(|t| &t.target));
+    }
+
     #[test]
     fn log_slider_round_trips_with_three_digits() {
         let r = DIAMETER;

@@ -198,8 +198,14 @@ pub fn home(ui: &mut egui::Ui, lobby: &mut Lobby, state: &mut HomeState, opening
 
         or(ui, "or join one");
         ui.horizontal(|ui| {
-            if text_box(ui, &state.join, "Code, name or link", width - 100.0) {
+            if text_box(ui, &state.join, "Code, name or link", width - 180.0) {
                 *typing = Some(Typing::new(Target::Join, &state.join));
+            }
+            // What is copied on the PC (a code, or a link from the 2D app).
+            if plain(ui, "Paste", 72.0, true) {
+                if let Some(t) = super::keyboard::clipboard() {
+                    state.join = t.chars().take(300).collect();
+                }
             }
             if primary(ui, "Join", 76.0, !busy && !state.join.trim().is_empty()) {
                 lobby.join(state.join.trim().to_string());
