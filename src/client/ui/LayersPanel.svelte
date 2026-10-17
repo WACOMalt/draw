@@ -47,6 +47,8 @@
     return out;
   });
   const active = $derived(ed.layers.find((l) => l.id === ed.activeLayerId) ?? null);
+  /** The canvas has 3D layers (from vdraw): the header offers to hide them on this device. */
+  const hasThreeD = $derived(ed.layers.some((l) => l.threed));
 
   let editing = $state<string | null>(null);
   let adjustMenu = $state(false);
@@ -285,7 +287,21 @@
 </script>
 
 <section>
-  <h2>Layers</h2>
+  <div class="head">
+    <h2>Layers</h2>
+    {#if hasThreeD}
+      <!-- This device only: no op, the 3D layers stay visible for everyone else. -->
+      <button
+        class="small threedtoggle"
+        class:on={ed.show3dLayers}
+        aria-pressed={ed.show3dLayers}
+        title={ed.show3dLayers ? 'Hide the 3D layers on this device (others still see them)' : 'Show the 3D layers (hidden on this device only)'}
+        onclick={() => engine?.setShow3dLayers(!ed.show3dLayers)}
+      >
+        <Icon name={ed.show3dLayers ? 'eye' : 'eyeoff'} /> 3D
+      </button>
+    {/if}
+  </div>
   <div class="controls">
     <select
       disabled={!active || active.kind === 'adjust'}
@@ -364,7 +380,7 @@
             }}
           />
         {:else}
-          <span class="name" class:hidden={!layer.visible} class:target={isActive && !ed.maskTarget}>
+          <span class="name" class:hidden={!layer.visible || (layer.threed && !ed.show3dLayers)} class:target={isActive && !ed.maskTarget}>
             {#if layer.kind === 'adjust'}<span class="kind" title="Adjustment layer"><Icon name="adjust" /></span>{/if}
             {#if layer.kind === 'shape'}<span class="kind" title="Shape layer: holds shapes"><Icon name="shapes" /></span>{/if}
             {#if row.group}<span class="kind" title="Group"><Icon name="folder" /></span>{/if}
@@ -392,6 +408,7 @@
           {#each peersOn(layer.id) as p (p.id)}
             <span class="pdot" style:background={p.color} title="{p.name} is on this layer"></span>
           {/each}
+          {#if layer.threed}<span class="tag threed" title="A 3D layer: its strokes have depth (painted in VR in vdraw, or moved in 3D)">3D</span>{/if}
           {#if layer.blend !== 'normal' && layer.blend !== 'pass'}<span class="tag">{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
           {#if layer.opacity < 1}<span class="tag">{Math.round(layer.opacity * 100)}%</span>{/if}
           {#if layer.effects?.length}
@@ -658,6 +675,24 @@
     display: flex;
     flex-direction: column;
   }
+  .head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-right: 8px;
+  }
+  .threedtoggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .threedtoggle :global(svg.i) {
+    width: 12px;
+    height: 12px;
+  }
   h2 {
     margin: 0;
     padding: 8px 10px;
@@ -741,6 +776,10 @@
   }
   .tag.fx {
     color: var(--accent);
+  }
+  .tag.threed {
+    font-weight: 600;
+    letter-spacing: 0.3px;
   }
   li {
     padding-left: calc(2px + var(--depth, 0) * 14px);

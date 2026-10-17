@@ -1,11 +1,11 @@
 // Client document: the confirmed state from the server, plus this client's ops that the
 // server has not echoed yet. The UI shows confirmed state with pending layer ops on top.
 
-import { duplicateOf, paintOrder, subtreeIds, transformStroke } from '../../shared/layers';
+import { duplicateOf, flatAffine, paintOrder, subtreeIds, transformStroke, transformStroke3 } from '../../shared/layers';
 import { transformLayerLengths } from '../../shared/effects';
 import { shapeBounds, stripForKind, transformShapeMatrix } from '../../shared/shapes';
 import { planFromPaint, planToPaint, vectorShape } from '../../shared/flatten';
-import { DEFAULT_PAPER, LIMITS, type AppliedOp, type Layer, type MixMode, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
+import { DEFAULT_PAPER, LIMITS, type Affine3, type AppliedOp, type Layer, type MixMode, type Op, type Paper, type Shape, type Stroke } from '../../shared/types';
 
 export interface PendingOp {
   opId: string;
@@ -23,6 +23,7 @@ function applyLayerOp(layers: Map<string, Layer>, op: Op | AppliedOp): boolean {
         const next = { ...l, ...op.props } as Layer;
         if (next.parent === null) delete next.parent;
         if (!next.effects?.length) delete next.effects;
+        if (!next.threed) delete next.threed;
         layers.set(op.id, next);
       }
       return true;
@@ -137,6 +138,7 @@ export class Doc {
     this.seq = seq;
     switch (op.type) {
       case 'layer.transform': {
+        if ('m3' in op) return this.transform3(op.id, op.m3);
         const ids = subtreeIds(this.layers.values(), op.id);
         const changed: Stroke[] = [];
         const shapes: Shape[] = [];
@@ -252,6 +254,25 @@ export class Doc {
         applyLayerOp(this.layers, op);
     }
     return null;
+  }
+
+  /** A 3D transform of a 3D layer (shared/docState.ts transform3, which the server checked). */
+  private transform3(id: string, m3: Affine3): StrokeChanges {
+    const changed: Stroke[] = [];
+    for (const st of this.strokes.values()) {
+      if (st.layerId !== id) continue;
+      // The server checked the range; a failure here means the documents differ: skip.
+      const t = transformStroke3(st, m3, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
+      if (!t) continue;
+      const next = { ...st, ...t };
+      this.strokes.set(st.id, next);
+      this.bounds.set(st.id, strokeBounds(next));
+      changed.push(next);
+    }
+    const l = this.layers.get(id);
+    if (l) this.layers.set(id, transformLayerLengths(l, flatAffine(m3)));
+    this.version++;
+    return { changed, added: [], shapes: [], shapesGone: [] };
   }
 
   /**

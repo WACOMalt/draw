@@ -10,7 +10,7 @@
 //   before the group itself. The panel shows the reverse: the group's row, then its layers.
 
 import { derivedId } from './ids';
-import type { Affine, Brush, Layer, Shape, Stroke } from './types';
+import type { Affine, Affine3, Brush, Layer, Shape, Stroke, StrokeThreeD } from './types';
 
 export interface LayerNode {
   layer: Layer;
@@ -146,10 +146,11 @@ export const applyPoint = (m: Affine, x: number, y: number): [number, number] =>
 /**
  * A stroke after a transform: points mapped, the brush size scaled by √|det| (the average scale),
  * and a fixed tip angle turned with the rotation. A non-uniform scale or a skew keeps the tip
- * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). Null: a point would go
- * past `maxCoord` or the size out of range.
+ * shape (as Photoshop's vector strokes would not, but dabs cannot stretch). The depth of a 3D
+ * stroke follows (transformThreeD). Null: a point or a depth would go past `maxCoord` or the size out
+ * of range.
  */
-export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector'> | null {
+export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'vector' | 'threed'> | null {
   const pts = s.pts.slice();
   for (let i = 0; i < pts.length; i += 3) {
     const x = pts[i], y = pts[i + 1];
@@ -159,24 +160,71 @@ export function transformStroke(s: Stroke, m: Affine, maxCoord: number, sizeRang
     pts[i] = nx;
     pts[i + 1] = ny;
   }
-  const scale = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
-  const size = s.brush.size * scale;
-  if (!(size >= sizeRange[0] && size <= sizeRange[1])) return null;
-  const brush: Brush = { ...s.brush, size };
-  if (brush.angle !== undefined || (brush.tip && brush.tip !== 'round') || (brush.roundness ?? 1) < 1) {
-    // Turn the tip with the transform's rotation (not needed with followDirection: dabs follow the path).
-    if (!brush.followDirection) {
-      const deg = (Math.atan2(m[1], m[0]) * 180) / Math.PI;
-      brush.angle = ((((brush.angle ?? 0) + deg) % 360) + 360) % 360;
-    }
-  }
+  const brush = scaledBrush(s.brush, Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])), Math.atan2(m[1], m[0]), sizeRange);
+  if (!brush) return null;
   if (s.vector) {
     // A vector stroke: its shape's matrix follows (its frame corners, in pts, are checked above).
     const vm = compose(m, s.vector.m);
     if (!validAffine(vm)) return null;
     return { pts, brush, vector: { ...s.vector, m: vm } };
   }
+  if (s.threed) {
+    const threed = transformThreeD(s.threed, m, maxCoord);
+    if (!threed) return null;
+    return { pts, brush, threed };
+  }
   return { pts, brush };
+}
+
+/**
+ * The brush after a transform that scales by `scale` and turns by `turn` radians: the size
+ * scales, and a fixed tip angle turns (not needed with followDirection: dabs follow the path).
+ * Null: the size would go out of `sizeRange`.
+ */
+function scaledBrush(b: Brush, scale: number, turn: number, sizeRange: [number, number]): Brush | null {
+  const size = b.size * scale;
+  if (!(size >= sizeRange[0] && size <= sizeRange[1])) return null;
+  const brush: Brush = { ...b, size };
+  if ((brush.angle !== undefined || (brush.tip && brush.tip !== 'round') || (brush.roundness ?? 1) < 1) && !brush.followDirection) {
+    const deg = (turn * 180) / Math.PI;
+    brush.angle = ((((brush.angle ?? 0) + deg) % 360) + 360) % 360;
+  }
+  return brush;
+}
+
+/**
+ * The depth of a 3D stroke after a transform of the paper: the 2D affine `m` as a 3D map that
+ * scales depth by √|det| (the average scale, as brush sizes). Depths scale; the up directions
+ * turn with the map (turnUps). Null: a depth would go past `maxCoord`.
+ */
+export function transformThreeD(threed: StrokeThreeD, m: Affine, maxCoord: number): StrokeThreeD | null {
+  const [a, b, c, d] = m;
+  const k = Math.sqrt(Math.abs(a * d - b * c));
+  const z = threed.z.map((v) => v * k);
+  if (!z.every((v) => Math.abs(v) <= maxCoord)) return null;
+  return threed.up ? { z, up: turnUps(threed.up, [a, b, 0, c, d, 0, 0, 0, k]) } : { z };
+}
+
+/**
+ * Up directions (three numbers each) through the linear map `l` (3×3, column-major, as the
+ * first nine numbers of an Affine3), made unit again and rounded to 3 decimals, as clients send
+ * them. One that would vanish stays as it was.
+ */
+function turnUps(up: number[], l: number[]): number[] {
+  const out = up.slice();
+  const round = (v: number) => Math.round(v * 1000) / 1000;
+  for (let i = 0; i < out.length; i += 3) {
+    const ux = out[i], uy = out[i + 1], uz = out[i + 2];
+    const nx = l[0] * ux + l[3] * uy + l[6] * uz;
+    const ny = l[1] * ux + l[4] * uy + l[7] * uz;
+    const nz = l[2] * ux + l[5] * uy + l[8] * uz;
+    const len = Math.hypot(nx, ny, nz);
+    if (!(len > 1e-9 && Number.isFinite(len))) continue;
+    out[i] = round(nx / len);
+    out[i + 1] = round(ny / len);
+    out[i + 2] = round(nz / len);
+  }
+  return out;
 }
 
 /** Checks a transform: finite, invertible, and not absurdly large or small. */
@@ -184,6 +232,72 @@ export function validAffine(m: unknown): m is Affine {
   if (!Array.isArray(m) || m.length !== 6 || !m.every((v) => typeof v === 'number' && Number.isFinite(v))) return false;
   const det = Math.abs(m[0] * m[3] - m[1] * m[2]);
   return det > 1e-24 && det < 1e24;
+}
+
+// --- 3D transforms (3D layers) ---------------------------------------------------------------
+
+/** The uniform scale of a 3D transform's linear part: ∛|det|. */
+export function scale3(m: Affine3): number {
+  const det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[3] * (m[1] * m[8] - m[2] * m[7]) + m[6] * (m[1] * m[5] - m[2] * m[4]);
+  return Math.cbrt(Math.abs(det));
+}
+
+/**
+ * Checks a 3D transform: 12 finite numbers, and a linear part that is a turn times one uniform
+ * scale (columns of equal length and at right angles, within a relative 1e-6, no mirror), with
+ * the scale in the range a 2D transform allows (validAffine: 1e-12 to 1e12).
+ */
+export function validAffine3(m: unknown): m is Affine3 {
+  if (!Array.isArray(m) || m.length !== 12 || !m.every((v) => typeof v === 'number' && Number.isFinite(v))) return false;
+  const det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[3] * (m[1] * m[8] - m[2] * m[7]) + m[6] * (m[1] * m[5] - m[2] * m[4]);
+  if (!(det > 1e-36 && det < 1e36)) return false;
+  const s2 = Math.cbrt(det) ** 2;
+  const dot = (i: number, j: number) => m[i] * m[j] + m[i + 1] * m[j + 1] + m[i + 2] * m[j + 2];
+  const tol = 1e-6 * s2;
+  return (
+    Math.abs(dot(0, 0) - s2) <= tol &&
+    Math.abs(dot(3, 3) - s2) <= tol &&
+    Math.abs(dot(6, 6) - s2) <= tol &&
+    Math.abs(dot(0, 3)) <= tol &&
+    Math.abs(dot(0, 6)) <= tol &&
+    Math.abs(dot(3, 6)) <= tol
+  );
+}
+
+/**
+ * A stroke of a 3D layer after a 3D transform: each point (x, y, depth) moves in 3D (a stroke
+ * without depth is at depth 0, and gets its depth), the up directions turn, the brush size
+ * scales by ∛|det|, and a fixed tip angle turns with the turn of the x axis in the paper (as a
+ * 2D transform does). Null: a vector stroke (it cannot move in 3D), or a point, a depth or the
+ * size would go out of range.
+ */
+export function transformStroke3(s: Stroke, m: Affine3, maxCoord: number, sizeRange: [number, number]): Pick<Stroke, 'pts' | 'brush' | 'threed'> | null {
+  if (s.vector) return null;
+  const pts = s.pts.slice();
+  const z = new Array<number>(pts.length / 3);
+  for (let i = 0, j = 0; i < pts.length; i += 3, j++) {
+    const x = pts[i], y = pts[i + 1], d = s.threed?.z[j] ?? 0;
+    const nx = m[0] * x + m[3] * y + m[6] * d + m[9];
+    const ny = m[1] * x + m[4] * y + m[7] * d + m[10];
+    const nz = m[2] * x + m[5] * y + m[8] * d + m[11];
+    if (!(Math.abs(nx) <= maxCoord && Math.abs(ny) <= maxCoord && Math.abs(nz) <= maxCoord)) return null;
+    pts[i] = nx;
+    pts[i + 1] = ny;
+    z[j] = nz;
+  }
+  const brush = scaledBrush(s.brush, scale3(m), Math.atan2(m[1], m[0]), sizeRange);
+  if (!brush) return null;
+  return { pts, brush, threed: s.threed?.up ? { z, up: turnUps(s.threed.up, m) } : { z } };
+}
+
+/**
+ * The paper's view of a 3D transform, for what lives in the 2D plane (effect lengths and
+ * offsets): its scale, the turn of the x axis in the paper, and the move of the origin.
+ */
+export function flatAffine(m: Affine3): Affine {
+  const k = scale3(m), t = Math.atan2(m[1], m[0]);
+  const c = Math.cos(t) * k, s = Math.sin(t) * k;
+  return [c, s, -s, c, m[9], m[10]];
 }
 
 // --- duplicates ------------------------------------------------------------------------------

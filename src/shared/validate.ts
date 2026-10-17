@@ -20,6 +20,7 @@ import {
   type CompoundPart,
   type Adjust,
   type Affine,
+  type Affine3,
   type BlendMode,
   type Brush,
   type BrushSettings,
@@ -33,11 +34,14 @@ import {
   type ShapeInput,
   type ShapeProps,
   type ShapeUpdate,
+  type Avatar,
+  type Pose,
   type StrokeVector,
+  type StrokeThreeD,
   POINT_STRIDE,
   POINT_TYPES,
 } from './types';
-import { validAffine } from './layers';
+import { validAffine, validAffine3 } from './layers';
 import { takesEffects } from './effects';
 import { cornersWithin, stripForKind } from './shapes';
 
@@ -240,6 +244,20 @@ export function validatePoints(v: unknown, minPoints = 1): number[] {
   return out;
 }
 
+/**
+ * The depth of a 3D stroke's points `pts` (validated): `z`, one depth per point within
+ * ±LIMITS.maxCoord, and optionally `up`, a direction per point (three numbers, each -1 to 1).
+ */
+export function validateStrokeThreeD(v: unknown, pts: number[]): StrokeThreeD {
+  const o = obj(v, 'threed');
+  const n = pts.length / 3;
+  if (!Array.isArray(o.z) || o.z.length !== n) fail('bad threed.z length');
+  const z = o.z.map((x) => num(x, -LIMITS.maxCoord, LIMITS.maxCoord, 'threed.z'));
+  if (o.up === undefined) return { z };
+  if (!Array.isArray(o.up) || o.up.length !== pts.length) fail('bad threed.up length');
+  return { z, up: o.up.map((x) => num(x, -1, 1, 'threed.up')) };
+}
+
 function blend(v: unknown): LayerBlend {
   if (v === 'pass') return 'pass'; // groups only (checked where the layer kind is known)
   if (typeof v !== 'string' || !(BLEND_MODES as readonly string[]).includes(v)) fail('bad blend');
@@ -260,6 +278,8 @@ function layerProps(v: unknown, partial: boolean): Partial<LayerProps> {
   if (p.mask !== undefined) out.mask = layerMask(p.mask);
   if (p.parent !== undefined) out.parent = p.parent === null ? null : id(p.parent, 'parent');
   if (p.effects !== undefined) out.effects = validateEffects(p.effects);
+  // A 3D layer (paint layers only: checked where the kind is known).
+  if (p.threed !== undefined) out.threed = bool(p.threed, 'threed');
   if (partial && Object.keys(out).length === 0) fail('empty props');
   return out;
 }
@@ -269,16 +289,21 @@ export function validateOp(v: unknown): Op {
   switch (o.type) {
     case 'stroke.add': {
       const s = obj(o.stroke, 'stroke');
+      const pts = validatePoints(s.pts);
+      // A vector stroke draws its shape, flat: no depth. (A mask stroke may have one: a 3D
+      // transform of a 3D layer moves its mask too.)
+      if (s.threed !== undefined && s.vector !== undefined) fail('vector strokes take no threed');
       return {
         type: 'stroke.add',
         stroke: {
           id: id(s.id),
           layerId: id(s.layerId, 'layerId'),
           brush: validateBrush(s.brush),
-          pts: validatePoints(s.pts),
+          pts,
           ...(s.mask !== undefined ? { mask: id(s.mask, 'mask') } : {}),
           // A vector stroke (from a .bdraw file; live clients make them with shapes.toPaint).
           ...(s.vector !== undefined && s.mask === undefined ? { vector: validateVector(s.vector) } : {}),
+          ...(s.threed !== undefined ? { threed: validateStrokeThreeD(s.threed, pts) } : {}),
         },
       };
     }
@@ -304,11 +329,19 @@ export function validateOp(v: unknown): Op {
         if (props.effects && !takesEffects(kind)) fail('adjustment layers take no effects');
         if (!props.effects) delete props.effects;
       }
+      if (props.threed && kind !== undefined && kind !== 'paint') fail('3D layers are paint layers');
+      if (props.threed === false) delete props.threed;
       return { type: 'layer.add', layer: { id: id(l.id), ...(kind ? { kind } : {}), ...props } };
     }
     case 'layer.update':
       return { type: 'layer.update', id: id(o.id), props: layerProps(o.props, true) };
     case 'layer.transform':
+      // A 2D transform `m`, or a 3D one `m3` (3D layers): exactly one.
+      if ((o.m === undefined) === (o.m3 === undefined)) fail('bad transform');
+      if (o.m3 !== undefined) {
+        if (!validAffine3(o.m3)) fail('bad transform');
+        return { type: 'layer.transform', id: id(o.id), m3: [...o.m3] as Affine3 };
+      }
       if (!validAffine(o.m)) fail('bad transform');
       return { type: 'layer.transform', id: id(o.id), m: [...(o.m as Affine)] as Affine };
     case 'shape.add':
@@ -532,6 +565,40 @@ export function validateShapeInput(v: unknown): ShapeInput {
 export function validateVector(v: unknown): StrokeVector {
   const { id: _i, layerId: _l, name: _n, z: _z, ...rest } = validateShapeInput({ ...obj(v, 'vector'), id: 'vector0000', layerId: 'vector0000', name: '', z: 0 });
   return rest;
+}
+
+// --- presence --------------------------------------------------------------------------------
+
+/** A position in range. */
+function point3(v: unknown, what: string): [number, number, number] {
+  if (!Array.isArray(v) || v.length !== 3) fail(`bad ${what}`);
+  return [coord(v[0], what), coord(v[1], what), coord(v[2], what)];
+}
+
+/** A direction, made unit; a zero (or absurd) one is refused. */
+function unit3(v: unknown, what: string): [number, number, number] {
+  if (!Array.isArray(v) || v.length !== 3) fail(`bad ${what}`);
+  const [x, y, z] = v.map((c) => num(c, -1e6, 1e6, what));
+  const len = Math.hypot(x, y, z);
+  if (!(len > 1e-9)) fail(`bad ${what}`);
+  return [x / len, y / len, z / len];
+}
+
+function pose(v: unknown, what: string): Pose {
+  const o = obj(v, what);
+  return { p: point3(o.p, `${what}.p`), f: unit3(o.f, `${what}.f`), u: unit3(o.u, `${what}.u`) };
+}
+
+/** A VR user's head and hands (an avatar message without `t`): positions in range, unit directions. */
+export function validateAvatar(v: unknown): Avatar {
+  const o = obj(v, 'avatar');
+  if (!Array.isArray(o.hands) || o.hands.length !== 2) fail('bad hands');
+  const hand = (h: unknown, what: string) => (h === null ? null : pose(h, what));
+  return {
+    m: num(o.m, LIMITS.minBrushWorld, LIMITS.maxBrushWorld, 'm'),
+    head: pose(o.head, 'head'),
+    hands: [hand(o.hands[0], 'left hand'), hand(o.hands[1], 'right hand')],
+  };
 }
 
 export { id as validateId, num as validateNumber, str as validateString };

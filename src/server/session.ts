@@ -1,7 +1,7 @@
 import type { WebSocket } from 'ws';
 import { newId } from '../shared/ids';
 import { DOC_FEATURES, LIMITS, PREVIEW_LIMITS, type AppliedOp, type ClientMsg, type Op, type Peer, type ServerMsg } from '../shared/types';
-import { ValidationError, validateBrush, validateColor, validateId, validateNumber, validateOp, validatePoints, validateShapeInput, validateString } from '../shared/validate';
+import { ValidationError, validateBrush, validateColor, validateId, validateNumber, validateOp, validatePoints, validateShapeInput, validateString, validateStrokeThreeD, validateAvatar } from '../shared/validate';
 import { docFeatures } from '../shared/features';
 import { DocState, OpError, importOps } from '../shared/docState';
 import { atLeast, canClaim, isTemporary, recheckAccess, resolveAccess, TEMP_TTL_MS, type AccessInput } from './access';
@@ -39,6 +39,7 @@ export interface Client {
   ops: Bucket;
   live: Bucket;
   cursor: Bucket;
+  avatar: Bucket;
 }
 
 export function newClient(ws: WebSocket, user: UserRow | undefined): Client {
@@ -54,6 +55,7 @@ export function newClient(ws: WebSocket, user: UserRow | undefined): Client {
     ops: new Bucket(200, 60),
     live: new Bucket(120, 60),
     cursor: new Bucket(40, 30),
+    avatar: new Bucket(40, 30),
   };
 }
 
@@ -158,6 +160,7 @@ export class Session {
       case 'live': {
         if (!atLeast(client.role, 'editor') || !client.live.take()) return;
         try {
+          const pts = validatePoints(msg.pts, 0);
           this.broadcast(
             {
               t: 'live',
@@ -166,7 +169,9 @@ export class Session {
               layerId: validateId(msg.layerId, 'layerId'),
               ...(msg.mask !== undefined ? { mask: validateId(msg.mask, 'mask') } : {}),
               brush: validateBrush(msg.brush),
-              pts: validatePoints(msg.pts, 0),
+              pts,
+              // The depth of these points (a 3D stroke).
+              ...(msg.threed !== undefined ? { threed: validateStrokeThreeD(msg.threed, pts) } : {}),
               start: msg.start === true,
             },
             client,
@@ -209,6 +214,17 @@ export class Session {
           );
         } catch {
           // ignore
+        }
+        return;
+      }
+      case 'avatar': {
+        // A VR user's head and hands (anyone shown may send their own, viewers too).
+        if (client.embed || !client.avatar.take()) return;
+        try {
+          if ('off' in msg && msg.off === true) this.broadcast({ t: 'avatar', by: client.id, off: true }, client);
+          else this.broadcast({ t: 'avatar', by: client.id, ...validateAvatar(msg) }, client);
+        } catch {
+          // Drop malformed presence. It is not persisted.
         }
         return;
       }

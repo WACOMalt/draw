@@ -1,7 +1,7 @@
 // Reactive editor state shared by the Svelte UI and the engine.
 
 import { DEFAULT_BRUSH } from '../shared/brush';
-import { DEFAULT_PAPER, type ArrowKind, type Brush, type CanvasInfo, type CustomShape, type DeniedReason, type Layer, type LineCap, type MixMode, type Paper, type Role, type Shape, type ShapeKind, type StrokeAlign } from '../shared/types';
+import { DEFAULT_PAPER, type Avatar, type ArrowKind, type Brush, type CanvasInfo, type CustomShape, type DeniedReason, type Layer, type LineCap, type MixMode, type Paper, type Role, type Shape, type ShapeKind, type StrokeAlign } from '../shared/types';
 import type { NetStatus } from './engine/net';
 import type { Marker } from './engine/navigator';
 
@@ -102,6 +102,12 @@ export interface User {
 /** Which account dialog is open. */
 export type AuthView = 'login' | 'register' | 'forgot' | 'reset' | 'sent';
 
+/** A VR user's presence as last heard (`at`: performance.now() then; old ones fade out). */
+export interface AvatarView extends Avatar {
+  id: string;
+  at: number;
+}
+
 export interface PeerView {
   id: string;
   name: string;
@@ -176,6 +182,10 @@ const prefs = load('draw.prefs', {
   keepSelection: false,
   /** Taps and drags add to the selection or remove from it, as with Shift (for touch screens). */
   addSelection: false,
+  /** 3D layers (painted in vdraw) are drawn. Off: this device draws them as hidden. */
+  show3dLayers: true,
+  /** VR people (their head and hands, projected on the canvas) are drawn. */
+  showAvatars: true,
 });
 
 export interface ExportRegion {
@@ -214,6 +224,12 @@ class EditorState {
   penStyle = $state<PenStyle>({ ...PEN_STYLE, ...prefs.penStyle });
   keepSelection = $state(prefs.keepSelection);
   addSelection = $state(prefs.addSelection);
+  /** Draw 3D layers (this device only; Engine.setShow3dLayers applies a change). */
+  show3dLayers = $state(prefs.show3dLayers);
+  /** Draw VR people (this device only). */
+  showAvatars = $state(prefs.showAvatars);
+  /** VR people on this canvas (avatar messages), by peer. */
+  avatars = $state.raw<AvatarView[]>([]);
   /** Height of the floating options bar over the canvas (CSS px from the canvas top; 0: none). */
   optsHeight = $state(0);
   /** Point editing of a shape (a double-click or Enter with the Select tool): its id and the selected points ("contour:index"). */
@@ -329,6 +345,8 @@ class EditorState {
       penStyle: $state.snapshot(this.penStyle),
       keepSelection: this.keepSelection,
       addSelection: this.addSelection,
+      show3dLayers: this.show3dLayers,
+      showAvatars: this.showAvatars,
     });
   }
 }
