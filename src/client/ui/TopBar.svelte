@@ -8,6 +8,7 @@
   import { pickFile } from '../files';
   import { dismiss } from '../dismiss';
   import { canFullScreen, fullScreen, toggleFullScreen } from '../fullscreen.svelte';
+  import { checkVr, startVr, stopVr, vr } from '../vrSession.svelte';
 
   let {
     engine,
@@ -31,6 +32,16 @@
     more = false;
     f();
   }
+
+  // "Open in VR" (desktop apps with an OpenXR runtime): ask again each time a canvas opens.
+  checkVr();
+  /** An online canvas this client has joined (not one on this device). */
+  const vrOk = $derived(vr.available && localName === null && !!ed.canvas && !ed.canvas.local && !ed.denied);
+  function toggleVr() {
+    if (vr.inVr || vr.starting) stopVr();
+    else if (engine) void startVr(engine, code);
+  }
+  const vrTitle = $derived(vr.inVr ? 'This canvas is open in VR. Click to close VR.' : vr.starting ? 'Opening VR… Click to cancel.' : 'Open this canvas in VR');
 
   /** Copies the link this person came with (owners use the Share dialog instead). */
   async function copyLink() {
@@ -75,6 +86,12 @@
 
   <div class="grow"></div>
 
+  {#if vrOk && !narrow}
+    <button class="vr" class:on={vr.inVr || vr.starting} title={vrTitle} aria-pressed={vr.inVr} onclick={toggleVr}>
+      <Icon name="headset" /><span>{vr.inVr ? 'In VR' : vr.starting ? 'Opening VR…' : 'Open in VR'}</span>
+    </button>
+  {/if}
+
   <div class="peers">
     {#each ed.peers as p (p.id)}
       <span class="avatar" style:background={p.color} title={p.name}>{initials(p.name)}</span>
@@ -93,6 +110,9 @@
       <button class="icon" title="More" aria-label="More" aria-expanded={more} onclick={() => (more = !more)}><Icon name="more" /></button>
       {#if more}
         <div class="menu" role="menu">
+          {#if vrOk}
+            <button role="menuitem" onclick={() => act(toggleVr)}><Icon name="headset" />{vr.inVr || vr.starting ? 'Close VR' : 'Open in VR'}</button>
+          {/if}
           <button role="menuitem" onclick={() => act(pickFile)}><Icon name="open" />Open a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => engine?.saveBdraw())}><Icon name="save" />Save to a .bdraw file</button>
           <button role="menuitem" onclick={() => act(() => (ed.exportOpen = true))}><Icon name="download" />Export an image…</button>
@@ -172,6 +192,19 @@
   }
   .grow {
     flex: 1;
+  }
+  .vr {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    margin-right: 6px;
+    white-space: nowrap;
+  }
+  .vr.on {
+    color: #fff;
+    background: rgba(25, 113, 194, 0.92);
+    border-color: rgba(255, 255, 255, 0.45);
   }
   .peers {
     display: flex;

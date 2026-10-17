@@ -1,0 +1,15 @@
+[package]
+name = "vdraw-net"
+description = "vdraw's client of the 2D app's server (multiplayer-canvas): accounts, canvases, and the live canvas session."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+vdraw-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "3", features = ["json"] }

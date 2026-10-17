@@ -18,6 +18,7 @@ import {
   type MixMode,
   type Op,
   type Paper,
+  type Peer,
   type ServerMsg,
   type Shape,
   type Stroke,
@@ -175,6 +176,13 @@ export class Engine {
   private rect: DOMRect;
   private lastCursorSent = 0;
   private livesByPeer = new Map<string, Set<string>>();
+  /**
+   * Peers whose person is in VR (Peer.inVr): their VR connection shows them, so they are not in
+   * ed.peers (no second avatar in the list, no cursor). Kept here for when they come back.
+   */
+  private inVrPeers = new Map<string, Peer>();
+  /** This window's person has the canvas open in VR (vr.ts): no cursor, others hide this window. */
+  private inVr = false;
   private cleanup: (() => void)[] = [];
   private pointer: { x: number; y: number } | null = null;
   private touches = new Map<number, [number, number]>();
@@ -295,7 +303,40 @@ export class Engine {
       link: this.link,
       grant: grants.get(this.code),
       password,
+      ...(this.inVr ? { inVr: true } : {}),
     });
+  }
+
+  /** The share-link token this canvas was opened with, if any (vdraw joins with it too). */
+  get shareLink(): string | undefined {
+    return this.link;
+  }
+
+  /**
+   * The canvas is open in VR from this window (true), or that ended. Others then hide this
+   * window (Peer.inVr) and it stops sending its cursor.
+   */
+  setInVr(on: boolean): void {
+    if (on === this.inVr || this.frame) return;
+    this.inVr = on;
+    if (on) this.net.send({ t: 'cursor', x: null, y: null, layerId: ed.activeLayerId });
+    this.net.send({ t: 'status', inVr: on });
+  }
+
+  /** The view's center and the width it shows, in world units (what vdraw opens on). */
+  viewCenter(): { x: number; y: number; width: number } {
+    const { w, h } = this.comp.size;
+    const v = this.comp.view;
+    return { x: v.x + w / 2 / v.zoom, y: v.y + h / 2 / v.zoom, width: w / v.zoom };
+  }
+
+  /** Flies to a view center and width in world units (where the VR user last looked). */
+  showView(c: { x: number; y: number; width: number }): void {
+    const { w, h } = this.comp.size;
+    if (!(c.width > 0) || !Number.isFinite(c.x) || !Number.isFinite(c.y) || !w || !h) return;
+    const hw = c.width / 2;
+    const hh = (c.width * h) / w / 2;
+    this.flyTo({ x0: c.x - hw, y0: c.y - hh, x1: c.x + hw, y1: c.y + hh }, 1);
   }
 
   /** Answer to a join-password prompt. The socket is still open; the server waits for it. */
@@ -858,7 +899,7 @@ export class Engine {
       this.schedulePaths();
     }
     this.updateBrushCursor();
-    this.net.send({ t: 'cursor', x: null, y: null, layerId: ed.activeLayerId });
+    if (!this.inVr) this.net.send({ t: 'cursor', x: null, y: null, layerId: ed.activeLayerId });
   }
 
   // --- touch gestures ----------------------------------------------------------------------
@@ -1052,6 +1093,7 @@ export class Engine {
   }
 
   private sendCursor(wx: number, wy: number): void {
+    if (this.inVr) return;
     const now = performance.now();
     if (now - this.lastCursorSent < CURSOR_MS) return;
     this.lastCursorSent = now;
@@ -2127,6 +2169,18 @@ export class Engine {
 
   // --- server messages ----------------------------------------------------------------------------
 
+  /** A peer joined or changed: in the people list, or kept aside while in VR (Peer.inVr). */
+  private putPeer(peer: Peer): void {
+    const others = ed.peers.filter((p) => p.id !== peer.id);
+    if (peer.inVr) {
+      this.inVrPeers.set(peer.id, peer);
+      ed.peers = others;
+    } else {
+      this.inVrPeers.delete(peer.id);
+      ed.peers = [...others, { ...peer, x: null, y: null, layerId: null }];
+    }
+  }
+
   private onServer(m: ServerMsg): void {
     switch (m.t) {
       case 'welcome': {
@@ -2143,7 +2197,8 @@ export class Engine {
         this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper, m.mix);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);
-        ed.peers = m.peers.map((p) => ({ ...p, x: null, y: null, layerId: null }));
+        this.inVrPeers = new Map(m.peers.filter((p) => p.inVr).map((p) => [p.id, p]));
+        ed.peers = m.peers.filter((p) => !p.inVr).map((p) => ({ ...p, x: null, y: null, layerId: null }));
         ed.avatars = [];
         ed.strokeCount = this.doc.strokes.size;
         // Ops from before a reconnect have no echo yet. The server drops duplicates.
@@ -2251,10 +2306,16 @@ export class Engine {
         break;
       }
       case 'peer.join':
-        ed.peers = [...ed.peers.filter((p) => p.id !== m.peer.id), { ...m.peer, x: null, y: null, layerId: null }];
+        this.putPeer(m.peer);
         break;
+      case 'peer.status': {
+        const p = this.inVrPeers.get(m.id) ?? ed.peers.find((q) => q.id === m.id);
+        if (p) this.putPeer({ id: p.id, name: p.name, color: p.color, inVr: m.inVr });
+        break;
+      }
       case 'peer.leave':
         ed.peers = ed.peers.filter((p) => p.id !== m.id);
+        this.inVrPeers.delete(m.id);
         if (ed.avatars.some((a) => a.id === m.id)) ed.avatars = ed.avatars.filter((a) => a.id !== m.id);
         for (const id of this.livesByPeer.get(m.id) ?? []) this.comp.liveEnd(id);
         this.livesByPeer.delete(m.id);

@@ -1,0 +1,33 @@
+[package]
+name = "vdraw"
+description = "vdraw: volumetric painting in VR (OpenXR), and in a desktop window."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+# The OpenXR loader built in (release builds: nothing to install beside the app); without it,
+# the system's libopenxr_loader is loaded at run time.
+static-openxr = ["openxr/static"]
+
+[dependencies]
+vdraw-core.workspace = true
+vdraw-render.workspace = true
+vdraw-net.workspace = true
+ash.workspace = true
+ash-window.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true
+openxr.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ctrlc.workspace = true
+egui.workspace = true
+gpu-allocator.workspace = true
+arboard = { version = "3", features = ["wayland-data-control"] }

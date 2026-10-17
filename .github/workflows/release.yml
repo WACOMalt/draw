@@ -24,6 +24,8 @@ permissions:
 env:
   # electron-builder downloads its own Electron; npm ci does not need the 100 MB binary.
   ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+  # Shader compiler for vdraw, the VR app (vr/), bundled in the Windows and Linux apps.
+  SLANG_VERSION: '2026.19'
 
 jobs:
   prepare:
@@ -106,9 +108,11 @@ jobs:
       matrix:
         # Linux is the Electron job below: WebKitGTK has no pen pressure and slow WebGL on NVIDIA.
         include:
+          # vr: bundle vdraw, the VR app (OpenXR runs on Windows and Linux only).
           - name: Windows
             os: windows-latest
             args: ''
+            vr: true
           - name: macOS universal
             os: macos-latest
             args: --target universal-apple-darwin
@@ -129,8 +133,31 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.vr
+        with:
+          key: vdraw
+          workspaces: './vr -> target'
+
       - run: npm ci
       - run: node scripts/set-version.mjs ${{ needs.prepare.outputs.version }}
+
+      # vdraw goes in as a sidecar (src-tauri/tauri.windows.conf.json): the bundle step needs
+      # src-tauri/binaries/vdraw-<target triple>.exe.
+      - name: Build vdraw (VR app)
+        if: matrix.vr
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $slang = Join-Path $env:RUNNER_TEMP 'slang'
+          Invoke-WebRequest -Uri "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip" -OutFile (Join-Path $env:RUNNER_TEMP 'slang.zip')
+          Expand-Archive -Path (Join-Path $env:RUNNER_TEMP 'slang.zip') -DestinationPath $slang -Force
+          $env:SLANGC = Join-Path $slang 'bin\slangc.exe'
+          cargo build --manifest-path vr/Cargo.toml -p vdraw --release --features static-openxr
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $triple = (rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          Copy-Item vr/target/release/vdraw.exe "src-tauri/binaries/vdraw-$triple.exe"
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -151,9 +178,24 @@ jobs:
           node-version: 22
           cache: npm
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './vr -> target'
+
       - run: sudo apt-get update && sudo apt-get install -y rpm
       - run: npm ci
       - run: node scripts/set-version.mjs ${{ needs.prepare.outputs.version }}
+
+      # vdraw, the VR app: electron-builder.yml ships vr/target/release/vdraw in resources/.
+      - name: Build vdraw (VR app)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fsSL "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/slang-$SLANG_VERSION-linux-x86_64.tar.gz" | tar -xz -C "$RUNNER_TEMP/slang"
+          SLANGC="$RUNNER_TEMP/slang/bin/slangc" cargo build --manifest-path vr/Cargo.toml -p vdraw --release --features static-openxr
+          test -x vr/target/release/vdraw
+
       - run: npm run linux:build
 
       - name: Upload to the draft release
