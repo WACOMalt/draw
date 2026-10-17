@@ -234,9 +234,9 @@ pub struct Session {
     view: Option<Doc>,
 }
 
-/// The features this client draws (src/shared/features.ts DOC_FEATURES it knows of). A
-/// document using another one is shown as not fully drawable.
-pub const KNOWN_FEATURES: &[&str] = &["groups", "masks", "clip", "dynamics", "tips", "grain", "pigment", "paper", "adjust", "effects", "shapes", "vector"];
+/// The document features (src/shared/types.ts DOC_FEATURES) this client draws. A canvas
+/// using another one is drawn without it (the panel says which).
+pub const DRAWN_FEATURES: &[&str] = &["clip", "mask", "tips", "groups", "paper", "pigment", "vr"];
 
 impl Session {
     /// Opens the canvas `key` on `server` as `name` (`color`), with the anonymous secret, the
@@ -489,6 +489,11 @@ impl Session {
             self.view = Some(v);
         }
         self.view.as_ref().unwrap()
+    }
+
+    /// The canvas's features this client does not draw.
+    pub fn not_drawn(&self) -> Vec<&str> {
+        self.features.iter().map(String::as_str).filter(|f| !DRAWN_FEATURES.contains(f)).collect()
     }
 
     /// Edits are allowed (an editor or the owner, connected).

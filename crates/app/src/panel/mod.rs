@@ -152,6 +152,8 @@ pub struct CanvasInfo {
     pub role: String,
     pub state: String,
     pub peers: Vec<(String, String)>,
+    /// What of the canvas is not drawn here (shapes, effects, ...).
+    pub not_drawn: Vec<String>,
 }
 
 /// One frame of the panel: what to draw, egui's texture changes, and what was asked.
@@ -621,6 +623,9 @@ fn settings_tab(ui: &mut egui::Ui, canvas: Option<&CanvasInfo>, actions: &mut Ve
                 ui.label(RichText::new(&c.key).monospace().size(16.0));
                 ui.label(RichText::new(format!("{} · {}", c.role, c.state)).size(13.0).color(TEXT_DIM));
             });
+            if !c.not_drawn.is_empty() {
+                ui.label(RichText::new(format!("Not drawn in VR yet: {}", c.not_drawn.join(", "))).size(13.0).color(TEXT_DIM));
+            }
             for (name, color) in &c.peers {
                 ui.horizontal(|ui| {
                     let rgb = vdraw_core::doc::hex_rgb(color).map(|v| (v * 255.0).round() as u8);

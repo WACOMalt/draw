@@ -589,6 +589,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                     other => format!("{other:?}"),
                 },
                 peers: c.session.peers.values().map(|p| (p.name.clone(), p.color.clone())).collect(),
+                not_drawn: c.session.not_drawn().into_iter().map(str::to_string).collect(),
             }),
             _ => None,
         };
