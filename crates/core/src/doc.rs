@@ -854,8 +854,10 @@ impl Doc {
                 blend: crate::Blend::from_name(&l.blend),
                 opacity: l.opacity as f32,
                 visible: l.visible,
-                // A VR layer's strokes are in 3D: by depth, not by order.
-                ordered: !group && !l.vr,
+                // A shared canvas's strokes cover each other in order, as the 2D app draws them;
+                // a VR layer's have depth too.
+                ordered: !group,
+                vr: l.vr && !group,
                 group,
                 parent: None,
                 clip: l.clip.unwrap_or(false),
@@ -1060,11 +1062,11 @@ mod tests {
         assert!(st.samples[0].pos.abs_diff_eq(glam::Vec3::new(0.0, 0.0, 0.05), 1e-6));
         assert!(st.samples[1].pos.abs_diff_eq(glam::Vec3::new(0.2, 0.0, -0.05), 1e-6));
         assert!(st.samples[0].up.abs_diff_eq(glam::Vec3::Y, 1e-6));
-        // A layer of them is drawn by depth.
+        // A layer of them is a VR layer, its strokes covering each other in order (as in 2D).
         let layer: DocLayer = serde_json::from_value(json!({"id": "L1aaaa", "name": "VR", "order": 1.0, "blend": "normal", "opacity": 1.0, "visible": true, "vr": true})).unwrap();
         let doc = Doc::from_parts(vec![layer], vec![s], Vec::new(), None, None);
         let p = doc.painting(&frame).painting;
-        assert!(!p.layers[0].ordered);
+        assert!(p.layers[0].ordered && p.layers[0].vr);
         assert_eq!(serde_json::to_value(&doc.layers["L1aaaa"]).unwrap()["vr"], json!(true));
     }
 }

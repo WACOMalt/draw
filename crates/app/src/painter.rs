@@ -478,7 +478,7 @@ impl Painter {
                 g.matrix = pose * glam::Mat4::from_scale(Vec3::splat(g.scale)) * g.start.inverse();
                 // A shared canvas's flat layers (and groups) move in the paper's plane; its VR
                 // layers move freely.
-                let free = self.painting.index_of(self.active_layer).is_some_and(|i| !self.painting.layers[i].ordered && !self.painting.layers[i].group);
+                let free = self.painting.index_of(self.active_layer).is_some_and(|i| self.painting.layers[i].is_vr());
                 if self.shared && !free {
                     g.matrix = planar(g.matrix);
                 }

@@ -154,6 +154,8 @@ pub struct CanvasInfo {
     pub peers: Vec<(String, String)>,
     /// What of the canvas is not drawn here (shapes, effects, ...).
     pub not_drawn: Vec<String>,
+    /// Why the server refused the last edit, a few seconds after.
+    pub refused: Option<String>,
 }
 
 /// One frame of the panel: what to draw, egui's texture changes, and what was asked.
@@ -339,6 +341,9 @@ impl Panel {
                 }
             });
         });
+        if let Some(why) = canvas.and_then(|c| c.refused.as_ref()) {
+            ui.label(RichText::new(format!("The canvas refused that: {why}")).size(13.5).color(Color32::from_rgb(0xff, 0x6b, 0x6b)));
+        }
         ui.separator();
         let height = ui.available_height();
         ui.horizontal_top(|ui| {
@@ -468,7 +473,7 @@ fn tool_tab(ui: &mut egui::Ui, painter: &mut Painter, presets: &mut Presets, dyn
         // A shared canvas's VR layer: painted in the air with the pen, or on the paper with
         // the laser (as a flat layer is).
         let active = &painter.painting.layers[painter.active_index()];
-        if painter.shared && !active.ordered && !active.group {
+        if painter.shared && active.is_vr() {
             let id = active.id;
             let on = painter.on_paper.contains(&id);
             ui.horizontal(|ui| {

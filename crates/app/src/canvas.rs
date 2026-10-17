@@ -91,7 +91,7 @@ struct Meta {
 fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
     p.layers
         .iter()
-        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), vr: !l.ordered && !l.group })
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), vr: l.is_vr() })
         .collect()
 }
 
@@ -232,6 +232,8 @@ pub struct Canvas {
     ready: bool,
     /// When the paper was last sent.
     paper_sent: Instant,
+    /// Why the server refused edits, and when (the panel shows the last a while).
+    pub refused: Vec<(String, Instant)>,
 }
 
 impl Canvas {
@@ -258,6 +260,7 @@ impl Canvas {
             rebuild: None,
             ready: false,
             paper_sent: Instant::now(),
+            refused: Vec::new(),
         }
     }
 
@@ -278,6 +281,7 @@ impl Canvas {
         let changes = self.session.poll();
         for (_, why) in &changes.rejected {
             log::warn!("the server refused an edit: {why}");
+            self.refused.push((why.clone(), Instant::now()));
         }
         let remade = self.rebuild.as_ref().and_then(|r| r.rx.try_recv().ok());
         if let Some(r) = remade {
@@ -600,7 +604,7 @@ impl Canvas {
 
     /// Whether strokes on a painting layer (by id) are 3D (a VR layer).
     fn is_vr_layer(painter: &Painter, layer: u32) -> bool {
-        painter.painting.index_of(layer).is_some_and(|i| !painter.painting.layers[i].ordered && !painter.painting.layers[i].group)
+        painter.painting.index_of(layer).is_some_and(|i| painter.painting.layers[i].is_vr())
     }
 
     fn doc_brush(&self, painter: &Painter, b: &vdraw_core::Brush) -> Value {
@@ -984,7 +988,7 @@ impl Canvas {
                     continue;
                 }
                 let Ok(brush) = serde_json::from_value::<DocBrush>(l.brush.clone()) else { continue };
-                let depth = !painter.painting.layers[layer].ordered;
+                let depth = painter.painting.layers[layer].is_vr();
                 let stroke = doc::stroke(&l.id, &brush, &l.pts, l.vr.as_ref().filter(|_| depth), &self.frame);
                 self.lives.insert(key.clone(), Live { points: l.pts.len(), layer, mask, stroke });
             }
@@ -1367,11 +1371,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(other.doc.layers.values().filter(|l| !l.deleted).count(), 2, "one layer more");
-        while c.rebuilding() || !painter.painting.layers.iter().any(|l| !l.ordered) {
+        while c.rebuilding() || !painter.painting.layers.iter().any(|l| l.vr) {
             c.update(&mut painter, head);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!painter.painting.layers[painter.active_index()].ordered, "the new layer is active");
+        assert!(painter.painting.layers[painter.active_index()].vr, "the new layer is active");
         // A stroke 10 cm in front of the paper, the pen's up side straight up (its dabs as close
         // as they go: 0.01 as an f32 must not come out under the server's 0.01).
         painter.tools.smoothing = 0.0;
@@ -1392,7 +1396,7 @@ mod tests {
         // Up is +y in the scene: -y in canvas axes (y runs down).
         assert_eq!(&vr.up.unwrap()[..3], &[0.0, -1.0, 0.0]);
         // Back from the document: in 3D, 10 cm in front of the paper.
-        let shown = painter.painting.layers.iter().find(|l| !l.ordered && !l.group).unwrap();
+        let shown = painter.painting.layers.iter().find(|l| l.vr).unwrap();
         assert_eq!(shown.strokes.len(), 1);
         assert!((shown.strokes[0].samples[0].pos.z - 0.1).abs() < 1e-3);
         // The Move layer tool turns the VR layer a quarter turn about the vertical: the stroke
@@ -1406,9 +1410,9 @@ mod tests {
         painter.undo();
         wait(&mut c, &mut painter, &mut other, "the turn undone", &|o| ends(o).is_some_and(|(a, b)| (a - 0.1 / k).abs() < 1e-3 / k && (b - 0.1 / k).abs() < 1e-3 / k));
         // The flat layer made a VR layer, and back by undo.
-        let flat = painter.painting.layers.iter().position(|l| l.ordered).unwrap();
+        let flat = painter.painting.layers.iter().position(|l| !l.is_vr()).unwrap();
         painter.edit_layers(|p| {
-            p.layers[flat].ordered = false;
+            p.layers[flat].vr = true;
             (Some(flat), crate::painter::Removed::default())
         });
         wait(&mut c, &mut painter, &mut other, "a VR layer more", &|o| o.doc.layers.values().filter(|l| l.vr && !l.deleted).count() == 2);
@@ -1450,5 +1454,49 @@ mod tests {
         assert!((c.scale() - 2.0).abs() < 1e-5);
         let want = Vec3::new(0.0, 1.0, -0.5) + roll * Vec3::new(0.0, 0.2, 0.0);
         assert!(world(&c, beside).abs_diff_eq(want, 1e-4), "{} {want}", world(&c, beside));
+    }
+
+    /// The 2D app's pumpkin (~/Downloads/punkin.bdraw) on a test server: its "Layer 1" (a
+    /// Multiply layer) made a VR layer and turned in 3D. Run by hand.
+    #[test]
+    #[ignore]
+    fn the_pumpkins_layer_turns_in_3d() {
+        let base = std::env::var("VDRAW_TEST_SERVER").unwrap();
+        let server = vdraw_net::Server::new(&base, None);
+        let anon = vdraw_net::identity::base64url(&[17u8; 32]);
+        let bytes = std::fs::read(format!("{}/Downloads/punkin.bdraw", std::env::var("HOME").unwrap())).unwrap();
+        let key = server.import(&bytes, &anon).unwrap();
+        let mut c = Canvas::new(Session::open(&server, &key, "VR", "#ff6b6b", &anon, None));
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        painter.shared = true;
+        let head = Mat4::from_translation(Vec3::new(0.0, 1.6, 0.0));
+        let frames = |c: &mut Canvas, painter: &mut Painter, n: usize| {
+            for _ in 0..n {
+                c.update(painter, head);
+                c.commit(painter);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        while c.session.state != State::Open || !c.placed || c.rebuilding() || !c.ready {
+            c.update(&mut painter, head);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let i = painter.painting.layers.iter().position(|l| l.name == "Layer 1").unwrap();
+        painter.active_layer = painter.painting.layers[i].id;
+        painter.edit_layers(|p| {
+            p.layers[i].vr = true;
+            (Some(i), crate::painter::Removed::default())
+        });
+        frames(&mut c, &mut painter, 50);
+        let i = painter.active_index();
+        println!("{} vr {} ordered {} blend {:?}; refused {:?}", painter.painting.layers[i].name, painter.painting.layers[i].vr, painter.painting.layers[i].ordered, painter.painting.layers[i].blend, c.refused);
+        painter.tools.tool = crate::tools::Tool::Transform;
+        let at = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.3));
+        painter.grab(1, at, true, 0.0, 0.01);
+        painter.grab(1, Mat4::from_translation(Vec3::new(0.02, 0.0, 0.3)) * Mat4::from_rotation_y(0.4), true, 0.0, 0.01);
+        painter.grab(1, Mat4::from_translation(Vec3::new(0.02, 0.0, 0.3)) * Mat4::from_rotation_y(0.4), false, 0.0, 0.01);
+        frames(&mut c, &mut painter, 50);
+        println!("after the turn: refused {:?}", c.refused);
+        assert!(c.refused.is_empty());
     }
 }

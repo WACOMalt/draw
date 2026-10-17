@@ -278,7 +278,7 @@ fn layer_row(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState, 
         tags.push(tag(blend).to_string());
     }
     // On a shared canvas, a VR layer (its strokes in 3D) says so, as the 2D app's badge.
-    let vr = painter.shared && !group && !p.layers[i].ordered;
+    let vr = painter.shared && p.layers[i].is_vr();
     for (t, color) in tags.into_iter().map(|t| (t, TEXT_DIM)).chain(vr.then(|| ("VR".to_string(), ACCENT))) {
         let galley = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), color);
         let w = galley.size().x + 10.0;
@@ -329,7 +329,7 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
     let i = painter.active_index();
     let p = &painter.painting;
     let (group, has_mask, clip, can_clip) = (p.layers[i].group, p.layers[i].mask.is_some(), p.layers[i].clip, p.can_clip(i));
-    let (vr, id) = (!group && !p.layers[i].ordered, p.layers[i].id);
+    let (vr, id) = (p.layers[i].is_vr(), p.layers[i].id);
     // (A shared canvas's row has a button more.)
     let size = vec2(if painter.shared { 38.0 } else { 44.0 }, 40.0);
     let mut hint = String::new();
@@ -391,7 +391,9 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
             note(&r, if vr { "Make it a flat layer (drawn as in 2D)" } else { "Make it a VR layer: moved and drawn in 3D here, flat for 2D" });
             if r.clicked() && !group {
                 painter.edit_layers(|p| {
-                    p.layers[i].ordered = !p.layers[i].ordered;
+                    // Its strokes cover each other in order either way, as the 2D app draws them.
+                    p.layers[i].vr = !vr;
+                    p.layers[i].ordered = true;
                     (Some(i), Removed::default())
                 });
                 if vr {
