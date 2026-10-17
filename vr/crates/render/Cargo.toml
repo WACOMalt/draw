@@ -1,0 +1,16 @@
+[package]
+name = "vdraw-render"
+description = "Vulkan (ash) renderer of vdraw: raymarches the painting's round cones in compute."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+vdraw-core.workspace = true
+ash.workspace = true
+gpu-allocator.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+log.workspace = true
+egui.workspace = true
