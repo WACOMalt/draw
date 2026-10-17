@@ -126,11 +126,101 @@ pub struct Layer {
     /// order, as the 2D app draws them).
     #[serde(default)]
     pub threed: bool,
+    /// An adjustment layer (the 2D app's): no strokes (but a mask's); it changes the colors of
+    /// what is below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjust: Option<Adjust>,
+}
+
+/// An adjustment layer's settings, as the 2D app's (types.ts Adjust): all on 0..1 channels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Adjust {
+    Levels { in_black: f32, in_white: f32, gamma: f32, out_black: f32, out_white: f32 },
+    /// The master curve: 2 to 16 points (in, out), by `in`.
+    Curves { points: Vec<[f32; 2]> },
+    /// Hue in degrees (-180..180); saturation and lightness -1..1.
+    HueSat { hue: f32, saturation: f32, lightness: f32 },
+    BrightContrast { brightness: f32, contrast: f32 },
+    /// A blur of what is below (not drawn in VR yet).
+    Blur { radius: f32 },
+}
+
+/// The samples of a tone curve the renderer reads (it interpolates between them).
+pub const TONE_SAMPLES: usize = 256;
+
+impl Adjust {
+    /// The tone curve of levels, curves and brightness/contrast (the 2D app's adjust.ts
+    /// toneFunction), sampled over 0..1; None for the others.
+    pub fn tone(&self) -> Option<Vec<f32>> {
+        let f: Box<dyn Fn(f32) -> f32> = match self {
+            Adjust::Levels { in_black, in_white, gamma, out_black, out_white } => {
+                let (ib, span, g, ob, ow) = (*in_black, (in_white - in_black).max(1e-6), *gamma, *out_black, *out_white);
+                Box::new(move |x| ob + ((x - ib) / span).clamp(0.0, 1.0).powf(1.0 / g) * (ow - ob))
+            }
+            Adjust::Curves { points } => Box::new(monotone_curve(points)),
+            Adjust::BrightContrast { brightness, contrast } => {
+                let k = (((contrast.clamp(-0.999, 0.999) + 1.0) * std::f32::consts::PI) / 4.0).tan();
+                let b = *brightness;
+                Box::new(move |x| {
+                    let c = ((x - 0.5) * k + 0.5).clamp(0.0, 1.0);
+                    if b >= 0.0 { 1.0 - (1.0 - c).powf(1.0 + b * 2.0) } else { c.powf(1.0 - b * 2.0) }
+                })
+            }
+            Adjust::HueSat { .. } | Adjust::Blur { .. } => return None,
+        };
+        Some((0..TONE_SAMPLES).map(|i| f(i as f32 / (TONE_SAMPLES - 1) as f32).clamp(0.0, 1.0)).collect())
+    }
+}
+
+/// A monotone cubic (Fritsch–Carlson) through points sorted by x: no overshoot between them
+/// (the 2D app's monotoneCurve).
+fn monotone_curve(points: &[[f32; 2]]) -> impl Fn(f32) -> f32 {
+    let n = points.len().max(2);
+    let pts: Vec<[f32; 2]> = if points.len() >= 2 { points.to_vec() } else { vec![[0.0, 0.0], [1.0, 1.0]] };
+    let (xs, ys): (Vec<f32>, Vec<f32>) = pts.iter().map(|p| (p[0], p[1])).unzip();
+    let d: Vec<f32> = (0..n - 1).map(|i| (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]).max(1e-9)).collect();
+    let mut m = vec![0.0f32; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for i in 1..n - 1 {
+        m[i] = if d[i - 1] * d[i] <= 0.0 { 0.0 } else { (d[i - 1] + d[i]) / 2.0 };
+    }
+    for i in 0..n - 1 {
+        if d[i] == 0.0 {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+            continue;
+        }
+        let (a, b) = (m[i] / d[i], m[i + 1] / d[i]);
+        let h = a * a + b * b;
+        if h > 9.0 {
+            let t = 3.0 / h.sqrt();
+            m[i] = t * a * d[i];
+            m[i + 1] = t * b * d[i];
+        }
+    }
+    move |x: f32| {
+        if x <= xs[0] {
+            return ys[0];
+        }
+        if x >= xs[n - 1] {
+            return ys[n - 1];
+        }
+        let mut i = 0;
+        while x > xs[i + 1] {
+            i += 1;
+        }
+        let h = xs[i + 1] - xs[i];
+        let t = (x - xs[i]) / h;
+        let (t2, t3) = (t * t, t * t * t);
+        (2.0 * t3 - 3.0 * t2 + 1.0) * ys[i] + (t3 - 2.0 * t2 + t) * h * m[i] + (-2.0 * t3 + 3.0 * t2) * ys[i + 1] + (t3 - t2) * h * m[i + 1]
+    }
 }
 
 impl Default for Layer {
     fn default() -> Self {
-        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false }
+        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false, adjust: None }
     }
 }
 
@@ -181,6 +271,8 @@ pub enum Step {
     /// A layer's mask (it comes right before its layer).
     Mask(usize),
     Layer(usize),
+    /// An adjustment layer: the colors below change (after its mask, if it has one).
+    Adjust(usize),
 }
 
 /// A run of segments of one step (a layer's or a mask's strokes), as `Painting::build` lays
@@ -391,7 +483,7 @@ impl Painting {
                     if l.mask.as_ref().is_some_and(|m| m.enabled) {
                         out.push(Step::Mask(i));
                     }
-                    out.push(Step::Layer(i));
+                    out.push(if l.adjust.is_some() { Step::Adjust(i) } else { Step::Layer(i) });
                 }
             }
         }

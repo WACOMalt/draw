@@ -701,7 +701,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                 tag_list = names.into_iter().map(|(name, color, at, _)| (name, color, c.view.transform_point3(at))).collect();
             }
         }
-        let steps = painter.scene_steps();
+        let (steps, adjust) = painter.scene_steps();
 
         let sc = match &mut swapchain {
             Some(s) => s,
@@ -783,7 +783,7 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                 Mode::Canvas(c) if c.placed => (painter.paper, if painter.paper[3] < 1.0 { c.grid() } else { 0.0 }),
                 _ => ([0.0; 4], 0.0),
             };
-            let scene = vdraw_render::Scene { world_from_scene, paper, paper_grid, ..painter.scene(&steps) };
+            let scene = vdraw_render::Scene { world_from_scene, paper, paper_grid, canvas: matches!(mode, Mode::Canvas(_)), ..painter.scene(&steps, &adjust) };
             rm.record(cmd, frame, &scene, &eyes, &Overlays { tip, laser, lines: &lines, pick })?;
             if pick.is_some() {
                 let region = vk::BufferImageCopy::default()

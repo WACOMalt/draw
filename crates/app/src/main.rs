@@ -121,6 +121,15 @@ fn main() -> Result<()> {
                     _ => anyhow::bail!("--mix normal|pigment"),
                 };
             }
+            // VDRAW_ADJUST=hue|levels: an adjustment layer on top (a check of the renderer's).
+            if let Ok(kind) = std::env::var("VDRAW_ADJUST") {
+                let adjust = match kind.as_str() {
+                    "levels" => vdraw_core::Adjust::Levels { in_black: 0.2, in_white: 0.8, gamma: 1.0, out_black: 0.0, out_white: 1.0 },
+                    _ => vdraw_core::Adjust::HueSat { hue: 180.0, saturation: 0.0, lightness: 0.0 },
+                };
+                let id = painting.new_id();
+                painting.layers.push(vdraw_core::Layer { id, name: "Adjust".into(), ordered: true, adjust: Some(adjust), ..Default::default() });
+            }
             // --orbit x y z yaw pitch distance: look at (x, y, z) from another place.
             let cam = match args.iter().position(|a| a == "--orbit") {
                 Some(i) => {

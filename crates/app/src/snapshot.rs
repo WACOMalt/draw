@@ -44,9 +44,9 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
     let mut segs = Vec::new();
     let built = painting.build(&mut segs);
     let runs = &built.runs;
-    let steps = vdraw_render::scene_steps(&painting, &built.steps);
+    let (steps, adjust) = vdraw_render::scene_steps(&painting, &built.steps);
     let cv = canvas.unwrap_or(CanvasView { world_from_scene: glam::Mat4::IDENTITY, paper: [0.0; 4], grid: 0.0 });
-    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_runs: &[], steps: &steps, pigment: painting.mix == vdraw_core::Mix::Pigment, world_from_scene: cv.world_from_scene, paper: cv.paper, paper_grid: cv.grid, lit: canvas.is_none() };
+    let scene = Scene { segments: &segs, runs, version: 0, active: &[], active_runs: &[], steps: &steps, adjust: &adjust, pigment: painting.mix == vdraw_core::Mix::Pigment, world_from_scene: cv.world_from_scene, paper: cv.paper, paper_grid: cv.grid, lit: canvas.is_none(), canvas: canvas.is_some() };
     let (eye, cam) = match view {
         View::Orbit(cam) => (EyeView { view_proj: perspective(0.9, width as f32 / height as f32, 0.02, 100.0) * cam.view(), pos: cam.eye() }, Some(cam)),
         View::Eye(eye) => (eye, None),

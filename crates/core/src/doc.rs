@@ -814,10 +814,10 @@ pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], vr: Option<&StrokeThreeD>, fr
 }
 
 impl Doc {
-    /// The layers a painting of the document has, in paint order: the live ones but adjustment
-    /// and shape layers.
+    /// The layers a painting of the document has, in paint order: the live ones but shape
+    /// layers.
     pub fn painted_layers(&self) -> Vec<&DocLayer> {
-        self.paint_order().into_iter().filter(|l| !matches!(l.kind.as_deref(), Some("adjust") | Some("shape"))).collect()
+        self.paint_order().into_iter().filter(|l| l.kind.as_deref() != Some("shape")).collect()
     }
 
     /// The box (x0, y0, x1, y1) around every live stroke's points and brush (None: none).
@@ -863,6 +863,12 @@ impl Doc {
                 clip: l.clip.unwrap_or(false),
                 mask: l.mask.as_ref().filter(|_| !group).map(|m| crate::Mask { enabled: m.enabled, strokes: strokes(Some(&m.id)) }),
                 strokes: if group { Vec::new() } else { strokes(None) },
+                // An adjustment layer's settings (one this client does not know: as none).
+                adjust: if l.kind.as_deref() == Some("adjust") {
+                    Some(l.extra.get("adjust").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or(crate::painting::Adjust::HueSat { hue: 0.0, saturation: 0.0, lightness: 0.0 }))
+                } else {
+                    None
+                },
             });
             ids.push(l.id.clone());
         }

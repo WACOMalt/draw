@@ -57,7 +57,8 @@ struct Params
     float4 paper;     // a shared canvas's paper (the plane z = 0): sRGB, alpha
     float paperGrid;  // how much a grid on the paper shows
     uint unlit;       // 1: strokes in 3D show their color as it is (as the 2D app shows it), no light
-    float pad1, pad2;
+    uint ownCanvas;   // 1: a shared canvas: its layers composite on its paper, then over the room
+    float pad2;
 };
 
 [[vk::binding(0, 0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> outImage;
@@ -86,6 +87,10 @@ static const uint STEP_LAYER = 0;
 static const uint STEP_MASK = 1;
 static const uint STEP_OPEN = 2;
 static const uint STEP_CLOSE = 3;
+static const uint STEP_ADJUST = 4; // an adjustment layer (blend: where its numbers start)
+static const uint ADJUST_TONE = 0;    // a tone curve, TONE_SAMPLES numbers
+static const uint ADJUST_HUE_SAT = 1; // hue (turns), saturation, lightness
+static const uint TONE_SAMPLES = 256;
 static const uint STEP_ORDERED = 1; // strokes cover each other in their order (2D app strokes)
 static const uint STEP_CLIP = 2;    // clipped to the layer below in its group
 static const uint STEP_ISOLATED = 4; // a group that is not pass through
@@ -489,6 +494,77 @@ float3 blendMode(uint mode, float3 b, float3 s)
     }
 }
 
+// ---- Adjustment layers (the 2D app's adjust.ts and its ADJUST_FS) ----
+
+// The adjustments' numbers: after the steps in their buffer, four to a step.
+float adjustAt(uint k)
+{
+    Step s = steps[params.stepCount + k / 4];
+    uint c = k % 4;
+    return c == 0 ? asfloat(s.kind) : c == 1 ? asfloat(s.blend) : c == 2 ? s.opacity : asfloat(s.flags);
+}
+
+float3 rgb2hsl(float3 c)
+{
+    float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
+    float l = (mx + mn) * 0.5, d = mx - mn;
+    if (d < 1e-6)
+        return float3(0.0, 0.0, l);
+    float s = l > 0.5 ? d / (2.0 - mx - mn) : d / (mx + mn);
+    float h = mx == c.r ? (c.g - c.b) / d + (c.g < c.b ? 6.0 : 0.0) : mx == c.g ? (c.b - c.r) / d + 2.0 : (c.r - c.g) / d + 4.0;
+    return float3(h / 6.0, s, l);
+}
+
+float hue2rgb(float p, float q, float t)
+{
+    t = frac(t);
+    if (t < 1.0 / 6.0)
+        return p + (q - p) * 6.0 * t;
+    if (t < 0.5)
+        return q;
+    if (t < 2.0 / 3.0)
+        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    return p;
+}
+
+float3 hsl2rgb(float3 h)
+{
+    if (h.y <= 0.0)
+        return float3(h.z, h.z, h.z);
+    float q = h.z < 0.5 ? h.z * (1.0 + h.y) : h.z + h.y - h.z * h.y;
+    float p = 2.0 * h.z - q;
+    return float3(hue2rgb(p, q, h.x + 1.0 / 3.0), hue2rgb(p, q, h.x), hue2rgb(p, q, h.x - 1.0 / 3.0));
+}
+
+float tone(uint start, float x)
+{
+    float t = saturate(x) * float(TONE_SAMPLES - 1);
+    uint i = min(uint(t), TONE_SAMPLES - 2);
+    return lerp(adjustAt(start + i), adjustAt(start + i + 1), t - float(i));
+}
+
+// The canvas (premultiplied sRGB) changed by an adjustment, by `amount` (its opacity times
+// its mask). Its alpha stays.
+float4 adjustCanvas(float4 canvas, Step step, float amount)
+{
+    if (canvas.a <= 0.0 || amount <= 0.0 || step.flags > ADJUST_HUE_SAT)
+        return canvas;
+    float3 c = saturate(canvas.rgb / canvas.a);
+    float3 r;
+    if (step.flags == ADJUST_TONE)
+        r = float3(tone(step.blend, c.r), tone(step.blend, c.g), tone(step.blend, c.b));
+    else
+    {
+        float3 hsl = float3(adjustAt(step.blend), adjustAt(step.blend + 1), adjustAt(step.blend + 2));
+        float3 h = rgb2hsl(c);
+        h.x += hsl.x;
+        h.y = hsl.y >= 0.0 ? h.y + (1.0 - h.y) * hsl.y : h.y * (1.0 + hsl.y);
+        h.z = hsl.z >= 0.0 ? h.z + (1.0 - h.z) * hsl.z : h.z * (1.0 + hsl.z);
+        r = hsl2rgb(clamp(h, float3(-10.0, 0.0, 0.0), float3(10.0, 1.0, 1.0)));
+    }
+    return float4(lerp(c, r, amount) * canvas.a, canvas.a);
+}
+
 // ---- Background ----
 
 // Sky and a floor grid at y = 0 (for scale and orientation in VR). `pix`: the angle of one
@@ -519,19 +595,18 @@ float3 background(float3 o, float3 dir, float pix, out float tFloor)
     return sky;
 }
 
-// A shared canvas's paper, the plane z = 0 of the scene, under every layer (as the 2D app's
-// canvas starts as its paper): its color over the world behind, by its alpha, seen from
-// either side; where it is see-through, a grid shows it (while the canvas moves). `color`:
-// the world behind, linear. Returns the color the canvas starts as, linear.
-float3 paperOver(float3 o, float3 dir, float pix, float3 color)
+// A shared canvas's paper, the plane z = 0 of the scene, seen from either side: how much paper
+// covers this ray (its alpha; 0 off the paper), and how much of a grid line shows on it (the
+// grid shows a see-through paper while the canvas moves).
+float2 paperAt(float3 o, float3 dir, float pix)
 {
     if ((params.paper.a <= 0.0 && params.paperGrid <= 0.0) || abs(dir.z) < 1e-6)
-        return color;
+        return float2(0.0, 0.0);
     float t = -o.z / dir.z;
     if (t <= 0.0)
-        return color;
+        return float2(0.0, 0.0);
     float2 q = (o + dir * t).xy;
-    color = linearFromSrgb(lerp(srgbFromLinear(color), params.paper.rgb, params.paper.a)); // in sRGB, as the 2D app
+    float line = 0.0;
     if (params.paperGrid > 0.0)
     {
         // Lines at powers of ten of the scene's units, the finer fading out as they crowd.
@@ -539,7 +614,6 @@ float3 paperOver(float3 o, float3 dir, float pix, float3 color)
         float level = log2(max(w, 1e-12) * 24.0) / log2(10.0);
         float l0 = floor(level);
         float fade = level - l0;
-        float line = 0.0;
         for (int k = 0; k < 2; k++)
         {
             float spacing = pow(10.0, l0 + float(k));
@@ -547,11 +621,9 @@ float3 paperOver(float3 o, float3 dir, float pix, float3 color)
             float on = 1.0 - saturate(min(g.x, g.y));
             line = max(line, on * (k == 0 ? 1.0 - fade : 1.0));
         }
-        float3 ink = dot(params.paper.rgb, float3(0.3, 0.6, 0.1)) * params.paper.a > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
-        float fadeFar = exp(-t * 0.05);
-        color = lerp(color, ink, 0.35 * params.paperGrid * line * fadeFar);
+        line *= params.paperGrid * exp(-t * 0.05);
     }
-    return color;
+    return float2(params.paper.a, line);
 }
 
 // One layer's (or mask's) strokes along the ray: list positions j to end of the tile's list.
@@ -987,9 +1059,12 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     // The eyedropper's view starts clear: it picks the paint alone, and nothing where there is
     // none (as the 2D app's, without its paper).
     bool picking = id.z == params.pickLayer;
-    if (!picking)
-        color = paperOver(o, dir, pix, color);
-    float4 canvas = picking ? float4(0.0) : float4(srgbFromLinear(color), 1.0);
+    // A shared canvas starts as its paper, as the 2D app's (its layers blend and its
+    // adjustments change the paper, not the room), and goes over the room at the end. A
+    // painting in the room starts as the room.
+    bool own = params.ownCanvas != 0;
+    float2 paper = picking ? float2(0.0, 0.0) : paperAt(o, dir, pix);
+    float4 canvas = picking ? float4(0.0) : own ? float4(params.paper.rgb * paper.x, paper.x) : float4(srgbFromLinear(color), 1.0);
     float4 base = 0.0;
     uint baseBlend = 0;
     float baseOpacity = 1.0;
@@ -1050,6 +1125,18 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
                 canvas = lerp(keptCanvas[depth], canvas, step.opacity); // pass through, faded
             continue;
         }
+        if (step.kind == STEP_ADJUST)
+        {
+            // The base below goes down first; then all below changes, by the adjustment's
+            // opacity and its mask.
+            if (hasBase)
+                canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+            hasBase = false;
+            float amount = step.opacity * (masked ? saturate(maskShow) : 1.0);
+            masked = false;
+            canvas = adjustCanvas(canvas, step, amount);
+            continue;
+        }
         float4 drawn = j < end ? drawLayer(j, end, (step.flags & STEP_ORDERED) != 0, o, dir, tFloor) : float4(0.0);
         if (step.kind == STEP_MASK)
         {
@@ -1083,7 +1170,15 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         outImage[id] = canvas.a > 0.0 ? float4(linearFromSrgb(canvas.rgb / canvas.a), canvas.a) : float4(0.0);
         return;
     }
+    if (own)
+        canvas += float4(srgbFromLinear(color), 1.0) * (1.0 - canvas.a);
     color = linearFromSrgb(canvas.rgb);
+    if (paper.y > 0.0)
+    {
+        // The grid, in a color that shows on the paper.
+        float3 ink = dot(params.paper.rgb, float3(0.3, 0.6, 0.1)) * params.paper.a > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
+        color = lerp(color, ink, 0.35 * paper.y);
+    }
 
     // 4. The brush tip, where the next stroke starts: a preview of its color, opacity and
     //    hardness (drawn over everything), with a thin outline so it shows at any opacity.

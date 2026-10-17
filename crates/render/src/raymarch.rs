@@ -57,7 +57,8 @@ struct ParamsGpu {
     paper: [f32; 4],
     paper_grid: f32,
     unlit: u32,
-    pad: [f32; 2],
+    own_canvas: u32,
+    pad: f32,
 }
 
 /// A compositing step as the shader reads it (vdraw_core::Step): what it is (`STEP_*`), the
@@ -82,10 +83,20 @@ pub const STEP_CLIP: u32 = 2;
 /// A group that is not pass through: its layers make one picture, which blends.
 pub const STEP_ISOLATED: u32 = 4;
 
-/// The steps of a painting as the shader reads them.
-pub fn scene_steps(painting: &vdraw_core::Painting, steps: &[vdraw_core::Step]) -> Vec<SceneStep> {
-    use vdraw_core::{Blend, Step};
-    steps
+/// An adjustment layer: the colors below change (`blend`: where its data starts in the
+/// adjustments' numbers; `flags`: `ADJUST_*`).
+pub const STEP_ADJUST: u32 = 4;
+/// A tone curve (levels, curves, brightness/contrast): `TONE_SAMPLES` numbers; hue/saturation:
+/// three (hue in turns, saturation, lightness); none (a blur: not drawn yet).
+pub const ADJUST_TONE: u32 = 0;
+pub const ADJUST_HUE_SAT: u32 = 1;
+pub const ADJUST_NONE: u32 = 2;
+
+/// The steps of a painting as the shader reads them, and the adjustment layers' numbers.
+pub fn scene_steps(painting: &vdraw_core::Painting, steps: &[vdraw_core::Step]) -> (Vec<SceneStep>, Vec<f32>) {
+    use vdraw_core::{Adjust, Blend, Step};
+    let mut data = Vec::new();
+    let out = steps
         .iter()
         .map(|&s| {
             let (kind, i) = match s {
@@ -93,7 +104,25 @@ pub fn scene_steps(painting: &vdraw_core::Painting, steps: &[vdraw_core::Step]) 
                 Step::Mask(i) => (STEP_MASK, i),
                 Step::Open(i) => (STEP_OPEN, i),
                 Step::Close(i) => (STEP_CLOSE, i),
+                Step::Adjust(i) => (STEP_ADJUST, i),
             };
+            if kind == STEP_ADJUST {
+                let l = &painting.layers[i];
+                let a = l.adjust.as_ref().expect("an adjustment layer");
+                let start = data.len() as u32;
+                let flags = match (a, a.tone()) {
+                    (_, Some(t)) => {
+                        data.extend(t);
+                        ADJUST_TONE
+                    }
+                    (Adjust::HueSat { hue, saturation, lightness }, None) => {
+                        data.extend([hue / 360.0, *saturation, *lightness]);
+                        ADJUST_HUE_SAT
+                    }
+                    _ => ADJUST_NONE,
+                };
+                return SceneStep { kind, blend: start, opacity: l.opacity, flags };
+            }
             let l = &painting.layers[i];
             let mut flags = 0;
             if l.ordered {
@@ -109,7 +138,8 @@ pub fn scene_steps(painting: &vdraw_core::Painting, steps: &[vdraw_core::Step]) 
             let (blend, opacity) = if kind == STEP_MASK { (0, 1.0) } else { (if l.blend == Blend::Pass { 0 } else { l.blend as u32 }, l.opacity) };
             SceneStep { kind, blend, opacity, flags }
         })
-        .collect()
+        .collect();
+    (out, data)
 }
 
 /// What to draw: the finished strokes' segments in layer runs (they change rarely: `version`
@@ -122,8 +152,10 @@ pub struct Scene<'a> {
     /// segments, and the runs of them by step (`first` is a place in `active`).
     pub active: &'a [GpuSegment],
     pub active_runs: &'a [LayerRun],
-    /// The compositing steps (`LayerRun::step` is a place here).
+    /// The compositing steps (`LayerRun::step` is a place here), and the adjustment layers'
+    /// numbers.
     pub steps: &'a [SceneStep],
+    pub adjust: &'a [f32],
     /// Paint mixes as paint (vdraw_core::Mix::Pigment), not as light.
     pub pigment: bool,
     /// Where the scene (the strokes, and the eyes given to `record`) is in the room, where the
@@ -136,6 +168,9 @@ pub struct Scene<'a> {
     pub paper_grid: f32,
     /// Strokes in 3D lit by the scene's light (else their color as it is, as in the 2D app).
     pub lit: bool,
+    /// A shared canvas: its layers composite on its paper (as the 2D app's), then over the
+    /// room; else on the room.
+    pub canvas: bool,
 }
 
 /// What is drawn over the painting: the brush tip, the pointer's laser, and lines.
@@ -569,7 +604,9 @@ impl Raymarcher {
         // Buffers: grow when needed (and then fill the finished strokes in again).
         let need = (n_segments.max(1) * size_of::<GpuSegment>()) as u64;
         let need_chunks = (n_chunks.max(1) * size_of::<GpuChunk>()) as u64;
-        let need_layers = (scene.steps.len().max(1) * size_of::<SceneStep>()) as u64;
+        // The steps, then the adjustments' numbers (four to a step's size).
+        let adjust_steps = scene.adjust.len().div_ceil(4);
+        let need_layers = ((scene.steps.len() + adjust_steps).max(1) * size_of::<SceneStep>()) as u64;
         let need_clusters = (n_clusters.max(1) * size_of::<GpuCluster>()) as u64;
         let need_lines = (overlays.lines.len().max(1) * size_of::<OverlayLine>()) as u64;
         {
@@ -601,7 +638,10 @@ impl Raymarcher {
         f.chunks.bytes()[n_static_chunks * chk..n_chunks * chk].copy_from_slice(bytemuck::cast_slice(&active_chunks));
         let clu = size_of::<GpuCluster>();
         f.clusters.bytes()[n_static_clusters * clu..n_clusters * clu].copy_from_slice(bytemuck::cast_slice(&active_clusters));
-        f.layers.bytes()[..scene.steps.len() * size_of::<SceneStep>()].copy_from_slice(bytemuck::cast_slice(scene.steps));
+        let ss = size_of::<SceneStep>();
+        f.layers.bytes()[..scene.steps.len() * ss].copy_from_slice(bytemuck::cast_slice(scene.steps));
+        let at = scene.steps.len() * ss;
+        f.layers.bytes()[at..at + scene.adjust.len() * 4].copy_from_slice(bytemuck::cast_slice(scene.adjust));
         f.lines.bytes()[..overlays.lines.len() * size_of::<OverlayLine>()].copy_from_slice(bytemuck::cast_slice(overlays.lines));
         let (segment_count, chunk_count) = (n_segments as u32, n_chunks as u32);
         let f = &mut self.frames[frame];
@@ -623,6 +663,7 @@ impl Raymarcher {
         p.paper = scene.paper;
         p.paper_grid = scene.paper_grid;
         p.unlit = u32::from(!scene.lit);
+        p.own_canvas = u32::from(scene.canvas);
         p.width = w;
         p.height = h;
         if let Some((a, b)) = overlays.laser {

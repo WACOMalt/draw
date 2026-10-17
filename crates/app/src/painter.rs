@@ -732,12 +732,12 @@ impl Painter {
     }
 
     /// The steps as the renderer reads them.
-    pub fn scene_steps(&self) -> Vec<SceneStep> {
+    pub fn scene_steps(&self) -> (Vec<SceneStep>, Vec<f32>) {
         vdraw_render::scene_steps(&self.painting, &self.built.steps)
     }
 
     /// What the renderer draws this frame.
-    pub fn scene<'a>(&'a self, steps: &'a [SceneStep]) -> Scene<'a> {
+    pub fn scene<'a>(&'a self, steps: &'a [SceneStep], adjust: &'a [f32]) -> Scene<'a> {
         Scene {
             segments: &self.done,
             runs: &self.built.runs,
@@ -745,11 +745,13 @@ impl Painter {
             active: &self.drawing,
             active_runs: &self.drawing_runs,
             steps,
+            adjust,
             pigment: self.painting.mix == Mix::Pigment,
             world_from_scene: glam::Mat4::IDENTITY,
             paper: [0.0; 4],
             paper_grid: 0.0,
             lit: self.lit,
+            canvas: false,
         }
     }
 }
