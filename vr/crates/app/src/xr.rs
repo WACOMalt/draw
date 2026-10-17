@@ -80,6 +80,60 @@ const TRIGGER_DEAD: f32 = 0.05;
 const CLICK_DOWN: f32 = 0.6;
 const CLICK_UP: f32 = 0.25;
 
+/// Starts an OpenXR runtime (with Vulkan): each of `bridge::runtimes_to_try` in turn, until one
+/// starts. Returns the loader and the instance.
+fn start_runtime() -> Result<(xr::Entry, xr::Instance)> {
+    let mut failed = Vec::new();
+    for runtime in crate::bridge::runtimes_to_try() {
+        if let Some(p) = &runtime {
+            // The loader reads it when the instance is made. (Nothing else reads the
+            // environment meanwhile.)
+            unsafe { std::env::set_var("XR_RUNTIME_JSON", p) };
+        }
+        let start = || -> Result<(xr::Entry, xr::Instance)> {
+            let entry = load_entry()?;
+            let available = entry.enumerate_extensions()?;
+            if !available.khr_vulkan_enable2 {
+                bail!("the OpenXR runtime has no XR_KHR_vulkan_enable2");
+            }
+            let mut exts = xr::ExtensionSet::default();
+            exts.khr_vulkan_enable2 = true;
+            let instance = entry.create_instance(
+                &xr::ApplicationInfo { application_name: "vdraw", application_version: 1, engine_name: "vdraw", engine_version: 1, api_version: xr::Version::new(1, 0, 0) },
+                &exts,
+                &[],
+            )?;
+            Ok((entry, instance))
+        };
+        let name = runtime.as_ref().map_or("the default runtime".to_string(), |p| p.display().to_string());
+        match start() {
+            Ok(started) => return Ok(started),
+            Err(e) => {
+                log::warn!("OpenXR: {name} did not start: {e:#}");
+                failed.push(format!("{name}: {e:#}"));
+            }
+        }
+        if runtime.is_some() {
+            unsafe { std::env::remove_var("XR_RUNTIME_JSON") };
+        }
+    }
+    bail!("no VR runtime started (is SteamVR, Monado or WiVRn running?): {}", failed.join("; "))
+}
+
+/// `vdraw --check-runtime`: which OpenXR runtime starts, and which headset it sees (no VR
+/// session; starting the runtime may start SteamVR). One line of JSON.
+pub fn check_runtime() -> serde_json::Value {
+    let order: Vec<String> = crate::bridge::runtimes_to_try().iter().map(|r| r.as_ref().map_or("default".into(), |p| p.display().to_string())).collect();
+    match start_runtime() {
+        Ok((_, instance)) => {
+            let runtime = instance.properties().map(|p| format!("{} {}", p.runtime_name, p.runtime_version)).unwrap_or_default();
+            let headset = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY).ok().and_then(|s| instance.system_properties(s).ok()).map(|p| p.system_name);
+            serde_json::json!({ "ok": true, "runtime": runtime, "headset": headset, "tried": order })
+        }
+        Err(e) => serde_json::json!({ "ok": false, "reason": format!("{e:#}"), "tried": order }),
+    }
+}
+
 #[cfg(feature = "static-openxr")]
 fn load_entry() -> Result<xr::Entry> {
     Ok(xr::Entry::linked())
@@ -232,18 +286,7 @@ pub fn run(start: Start, server: Option<String>, quit: Arc<AtomicBool>) -> Resul
     let q = quit.clone();
     ctrlc::set_handler(move || q.store(true, Ordering::Relaxed))?;
 
-    let entry = load_entry()?;
-    let available = entry.enumerate_extensions()?;
-    if !available.khr_vulkan_enable2 {
-        bail!("the OpenXR runtime has no XR_KHR_vulkan_enable2");
-    }
-    let mut exts = xr::ExtensionSet::default();
-    exts.khr_vulkan_enable2 = true;
-    let instance = entry.create_instance(
-        &xr::ApplicationInfo { application_name: "vdraw", application_version: 1, engine_name: "vdraw", engine_version: 1, api_version: xr::Version::new(1, 0, 0) },
-        &exts,
-        &[],
-    )?;
+    let (_entry, instance) = start_runtime()?;
     let props = instance.properties()?;
     log::info!("OpenXR runtime: {} {}", props.runtime_name, props.runtime_version);
     let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY).context("no headset found (is it on, and is the runtime running?)")?;

@@ -233,6 +233,11 @@ fn main() -> Result<()> {
             println!("{}", bridge::probe());
             Ok(())
         }
+        // --check-runtime: which VR runtime starts here, and its headset (may start SteamVR).
+        Some("--check-runtime") => {
+            println!("{}", xr::check_runtime());
+            Ok(())
+        }
         // --bridge: opened from the 2D desktop app, which talks to it over stdin and stdout.
         Some("--bridge") => {
             let quit: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();

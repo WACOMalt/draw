@@ -130,3 +130,101 @@ fn active_runtime() -> Option<std::path::PathBuf> {
             .find(|p| p.exists())
     }
 }
+
+/// The OpenXR runtimes to start, in order (None: the system's default). The default is what
+/// the OpenXR loader starts, but it may name a runtime that is not running while another is
+/// (Monado installed as the default, SteamVR in use): so a running SteamVR comes first, then
+/// the default, then the other runtimes installed. XR_RUNTIME_JSON, when set, is the only one.
+pub fn runtimes_to_try() -> Vec<Option<std::path::PathBuf>> {
+    if std::env::var_os("XR_RUNTIME_JSON").is_some() {
+        return vec![None];
+    }
+    let default = active_runtime().and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
+    let installed = installed_runtimes();
+    let steam = installed.iter().find(|p| p.to_string_lossy().contains("steamxr")).cloned();
+    let mut out: Vec<Option<std::path::PathBuf>> = Vec::new();
+    if let Some(s) = steam.clone().filter(|_| steamvr_running()) {
+        out.push(Some(s));
+    }
+    out.push(None);
+    for p in steam.into_iter().chain(installed) {
+        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        if Some(&p) != default.as_ref() && !out.iter().flatten().any(|o| *o == p) {
+            out.push(Some(p));
+        }
+    }
+    // The default, when it is one of the others already, need not be tried twice.
+    if let Some(d) = &default {
+        let first_steam = out.first().and_then(|o| o.as_ref()) == Some(d);
+        if first_steam {
+            out.retain(|o| o.is_some());
+        }
+    }
+    out
+}
+
+/// OpenXR runtime manifests installed here (SteamVR's where Steam keeps it, and those in the
+/// OpenXR folders; on Windows the registry's list).
+fn installed_runtimes() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Ok(o) = std::process::Command::new("reg").args(["query", r"HKLM\SOFTWARE\Khronos\OpenXR\1\AvailableRuntimes"]).output() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Some(path) = line.split("REG_DWORD").next().map(str::trim).filter(|p| p.to_ascii_lowercase().ends_with(".json")) {
+                    out.push(PathBuf::from(path));
+                }
+            }
+        }
+        out.push(PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\SteamVR\steamxr_win64.json"));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            // Steam's own folders, its libraries (libraryfolders.vdf), and the Flatpak's.
+            let roots = [home.join(".local/share/Steam"), home.join(".steam/steam"), home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam")];
+            let mut libraries: Vec<PathBuf> = roots.to_vec();
+            for r in &roots {
+                if let Ok(vdf) = std::fs::read_to_string(r.join("steamapps/libraryfolders.vdf")) {
+                    for line in vdf.lines() {
+                        let parts: Vec<&str> = line.split('"').collect();
+                        if parts.len() >= 4 && parts[1] == "path" {
+                            libraries.push(PathBuf::from(parts[3]));
+                        }
+                    }
+                }
+            }
+            for l in libraries {
+                out.push(l.join("steamapps/common/SteamVR/steamxr_linux64.json"));
+            }
+        }
+        for dir in ["/usr/share/openxr/1", "/usr/local/share/openxr/1", "/etc/xdg/openxr/1"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "json") && !p.ends_with("active_runtime.json") {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    out.retain(|p| p.exists());
+    out
+}
+
+/// Whether SteamVR's server is running.
+fn steamvr_running() -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq vrserver.exe", "/NH"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("vrserver.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_dir("/proc").is_ok_and(|rd| rd.flatten().any(|e| std::fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "vrserver")))
+    }
+}
