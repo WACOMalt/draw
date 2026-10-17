@@ -31,11 +31,11 @@ use crate::panel::{Action, CanvasInfo, Model, Panel, Placement, Pointer, Screen}
 use crate::rig::{Locomotion, Rig};
 use crate::painter::Painter;
 use crate::tools::Tool;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ash::vk::{self, Handle};
 use glam::{Mat4, Quat, Vec2, Vec3};
 use openxr as xr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -77,11 +77,17 @@ const TRIGGER_DEAD: f32 = 0.05;
 const CLICK_DOWN: f32 = 0.6;
 const CLICK_UP: f32 = 0.25;
 
+#[cfg(feature = "static-openxr")]
+fn load_entry() -> Result<xr::Entry> {
+    Ok(xr::Entry::linked())
+}
+
+#[cfg(not(feature = "static-openxr"))]
 fn load_entry() -> Result<xr::Entry> {
     // The crate looks for the unversioned libopenxr_loader.so (a dev package); most systems
     // install only the .so.1.
-    unsafe { xr::Entry::load().or_else(|_| xr::Entry::load_from(Path::new("libopenxr_loader.so.1"))) }
-        .map_err(|e| anyhow!("no OpenXR loader (libopenxr_loader.so.1): {e}"))
+    unsafe { xr::Entry::load().or_else(|_| xr::Entry::load_from(std::path::Path::new("libopenxr_loader.so.1"))) }
+        .map_err(|e| anyhow::anyhow!("no OpenXR loader (libopenxr_loader.so.1): {e}"))
 }
 
 fn pose_mat(p: xr::Posef) -> Mat4 {

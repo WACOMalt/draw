@@ -5,6 +5,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# The OpenXR loader built in (release builds: nothing to install beside the app); without it,
+# the system's libopenxr_loader is loaded at run time.
+static-openxr = ["openxr/static"]
+
 [dependencies]
 vdraw-core.workspace = true
 vdraw-render.workspace = true
