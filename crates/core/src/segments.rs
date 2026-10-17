@@ -514,19 +514,17 @@ impl Stroke {
         if self.samples.is_empty() {
             return;
         }
-        // Strokes from the 2D app (with its brush, `dabs`) are tubes.
-        if brush.dabs.is_some() {
-            self.tube_segments(filter, id, out);
-            return;
-        }
-        // 1. Filter the positions (the pressure and the pen's up direction stay raw).
+        // 1. Filter the positions (the pressure and the pen's up direction stay raw). A 2D app
+        //    stroke (with its brush, `dabs`) in a layer drawn by depth (a shared canvas's VR
+        //    layer) keeps its points: they were smoothed where it was drawn. It is resampled as
+        //    a VR stroke is, so points far apart (a mouse's) still make one trail.
         let mut f = filter;
         f.reset();
         let mut ups: Vec<Vec3> = Vec::with_capacity(self.samples.len());
         for s in &self.samples {
             ups.push(align(s.up, ups.last().copied()));
         }
-        let pts: Vec<(Vec3, f32, Vec3)> = self.samples.iter().zip(&ups).map(|(s, &up)| (f.filter(s.time, s.pos), s.pressure, up)).collect();
+        let pts: Vec<(Vec3, f32, Vec3)> = self.samples.iter().zip(&ups).map(|(s, &up)| (if brush.dabs.is_some() { s.pos } else { f.filter(s.time, s.pos) }, s.pressure, up)).collect();
         // Airbrush: where the pen held still (a point repeats: the painter adds one every
         // 30 ms then), a dab more.
         let held: Vec<usize> = if brush.buildup && !brush.solid() { (1..self.samples.len()).filter(|&i| self.samples[i].pos == self.samples[i - 1].pos).collect() } else { Vec::new() };

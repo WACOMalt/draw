@@ -97,6 +97,11 @@ fn blend_name(b: Blend) -> Value {
     serde_json::to_value(b).unwrap_or_else(|_| "normal".into())
 }
 
+/// A brush setting as the document has it: four decimals.
+fn r4(x: f32) -> f64 {
+    (x as f64 * 1e4).round() / 1e4
+}
+
 /// The opposite of an affine ([a, b, c, d, e, f], as the 2D app's).
 fn invert_affine(m: &[f64; 6]) -> Option<[f64; 6]> {
     let det = m[0] * m[3] - m[1] * m[2];
@@ -220,6 +225,8 @@ pub struct Canvas {
     /// The layer (by document id) to make active once the document has it.
     want_active: Option<String>,
     rebuild: Option<Rebuild>,
+    /// A painting of the document is in (what this user does can be sent).
+    ready: bool,
 }
 
 impl Canvas {
@@ -244,6 +251,7 @@ impl Canvas {
             live: (String::new(), 0, false, Instant::now()),
             want_active: None,
             rebuild: None,
+            ready: false,
         }
     }
 
@@ -328,7 +336,15 @@ impl Canvas {
         let active = painter.painting.index_of(painter.active_layer).and_then(|i| self.shown.get(i)).map(|s| s.id.clone());
         let mut converted = r.converted;
         // The layers keep the ids they had (a new one gets the next free id).
-        let numbers: Vec<u32> = converted.layer_ids.iter().map(|id| self.number(id)).collect();
+        let mut numbers: Vec<u32> = converted.layer_ids.iter().map(|id| self.number(id)).collect();
+        // (Two layers with one number: the later gets a new one.)
+        for k in 0..numbers.len() {
+            if numbers[..k].contains(&numbers[k]) {
+                numbers[k] = self.next_id;
+                self.next_id += 1;
+                self.ids.insert(converted.layer_ids[k].clone(), numbers[k]);
+            }
+        }
         let old: Vec<u32> = converted.painting.layers.iter().map(|l| l.id).collect();
         for l in &mut converted.painting.layers {
             l.id = numbers[old.iter().position(|&o| o == l.id).unwrap()];
@@ -349,6 +365,7 @@ impl Canvas {
         painter.shared = true;
         self.synced = metas(&painter.painting);
         self.lives.clear();
+        self.ready = true;
     }
 
     /// The painting's layer id of a document layer.
@@ -555,25 +572,26 @@ impl Canvas {
             "tool": if b.erase { "erase" } else { "paint" },
             "color": hex,
             "size": size,
-            "opacity": b.opacity.clamp(0.0, 1.0),
-            "flow": b.flow.clamp(0.001, 1.0),
-            "hardness": b.hardness.clamp(0.0, 1.0),
-            "spacing": b.spacing.clamp(0.01, 2.0),
+            // In f64 (0.01 as an f32 is just under 0.01) and rounded.
+            "opacity": r4(b.opacity).clamp(0.0, 1.0),
+            "flow": r4(b.flow).clamp(0.001, 1.0),
+            "hardness": r4(b.hardness).clamp(0.0, 1.0),
+            "spacing": r4(b.spacing).clamp(0.01, 2.0),
             "pressureSize": b.pressure_size,
             "pressureFlow": b.pressure_flow,
             "buildup": b.buildup,
         });
-        let mut extra = |k: &str, x: f32, none: f32| {
+        let mut extra = |k: &str, x: f64, none: f64| {
             if x != none {
                 v[k] = x.into();
             }
         };
-        extra("roundness", b.roundness.clamp(0.05, 1.0), 1.0);
-        extra("angle", angle, 0.0);
-        extra("sizeJitter", b.size_jitter, 0.0);
-        extra("angleJitter", b.angle_jitter, 0.0);
-        extra("scatter", b.scatter.clamp(0.0, 4.0), 0.0);
-        extra("opacityJitter", b.flow_jitter, 0.0);
+        extra("roundness", r4(b.roundness).clamp(0.05, 1.0), 1.0);
+        extra("angle", r4(angle).clamp(0.0, 360.0), 0.0);
+        extra("sizeJitter", r4(b.size_jitter).clamp(0.0, 1.0), 0.0);
+        extra("angleJitter", r4(b.angle_jitter).clamp(0.0, 1.0), 0.0);
+        extra("scatter", r4(b.scatter).clamp(0.0, 4.0), 0.0);
+        extra("opacityJitter", r4(b.flow_jitter).clamp(0.0, 1.0), 0.0);
         v
     }
 
@@ -601,6 +619,11 @@ impl Canvas {
     /// Sends what this user did since the last frame (strokes, sweeps, layer edits, undo and
     /// redo) as ops, and shows the document with them.
     pub fn commit(&mut self, painter: &mut Painter) {
+        // Until a painting of the document is in (and while one is made again), what was done
+        // waits: it is told against the painting as the document has it.
+        if !self.ready || self.rebuilding() {
+            return;
+        }
         let outbox = std::mem::take(&mut painter.outbox);
         let asked = std::mem::take(&mut painter.asked);
         let edited = metas(&painter.painting) != self.synced;
@@ -669,6 +692,8 @@ impl Canvas {
         for op in ops {
             self.session.send_op(op);
         }
+        // Sent: not to be sent again (the document brings the painting up to date).
+        self.synced = metas(&painter.painting);
         if !step.undo.is_empty() {
             step.undo.reverse();
             self.undo.push(step);
@@ -837,7 +862,13 @@ impl Canvas {
             step.undo.push(json!({ "type": "layer.restore", "id": id }));
             step.redo.push(json!({ "type": "layer.remove", "id": id }));
         }
-        // The new active layer, once the document has it.
+        // The new layers keep their ids when the document has them; the new active one stays
+        // active.
+        for (&n, nid) in &new_ids {
+            self.ids.retain(|_, v| *v != n);
+            self.ids.insert(nid.clone(), n);
+        }
+        self.next_id = self.next_id.max(new_ids.keys().max().map_or(0, |m| m + 1));
         if let Some(nid) = new_ids.get(&painter.active_layer) {
             self.want_active = Some(nid.clone());
         }
@@ -1228,13 +1259,23 @@ mod tests {
         let at = painter.active_index();
         painter.edit_layers(|p| (Some(p.add_layer(Some(at))), crate::painter::Removed::default()));
         wait(&mut c, &mut painter, &mut other, "the VR layer", &|o| o.doc.layers.values().any(|l| l.vr));
+        // Sent once, also while the painting is made again (a while of frames).
+        for _ in 0..30 {
+            other.poll();
+            c.update(&mut painter, head);
+            c.commit(&mut painter);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(other.doc.layers.values().filter(|l| !l.deleted).count(), 2, "one layer more");
         while c.rebuilding() || !painter.painting.layers.iter().any(|l| !l.ordered) {
             c.update(&mut painter, head);
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!painter.painting.layers[painter.active_index()].ordered, "the new layer is active");
-        // A stroke 10 cm in front of the paper, the pen's up side straight up.
+        // A stroke 10 cm in front of the paper, the pen's up side straight up (its dabs as close
+        // as they go: 0.01 as an f32 must not come out under the server's 0.01).
         painter.tools.smoothing = 0.0;
+        painter.tools.brush.spacing = 0.01;
         for (k, x) in [0.0f32, 0.05, 0.1].iter().enumerate() {
             painter.hand(1, k as f64 * 0.05, Vec3::new(*x, 0.0, 0.1), Vec3::Y, 0.8);
         }
