@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
-use vdraw_core::doc::{Doc, DocLayer, DocStroke, OpError, Paper, StrokeVr, new_id};
+use vdraw_core::doc::{Doc, DocLayer, DocStroke, OpError, Paper, StrokeThreeD, new_id};
 
 /// What the socket thread says.
 enum Event {
@@ -179,8 +179,8 @@ pub struct LiveStroke {
     pub mask: Option<String>,
     pub brush: Value,
     pub pts: Vec<f64>,
-    /// A 3D stroke's depth and up sides so far (see `StrokeVr`).
-    pub vr: Option<StrokeVr>,
+    /// A 3D stroke's depth and up sides so far (see `StrokeThreeD`).
+    pub threed: Option<StrokeThreeD>,
 }
 
 /// What changed in a session since it was last asked.
@@ -236,7 +236,7 @@ pub struct Session {
 
 /// The document features (src/shared/types.ts DOC_FEATURES) this client draws. A canvas
 /// using another one is drawn without it (the panel says which).
-pub const DRAWN_FEATURES: &[&str] = &["clip", "mask", "tips", "groups", "paper", "pigment", "vr"];
+pub const DRAWN_FEATURES: &[&str] = &["clip", "mask", "tips", "groups", "paper", "pigment", "threed"];
 
 impl Session {
     /// Opens the canvas `key` on `server` as `name` (`color`), with the anonymous secret, the
@@ -397,15 +397,15 @@ impl Session {
             "live" => {
                 let key = (s("by"), s("id"));
                 let pts: Vec<f64> = m.get("pts").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
-                let vr: Option<StrokeVr> = m.get("vr").and_then(|v| serde_json::from_value(v.clone()).ok());
+                let vr: Option<StrokeThreeD> = m.get("threed").and_then(|v| serde_json::from_value(v.clone()).ok());
                 if m.get("start").and_then(Value::as_bool) == Some(true) || !self.lives.contains_key(&key) {
                     self.lives.insert(
                         key.clone(),
-                        LiveStroke { by: key.0.clone(), id: key.1.clone(), layer_id: s("layerId"), mask: m.get("mask").and_then(Value::as_str).map(str::to_string), brush: m.get("brush").cloned().unwrap_or(Value::Null), pts, vr },
+                        LiveStroke { by: key.0.clone(), id: key.1.clone(), layer_id: s("layerId"), mask: m.get("mask").and_then(Value::as_str).map(str::to_string), brush: m.get("brush").cloned().unwrap_or(Value::Null), pts, threed: vr },
                     );
                 } else if let Some(l) = self.lives.get_mut(&key) {
                     l.pts.extend(pts);
-                    if let (Some(have), Some(more)) = (&mut l.vr, vr) {
+                    if let (Some(have), Some(more)) = (&mut l.threed, vr) {
                         have.z.extend(more.z);
                         if let (Some(u), Some(mu)) = (&mut have.up, more.up) {
                             u.extend(mu);
@@ -455,13 +455,13 @@ impl Session {
 
     /// A stroke's points while it is drawn (the first with `start`), for the others to see.
     /// `vr`: a 3D stroke's depth and up sides for these points.
-    pub fn send_live(&self, id: &str, layer_id: &str, mask: Option<&str>, brush: &Value, pts: &[f64], vr: Option<&StrokeVr>, start: bool) {
+    pub fn send_live(&self, id: &str, layer_id: &str, mask: Option<&str>, brush: &Value, pts: &[f64], vr: Option<&StrokeThreeD>, start: bool) {
         let mut m = json!({ "t": "live", "id": id, "layerId": layer_id, "brush": brush, "pts": pts, "start": start });
         if let Some(mk) = mask {
             m["mask"] = mk.into();
         }
         if let Some(v) = vr {
-            m["vr"] = serde_json::to_value(v).unwrap_or(Value::Null);
+            m["threed"] = serde_json::to_value(v).unwrap_or(Value::Null);
         }
         let _ = self.socket.tx.send(Out::Send(m));
     }

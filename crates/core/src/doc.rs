@@ -91,18 +91,18 @@ pub struct DocStroke {
     /// The mask (its id) it paints, when it is a mask stroke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<String>,
-    /// A stroke painted in 3D (on a VR layer): its points' depth, and the pen's up side.
+    /// A stroke painted in 3D (on a 3D layer): its points' depth, and the pen's up side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vr: Option<StrokeVr>,
+    pub threed: Option<StrokeThreeD>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
-/// A 3D stroke's depth (types.ts Stroke.vr): `z`, one per point, in canvas units toward the
+/// A 3D stroke's depth (types.ts Stroke.threed): `z`, one per point, in canvas units toward the
 /// 2D viewer (out of the paper); `up`, three per point, the pen's up side in canvas axes (x
 /// right, y down, z toward the viewer). The 2D app draws the stroke flat (x, y).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StrokeVr {
+pub struct StrokeThreeD {
     pub z: Vec<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<Vec<f64>>,
@@ -145,9 +145,9 @@ pub struct DocLayer {
     pub clip: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<LayerMask>,
-    /// A VR layer (painted in 3D in vdraw): its strokes may have depth. Set when it is made.
+    /// A 3D layer (painted in 3D in vdraw): its strokes may have depth. Set when it is made.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub vr: bool,
+    pub threed: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -394,7 +394,7 @@ impl Doc {
                 let id = id();
                 let Some(l) = self.layers.get(&id) else { return refused("no such layer") };
                 let mut props = field("props").and_then(Value::as_object).cloned().unwrap_or_default();
-                // A layer's kind is set when it is made (whether it is a VR layer can change).
+                // A layer's kind is set when it is made (whether it is a 3D layer can change).
                 props.remove("kind");
                 if props.get("blend").and_then(Value::as_str) == Some("pass") && !l.is_group() {
                     return refused("pass through is for groups");
@@ -439,11 +439,11 @@ impl Doc {
                 if self.effectively_deleted(l) {
                     return refused("no such layer");
                 }
-                // A VR layer moved in 3D (m3), its strokes' depth with it.
+                // A 3D layer moved in 3D (m3), its strokes' depth with it.
                 if let Some(m3) = field("m3") {
                     let m3: [f64; 12] = serde_json::from_value(m3.clone()).map_err(|_| OpError::Refused("bad transform".into()))?;
-                    if !l.vr || l.is_group() {
-                        return refused("a 3D transform is for VR layers");
+                    if !l.threed || l.is_group() {
+                        return refused("3D transforms are for 3D layers");
                     }
                     let mut changes = Vec::new();
                     for s in self.strokes.values().filter(|s| s.layer_id == id) {
@@ -459,7 +459,7 @@ impl Doc {
                         let s = self.strokes.get_mut(&sid).unwrap();
                         s.pts = pts;
                         s.brush = brush;
-                        s.vr = vr;
+                        s.threed = vr;
                     }
                     return Ok(());
                 }
@@ -485,7 +485,7 @@ impl Doc {
                     let s = self.strokes.get_mut(&sid).unwrap();
                     s.pts = pts;
                     s.brush = brush;
-                    s.vr = vr;
+                    s.threed = vr;
                 }
                 // Effect lengths scale too (effects are not drawn here; a reload keeps them right).
                 if ids.iter().any(|lid| self.layers.get(lid).is_some_and(|l| l.extra.contains_key("effects") || l.extra.contains_key("adjust"))) {
@@ -627,7 +627,7 @@ impl Doc {
 /// A stroke after an affine transform [a, b, c, d, e, f] (layers.ts transformStroke): points
 /// mapped, the size scaled by the square root of |det|, a fixed tip angle turned with the
 /// rotation. None: out of range.
-pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBrush, Option<StrokeVr>)> {
+pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBrush, Option<StrokeThreeD>)> {
     let mut pts = s.pts.clone();
     for p in pts.chunks_exact_mut(3) {
         let (x, y) = (p[0], p[1]);
@@ -651,7 +651,7 @@ pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBru
         brush.extra.insert("angle".into(), angle.into());
     }
     // A 3D stroke's depth scales as the canvas does; the pen's up side turns with it.
-    let vr = match &s.vr {
+    let vr = match &s.threed {
         Some(v) => {
             let z: Vec<f64> = v.z.iter().map(|z| z * scale).collect();
             if z.iter().any(|z| !(z.abs() <= MAX_COORD)) {
@@ -669,7 +669,7 @@ pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBru
                 }
                 out
             });
-            Some(StrokeVr { z, up })
+            Some(StrokeThreeD { z, up })
         }
         None => None,
     };
@@ -680,14 +680,14 @@ pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBru
 /// m[6] z + m[9], ...), as the 2D app's layer.transform with `m3`: its points and their depth
 /// (a stroke without depth gets it), its up sides turned, its size scaled, its tip turned by
 /// the turn in the paper's plane.
-pub fn transform_stroke_3d(s: &DocStroke, m: &[f64; 12]) -> Option<(Vec<f64>, DocBrush, Option<StrokeVr>)> {
+pub fn transform_stroke_3d(s: &DocStroke, m: &[f64; 12]) -> Option<(Vec<f64>, DocBrush, Option<StrokeThreeD>)> {
     let det = m[0] * (m[4] * m[8] - m[7] * m[5]) - m[3] * (m[1] * m[8] - m[7] * m[2]) + m[6] * (m[1] * m[5] - m[4] * m[2]);
     let scale = det.abs().cbrt();
     let n = s.pts.len() / 3;
     let mut pts = s.pts.clone();
     let mut z = Vec::with_capacity(n);
     for i in 0..n {
-        let (x, y, d) = (pts[3 * i], pts[3 * i + 1], s.vr.as_ref().and_then(|v| v.z.get(i)).copied().unwrap_or(0.0));
+        let (x, y, d) = (pts[3 * i], pts[3 * i + 1], s.threed.as_ref().and_then(|v| v.z.get(i)).copied().unwrap_or(0.0));
         let p = [m[0] * x + m[3] * y + m[6] * d + m[9], m[1] * x + m[4] * y + m[7] * d + m[10], m[2] * x + m[5] * y + m[8] * d + m[11]];
         if p.iter().any(|c| !(c.abs() <= MAX_COORD)) {
             return None;
@@ -707,7 +707,7 @@ pub fn transform_stroke_3d(s: &DocStroke, m: &[f64; 12]) -> Option<(Vec<f64>, Do
         let angle = ((brush.num("angle").unwrap_or(0.0) + deg) % 360.0 + 360.0) % 360.0;
         brush.extra.insert("angle".into(), angle.into());
     }
-    let up = s.vr.as_ref().and_then(|v| v.up.as_ref()).map(|up| {
+    let up = s.threed.as_ref().and_then(|v| v.up.as_ref()).map(|up| {
         let mut out = up.clone();
         for u in out.chunks_exact_mut(3) {
             let t = [m[0] * u[0] + m[3] * u[1] + m[6] * u[2], m[1] * u[0] + m[4] * u[1] + m[7] * u[2], m[2] * u[0] + m[5] * u[1] + m[8] * u[2]];
@@ -718,7 +718,7 @@ pub fn transform_stroke_3d(s: &DocStroke, m: &[f64; 12]) -> Option<(Vec<f64>, Do
         }
         out
     });
-    Some((pts, brush, Some(StrokeVr { z, up })))
+    Some((pts, brush, Some(StrokeThreeD { z, up })))
 }
 
 /// How the document's canvas units map into a painting's space: a point (x, y) (2D: y down)
@@ -789,7 +789,7 @@ pub fn brush(b: &DocBrush, k: f64, stroke_id: &str) -> crate::Brush {
 /// the tip's turn as the 2D app's dabs (brush.ts DabWalker): its angle (degrees, clockwise on
 /// the canvas, whose y runs down), plus the direction of travel when it follows it. Its width
 /// lies along the turned x; it is squashed along the turned y, which is the pen's up direction.
-pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], vr: Option<&StrokeVr>, frame: &Frame) -> crate::Stroke {
+pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], vr: Option<&StrokeThreeD>, frame: &Frame) -> crate::Stroke {
     let mut out = crate::Stroke::new(brush(b, frame.k, id));
     let angle = b.num("angle").unwrap_or(0.0).to_radians();
     let follow = b.flag("followDirection");
@@ -845,9 +845,9 @@ impl Doc {
             let id = layers.len() as u32 + 1;
             num.insert(&l.id, id);
             let group = l.is_group();
-            // A flat layer's strokes lie on the paper (a VR layer made flat keeps their depth
-            // for when it is made a VR layer again).
-            let strokes = |mask: Option<&str>| self.strokes_of(&l.id, mask).into_iter().map(|s| stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref().filter(|_| l.vr), frame)).collect::<Vec<_>>();
+            // A flat layer's strokes lie on the paper (a 3D layer made flat keeps their depth
+            // for when it is made a 3D layer again).
+            let strokes = |mask: Option<&str>| self.strokes_of(&l.id, mask).into_iter().map(|s| stroke(&s.id, &s.brush, &s.pts, s.threed.as_ref().filter(|_| l.threed), frame)).collect::<Vec<_>>();
             layers.push(crate::Layer {
                 id,
                 name: l.name.clone(),
@@ -855,9 +855,9 @@ impl Doc {
                 opacity: l.opacity as f32,
                 visible: l.visible,
                 // A shared canvas's strokes cover each other in order, as the 2D app draws them;
-                // a VR layer's have depth too.
+                // a 3D layer's have depth too.
                 ordered: !group,
-                vr: l.vr && !group,
+                threed: l.threed && !group,
                 group,
                 parent: None,
                 clip: l.clip.unwrap_or(false),
@@ -1044,7 +1044,7 @@ mod tests {
             "id": "S3dddddddd", "layerId": "L1aaaa",
             "brush": {"tool": "paint", "color": "#000000", "size": 2.0, "opacity": 1.0, "flow": 1.0, "hardness": 0.8, "spacing": 0.1, "pressureSize": true, "pressureFlow": false, "buildup": false},
             "pts": [10.0, 20.0, 0.5, 30.0, 20.0, 0.5],
-            "vr": {"z": [5.0, -5.0], "up": [0.0, -1.0, 0.0, 1.0, 0.0, 0.0]}
+            "threed": {"z": [5.0, -5.0], "up": [0.0, -1.0, 0.0, 1.0, 0.0, 0.0]}
         }))
         .unwrap();
         // A turn by 90 degrees and a scale of 2: depth doubles, the up sides turn in the paper.
@@ -1058,15 +1058,15 @@ mod tests {
         assert!(up[3].abs() < 1e-12 && (up[4] - 1.0).abs() < 1e-12, "{up:?}");
         // Into a painting: depth along z, and the up side with y turned up.
         let frame = Frame { anchor: [10.0, 20.0], k: 0.01, offset: glam::Vec3::ZERO };
-        let st = super::stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref(), &frame);
+        let st = super::stroke(&s.id, &s.brush, &s.pts, s.threed.as_ref(), &frame);
         assert!(st.samples[0].pos.abs_diff_eq(glam::Vec3::new(0.0, 0.0, 0.05), 1e-6));
         assert!(st.samples[1].pos.abs_diff_eq(glam::Vec3::new(0.2, 0.0, -0.05), 1e-6));
         assert!(st.samples[0].up.abs_diff_eq(glam::Vec3::Y, 1e-6));
-        // A layer of them is a VR layer, its strokes covering each other in order (as in 2D).
-        let layer: DocLayer = serde_json::from_value(json!({"id": "L1aaaa", "name": "VR", "order": 1.0, "blend": "normal", "opacity": 1.0, "visible": true, "vr": true})).unwrap();
+        // A layer of them is a 3D layer, its strokes covering each other in order (as in 2D).
+        let layer: DocLayer = serde_json::from_value(json!({"id": "L1aaaa", "name": "VR", "order": 1.0, "blend": "normal", "opacity": 1.0, "visible": true, "threed": true})).unwrap();
         let doc = Doc::from_parts(vec![layer], vec![s], Vec::new(), None, None);
         let p = doc.painting(&frame).painting;
-        assert!(p.layers[0].ordered && p.layers[0].vr);
-        assert_eq!(serde_json::to_value(&doc.layers["L1aaaa"]).unwrap()["vr"], json!(true));
+        assert!(p.layers[0].ordered && p.layers[0].threed);
+        assert_eq!(serde_json::to_value(&doc.layers["L1aaaa"]).unwrap()["threed"], json!(true));
     }
 }

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::time::Instant;
-use vdraw_core::doc::{self, Doc, DocBrush, DocLayer, DocStroke, Frame, StrokeVr};
+use vdraw_core::doc::{self, Doc, DocBrush, DocLayer, DocStroke, Frame, StrokeThreeD};
 use vdraw_core::{Blend, Stroke};
 use vdraw_net::session::{Session, State};
 use vdraw_render::OverlayLine;
@@ -35,7 +35,7 @@ struct Print {
     id: String,
     n: usize,
     ends: [u64; 4],
-    /// The depth at the ends (a VR layer's stroke moved toward or away from the paper).
+    /// The depth at the ends (a 3D layer's stroke moved toward or away from the paper).
     depth: [u64; 2],
     size: u64,
 }
@@ -44,7 +44,7 @@ fn print(s: &DocStroke) -> Print {
     let p = &s.pts;
     let at = |i: usize| p.get(i).copied().unwrap_or(0.0).to_bits();
     let last = p.len().saturating_sub(3);
-    let z = |i: usize| s.vr.as_ref().and_then(|v| v.z.get(i)).copied().unwrap_or(0.0).to_bits();
+    let z = |i: usize| s.threed.as_ref().and_then(|v| v.z.get(i)).copied().unwrap_or(0.0).to_bits();
     Print { id: s.id.clone(), n: p.len(), ends: [at(0), at(1), at(last), at(last + 1)], depth: [z(0), z((p.len() / 3).saturating_sub(1))], size: s.brush.size.to_bits() }
 }
 
@@ -65,11 +65,11 @@ struct Form {
     parent: Option<String>,
     clip: bool,
     mask: Option<String>,
-    vr: bool,
+    threed: bool,
 }
 
 fn form(l: &DocLayer) -> Form {
-    Form { id: l.id.clone(), group: l.is_group(), parent: l.parent.clone(), clip: l.clip.unwrap_or(false), mask: l.mask.as_ref().map(|m| m.id.clone()), vr: l.vr }
+    Form { id: l.id.clone(), group: l.is_group(), parent: l.parent.clone(), clip: l.clip.unwrap_or(false), mask: l.mask.as_ref().map(|m| m.id.clone()), threed: l.threed }
 }
 
 /// A layer as the panel edits it (no strokes): what a layer edit changed is sent as ops.
@@ -84,14 +84,14 @@ struct Meta {
     parent: Option<u32>,
     clip: bool,
     mask: Option<bool>,
-    /// A VR layer (its strokes in 3D).
-    vr: bool,
+    /// A 3D layer (its strokes in 3D).
+    threed: bool,
 }
 
 fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
     p.layers
         .iter()
-        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), vr: l.is_vr() })
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), threed: l.is_3d() })
         .collect()
 }
 
@@ -473,9 +473,9 @@ impl Canvas {
         }
         for (i, mask, out, ins, want, prints) in plans {
             // (A flat layer's strokes lie on the paper.)
-            let depth = layers[i].vr;
+            let depth = layers[i].threed;
             let ordered_in = |painter: &mut Painter, j: usize, s: &DocStroke, frame: &Frame| {
-                let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref().filter(|_| depth), frame);
+                let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.threed.as_ref().filter(|_| depth), frame);
                 if steps_changed {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
@@ -536,14 +536,14 @@ impl Canvas {
             s["mask"] = m.into();
         }
         if let Some(v) = vr {
-            s["vr"] = serde_json::to_value(v).unwrap_or(Value::Null);
+            s["threed"] = serde_json::to_value(v).unwrap_or(Value::Null);
         }
         s
     }
 
-    /// Points as the document has them (x, y, pressure), and with `depth` (a VR layer's
+    /// Points as the document has them (x, y, pressure), and with `depth` (a 3D layer's
     /// stroke) their depth and the pen's up sides.
-    fn doc_points(&self, samples: &[vdraw_core::Sample], depth: bool) -> (Vec<f64>, Option<StrokeVr>) {
+    fn doc_points(&self, samples: &[vdraw_core::Sample], depth: bool) -> (Vec<f64>, Option<StrokeThreeD>) {
         // A pixel at arm's length is about half a millimeter.
         let device_scale = self.frame.k * self.scale() as f64 / 0.0005;
         let d = doc::point_decimals(device_scale);
@@ -560,7 +560,7 @@ impl Canvas {
                 up.extend([r3(s.up.x), r3(-s.up.y), r3(s.up.z)]);
             }
         }
-        (out, depth.then_some(StrokeVr { z, up: Some(up) }))
+        (out, depth.then_some(StrokeThreeD { z, up: Some(up) }))
     }
 
     /// A scene matrix held to the paper's plane as the 2D app's affine on canvas units
@@ -602,9 +602,9 @@ impl Canvas {
         (cols(c), cols(c.inverse()))
     }
 
-    /// Whether strokes on a painting layer (by id) are 3D (a VR layer).
-    fn is_vr_layer(painter: &Painter, layer: u32) -> bool {
-        painter.painting.index_of(layer).is_some_and(|i| painter.painting.layers[i].is_vr())
+    /// Whether strokes on a painting layer (by id) are 3D (a 3D layer).
+    fn is_3d_layer(painter: &Painter, layer: u32) -> bool {
+        painter.painting.index_of(layer).is_some_and(|i| painter.painting.layers[i].is_3d())
     }
 
     fn doc_brush(&self, painter: &Painter, b: &vdraw_core::Brush) -> Value {
@@ -655,7 +655,7 @@ impl Canvas {
         }
         let Some(layer) = painter.painting.index_of(painter.active_layer).and_then(|i| self.doc_layer(i)).map(str::to_string) else { return };
         let mask = if painter.mask_target { painter.painting.index_of(painter.active_layer).and_then(|i| self.shown[i].mask_id.clone()) } else { None };
-        let (pts, vr) = self.doc_points(&stroke.samples[self.live.1..n], Self::is_vr_layer(painter, painter.active_layer) && !painter.mask_target);
+        let (pts, vr) = self.doc_points(&stroke.samples[self.live.1..n], Self::is_3d_layer(painter, painter.active_layer) && !painter.mask_target);
         let brush = self.doc_brush(painter, &stroke.brush);
         self.session.send_live(&self.live.0, &layer, mask.as_deref(), &brush, &pts, vr.as_ref(), !self.live.2);
         self.live = (self.live.0.clone(), n, true, Instant::now());
@@ -722,7 +722,7 @@ impl Canvas {
                         continue;
                     }
                     // The last points the others have not seen, then the stroke itself.
-                    let depth = Self::is_vr_layer(painter, layer) && !mask;
+                    let depth = Self::is_3d_layer(painter, layer) && !mask;
                     if self.live.0 == id && self.live.1 < stroke.samples.len() && self.live.2 {
                         let (pts, vr) = self.doc_points(&stroke.samples[self.live.1..], depth);
                         self.session.send_live(&id, &doc_layer, mask_id.as_deref(), &self.doc_brush(painter, &stroke.brush), &pts, vr.as_ref(), false);
@@ -735,8 +735,8 @@ impl Canvas {
                         painter.add_recent(crate::panel::to_srgb(stroke.brush.color));
                     }
                 }
-                // A VR layer moves freely (m3); a flat one, or a group, in the paper's plane (m).
-                Outgoing::Transform { layer, matrix } if Self::is_vr_layer(painter, layer) => {
+                // A 3D layer moves freely (m3); a flat one, or a group, in the paper's plane (m).
+                Outgoing::Transform { layer, matrix } if Self::is_3d_layer(painter, layer) => {
                     let Some(id) = self.doc_id(layer) else { continue };
                     let (m3, inv) = self.affine_3d(matrix);
                     ops.push(json!({ "type": "layer.transform", "id": id, "m3": m3 }));
@@ -874,8 +874,8 @@ impl Canvas {
                 if m.clip {
                     layer["clip"] = true.into();
                 }
-                if m.vr {
-                    layer["vr"] = true.into();
+                if m.threed {
+                    layer["threed"] = true.into();
                 }
                 adds.push(json!({ "type": "layer.add", "layer": layer }));
             }
@@ -907,8 +907,8 @@ impl Canvas {
             if m.clip != b.clip {
                 set("clip", m.clip.into(), dl.clip.unwrap_or(false).into());
             }
-            if m.vr != b.vr && !m.group {
-                set("vr", m.vr.into(), dl.vr.into());
+            if m.threed != b.threed && !m.group {
+                set("threed", m.threed.into(), dl.threed.into());
             }
             if m.parent != b.parent {
                 let par = m.parent.and_then(|x| doc_of(x, &new_ids)).map_or(Value::Null, Value::from);
@@ -988,8 +988,8 @@ impl Canvas {
                     continue;
                 }
                 let Ok(brush) = serde_json::from_value::<DocBrush>(l.brush.clone()) else { continue };
-                let depth = painter.painting.layers[layer].is_vr();
-                let stroke = doc::stroke(&l.id, &brush, &l.pts, l.vr.as_ref().filter(|_| depth), &self.frame);
+                let depth = painter.painting.layers[layer].is_3d();
+                let stroke = doc::stroke(&l.id, &brush, &l.pts, l.threed.as_ref().filter(|_| depth), &self.frame);
                 self.lives.insert(key.clone(), Live { points: l.pts.len(), layer, mask, stroke });
             }
             if let Some(c) = self.lives.get(key) {
@@ -1327,7 +1327,7 @@ mod tests {
         other.close();
     }
 
-    /// A layer made in VR is a VR layer; strokes painted on it with the pen keep their depth
+    /// A layer made in VR is a 3D layer; strokes painted on it with the pen keep their depth
     /// and the pen's up side, for the others too (also while they are drawn), and come back
     /// in 3D. (A test server with the VR fields, as above.)
     #[test]
@@ -1362,7 +1362,7 @@ mod tests {
         }
         let at = painter.active_index();
         painter.edit_layers(|p| (Some(p.add_layer(Some(at))), crate::painter::Removed::default()));
-        wait(&mut c, &mut painter, &mut other, "the VR layer", &|o| o.doc.layers.values().any(|l| l.vr));
+        wait(&mut c, &mut painter, &mut other, "the 3D layer", &|o| o.doc.layers.values().any(|l| l.threed));
         // Sent once, also while the painting is made again (a while of frames).
         for _ in 0..30 {
             other.poll();
@@ -1371,11 +1371,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(other.doc.layers.values().filter(|l| !l.deleted).count(), 2, "one layer more");
-        while c.rebuilding() || !painter.painting.layers.iter().any(|l| l.vr) {
+        while c.rebuilding() || !painter.painting.layers.iter().any(|l| l.threed) {
             c.update(&mut painter, head);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(painter.painting.layers[painter.active_index()].vr, "the new layer is active");
+        assert!(painter.painting.layers[painter.active_index()].threed, "the new layer is active");
         // A stroke 10 cm in front of the paper, the pen's up side straight up (its dabs as close
         // as they go: 0.01 as an f32 must not come out under the server's 0.01).
         painter.tools.smoothing = 0.0;
@@ -1386,38 +1386,38 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         c.send_live(&painter);
         let k = c.frame.k;
-        wait(&mut c, &mut painter, &mut other, "the live stroke's depth", &|o| o.lives.values().any(|l| l.vr.as_ref().is_some_and(|v| v.z.iter().all(|z| (z - 0.1 / k).abs() < 1e-3 / k))));
+        wait(&mut c, &mut painter, &mut other, "the live stroke's depth", &|o| o.lives.values().any(|l| l.threed.as_ref().is_some_and(|v| v.z.iter().all(|z| (z - 0.1 / k).abs() < 1e-3 / k))));
         painter.hand(1, 0.2, Vec3::new(0.1, 0.0, 0.1), Vec3::Y, 0.0);
-        wait(&mut c, &mut painter, &mut other, "the stroke", &|o| o.doc.strokes.values().any(|s| s.vr.is_some()));
-        let s = other.doc.strokes.values().find(|s| s.vr.is_some()).unwrap().clone();
-        let vr = s.vr.unwrap();
+        wait(&mut c, &mut painter, &mut other, "the stroke", &|o| o.doc.strokes.values().any(|s| s.threed.is_some()));
+        let s = other.doc.strokes.values().find(|s| s.threed.is_some()).unwrap().clone();
+        let vr = s.threed.unwrap();
         assert_eq!(vr.z.len(), s.pts.len() / 3);
         assert!(vr.z.iter().all(|z| (z - 0.1 / k).abs() < 1e-3 / k), "{:?}", vr.z);
         // Up is +y in the scene: -y in canvas axes (y runs down).
         assert_eq!(&vr.up.unwrap()[..3], &[0.0, -1.0, 0.0]);
         // Back from the document: in 3D, 10 cm in front of the paper.
-        let shown = painter.painting.layers.iter().find(|l| l.vr).unwrap();
+        let shown = painter.painting.layers.iter().find(|l| l.threed).unwrap();
         assert_eq!(shown.strokes.len(), 1);
         assert!((shown.strokes[0].samples[0].pos.z - 0.1).abs() < 1e-3);
-        // The Move layer tool turns the VR layer a quarter turn about the vertical: the stroke
+        // The Move layer tool turns the 3D layer a quarter turn about the vertical: the stroke
         // along x at 10 cm in front of the paper ends up across it (depth 0 down to -10 cm).
         painter.tools.tool = crate::tools::Tool::Transform;
         painter.grab(1, Mat4::IDENTITY, true, 0.0, 0.01);
         painter.grab(1, Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2), true, 0.0, 0.01);
         painter.grab(1, Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2), false, 0.0, 0.01);
-        let ends = |o: &Session| o.doc.strokes.values().find_map(|s| s.vr.as_ref().filter(|_| !s.deleted).map(|v| (v.z[0], *v.z.last().unwrap())));
+        let ends = |o: &Session| o.doc.strokes.values().find_map(|s| s.threed.as_ref().filter(|_| !s.deleted).map(|v| (v.z[0], *v.z.last().unwrap())));
         wait(&mut c, &mut painter, &mut other, "the turn", &|o| ends(o).is_some_and(|(a, b)| a.abs() < 1e-3 / k && (b + 0.1 / k).abs() < 1e-3 / k));
         painter.undo();
         wait(&mut c, &mut painter, &mut other, "the turn undone", &|o| ends(o).is_some_and(|(a, b)| (a - 0.1 / k).abs() < 1e-3 / k && (b - 0.1 / k).abs() < 1e-3 / k));
-        // The flat layer made a VR layer, and back by undo.
-        let flat = painter.painting.layers.iter().position(|l| !l.is_vr()).unwrap();
+        // The flat layer made a 3D layer, and back by undo.
+        let flat = painter.painting.layers.iter().position(|l| !l.is_3d()).unwrap();
         painter.edit_layers(|p| {
-            p.layers[flat].vr = true;
+            p.layers[flat].threed = true;
             (Some(flat), crate::painter::Removed::default())
         });
-        wait(&mut c, &mut painter, &mut other, "a VR layer more", &|o| o.doc.layers.values().filter(|l| l.vr && !l.deleted).count() == 2);
+        wait(&mut c, &mut painter, &mut other, "a 3D layer more", &|o| o.doc.layers.values().filter(|l| l.threed && !l.deleted).count() == 2);
         painter.undo();
-        wait(&mut c, &mut painter, &mut other, "flat again", &|o| o.doc.layers.values().filter(|l| l.vr && !l.deleted).count() == 1);
+        wait(&mut c, &mut painter, &mut other, "flat again", &|o| o.doc.layers.values().filter(|l| l.threed && !l.deleted).count() == 1);
         c.session.close();
         other.close();
     }
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     /// The 2D app's pumpkin (~/Downloads/punkin.bdraw) on a test server: its "Layer 1" (a
-    /// Multiply layer) made a VR layer and turned in 3D. Run by hand.
+    /// Multiply layer) made a 3D layer and turned in 3D. Run by hand.
     #[test]
     #[ignore]
     fn the_pumpkins_layer_turns_in_3d() {
@@ -1484,12 +1484,12 @@ mod tests {
         let i = painter.painting.layers.iter().position(|l| l.name == "Layer 1").unwrap();
         painter.active_layer = painter.painting.layers[i].id;
         painter.edit_layers(|p| {
-            p.layers[i].vr = true;
+            p.layers[i].threed = true;
             (Some(i), crate::painter::Removed::default())
         });
         frames(&mut c, &mut painter, 50);
         let i = painter.active_index();
-        println!("{} vr {} ordered {} blend {:?}; refused {:?}", painter.painting.layers[i].name, painter.painting.layers[i].vr, painter.painting.layers[i].ordered, painter.painting.layers[i].blend, c.refused);
+        println!("{} vr {} ordered {} blend {:?}; refused {:?}", painter.painting.layers[i].name, painter.painting.layers[i].threed, painter.painting.layers[i].ordered, painter.painting.layers[i].blend, c.refused);
         painter.tools.tool = crate::tools::Tool::Transform;
         let at = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.3));
         painter.grab(1, at, true, 0.0, 0.01);

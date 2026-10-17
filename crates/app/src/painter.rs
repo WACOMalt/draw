@@ -45,7 +45,7 @@ pub enum Outgoing {
     /// Strokes the stroke eraser took, by place.
     Remove(Vec<At>),
     /// The layer (by id; a group: with what is in it) the Move layer tool moved, turned and
-    /// scaled, by a matrix (the scene's): in the paper's plane, or freely (a VR layer).
+    /// scaled, by a matrix (the scene's): in the paper's plane, or freely (a 3D layer).
     Transform { layer: u32, matrix: glam::Mat4 },
 }
 
@@ -159,8 +159,8 @@ pub struct Painter {
     pub lit: bool,
     /// A shared canvas's paper as the panel sets it (sRGB, alpha; alpha 0: none).
     pub paper: [f32; 4],
-    /// VR layers (by id) painted with the laser on the paper, as a flat layer is (a flat
-    /// layer made a VR layer, to begin with); the others are painted in the air.
+    /// 3D layers (by id) painted with the laser on the paper, as a flat layer is (a flat
+    /// layer made a 3D layer, to begin with); the others are painted in the air.
     pub on_paper: HashSet<u32>,
 }
 
@@ -478,7 +478,7 @@ impl Painter {
                 g.matrix = pose * glam::Mat4::from_scale(Vec3::splat(g.scale)) * g.start.inverse();
                 // A shared canvas's flat layers (and groups) move in the paper's plane; its VR
                 // layers move freely.
-                let free = self.painting.index_of(self.active_layer).is_some_and(|i| self.painting.layers[i].is_vr());
+                let free = self.painting.index_of(self.active_layer).is_some_and(|i| self.painting.layers[i].is_3d());
                 if self.shared && !free {
                     g.matrix = planar(g.matrix);
                 }

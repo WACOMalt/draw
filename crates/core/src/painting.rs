@@ -122,23 +122,23 @@ pub struct Layer {
     pub clip: bool,
     pub mask: Option<Mask>,
     pub strokes: Vec<Stroke>,
-    /// A shared canvas's VR layer: its strokes have depth (they still cover each other in
+    /// A shared canvas's 3D layer: its strokes have depth (they still cover each other in
     /// order, as the 2D app draws them).
     #[serde(default)]
-    pub vr: bool,
+    pub threed: bool,
 }
 
 impl Default for Layer {
     fn default() -> Self {
-        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), vr: false }
+        Self { id: 0, name: "Layer".into(), blend: Blend::Normal, opacity: 1.0, visible: true, ordered: false, group: false, parent: None, clip: false, mask: None, strokes: Vec::new(), threed: false }
     }
 }
 
 impl Layer {
-    /// A layer of strokes in 3D: a VR layer, or one whose strokes are drawn by depth (a new
+    /// A layer of strokes in 3D: a 3D layer, or one whose strokes are drawn by depth (a new
     /// layer made in VR).
-    pub fn is_vr(&self) -> bool {
-        !self.group && (self.vr || !self.ordered)
+    pub fn is_3d(&self) -> bool {
+        !self.group && (self.threed || !self.ordered)
     }
 }
 
