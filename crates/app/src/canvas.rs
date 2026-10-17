@@ -9,7 +9,8 @@
 //! the viewer is, so the scene keeps meter-like units near them (the renderer's depth and
 //! precision are meant for that).
 
-use crate::painter::Painter;
+use crate::painter::{Outgoing, Painter};
+use serde_json::{Value, json};
 use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -67,6 +68,63 @@ fn form(l: &DocLayer) -> Form {
     Form { id: l.id.clone(), group: l.is_group(), parent: l.parent.clone(), clip: l.clip.unwrap_or(false), mask: l.mask.as_ref().map(|m| m.id.clone()) }
 }
 
+/// A layer as the panel edits it (no strokes): what a layer edit changed is sent as ops.
+#[derive(Clone, Debug, PartialEq)]
+struct Meta {
+    id: u32,
+    name: String,
+    blend: Blend,
+    opacity: f32,
+    visible: bool,
+    group: bool,
+    parent: Option<u32>,
+    clip: bool,
+    mask: Option<bool>,
+}
+
+fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
+    p.layers
+        .iter()
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled) })
+        .collect()
+}
+
+/// A blend mode's name in the document ("normal", "color-burn", "pass", ...).
+fn blend_name(b: Blend) -> Value {
+    serde_json::to_value(b).unwrap_or_else(|_| "normal".into())
+}
+
+/// One step of undo: the ops that take an action back, and those that do it again (the 2D
+/// app's undo entries).
+#[derive(Default)]
+struct UndoStep {
+    undo: Vec<Value>,
+    redo: Vec<Value>,
+}
+
+/// The longest run of increasing values, as places (for orders kept when layers move).
+fn increasing(v: &[f64]) -> Vec<usize> {
+    let n = v.len();
+    let mut len = vec![1usize; n];
+    let mut prev = vec![usize::MAX; n];
+    for i in 0..n {
+        for j in 0..i {
+            if v[j] < v[i] && len[j] + 1 > len[i] {
+                len[i] = len[j] + 1;
+                prev[i] = j;
+            }
+        }
+    }
+    let Some(mut at) = (0..n).max_by_key(|&i| len[i]) else { return Vec::new() };
+    let mut out = vec![at];
+    while prev[at] != usize::MAX {
+        at = prev[at];
+        out.push(at);
+    }
+    out.reverse();
+    out
+}
+
 /// Another user's stroke being drawn, as last converted (made again when points come).
 struct Live {
     points: usize,
@@ -93,6 +151,20 @@ pub struct Canvas {
     pub moved_at: Option<Instant>,
     /// Where this user points on the paper, as last sent (canvas units), and when.
     cursor: (Option<(f64, f64)>, Instant),
+    /// The painting's layer ids by document layer id, kept from one making to the next (so
+    /// the panel's ids stay), and the next free one.
+    ids: HashMap<String, u32>,
+    next_id: u32,
+    /// The layers as last made from the document: the panel's edits are what differs.
+    synced: Vec<Meta>,
+    /// Undo and redo, as the 2D app's: steps of ops.
+    undo: Vec<UndoStep>,
+    redo: Vec<UndoStep>,
+    /// The stroke being drawn as the others see it: its id, the points sent, if it started,
+    /// and when they were sent.
+    live: (String, usize, bool, Instant),
+    /// The layer (by document id) to make active once the document has it.
+    want_active: Option<String>,
 }
 
 impl Canvas {
@@ -109,6 +181,13 @@ impl Canvas {
             held: [None; 2],
             moved_at: None,
             cursor: (None, Instant::now()),
+            ids: HashMap::new(),
+            next_id: 1,
+            synced: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            live: (String::new(), 0, false, Instant::now()),
+            want_active: None,
         }
     }
 
@@ -161,7 +240,15 @@ impl Canvas {
     /// The painting made again from the document, the active layer kept (by its document id).
     fn rebuild_all(&mut self, painter: &mut Painter, doc: &Doc) {
         let active = painter.painting.index_of(painter.active_layer).and_then(|i| self.shown.get(i)).map(|s| s.id.clone());
-        let converted = doc.painting(&self.frame);
+        let mut converted = doc.painting(&self.frame);
+        // The layers keep the ids they had (a new one gets the next free id).
+        let numbers: Vec<u32> = converted.layer_ids.iter().map(|id| self.number(id)).collect();
+        let old: Vec<u32> = converted.painting.layers.iter().map(|l| l.id).collect();
+        for l in &mut converted.painting.layers {
+            l.id = numbers[old.iter().position(|&o| o == l.id).unwrap()];
+            l.parent = l.parent.and_then(|p| old.iter().position(|&o| o == p)).map(|k| numbers[k]);
+        }
+        let active = self.want_active.take().or(active);
         let place = active.and_then(|a| converted.layer_ids.iter().position(|id| *id == a));
         let active_id = place.or_else(|| converted.painting.layers.iter().rposition(|l| !l.group)).map_or(0, |i| converted.painting.layers[i].id);
         let layers = doc.painted_layers();
@@ -180,7 +267,25 @@ impl Canvas {
             })
             .collect();
         painter.replace_painting(converted.painting, active_id);
+        painter.shared = true;
+        self.synced = metas(&painter.painting);
         self.lives.clear();
+    }
+
+    /// The painting's layer id of a document layer.
+    fn number(&mut self, doc_id: &str) -> u32 {
+        if let Some(&n) = self.ids.get(doc_id) {
+            return n;
+        }
+        let n = self.next_id;
+        self.next_id += 1;
+        self.ids.insert(doc_id.to_string(), n);
+        n
+    }
+
+    /// The document layer of a painting layer id.
+    fn doc_id(&self, id: u32) -> Option<String> {
+        self.ids.iter().find(|(_, n)| **n == id).map(|(d, _)| d.clone()).filter(|d| !d.is_empty())
     }
 
     /// Brings the painting up to date with the document: made again when the layers' tree
@@ -288,6 +393,343 @@ impl Canvas {
         if steps_changed {
             painter.rebuild();
         }
+        if let Some(a) = self.want_active.take() {
+            match self.ids.get(&a) {
+                Some(&n) => painter.active_layer = n,
+                None => self.want_active = Some(a),
+            }
+        }
+        self.synced = metas(&painter.painting);
+    }
+
+    // ---- What this user does, as ops (as the 2D app sends them). ----
+
+    /// A finished stroke as the document has it: its points on the paper (canvas units,
+    /// rounded to a tenth of what a pixel shows at this zoom, as the 2D app does), and its
+    /// brush as the 2D app's.
+    fn doc_stroke(&self, painter: &Painter, id: &str, layer: &str, mask: Option<&str>, stroke: &Stroke) -> Value {
+        let brush = self.doc_brush(painter, &stroke.brush);
+        let pts = self.doc_points(&stroke.samples[..stroke.samples.len().min(20_000)]);
+        let mut s = json!({ "id": id, "layerId": layer, "brush": brush, "pts": pts });
+        if let Some(m) = mask {
+            s["mask"] = m.into();
+        }
+        s
+    }
+
+    fn doc_points(&self, samples: &[vdraw_core::Sample]) -> Vec<f64> {
+        // A pixel at arm's length is about half a millimeter.
+        let device_scale = self.frame.k * self.scale() as f64 / 0.0005;
+        let d = doc::point_decimals(device_scale);
+        let mut out = Vec::with_capacity(samples.len() * 3);
+        for s in samples {
+            let c = self.frame.canvas(s.pos);
+            out.extend([doc::round_to(c[0], d), doc::round_to(c[1], d), (s.pressure.clamp(0.0, 1.0) as f64 * 1000.0).round() / 1000.0]);
+        }
+        out
+    }
+
+    fn doc_brush(&self, painter: &Painter, b: &vdraw_core::Brush) -> Value {
+        let c = crate::panel::to_srgb(b.color);
+        let hex = crate::palettes::to_hex(c);
+        // In the ranges the server takes (validate.ts).
+        let angle = painter.tools.angle[if b.erase { 1 } else { 0 }].rem_euclid(360.0);
+        let size = (2.0 * b.radius as f64 / self.frame.k).clamp(doc::BRUSH_WORLD.0, doc::BRUSH_WORLD.1);
+        let mut v = json!({
+            "tool": if b.erase { "erase" } else { "paint" },
+            "color": hex,
+            "size": size,
+            "opacity": b.opacity.clamp(0.0, 1.0),
+            "flow": b.flow.clamp(0.001, 1.0),
+            "hardness": b.hardness.clamp(0.0, 1.0),
+            "spacing": b.spacing.clamp(0.01, 2.0),
+            "pressureSize": b.pressure_size,
+            "pressureFlow": b.pressure_flow,
+            "buildup": b.buildup,
+        });
+        let mut extra = |k: &str, x: f32, none: f32| {
+            if x != none {
+                v[k] = x.into();
+            }
+        };
+        extra("roundness", b.roundness.clamp(0.05, 1.0), 1.0);
+        extra("angle", angle, 0.0);
+        extra("sizeJitter", b.size_jitter, 0.0);
+        extra("angleJitter", b.angle_jitter, 0.0);
+        extra("scatter", b.scatter.clamp(0.0, 4.0), 0.0);
+        extra("opacityJitter", b.flow_jitter, 0.0);
+        v
+    }
+
+    /// The stroke being drawn, for the others to see (every 40 ms, as the 2D app sends it).
+    pub fn send_live(&mut self, painter: &Painter) {
+        let Some((_, stroke)) = &painter.active else { return };
+        if !painter.shared || painter.stroke_id.is_empty() || self.session.state != State::Open {
+            return;
+        }
+        if self.live.0 != painter.stroke_id {
+            self.live = (painter.stroke_id.clone(), 0, false, Instant::now());
+        }
+        let n = stroke.samples.len();
+        if n <= self.live.1 || self.live.3.elapsed().as_millis() < 40 {
+            return;
+        }
+        let Some(layer) = painter.painting.index_of(painter.active_layer).and_then(|i| self.doc_layer(i)).map(str::to_string) else { return };
+        let mask = if painter.mask_target { painter.painting.index_of(painter.active_layer).and_then(|i| self.shown[i].mask_id.clone()) } else { None };
+        let pts = self.doc_points(&stroke.samples[self.live.1..n]);
+        let brush = self.doc_brush(painter, &stroke.brush);
+        self.session.send_live(&self.live.0, &layer, mask.as_deref(), &brush, &pts, !self.live.2);
+        self.live = (self.live.0.clone(), n, true, Instant::now());
+    }
+
+    /// Sends what this user did since the last frame (strokes, sweeps, layer edits, undo and
+    /// redo) as ops, and shows the document with them.
+    pub fn commit(&mut self, painter: &mut Painter) {
+        let outbox = std::mem::take(&mut painter.outbox);
+        let asked = std::mem::take(&mut painter.asked);
+        let edited = metas(&painter.painting) != self.synced;
+        if outbox.is_empty() && asked.is_empty() && !edited {
+            return;
+        }
+        if !self.session.can_edit() {
+            // A viewer (or not connected): what was done locally goes back.
+            if edited {
+                let doc = self.session.view().clone();
+                self.rebuild_all(painter, &doc);
+            }
+            return;
+        }
+        let mut step = UndoStep::default();
+        let mut ops = Vec::new();
+        for out in outbox {
+            match out {
+                Outgoing::Add { layer, mask, id, stroke } => {
+                    let Some(place) = painter.painting.index_of(layer) else { continue };
+                    let Some(doc_layer) = self.doc_layer(place).map(str::to_string) else { continue };
+                    let mask_id = if mask { self.shown[place].mask_id.clone() } else { None };
+                    if mask && mask_id.is_none() {
+                        continue;
+                    }
+                    if stroke.samples.is_empty() {
+                        continue;
+                    }
+                    // The last points the others have not seen, then the stroke itself.
+                    if self.live.0 == id && self.live.1 < stroke.samples.len() && self.live.2 {
+                        let pts = self.doc_points(&stroke.samples[self.live.1..]);
+                        self.session.send_live(&id, &doc_layer, mask_id.as_deref(), &self.doc_brush(painter, &stroke.brush), &pts, false);
+                    }
+                    let s = self.doc_stroke(painter, &id, &doc_layer, mask_id.as_deref(), &stroke);
+                    ops.push(json!({ "type": "stroke.add", "stroke": s }));
+                    step.undo.push(json!({ "type": "stroke.remove", "id": id }));
+                    step.redo.push(json!({ "type": "stroke.restore", "id": id }));
+                    if !mask && !stroke.brush.erase {
+                        painter.add_recent(crate::panel::to_srgb(stroke.brush.color));
+                    }
+                }
+                Outgoing::Remove(at) => {
+                    for a in at {
+                        let Some(place) = painter.painting.index_of(a.layer) else { continue };
+                        let list = if a.mask { &self.shown[place].mask } else { &self.shown[place].strokes };
+                        let Some(p) = list.get(a.index) else { continue };
+                        ops.push(json!({ "type": "stroke.remove", "id": p.id }));
+                        step.undo.push(json!({ "type": "stroke.restore", "id": p.id }));
+                        step.redo.push(json!({ "type": "stroke.remove", "id": p.id }));
+                    }
+                }
+            }
+        }
+        if edited {
+            self.layer_ops(painter, &mut ops, &mut step);
+        }
+        for op in ops {
+            self.session.send_op(op);
+        }
+        if !step.undo.is_empty() {
+            step.undo.reverse();
+            self.undo.push(step);
+            if self.undo.len() > 300 {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
+        for undo in asked {
+            let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
+            if let Some(s) = from.pop() {
+                for op in if undo { &s.undo } else { &s.redo } {
+                    self.session.send_op(op.clone());
+                }
+                to.push(s);
+            }
+        }
+        painter.history = (!self.undo.is_empty(), !self.redo.is_empty());
+        self.sync(painter);
+    }
+
+    /// The panel's layer edits (the painting's layers against those last made from the
+    /// document), as ops: layers added (or duplicated), changed, moved, and removed.
+    fn layer_ops(&mut self, painter: &Painter, ops: &mut Vec<Value>, step: &mut UndoStep) {
+        let doc = self.session.view().clone();
+        let p = &painter.painting;
+        let before: HashMap<u32, &Meta> = self.synced.iter().map(|m| (m.id, m)).collect();
+        let after = metas(p);
+        let now: HashMap<u32, &Meta> = after.iter().map(|m| (m.id, m)).collect();
+        // New layers get document ids. One whose name is another's with " copy" (and that holds
+        // what that one holds) is its duplicate; the rest are added.
+        let mut new_ids: HashMap<u32, String> = HashMap::new();
+        for m in &after {
+            if !before.contains_key(&m.id) {
+                new_ids.insert(m.id, doc::new_id());
+            }
+        }
+        let doc_of = |id: u32, new_ids: &HashMap<u32, String>| new_ids.get(&id).cloned().or_else(|| self.doc_id(id));
+        // Orders: in each group, the layers that kept their order keep it; the others go
+        // between their neighbors.
+        let mut orders: HashMap<u32, f64> = HashMap::new();
+        let mut parents: Vec<Option<u32>> = vec![None];
+        parents.extend(after.iter().filter(|m| m.group).map(|m| Some(m.id)));
+        for parent in parents {
+            let kids: Vec<u32> = p.children(parent).into_iter().map(|i| p.layers[i].id).collect();
+            let old: Vec<Option<f64>> = kids
+                .iter()
+                .map(|&k| {
+                    let same_parent = before.get(&k).is_some_and(|b| b.parent == parent);
+                    self.doc_id(k).filter(|_| same_parent).and_then(|d| doc.layers.get(&d)).map(|l| l.order)
+                })
+                .collect();
+            let known: Vec<usize> = (0..kids.len()).filter(|&i| old[i].is_some()).collect();
+            let keep: Vec<usize> = increasing(&known.iter().map(|&i| old[i].unwrap()).collect::<Vec<_>>()).into_iter().map(|k| known[k]).collect();
+            let mut prev: Option<f64> = None;
+            for i in 0..kids.len() {
+                if keep.contains(&i) {
+                    prev = old[i];
+                    continue;
+                }
+                let next = keep.iter().find(|&&k| k > i).and_then(|&k| old[k]);
+                // How many in a row go before `next`, to spread them evenly.
+                let run = (i..kids.len()).take_while(|j| !keep.contains(j)).count() as f64;
+                let o = match (prev, next) {
+                    (Some(a), Some(b)) => a + (b - a) / (run + 1.0),
+                    (Some(a), None) => a + 1.0,
+                    (None, Some(b)) => b - run,
+                    (None, None) => 1.0,
+                };
+                orders.insert(kids[i], o);
+                prev = Some(o);
+            }
+        }
+        // Added first (groups before what goes in them), then changes, then removals.
+        let mut adds = Vec::new();
+        let mut added: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for m in after.iter().filter(|m| m.group).chain(after.iter().filter(|m| !m.group)) {
+            let Some(nid) = new_ids.get(&m.id) else { continue };
+            if m.parent.is_some_and(|par| added.contains(&par) && !before.contains_key(&par) && self.is_copy(p, par, &before)) {
+                // In a duplicated group: the duplicate brings it.
+                added.insert(m.id);
+                continue;
+            }
+            added.insert(m.id);
+            let parent = m.parent.and_then(|par| doc_of(par, &new_ids));
+            let order = orders.get(&m.id).copied().unwrap_or(1.0);
+            if let Some(src) = self.copy_source(p, m.id, &before) {
+                let mut op = json!({ "type": "layer.duplicate", "id": src, "newId": nid, "name": m.name, "order": order });
+                if let Some(par) = &parent {
+                    op["parent"] = par.as_str().into();
+                }
+                adds.push(op);
+            } else {
+                let mut layer = json!({ "id": nid, "name": m.name, "order": order, "blend": blend_name(m.blend), "opacity": m.opacity, "visible": m.visible });
+                if m.group {
+                    layer["kind"] = "group".into();
+                }
+                if let Some(par) = &parent {
+                    layer["parent"] = par.as_str().into();
+                }
+                if m.clip {
+                    layer["clip"] = true.into();
+                }
+                adds.push(json!({ "type": "layer.add", "layer": layer }));
+            }
+            step.undo.push(json!({ "type": "layer.remove", "id": nid }));
+            step.redo.push(json!({ "type": "layer.restore", "id": nid }));
+        }
+        let mut updates = Vec::new();
+        for m in &after {
+            let (Some(b), Some(id)) = (before.get(&m.id), self.doc_id(m.id)) else { continue };
+            let Some(dl) = doc.layers.get(&id) else { continue };
+            let mut props = serde_json::Map::new();
+            let mut old = serde_json::Map::new();
+            let mut set = |k: &str, new: Value, was: Value| {
+                props.insert(k.into(), new);
+                old.insert(k.into(), was);
+            };
+            if m.name != b.name {
+                set("name", m.name.clone().into(), dl.name.clone().into());
+            }
+            if m.blend != b.blend {
+                set("blend", blend_name(m.blend), dl.blend.clone().into());
+            }
+            if m.opacity != b.opacity {
+                set("opacity", m.opacity.into(), dl.opacity.into());
+            }
+            if m.visible != b.visible {
+                set("visible", m.visible.into(), dl.visible.into());
+            }
+            if m.clip != b.clip {
+                set("clip", m.clip.into(), dl.clip.unwrap_or(false).into());
+            }
+            if m.parent != b.parent {
+                let par = m.parent.and_then(|x| doc_of(x, &new_ids)).map_or(Value::Null, Value::from);
+                set("parent", par, dl.parent.clone().map_or(Value::Null, Value::from));
+            }
+            if let Some(&o) = orders.get(&m.id) {
+                set("order", o.into(), dl.order.into());
+            }
+            if m.mask != b.mask {
+                let was = dl.mask.as_ref().map_or(Value::Null, |mk| json!({ "id": mk.id, "enabled": mk.enabled }));
+                let new = match (m.mask, &dl.mask) {
+                    (None, _) => Value::Null,
+                    (Some(on), Some(mk)) => json!({ "id": mk.id, "enabled": on }),
+                    (Some(on), None) => json!({ "id": doc::new_id(), "enabled": on }),
+                };
+                set("mask", new, was);
+            }
+            if !props.is_empty() {
+                updates.push(json!({ "type": "layer.update", "id": id, "props": props }));
+                step.undo.push(json!({ "type": "layer.update", "id": id, "props": old }));
+                step.redo.push(json!({ "type": "layer.update", "id": id, "props": props }));
+            }
+        }
+        let mut removes = Vec::new();
+        for b in &self.synced {
+            if now.contains_key(&b.id) || b.parent.is_some_and(|par| !now.contains_key(&par)) {
+                continue;
+            }
+            let Some(id) = self.doc_id(b.id) else { continue };
+            removes.push(json!({ "type": "layer.remove", "id": id }));
+            step.undo.push(json!({ "type": "layer.restore", "id": id }));
+            step.redo.push(json!({ "type": "layer.remove", "id": id }));
+        }
+        // The new active layer, once the document has it.
+        if let Some(nid) = new_ids.get(&painter.active_layer) {
+            self.want_active = Some(nid.clone());
+        }
+        ops.extend(adds);
+        ops.extend(updates);
+        ops.extend(removes);
+    }
+
+    /// Whether a new layer is a duplicate (see `copy_source`).
+    fn is_copy(&self, p: &vdraw_core::Painting, id: u32, before: &HashMap<u32, &Meta>) -> bool {
+        self.copy_source(p, id, before).is_some()
+    }
+
+    /// The document layer a new layer duplicates: one that was there, named as it without
+    /// " copy", of its kind, with as many strokes.
+    fn copy_source(&self, p: &vdraw_core::Painting, id: u32, before: &HashMap<u32, &Meta>) -> Option<String> {
+        let l = &p.layers[p.index_of(id)?];
+        let name = l.name.strip_suffix(" copy")?;
+        let src = p.layers.iter().find(|o| before.contains_key(&o.id) && o.name == name && o.group == l.group && o.strokes.len() == l.strokes.len())?;
+        self.doc_id(src.id)
     }
 
     /// Others' strokes being drawn, into the painter's strokes being drawn (call after
@@ -511,6 +953,98 @@ mod tests {
         c.draw_live(&mut painter);
         assert_eq!(painter.drawing_runs.len(), 1);
         assert!(!painter.drawing.is_empty());
+        c.session.close();
+        other.close();
+    }
+
+    /// This user's edits go out as the 2D app's ops: a stroke painted on the paper, one swept
+    /// away, layer edits from the panel; undo and redo send their opposites. Another client
+    /// sees each. (A test server, as above.)
+    #[test]
+    fn edits_in_vr_reach_the_others() {
+        let Ok(base) = std::env::var("VDRAW_TEST_SERVER") else { return };
+        let server = vdraw_net::Server::new(&base, None);
+        let anon = vdraw_net::identity::base64url(&[11u8; 32]);
+        let key = server.create(&anon, None, None).unwrap();
+        let mut c = Canvas::new(Session::open(&server, &key, "VR", "#ff6b6b", &anon, None));
+        let mut other = Session::open(&server, &key, "2D", "#4dabf7", &anon, None);
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        let head = Mat4::from_translation(Vec3::new(0.0, 1.6, 0.0));
+        let wait = |c: &mut Canvas, painter: &mut Painter, other: &mut Session, what: &str, done: &dyn Fn(&Session) -> bool| {
+            let t = Instant::now();
+            loop {
+                other.poll();
+                c.update(painter, head);
+                c.commit(painter);
+                if done(other) {
+                    break;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait(&mut c, &mut painter, &mut other, "both open", &|o| o.state == State::Open);
+        while c.session.state != State::Open || !c.placed {
+            c.update(&mut painter, head);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(painter.shared);
+        let live = |o: &Session| o.doc.strokes.values().filter(|s| !s.deleted).count();
+        // A stroke on the paper (z = 0 of the scene), 10 cm long, the brush 1 cm across.
+        painter.tools.brush.radius = 0.005;
+        for (k, x) in [0.0f32, 0.05, 0.1].iter().enumerate() {
+            painter.hand(1, k as f64 * 0.02, Vec3::new(*x, 0.0, 0.0), Vec3::NEG_Y, 0.8);
+        }
+        painter.hand(1, 0.1, Vec3::new(0.1, 0.0, 0.0), Vec3::NEG_Y, 0.0);
+        wait(&mut c, &mut painter, &mut other, "the stroke", &|o| live(o) == 1);
+        let s = other.doc.strokes.values().next().unwrap().clone();
+        // Its size in canvas units is 1 cm at the canvas's scale; its points lie along x.
+        assert!((s.brush.size * c.frame.k - 0.01).abs() < 1e-4, "{} {}", s.brush.size, c.frame.k);
+        assert_eq!(s.pts.len(), 12, "{:?}", s.pts);
+        assert!((s.pts[9] - s.pts[0] - 0.1 / c.frame.k).abs() < 1e-2 / c.frame.k, "it ends where the pen did");
+        assert_eq!(painter.built.strokes.len(), 1, "shown once, from the document");
+        // Undo takes it away for the others too; redo brings it back.
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "undo", &|o| live(o) == 0);
+        assert_eq!(painter.built.strokes.len(), 0);
+        painter.redo();
+        wait(&mut c, &mut painter, &mut other, "redo", &|o| live(o) == 1);
+        // The stroke eraser, across it.
+        painter.tools.tool = crate::tools::Tool::StrokeEraser;
+        painter.tools.sweep_size = 0.02;
+        painter.hand(1, 1.0, Vec3::new(0.05, 0.05, 0.0), Vec3::NEG_Y, 1.0);
+        painter.hand(1, 1.1, Vec3::new(0.05, -0.05, 0.0), Vec3::NEG_Y, 1.0);
+        painter.hand(1, 1.2, Vec3::new(0.05, -0.05, 0.0), Vec3::NEG_Y, 0.0);
+        wait(&mut c, &mut painter, &mut other, "the sweep", &|o| live(o) == 0);
+        // Layer edits from the panel: a new layer above, renamed, at half opacity.
+        let at = painter.active_index();
+        painter.edit_layers(|p| (Some(p.add_layer(Some(at))), crate::painter::Removed::default()));
+        let i = painter.active_index();
+        painter.edit_layers(|p| {
+            p.layers[i].name = "From VR".into();
+            p.layers[i].opacity = 0.5;
+            (None, crate::painter::Removed::default())
+        });
+        wait(&mut c, &mut painter, &mut other, "the new layer", &|o| o.doc.layers.values().any(|l| l.name == "From VR" && l.opacity == 0.5 && !l.deleted));
+        let order = |o: &Session| o.doc.paint_order().iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&other).last().map(String::as_str), Some("From VR"), "{:?}", order(&other));
+        assert_eq!(painter.painting.layers[painter.active_index()].name, "From VR", "the new layer stays active");
+        // Moved below the first, then undone.
+        let i = painter.active_index();
+        painter.edit_layers(|p| (Some(p.move_layer(i, false)), crate::painter::Removed::default()));
+        wait(&mut c, &mut painter, &mut other, "the move", &|o| o.doc.paint_order().first().is_some_and(|l| l.name == "From VR"));
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the move undone", &|o| o.doc.paint_order().last().is_some_and(|l| l.name == "From VR"));
+        // Deleted, then undone.
+        let i = painter.active_index();
+        painter.edit_layers(|p| {
+            let (a, layers) = p.delete(i).unwrap();
+            (Some(a), crate::painter::Removed { layers, masks: Vec::new() })
+        });
+        wait(&mut c, &mut painter, &mut other, "the delete", &|o| o.doc.paint_order().len() == 1);
+        painter.undo();
+        wait(&mut c, &mut painter, &mut other, "the delete undone", &|o| o.doc.paint_order().len() == 2);
+        assert_eq!(painter.painting.layers.len(), 2);
         c.session.close();
         other.close();
     }

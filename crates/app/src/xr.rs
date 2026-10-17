@@ -447,6 +447,24 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
         painter.scale = 1.0 / world_from_scene.x_axis.truncate().length();
         let to_scene = |p: Vec3| scene_from_world.transform_point3(p);
         let dir_to_scene = |d: Vec3| scene_from_world.transform_vector3(d).normalize_or(Vec3::Y);
+        // On a shared canvas the 2D layers are painted with a laser onto the paper: the tip is
+        // where the controller's ray meets it, turned by the tool's angle as the 2D app turns
+        // its tip (in the paper's plane).
+        let laser_mode = matches!(mode, Mode::Canvas(_));
+        let laser_at = |rig: &Rig, aim: Mat4| -> Option<Vec3> {
+            let o = to_scene(rig.point(aim.w_axis.truncate()));
+            let d = scene_from_world.transform_vector3(rig.dir(aim.transform_vector3(Vec3::NEG_Z)));
+            let t = -o.z / d.z;
+            (d.z.abs() > 1e-9 && t > 0.0).then(|| o + d * t)
+        };
+        let flat_up = {
+            let rot = painter.tools.angle[if painter.tools.tool == Tool::Eraser { 1 } else { 0 }].to_radians();
+            Vec3::new(-rot.sin(), -rot.cos(), 0.0)
+        };
+        // Where the tool is (the scene), the pen's up side, and whether it is there at all.
+        let tool_at = |rig: &Rig, aim: Mat4| -> Option<(Vec3, Vec3)> {
+            if laser_mode { laser_at(rig, aim).map(|p| (p, flat_up)) } else { Some((to_scene(rig.point(tip_of(aim))), dir_to_scene(rig.dir(up_of(aim))))) }
+        };
 
         // The panel floats above the hand that is not painting.
         let panel_hand = 1 - painting_hand;
@@ -485,7 +503,12 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
                 Press::Panel | Press::Paint if pull <= TRIGGER_DEAD => Press::Off,
                 p => p,
             };
-            painter.hand(h, t, to_scene(rig.point(tip_of(aim))), dir_to_scene(rig.dir(up_of(aim))), if press[h] == Press::Paint { pull } else { 0.0 });
+            let pull = if press[h] == Press::Paint { pull } else { 0.0 };
+            match tool_at(&rig, aim) {
+                Some((at, up)) => painter.hand(h, t, at, up, pull),
+                // The laser is off the paper: the stroke ends.
+                None => painter.hand(h, t, Vec3::ZERO, Vec3::Y, 0.0),
+            }
             if h == painting_hand {
                 if press[h] == Press::Panel {
                     let was = click;
@@ -626,8 +649,13 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
         }
         // The overlays are drawn in the scene.
         let laser = laser.map(|(a, b)| (to_scene(a), to_scene(b)));
-        let tip = aims[painting_hand].filter(|_| pointer.at.is_none() && !matches!(painter.tools.tool, Tool::Eyedropper | Tool::Transform)).map(|aim| {
-            let (pos, up) = (to_scene(rig.point(tip_of(aim))), dir_to_scene(rig.dir(up_of(aim))));
+        let tool_pos = aims[painting_hand].filter(|_| pointer.at.is_none() && !matches!(painter.tools.tool, Tool::Eyedropper | Tool::Transform)).and_then(|aim| tool_at(&rig, aim).map(|t| (aim, t)));
+        // The laser to the paper.
+        let laser = match (laser, tool_pos) {
+            (None, Some((aim, (pos, _)))) if laser_mode => Some((to_scene(rig.point(aim.w_axis.truncate())), pos)),
+            (l, _) => l,
+        };
+        let tip = tool_pos.map(|(_, (pos, up))| {
             match painter.tools.paint() {
                 Some(b) => BrushTip {
                     pos,
@@ -646,6 +674,10 @@ pub fn run(start: Start, server: Option<String>) -> Result<()> {
         });
         painter.update_drawing();
         if let Mode::Canvas(c) = &mut mode {
+            // What this user did, out as ops; their stroke being drawn, out for the others.
+            c.commit(&mut painter);
+            c.send_live(&painter);
+            painter.update_drawing();
             c.draw_live(&mut painter);
             c.cursor_lines(&mut lines);
         }

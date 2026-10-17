@@ -329,10 +329,10 @@ impl Panel {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if icon_button(ui, "redo", vec2(38.0, 36.0), false, !painter.redo.is_empty()).clicked() {
+                if icon_button(ui, "redo", vec2(38.0, 36.0), false, painter.can_redo()).clicked() {
                     painter.redo();
                 }
-                if icon_button(ui, "undo", vec2(38.0, 36.0), false, !painter.undo.is_empty()).clicked() {
+                if icon_button(ui, "undo", vec2(38.0, 36.0), false, painter.can_undo()).clicked() {
                     painter.undo();
                 }
             });

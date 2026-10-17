@@ -37,6 +37,15 @@ pub enum Edit {
     Transform { layers: Vec<u32>, matrix: glam::Mat4 },
 }
 
+/// What the hands did to a shared canvas, for it to send as ops (on a shared canvas the
+/// painter does not change the strokes itself: the document does, when they come back).
+pub enum Outgoing {
+    /// A stroke finished, for layer `layer` (by id) or its mask, with the id it goes by.
+    Add { layer: u32, mask: bool, id: String, stroke: Stroke },
+    /// Strokes the stroke eraser took, by place.
+    Remove(Vec<At>),
+}
+
 /// The Move layer tool's grab: the hand, its pose when it took hold (world), the scale the
 /// stick has set, the layers held (by id), and their segments as they were (the ranges of
 /// `done`, and a copy), moved each frame until it lets go.
@@ -115,6 +124,9 @@ pub struct Painter {
     /// when a point was last added (airbrush: one every 30 ms while the pen holds still).
     smoothed: Vec3,
     last_point: f64,
+    /// Where the pen really was last, its up side and its pull (a smoothed stroke ends
+    /// there), and when.
+    raw: (Vec3, Vec3, f32, f64),
     /// Colors used, newest first (sRGB), for the panel's swatches.
     pub recent: Vec<[u8; 3]>,
     /// The strokes changed since the last save.
@@ -122,6 +134,14 @@ pub struct Painter {
     /// Scene units per meter (1 in the room; a shared canvas's zoom): brush sizes are meters
     /// as they look, at any zoom.
     pub scale: f32,
+    /// On a shared canvas: strokes and sweeps go out (`outbox`), undo and redo are asked for
+    /// (`asked`: true for undo), and whether there is any (`history`) is the canvas's.
+    pub shared: bool,
+    pub outbox: Vec<Outgoing>,
+    pub asked: Vec<bool>,
+    pub history: (bool, bool),
+    /// The stroke being drawn's id (a shared canvas's: it goes by it while it is drawn).
+    pub stroke_id: String,
 }
 
 impl Painter {
@@ -146,9 +166,15 @@ impl Painter {
             merge: None,
             smoothed: Vec3::ZERO,
             last_point: 0.0,
+            raw: (Vec3::ZERO, Vec3::Y, 0.0, 0.0),
             recent: Vec::new(),
             changed: false,
             scale: 1.0,
+            shared: false,
+            outbox: Vec::new(),
+            asked: Vec::new(),
+            history: (false, false),
+            stroke_id: String::new(),
         };
         p.rebuild();
         p
@@ -225,7 +251,20 @@ impl Painter {
         }
     }
 
+    /// Whether there is anything to undo and redo.
+    pub fn can_undo(&self) -> bool {
+        if self.shared { self.history.0 } else { !self.undo.is_empty() }
+    }
+
+    pub fn can_redo(&self) -> bool {
+        if self.shared { self.history.1 } else { !self.redo.is_empty() }
+    }
+
     pub fn undo(&mut self) {
+        if self.shared {
+            self.asked.push(true);
+            return;
+        }
         self.end_sweep();
         self.drop_grab();
         if let Some(edit) = self.undo.pop() {
@@ -235,6 +274,10 @@ impl Painter {
     }
 
     pub fn redo(&mut self) {
+        if self.shared {
+            self.asked.push(false);
+            return;
+        }
         self.end_sweep();
         self.drop_grab();
         if let Some(edit) = self.redo.pop() {
@@ -344,7 +387,9 @@ impl Painter {
         if self.painting.index_of(self.active_layer).is_none() || self.painting.layers[self.active_index()].mask.is_none() {
             self.mask_target = false;
         }
-        if record {
+        if self.shared {
+            // The canvas sends what changed; its undo takes it back.
+        } else if record {
             self.undo.push(Edit::Layers { layout: before, kept: removed.layers, masks: removed.masks, active: was });
         } else if let Some(Edit::Layers { kept, masks, .. }) = self.undo.last_mut() {
             kept.extend(removed.layers);
@@ -374,6 +419,10 @@ impl Painter {
     /// scales), and the frame's time. Pressed: takes hold of the active layer (a group: all its
     /// layers); held: they follow the hand; let go: they stay there, one step of undo.
     pub fn grab(&mut self, hand: usize, pose: glam::Mat4, down: bool, stick: f32, dt: f32) {
+        if self.shared {
+            // Not on a shared canvas yet.
+            return;
+        }
         match (&mut self.grab, down) {
             (None, true) => {
                 let i = self.active_index();
@@ -438,6 +487,10 @@ impl Painter {
     /// all are made again.
     fn finish(&mut self, stroke: Stroke) {
         let Some(step) = self.target_step() else { return };
+        if self.shared {
+            self.outbox.push(Outgoing::Add { layer: self.active_layer, mask: self.mask_target, id: std::mem::take(&mut self.stroke_id), stroke });
+            return;
+        }
         let (layer, mask) = (self.active_layer, self.mask_target);
         let i = self.active_index();
         let ordered = self.painting.layers[i].ordered;
@@ -479,6 +532,7 @@ impl Painter {
         match &mut self.active {
             Some((h, stroke)) if *h == hand => {
                 if down {
+                    self.raw = (tip, up, pull, t);
                     let last = stroke.samples.last().map(|s| s.pos).unwrap_or(tip);
                     self.smoothed += (tip - self.smoothed) * follow;
                     if (self.smoothed - last).length() > 5e-4 * self.scale {
@@ -490,7 +544,14 @@ impl Painter {
                         self.last_point = t;
                     }
                 } else {
-                    let (_, stroke) = self.active.take().unwrap();
+                    let (_, mut stroke) = self.active.take().unwrap();
+                    // Smoothing trails the pen: the stroke ends where the pen did (as the 2D
+                    // app's).
+                    let (tip, up, pull, _) = self.raw;
+                    if let Some(last) = stroke.samples.last().filter(|s| (s.pos - tip).length() > 1e-6 * self.scale) {
+                        let t = t.max(last.time + 1e-6);
+                        stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
+                    }
                     self.finish(stroke);
                 }
             }
@@ -513,10 +574,20 @@ impl Painter {
                         self.add_recent(panel::to_srgb(brush.color));
                     }
                     brush.radius *= self.scale;
-                    // The dynamics' random numbers: a seed of the stroke's own.
-                    brush.seed = (t * 1e6) as u64 as u32 ^ (tip.x.to_bits().rotate_left(13) ^ tip.z.to_bits());
+                    if self.shared {
+                        // As the 2D app paints it: its dabs, its pressure, and the random
+                        // numbers of the id the stroke goes by.
+                        self.stroke_id = vdraw_core::doc::new_id();
+                        brush.dabs = Some(vdraw_core::stroke::Dabs { flow: brush.flow, spacing: brush.spacing, pressure_flow: brush.pressure_flow });
+                        brush.min_ratio = 0.02;
+                        brush.seed = vdraw_core::stroke::stroke_seed(&self.stroke_id);
+                    } else {
+                        // The dynamics' random numbers: a seed of the stroke's own.
+                        brush.seed = (t * 1e6) as u64 as u32 ^ (tip.x.to_bits().rotate_left(13) ^ tip.z.to_bits());
+                    }
                     let mut stroke = Stroke::new(brush);
                     stroke.push(Sample { up, ..Sample::new(tip, pull, t) });
+                    self.raw = (tip, up, pull, t);
                     self.smoothed = tip;
                     self.last_point = t;
                     self.active = Some((hand, stroke));
@@ -570,6 +641,10 @@ impl Painter {
         }
         at.sort();
         log::info!("removed {} stroke{}", at.len(), if at.len() == 1 { "" } else { "s" });
+        if self.shared {
+            self.outbox.push(Outgoing::Remove(at));
+            return;
+        }
         let edit = self.apply(Edit::Erase { at, strokes: Vec::new() });
         self.undo.push(edit);
         self.redo.clear();
