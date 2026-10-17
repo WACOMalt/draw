@@ -1191,4 +1191,70 @@ mod tests {
         c.session.close();
         other.close();
     }
+
+    /// A layer made in VR is a VR layer; strokes painted on it with the pen keep their depth
+    /// and the pen's up side, for the others too (also while they are drawn), and come back
+    /// in 3D. (A test server with the VR fields, as above.)
+    #[test]
+    fn strokes_on_vr_layers_keep_their_depth() {
+        let Ok(base) = std::env::var("VDRAW_TEST_SERVER") else { return };
+        let server = vdraw_net::Server::new(&base, None);
+        let anon = vdraw_net::identity::base64url(&[13u8; 32]);
+        let key = server.create(&anon, None, None).unwrap();
+        let mut c = Canvas::new(Session::open(&server, &key, "VR", "#ff6b6b", &anon, None));
+        let mut other = Session::open(&server, &key, "2D", "#4dabf7", &anon, None);
+        let mut painter = Painter::new(vdraw_core::Painting::default());
+        painter.shared = true;
+        let head = Mat4::from_translation(Vec3::new(0.0, 1.6, 0.0));
+        let wait = |c: &mut Canvas, painter: &mut Painter, other: &mut Session, what: &str, done: &dyn Fn(&Session) -> bool| {
+            let t = Instant::now();
+            loop {
+                other.poll();
+                c.update(painter, head);
+                c.commit(painter);
+                c.send_live(painter);
+                if done(other) {
+                    break;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait(&mut c, &mut painter, &mut other, "both open", &|o| o.state == State::Open);
+        while c.session.state != State::Open || !c.placed || c.rebuilding() {
+            c.update(&mut painter, head);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let at = painter.active_index();
+        painter.edit_layers(|p| (Some(p.add_layer(Some(at))), crate::painter::Removed::default()));
+        wait(&mut c, &mut painter, &mut other, "the VR layer", &|o| o.doc.layers.values().any(|l| l.vr));
+        while c.rebuilding() || !painter.painting.layers.iter().any(|l| !l.ordered) {
+            c.update(&mut painter, head);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!painter.painting.layers[painter.active_index()].ordered, "the new layer is active");
+        // A stroke 10 cm in front of the paper, the pen's up side straight up.
+        painter.tools.smoothing = 0.0;
+        for (k, x) in [0.0f32, 0.05, 0.1].iter().enumerate() {
+            painter.hand(1, k as f64 * 0.05, Vec3::new(*x, 0.0, 0.1), Vec3::Y, 0.8);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        c.send_live(&painter);
+        let k = c.frame.k;
+        wait(&mut c, &mut painter, &mut other, "the live stroke's depth", &|o| o.lives.values().any(|l| l.vr.as_ref().is_some_and(|v| v.z.iter().all(|z| (z - 0.1 / k).abs() < 1e-3 / k))));
+        painter.hand(1, 0.2, Vec3::new(0.1, 0.0, 0.1), Vec3::Y, 0.0);
+        wait(&mut c, &mut painter, &mut other, "the stroke", &|o| o.doc.strokes.values().any(|s| s.vr.is_some()));
+        let s = other.doc.strokes.values().find(|s| s.vr.is_some()).unwrap().clone();
+        let vr = s.vr.unwrap();
+        assert_eq!(vr.z.len(), s.pts.len() / 3);
+        assert!(vr.z.iter().all(|z| (z - 0.1 / k).abs() < 1e-3 / k), "{:?}", vr.z);
+        // Up is +y in the scene: -y in canvas axes (y runs down).
+        assert_eq!(&vr.up.unwrap()[..3], &[0.0, -1.0, 0.0]);
+        // Back from the document: in 3D, 10 cm in front of the paper.
+        let shown = painter.painting.layers.iter().find(|l| !l.ordered && !l.group).unwrap();
+        assert_eq!(shown.strokes.len(), 1);
+        assert!((shown.strokes[0].samples[0].pos.z - 0.1).abs() < 1e-3);
+        c.session.close();
+        other.close();
+    }
 }

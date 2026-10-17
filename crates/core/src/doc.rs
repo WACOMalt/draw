@@ -393,7 +393,10 @@ impl Doc {
             "layer.update" => {
                 let id = id();
                 let Some(l) = self.layers.get(&id) else { return refused("no such layer") };
-                let props = field("props").and_then(Value::as_object).cloned().unwrap_or_default();
+                let mut props = field("props").and_then(Value::as_object).cloned().unwrap_or_default();
+                // A layer's kind and whether it is a VR layer are set when it is made.
+                props.remove("kind");
+                props.remove("vr");
                 if props.get("blend").and_then(Value::as_str) == Some("pass") && !l.is_group() {
                     return refused("pass through is for groups");
                 }
@@ -637,7 +640,8 @@ pub fn transform_stroke(s: &DocStroke, m: &[f64; 6]) -> Option<(Vec<f64>, DocBru
                     let t = [m[0] * u[0] + m[2] * u[1], m[1] * u[0] + m[3] * u[1], scale * u[2]];
                     let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
                     if len > 1e-12 {
-                        u.copy_from_slice(&t.map(|c| c / len));
+                        // Rounded as clients send them (validate.ts).
+                        u.copy_from_slice(&t.map(|c| (c / len * 1000.0).round() / 1000.0));
                     }
                 }
                 out
