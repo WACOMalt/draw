@@ -53,6 +53,20 @@
   let editing = $state<string | null>(null);
   let adjustMenu = $state(false);
   const canFx = $derived(!!active && takesEffects(active.kind) && ed.effectsOk);
+  /** The paint layers under `l`: itself, or a group's (3D layers are paint layers). */
+  function paintIn(l: Layer): Layer[] {
+    if (l.kind !== 'group') return (l.kind ?? 'paint') === 'paint' ? [l] : [];
+    const ids = subtreeIds(ed.layers, l.id);
+    return ed.layers.filter((x) => ids.has(x.id) && (x.kind ?? 'paint') === 'paint');
+  }
+  /** 3D: a 3D layer, or a group whose paint layers are all 3D. */
+  function isThreeD(l: Layer): boolean {
+    const p = paintIn(l);
+    return p.length > 0 && p.every((x) => x.threed);
+  }
+  /** The 3D button changes the active layer, or a group's paint layers. */
+  const canThreeD = $derived(!!active && paintIn(active).length > 0);
+  const activeThreeD = $derived(!!active && isThreeD(active));
   const fxShown = $derived(!!active && ed.effectsLayer === active.id);
   const EFFECT_LABEL: Record<EffectType, string> = { blur: 'Blur', dropShadow: 'Drop shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow', kaleidoscope: 'Kaleidoscope' };
   /** Opens the effects window of a layer (or closes it when it is open). */
@@ -408,7 +422,8 @@
           {#each peersOn(layer.id) as p (p.id)}
             <span class="pdot" style:background={p.color} title="{p.name} is on this layer"></span>
           {/each}
-          {#if layer.threed}<span class="tag threed" title="A 3D layer: its strokes have depth (painted in VR in vdraw, or moved in 3D)">3D</span>{/if}
+          {#if layer.threed}<span class="tag threed" title="A 3D layer: its strokes have depth (painted in VR in vdraw, or moved in 3D)">3D</span>
+          {:else if row.group && isThreeD(layer)}<span class="tag threed" title="A 3D group: all its paint layers are 3D layers (the Select tool turns it in 3D)">3D</span>{/if}
           {#if layer.blend !== 'normal' && layer.blend !== 'pass'}<span class="tag">{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
           {#if layer.opacity < 1}<span class="tag">{Math.round(layer.opacity * 100)}%</span>{/if}
           {#if layer.effects?.length}
@@ -600,6 +615,27 @@
       disabled={!canFx}
       onclick={() => active && openEffects(active.id, true)}>fx</button
     >
+    <!-- 2D or 3D: a 3D layer keeps depth (VR paints in it) and the Select tool turns it in 3D. -->
+    <button
+      class="icon threedbtn"
+      title={!canThreeD
+        ? active?.kind === 'group'
+          ? 'The group has no paint layers'
+          : '3D layers are paint layers'
+        : activeThreeD
+          ? active?.kind === 'group'
+            ? 'A 3D group: click to make its layers flat (2D) again. They draw the same.'
+            : 'A 3D layer: click to make it flat (2D) again. It draws the same.'
+          : !ed.threedOk
+            ? '3D layers need a newer server. Canvases on this device have them.'
+            : active?.kind === 'group'
+              ? 'Make all its paint layers 3D layers: the Select tool then turns the group in 3D, and in VR they paint with depth'
+              : 'Make it a 3D layer: the Select tool then turns it in 3D, and in VR it paints with depth'}
+      aria-pressed={activeThreeD}
+      class:on={activeThreeD}
+      disabled={!canThreeD || !ed.canEdit || (!activeThreeD && !ed.threedOk)}
+      onclick={() => active && engine?.setThreeD(active.id, !activeThreeD)}>3D</button
+    >
     <button
       class="icon"
       title={active?.mask ? 'Delete the layer mask' : 'Add a layer mask'}
@@ -773,6 +809,10 @@
   .fxbtn {
     font-style: italic;
     font-weight: 600;
+  }
+  .threedbtn {
+    font-size: 11px;
+    font-weight: 700;
   }
   .tag.fx {
     color: var(--accent);

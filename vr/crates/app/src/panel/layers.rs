@@ -281,8 +281,16 @@ fn layer_row(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState, 
     if blend != Blend::Normal && blend != Blend::Pass {
         tags.push(tag(blend).to_string());
     }
-    // On a shared canvas, a 3D layer (its strokes in 3D) says so, as the 2D app's badge.
-    let vr = painter.shared && p.layers[i].is_3d();
+    // On a shared canvas, a 3D layer (its strokes in 3D) says so, as the 2D app's badge; so
+    // does a group whose paint layers are all 3D layers.
+    let vr = painter.shared
+        && if p.layers[i].group {
+            let g = p.layers[i].id;
+            let mut paint = (0..p.layers.len()).filter(|&j| p.is_in(j, g) && !p.layers[j].group && p.layers[j].adjust.is_none()).peekable();
+            paint.peek().is_some() && paint.all(|j| p.layers[j].is_3d())
+        } else {
+            p.layers[i].is_3d()
+        };
     for (t, color) in tags.into_iter().map(|t| (t, TEXT_DIM)).chain(vr.then(|| ("3D".to_string(), ACCENT))) {
         let galley = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), color);
         let w = galley.size().x + 10.0;
@@ -333,7 +341,7 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
     let i = painter.active_index();
     let p = &painter.painting;
     let (group, has_mask, clip, can_clip) = (p.layers[i].group, p.layers[i].mask.is_some(), p.layers[i].clip, p.can_clip(i));
-    let (vr, id, adjusts) = (p.layers[i].is_3d(), p.layers[i].id, p.layers[i].adjust.is_some());
+    let (id, adjusts) = (p.layers[i].id, p.layers[i].adjust.is_some());
     // (A shared canvas's row has a button more.)
     let size = vec2(if painter.shared { 38.0 } else { 44.0 }, 40.0);
     let mut hint = String::new();
@@ -407,23 +415,45 @@ fn footer(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState) -> 
         }
         if painter.shared {
             // A flat layer made a 3D layer (drawn in 3D here, still flat for the 2D app; painted
-            // on the paper still), and back.
+            // on the paper still), and back. On a group: all its paint layers (as the 2D app).
+            let p = &painter.painting;
+            let targets: Vec<usize> = if group {
+                (0..p.layers.len()).filter(|&j| p.is_in(j, id) && !p.layers[j].group && p.layers[j].adjust.is_none()).collect()
+            } else if adjusts {
+                Vec::new()
+            } else {
+                vec![i]
+            };
+            let on = !targets.is_empty() && targets.iter().all(|&j| p.layers[j].is_3d());
             let (rect, r) = ui.allocate_exact_size(size, Sense::click());
-            let fill = if vr { TOGGLE_ON } else if r.hovered() { BG_4 } else { BG_3 };
-            ui.painter().rect(rect, 4.0, fill, stroke(1.0, if vr { ACCENT } else { LINE }));
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "3D", egui::FontId::proportional(14.0), if group { TEXT_FAINT } else if vr { ACCENT } else { TEXT });
-            note(&r, if vr { "Make it a flat layer (drawn as in 2D)" } else { "Make it a 3D layer: its strokes get depth, and it moves in 3D (seen flat in 2D)" });
-            if r.clicked() && !group && !adjusts {
+            let fill = if on { TOGGLE_ON } else if r.hovered() { BG_4 } else { BG_3 };
+            ui.painter().rect(rect, 4.0, fill, stroke(1.0, if on { ACCENT } else { LINE }));
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "3D", egui::FontId::proportional(14.0), if targets.is_empty() { TEXT_FAINT } else if on { ACCENT } else { TEXT });
+            note(
+                &r,
+                match (group, on) {
+                    (true, true) => "Make the group's layers flat (drawn as in 2D)",
+                    (true, false) => "Make all the group's layers 3D layers: their strokes get depth (seen flat in 2D)",
+                    (false, true) => "Make it a flat layer (drawn as in 2D)",
+                    (false, false) => "Make it a 3D layer: its strokes get depth, and it moves in 3D (seen flat in 2D)",
+                },
+            );
+            if r.clicked() && !targets.is_empty() {
+                let ids: Vec<u32> = targets.iter().map(|&j| p.layers[j].id).collect();
                 painter.edit_layers(|p| {
-                    // Its strokes cover each other in order either way, as the 2D app draws them.
-                    p.layers[i].threed = !vr;
-                    p.layers[i].ordered = true;
+                    // Their strokes cover each other in order either way, as the 2D app draws them.
+                    for &j in &targets {
+                        p.layers[j].threed = !on;
+                        p.layers[j].ordered = true;
+                    }
                     (Some(i), Removed::default())
                 });
-                if vr {
-                    painter.on_paper.remove(&id);
-                } else {
-                    painter.on_paper.insert(id);
+                for lid in ids {
+                    if on {
+                        painter.on_paper.remove(&lid);
+                    } else {
+                        painter.on_paper.insert(lid);
+                    }
                 }
             }
         }

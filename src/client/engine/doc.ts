@@ -256,11 +256,12 @@ export class Doc {
     return null;
   }
 
-  /** A 3D transform of a 3D layer (shared/docState.ts transform3, which the server checked). */
+  /** A 3D transform of a 3D layer or a 3D group (shared/docState.ts transform3, which the server checked). */
   private transform3(id: string, m3: Affine3): StrokeChanges {
+    const ids = subtreeIds(this.layers.values(), id);
     const changed: Stroke[] = [];
     for (const st of this.strokes.values()) {
-      if (st.layerId !== id) continue;
+      if (!ids.has(st.layerId)) continue;
       // The server checked the range; a failure here means the documents differ: skip.
       const t = transformStroke3(st, m3, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
       if (!t) continue;
@@ -269,8 +270,10 @@ export class Doc {
       this.bounds.set(st.id, strokeBounds(next));
       changed.push(next);
     }
-    const l = this.layers.get(id);
-    if (l) this.layers.set(id, transformLayerLengths(l, flatAffine(m3)));
+    for (const lid of ids) {
+      const l = this.layers.get(lid);
+      if (l) this.layers.set(lid, transformLayerLengths(l, flatAffine(m3)));
+    }
     this.version++;
     return { changed, added: [], shapes: [], shapesGone: [] };
   }

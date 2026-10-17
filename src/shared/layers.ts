@@ -265,6 +265,32 @@ export function validAffine3(m: unknown): m is Affine3 {
 }
 
 /**
+ * The layers a 3D transform of `l` moves: a 3D layer, or a group whose paint layers are all 3D
+ * layers (with everything in it, deleted layers too, as a 2D transform of a group). A message
+ * instead when it cannot: vector strokes and shapes cannot move in 3D.
+ */
+export function threeDTargets(layers: Map<string, Layer>, l: Layer, strokes: Iterable<Stroke>, shapes: Iterable<Shape>): Set<string> | string {
+  let ids: Set<string>;
+  if (l.kind === 'group') {
+    ids = subtreeIds(layers.values(), l.id);
+    let any = false;
+    for (const id of ids) {
+      const x = layers.get(id);
+      if (!x || x.kind === 'group' || x.kind === 'adjust' || effectivelyDeleted(layers, x)) continue;
+      if (!x.threed) return 'a 3D transform of a group needs all its layers to be 3D layers';
+      any = true;
+    }
+    if (!any) return '3D transforms are for 3D layers';
+  } else {
+    if (!l.threed) return '3D transforms are for 3D layers';
+    ids = new Set([l.id]);
+  }
+  for (const st of strokes) if (ids.has(st.layerId) && st.vector) return 'a 3D transform cannot move vector strokes';
+  for (const sh of shapes) if (ids.has(sh.layerId)) return 'a 3D transform cannot move shapes';
+  return ids;
+}
+
+/**
  * A stroke of a 3D layer after a 3D transform: each point (x, y, depth) moves in 3D (a stroke
  * without depth is at depth 0, and gets its depth), the up directions turn, the brush size
  * scales by ∛|det|, and a fixed tip angle turns with the turn of the x axis in the paper (as a

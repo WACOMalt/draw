@@ -442,11 +442,34 @@ impl Doc {
                 // A 3D layer moved in 3D (m3), its strokes' depth with it.
                 if let Some(m3) = field("m3") {
                     let m3: [f64; 12] = serde_json::from_value(m3.clone()).map_err(|_| OpError::Refused("bad transform".into()))?;
-                    if !l.threed || l.is_group() {
+                    // A 3D layer, or a group whose paint layers are all 3D layers (with everything
+                    // in it, deleted layers too, as a 2D transform of a group).
+                    let ids = if l.is_group() {
+                        let ids = self.subtree_ids(&id);
+                        let mut any = false;
+                        for x in ids.iter().filter_map(|x| self.layers.get(x)) {
+                            if x.is_group() || x.kind.as_deref() == Some("adjust") || self.effectively_deleted(x) {
+                                continue;
+                            }
+                            if !x.threed {
+                                return refused("a 3D transform of a group needs all its layers to be 3D layers");
+                            }
+                            any = true;
+                        }
+                        if !any {
+                            return refused("3D transforms are for 3D layers");
+                        }
+                        ids
+                    } else if l.threed {
+                        HashSet::from([id.clone()])
+                    } else {
                         return refused("3D transforms are for 3D layers");
+                    };
+                    if self.shapes.values().any(|sh| sh.get("layerId").and_then(Value::as_str).is_some_and(|l| ids.contains(l))) {
+                        return refused("a 3D transform cannot move shapes");
                     }
                     let mut changes = Vec::new();
-                    for s in self.strokes.values().filter(|s| s.layer_id == id) {
+                    for s in self.strokes.values().filter(|s| ids.contains(&s.layer_id)) {
                         if s.extra.contains_key("vector") {
                             return refused("vector strokes do not move in 3D");
                         }
@@ -1042,6 +1065,29 @@ mod tests {
         assert_eq!(point_decimals(0.001), -2);
         assert_eq!(round_to(1234.5678, 1), 1234.6);
         assert_eq!(round_to(1234.5678, -2), 1200.0);
+    }
+
+    #[test]
+    fn a_3d_group_turns_in_3d() {
+        let mut d = Doc::default();
+        d.apply(&json!({"type": "layer.add", "layer": layer("G1aaaa", 1.0, None, Some("group"))}), "c", 1).unwrap();
+        let mut l3 = layer("L1aaaa", 1.0, Some("G1aaaa"), None);
+        l3["threed"] = true.into();
+        d.apply(&json!({"type": "layer.add", "layer": l3}), "c", 2).unwrap();
+        d.apply(&json!({"type": "layer.add", "layer": layer("L2aaaa", 2.0, Some("G1aaaa"), None)}), "c", 3).unwrap();
+        d.apply(&json!({"type": "stroke.add", "stroke": stroke("S1aaaa", "L1aaaa")}), "c", 4).unwrap();
+        d.apply(&json!({"type": "stroke.add", "stroke": stroke("S2aaaa", "L2aaaa")}), "c", 5).unwrap();
+        // Turn 90 degrees about y (x to -z), scale 2, move (1, 2, 3).
+        let m3 = json!([0.0, 0.0, -2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+        // Not while a paint layer in it is flat.
+        assert!(matches!(d.apply(&json!({"type": "layer.transform", "id": "G1aaaa", "m3": m3}), "c", 6), Err(OpError::Refused(_))));
+        d.apply(&json!({"type": "layer.update", "id": "L2aaaa", "props": {"threed": true}}), "c", 7).unwrap();
+        d.apply(&json!({"type": "layer.transform", "id": "G1aaaa", "m3": m3}), "c", 8).unwrap();
+        for sid in ["S1aaaa", "S2aaaa"] {
+            let s = &d.strokes[sid];
+            assert_eq!((&s.pts[..2], &s.pts[3..5]), (&[1.0, 2.0][..], &[1.0, 2.0][..]), "{sid}");
+            assert_eq!(s.threed.as_ref().unwrap().z, vec![3.0, -17.0], "{sid}");
+        }
     }
 
     #[test]

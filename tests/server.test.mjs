@@ -1203,7 +1203,7 @@ try {
     r = await tryOp({ type: 'layer.transform', id: 'vrSHAPEL01', m3 });
     check(r?.t === 'reject' && /3D layers/.test(r.reason), '3D transform: refused on a layer that is not 3D');
     r = await tryOp({ type: 'layer.transform', id: 'vrGROUPL01', m3 });
-    check(r?.t === 'reject' && /3D layers/.test(r.reason), '3D transform: refused on a group');
+    check(r?.t === 'reject' && /3D layers/.test(r.reason), '3D transform: refused on a group without 3D layers');
     r = await tryOp({ type: 'layer.transform', id: 'vr3DLAYER1', m3: [1, 0, 0, 0, 1, 0, 0, 0, 1, 2e15, 0, 0] });
     check(r?.t === 'reject' && /range/.test(r.reason), '3D transform: refused when it goes out of range');
     await tryOp({ type: 'layer.add', layer: layer('vrVECLAYER', { threed: true }) });
@@ -1260,6 +1260,31 @@ try {
     vw = await welcome();
     a = vw.strokes.find((x) => x.id === 'vr3DSTRK01');
     check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.threed.z, [1, 2]) && close3(a.threed.up, up, 2e-3), '3D gizmo: its undo op brings the layer back (up within rounding)');
+
+    // A 3D group: a group whose paint layers are all 3D layers turns in 3D as one (one op).
+    check(w.supports.includes('threedGroups'), '3D group: the server says it takes 3D transforms of groups');
+    await tryOp({ type: 'layer.add', layer: layer('vr3DGROUP1', { kind: 'group', blend: 'pass' }) });
+    await tryOp({ type: 'layer.add', layer: layer('vr3DGRPL01', { threed: true, parent: 'vr3DGROUP1', order: 1 }) });
+    await tryOp({ type: 'layer.add', layer: layer('vrFLATGL01', { parent: 'vr3DGROUP1', order: 2 }) });
+    await tryOp({ type: 'stroke.add', stroke: stroke('vrGSTRK001', 'vr3DGRPL01', { threed: { z: [1, 2] } }) });
+    await tryOp({ type: 'stroke.add', stroke: stroke('vrGSTRK002', 'vrFLATGL01') });
+    r = await tryOp({ type: 'layer.transform', id: 'vr3DGROUP1', m3 });
+    check(r?.t === 'reject' && /all its layers/.test(r.reason), '3D group: refused while a paint layer in it is flat');
+    await tryOp({ type: 'layer.update', id: 'vrFLATGL01', props: { threed: true } });
+    await tryOp({ type: 'layer.add', layer: layer('vrGSHAPE01', { kind: 'shape', parent: 'vr3DGROUP1', order: 3 }) });
+    r = await tryOp({ type: 'layer.transform', id: 'vr3DGROUP1', m3 });
+    check(r?.t === 'reject' && /all its layers/.test(r.reason), '3D group: refused with a shape layer in it');
+    await tryOp({ type: 'layer.remove', id: 'vrGSHAPE01' });
+    r = await tryOp({ type: 'layer.transform', id: 'vr3DGROUP1', m3 });
+    vw = await welcome();
+    a = vw.strokes.find((x) => x.id === 'vrGSTRK001');
+    b = vw.strokes.find((x) => x.id === 'vrGSTRK002');
+    check(r?.t === 'op' && a.pts.join() === '3,2,1,5,22,1' && a.threed.z.join() === '3,-17', '3D group: the strokes of its layers move in 3D');
+    check(b.pts.join() === '1,2,1,1,22,1' && b.threed.z.join() === '3,-17', '3D group: a stroke without depth (made before its layer was 3D) gets it');
+    r = await tryOp({ type: 'layer.transform', id: 'vr3DGROUP1', m3: inv3(m3) });
+    vw = await welcome();
+    a = vw.strokes.find((x) => x.id === 'vrGSTRK001');
+    check(r?.t === 'op' && near(a.pts, [0, 0, 1, 10, 10, 1]) && near(a.threed.z, [1, 2]), '3D group: undo with the inverse brings it back');
 
     // Live strokes relay the depth of their points.
     const other = await new Browser().join(vc);

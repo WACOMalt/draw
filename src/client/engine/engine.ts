@@ -37,7 +37,7 @@ import { anonSecret, desktopToken, followRename, grants, links } from '../identi
 import { Net, type Channel } from './net';
 import { LocalNet } from '../local/localNet';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
-import { effectivelyVisible, invert, scale3, sortLayers, subtreeIds } from '../../shared/layers';
+import { effectivelyDeleted, effectivelyVisible, invert, scale3, sortLayers, subtreeIds, threeDTargets } from '../../shared/layers';
 import { applyM3, invertM3, isIdentity3 } from '../../shared/transform3';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { ShapeTool } from './shapeTool';
@@ -1341,6 +1341,34 @@ export class Engine {
   }
 
   /** Shows or hides the 3D layers on this device only (ed.show3dLayers). */
+  /**
+   * Makes a paint layer a 3D layer (VR paints in it with depth, and the Select tool turns it in
+   * 3D) or a flat layer again (its strokes keep their depth, unused: it draws the same). On a
+   * group: all its paint layers (its other layers cannot be 3D). One undo step.
+   */
+  setThreeD(id: string, on: boolean): void {
+    if (!ed.canEdit) return;
+    const l = this.doc.layer(id);
+    if (!l) return;
+    const layers = this.doc.layerView();
+    const ids = l.kind === 'group' ? subtreeIds(layers.values(), id) : new Set([id]);
+    const paint = [...ids].map((x) => layers.get(x)!).filter((x) => x && (x.kind ?? 'paint') === 'paint' && !effectivelyDeleted(layers, x));
+    if (!paint.length) return showToast(l.kind === 'group' ? 'The group has no paint layers' : '3D layers are paint layers');
+    const change = paint.filter((x) => !!x.threed !== on);
+    if (!change.length) return;
+    if (on && !ed.threedOk) return showToast('3D layers need a newer server. Canvases on this device have them.');
+    // The transform box changes kind (2D or 3D): it closes, and the Select tool opens the other.
+    const t = ed.transform;
+    if (t && (ids.has(t.id) || subtreeIds(layers.values(), t.id).has(id))) {
+      if (!this.transformIdle()) return showToast('Apply or cancel the transform first');
+      this.cancelTransform();
+    }
+    const redo: Op[] = change.map((x) => ({ type: 'layer.update', id: x.id, props: { threed: on } }));
+    for (const op of redo) this.sendOp(op);
+    this.pushUndo({ undo: change.map((x) => ({ type: 'layer.update', id: x.id, props: { threed: !on } })), redo });
+    if (on && !ed.show3dLayers) this.setShow3dLayers(true);
+  }
+
   setShow3dLayers(on: boolean): void {
     ed.show3dLayers = on;
     this.refreshLayers();
@@ -2024,22 +2052,25 @@ export class Engine {
   private preview3: { id: string; m3: Affine3; strokes: Stroke[]; moved: Float64Array[]; settling: boolean } | null = null;
   private settleTimer: number | undefined;
 
-  /** The 3D gizmo transforms this layer: a 3D layer without vector strokes or shapes (m3 cannot move them). */
+  /**
+   * The 3D gizmo transforms this layer: a 3D layer, or a group whose paint layers are all 3D
+   * layers (when the server takes that), without vector strokes or shapes (m3 cannot move them).
+   */
   takes3d(id: string): boolean {
-    const l = this.doc.layer(id);
-    if (!l?.threed || (l.kind ?? 'paint') !== 'paint') return false;
-    for (const st of this.doc.strokes.values()) if (st.layerId === id && st.vector) return false;
-    for (const sh of this.doc.shapes.values()) if (sh.layerId === id) return false;
-    return true;
+    const layers = this.doc.layerView();
+    const l = layers.get(id);
+    if (!l || (l.kind === 'group' && !ed.threedGroupsOk)) return false;
+    return typeof threeDTargets(layers, l, this.doc.strokes.values(), this.doc.shapes.values()) !== 'string';
   }
 
   /** The pivot of a 3D transform: the center of what the layer draws, at the middle of its depth. */
   pivot3(id: string): [number, number, number] | null {
     const b = this.contentOf(id);
     if (!b) return null;
+    const ids = subtreeIds(this.doc.layerView().values(), id);
     let z0 = Infinity, z1 = -Infinity;
     for (const st of this.doc.strokes.values()) {
-      if (st.layerId !== id || st.mask) continue;
+      if (!ids.has(st.layerId) || st.mask) continue;
       for (let i = 0; i < st.pts.length / 3; i++) {
         const z = st.threed?.z[i] ?? 0;
         if (z < z0) z0 = z;
@@ -2064,7 +2095,12 @@ export class Engine {
     let p = this.preview3;
     if (!p || p.id !== id || p.settling) {
       this.clearPreview3();
-      const strokes = [...this.doc.strokes.values()].filter((st) => st.layerId === id && !st.mask).sort((a, b) => a.seq - b.seq);
+      // The paint strokes of the shown layers (of a group: all of them, in paint order).
+      const order = new Map(this.doc.displayLayers().filter((l) => l.visible).map((l, i) => [l.id, i]));
+      const ids = subtreeIds(this.doc.layerView().values(), id);
+      const strokes = [...this.doc.strokes.values()]
+        .filter((st) => ids.has(st.layerId) && order.has(st.layerId) && !st.mask)
+        .sort((a, b) => order.get(a.layerId)! - order.get(b.layerId)! || a.seq - b.seq);
       p = this.preview3 = { id, m3, strokes, moved: [], settling: false };
       this.refreshLayers();
     }
@@ -2193,7 +2229,7 @@ export class Engine {
         ed.outdated = (m.features ?? []).some((f) => !(DOC_FEATURES as readonly string[]).includes(f));
         // A server from before effects sends no list: it refuses effects and blur layers.
         // A server from before `supports` takes none of the features that came with it or later.
-        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment' && f !== 'threed');
+        ed.serverSupports = m.supports ?? DOC_FEATURES.filter((f) => f !== 'effects' && f !== 'blur' && f !== 'pigment' && f !== 'threed' && f !== 'threedGroups');
         this.doc.reset(m.seq, m.layers, m.strokes, m.shapes ?? [], m.paper, m.mix);
         this.comp.resetStrokes(m.strokes, m.seq);
         this.comp.resetShapes(m.shapes ?? []);
@@ -2216,6 +2252,11 @@ export class Engine {
         const changes = this.doc.apply(m.seq, m.op, m.by);
         if (m.by === ed.clientId) this.doc.dropPending(m.opId);
         const op = m.op;
+        // Someone else made the layer in the transform box (or one in its group) 3D or flat: the box can be of the wrong kind.
+        if (op.type === 'layer.update' && op.props.threed !== undefined && m.by !== ed.clientId && ed.transform && subtreeIds(this.doc.layerView().values(), ed.transform.id).has(op.id)) {
+          if (!this.transformIdle()) showToast('Someone changed the layer between 2D and 3D: the transform was cancelled');
+          this.cancelTransform();
+        }
         if (changes) {
           // A transform or a duplicate: strokes changed in place, or new copies.
           for (const st of changes.changed) {
