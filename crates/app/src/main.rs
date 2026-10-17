@@ -91,7 +91,11 @@ fn canvas_snapshot(server: &str, input: &str) -> Result<(vdraw_core::Painting, s
     let mut painter = painter::Painter::new(vdraw_core::Painting::default());
     let head = glam::Mat4::from_translation(glam::Vec3::new(0.0, 1.6, 0.0));
     let t0 = std::time::Instant::now();
-    while !c.update(&mut painter, head) {
+    loop {
+        if c.update(&mut painter, head) && !c.rebuilding() && c.placed {
+            log::info!("the document into a painting: {:.1} ms after joining", t0.elapsed().as_secs_f64() * 1e3);
+            break;
+        }
         anyhow::ensure!(t0.elapsed().as_secs() < 10, "{key}: no document after 10 s ({:?})", c.session.state);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

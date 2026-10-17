@@ -138,6 +138,47 @@ fn increasing(v: &[f64]) -> Vec<usize> {
     out
 }
 
+/// A painting made again from the document on a thread of its own (a big canvas takes a
+/// tenth of a second): the frame it is made in, and the old scene from the new one (when the
+/// frame is anchored again).
+struct Rebuild {
+    rx: std::sync::mpsc::Receiver<Remade>,
+    frame: Frame,
+    old_from_new: Mat4,
+}
+
+/// What a rebuild made: the painting, its segments, and the document as shown in it.
+struct Remade {
+    converted: doc::Converted,
+    done: Vec<vdraw_core::GpuSegment>,
+    built: vdraw_core::Built,
+    forms: Vec<Form>,
+    shown: Vec<Shown>,
+}
+
+impl Remade {
+    fn make(doc: &Doc, frame: &Frame) -> Self {
+        let converted = doc.painting(frame);
+        let mut done = Vec::new();
+        let built = converted.painting.build(&mut done);
+        let forms = doc.painted_layers().iter().map(|l| form(l)).collect();
+        let shown = converted
+            .layer_ids
+            .iter()
+            .map(|id| match doc.layers.get(id) {
+                Some(l) => Shown {
+                    id: id.clone(),
+                    mask_id: l.mask.as_ref().map(|m| m.id.clone()),
+                    strokes: doc.strokes_of(id, None).into_iter().map(print).collect(),
+                    mask: l.mask.as_ref().map(|m| doc.strokes_of(id, Some(&m.id)).into_iter().map(print).collect()).unwrap_or_default(),
+                },
+                None => Shown::default(),
+            })
+            .collect();
+        Self { converted, done, built, forms, shown }
+    }
+}
+
 /// Another user's stroke being drawn, as last converted (made again when points come).
 struct Live {
     points: usize,
@@ -178,6 +219,7 @@ pub struct Canvas {
     live: (String, usize, bool, Instant),
     /// The layer (by document id) to make active once the document has it.
     want_active: Option<String>,
+    rebuild: Option<Rebuild>,
 }
 
 impl Canvas {
@@ -201,6 +243,7 @@ impl Canvas {
             redo: Vec::new(),
             live: (String::new(), 0, false, Instant::now()),
             want_active: None,
+            rebuild: None,
         }
     }
 
@@ -222,7 +265,10 @@ impl Canvas {
         for (_, why) in &changes.rejected {
             log::warn!("the server refused an edit: {why}");
         }
-        if !changes.doc {
+        let remade = self.rebuild.as_ref().and_then(|r| r.rx.try_recv().ok());
+        if let Some(r) = remade {
+            self.apply(painter, r);
+        } else if !changes.doc {
             return false;
         }
         if !self.placed {
@@ -230,6 +276,11 @@ impl Canvas {
         }
         self.sync(painter);
         true
+    }
+
+    /// A painting being made again (until it is, the last one shows, and changes wait).
+    pub fn rebuilding(&self) -> bool {
+        self.rebuild.is_some()
     }
 
     /// Fits the drawing in front of the head: the frame anchored at its middle, a scale that
@@ -250,10 +301,32 @@ impl Canvas {
         self.forms.clear();
     }
 
-    /// The painting made again from the document, the active layer kept (by its document id).
-    fn rebuild_all(&mut self, painter: &mut Painter, doc: &Doc) {
+    /// The painting made again from the document, on a thread: in the frame it is going to
+    /// (`frame` when it is anchored again, with the old scene from the new one).
+    fn rebuild_all(&mut self, doc: &Doc) {
+        let (frame, old_from_new) = self.rebuild.as_ref().map_or((self.frame, Mat4::IDENTITY), |r| (r.frame, r.old_from_new));
+        self.start_rebuild(doc, frame, old_from_new);
+    }
+
+    fn start_rebuild(&mut self, doc: &Doc, frame: Frame, old_from_new: Mat4) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let doc = doc.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let remade = Remade::make(&doc, &frame);
+            log::debug!("canvas made again: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            let _ = tx.send(remade);
+        });
+        // A rebuild under way is dropped: this one is of a newer document.
+        self.rebuild = Some(Rebuild { rx, frame, old_from_new });
+    }
+
+    /// A rebuild made: the painting in place of the last one, its layers keeping their ids, the
+    /// active layer kept (by its document id).
+    fn apply(&mut self, painter: &mut Painter, r: Remade) {
+        let job = self.rebuild.take().expect("a rebuild under way");
         let active = painter.painting.index_of(painter.active_layer).and_then(|i| self.shown.get(i)).map(|s| s.id.clone());
-        let mut converted = doc.painting(&self.frame);
+        let mut converted = r.converted;
         // The layers keep the ids they had (a new one gets the next free id).
         let numbers: Vec<u32> = converted.layer_ids.iter().map(|id| self.number(id)).collect();
         let old: Vec<u32> = converted.painting.layers.iter().map(|l| l.id).collect();
@@ -264,22 +337,15 @@ impl Canvas {
         let active = self.want_active.take().or(active);
         let place = active.and_then(|a| converted.layer_ids.iter().position(|id| *id == a));
         let active_id = place.or_else(|| converted.painting.layers.iter().rposition(|l| !l.group)).map_or(0, |i| converted.painting.layers[i].id);
-        let layers = doc.painted_layers();
-        self.forms = layers.iter().map(|l| form(l)).collect();
-        self.shown = converted
-            .layer_ids
-            .iter()
-            .map(|id| match doc.layers.get(id) {
-                Some(l) => Shown {
-                    id: id.clone(),
-                    mask_id: l.mask.as_ref().map(|m| m.id.clone()),
-                    strokes: doc.strokes_of(id, None).into_iter().map(print).collect(),
-                    mask: l.mask.as_ref().map(|m| doc.strokes_of(id, Some(&m.id)).into_iter().map(print).collect()).unwrap_or_default(),
-                },
-                None => Shown::default(),
-            })
-            .collect();
-        painter.replace_painting(converted.painting, active_id);
+        // Anchored again: the view and the stroke being drawn follow into the new scene.
+        if job.old_from_new != Mat4::IDENTITY {
+            self.view *= job.old_from_new;
+            painter.move_drawing(job.old_from_new.inverse());
+        }
+        self.frame = job.frame;
+        self.forms = r.forms;
+        self.shown = r.shown;
+        painter.replace_built(converted.painting, r.done, r.built, active_id);
         painter.shared = true;
         self.synced = metas(&painter.painting);
         self.lives.clear();
@@ -305,11 +371,15 @@ impl Canvas {
     /// changed; else their settings set in place, and the strokes that came or went put in or
     /// taken out one by one.
     fn sync(&mut self, painter: &mut Painter) {
+        if self.rebuilding() {
+            // It catches up when the rebuild is in.
+            return;
+        }
         let doc = self.session.view().clone();
         let layers = doc.painted_layers();
         let forms: Vec<Form> = layers.iter().map(|l| form(l)).collect();
         if forms != self.forms || self.shown.len() != painter.painting.layers.len() || layers.is_empty() {
-            self.rebuild_all(painter, &doc);
+            self.rebuild_all(&doc);
             self.paper = paper_of(&doc);
             return;
         }
@@ -371,7 +441,7 @@ impl Canvas {
             }
         }
         if edits > MAX_INCREMENTAL {
-            self.rebuild_all(painter, &doc);
+            self.rebuild_all(&doc);
             return;
         }
         for (i, mask, out, ins, want, prints) in plans {
@@ -541,7 +611,7 @@ impl Canvas {
             // A viewer (or not connected): what was done locally goes back.
             if edited {
                 let doc = self.session.view().clone();
-                self.rebuild_all(painter, &doc);
+                self.rebuild_all(&doc);
             }
             return;
         }
@@ -891,7 +961,7 @@ impl Canvas {
         if !holding && was.iter().any(Option::is_some) && painter.active.is_none() {
             let s = self.scale();
             if s < SCALE_RANGE.0 || s > SCALE_RANGE.1 {
-                self.anchor_again(painter, poses.iter().flatten().next().map(|p| p.w_axis.truncate()));
+                self.anchor_again(poses.iter().flatten().next().map(|p| p.w_axis.truncate()));
             }
         }
         holding
@@ -899,19 +969,22 @@ impl Canvas {
 
     /// Anchors the frame again: at the paper point nearest `near` (world; or the scene's
     /// origin), with the view's scale taken into the frame (the view's scale is 1 after).
-    fn anchor_again(&mut self, painter: &mut Painter, near: Option<Vec3>) {
+    fn anchor_again(&mut self, near: Option<Vec3>) {
+        if self.rebuilding() {
+            return;
+        }
         let s = self.scale() as f64;
         let inv = self.view.inverse();
         let p = near.map_or(Vec3::ZERO, |n| inv.transform_point3(n)).with_z(0.0);
         let c = self.frame.canvas(p);
         let new = Frame { anchor: [c[0], c[1]], k: self.frame.k * s, offset: Vec3::ZERO };
-        // Old scene from new: p_old = p_new / s + (the new anchor in the old scene).
+        // Old scene from new: p_old = p_new / s + (the new anchor in the old scene). The view
+        // takes it when the painting in the new frame is in.
         let at_old = self.frame.point(c[0], c[1], 0.0);
-        self.view = self.view * Mat4::from_translation(at_old) * Mat4::from_scale(Vec3::splat((1.0 / s) as f32));
-        self.frame = new;
+        let old_from_new = Mat4::from_translation(at_old) * Mat4::from_scale(Vec3::splat((1.0 / s) as f32));
         let doc = self.session.view().clone();
-        self.rebuild_all(painter, &doc);
-        log::info!("canvas anchored again at ({:.3}, {:.3}), {:.3e} m per canvas unit", c[0], c[1], self.frame.k);
+        self.start_rebuild(&doc, new, old_from_new);
+        log::info!("canvas anchored again at ({:.3}, {:.3}), {:.3e} m per canvas unit", c[0], c[1], new.k);
     }
 
     /// How much a see-through paper's grid shows: while the canvas is held, and fading after.
@@ -1042,7 +1115,7 @@ mod tests {
             }
         };
         wait(&mut c, &mut painter, &mut other, "both open", &|o| o.state == State::Open);
-        while c.session.state != State::Open || !c.placed {
+        while c.session.state != State::Open || !c.placed || c.rebuilding() {
             c.update(&mut painter, head);
             std::thread::sleep(Duration::from_millis(10));
         }

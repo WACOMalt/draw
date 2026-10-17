@@ -203,17 +203,33 @@ impl Painter {
         self.version += 1;
     }
 
-    /// A painting in place of this one (a shared canvas's, made again): `active` the active
-    /// layer (by id). What was being done to the last one (undo, a sweep, a grab) goes.
-    pub fn replace_painting(&mut self, painting: Painting, active: u32) {
+    /// A painting in place of this one with its segments made already (a shared canvas's, made again): `active` the active layer (by id). What was being done to the last one (undo, a sweep, a grab) goes.
+    pub fn replace_built(&mut self, painting: Painting, done: Vec<GpuSegment>, built: Built, active: u32) {
         self.painting = painting;
+        self.done = done;
+        self.built = built;
+        self.version += 1;
         self.active_layer = active;
         self.mask_target = self.mask_target && self.painting.index_of(active).is_some_and(|i| self.painting.layers[i].mask.is_some());
         self.sweep = None;
         self.grab = None;
         self.undo.clear();
         self.redo.clear();
-        self.rebuild();
+    }
+
+    /// The stroke being drawn moved by a matrix with a uniform scale (the scene anchored
+    /// again under it).
+    pub fn move_drawing(&mut self, m: glam::Mat4) {
+        let s = scale_of(m);
+        if let Some((_, stroke)) = &mut self.active {
+            stroke.brush.radius *= s;
+            for p in &mut stroke.samples {
+                p.pos = m.transform_point3(p.pos);
+                p.up = m.transform_vector3(p.up).normalize_or(Vec3::Y);
+            }
+        }
+        self.smoothed = m.transform_point3(self.smoothed);
+        self.raw.0 = m.transform_point3(self.raw.0);
     }
 
     /// A stroke put into layer number `layer` (by place) at `index`, without building all again.
