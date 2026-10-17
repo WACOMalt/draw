@@ -5,6 +5,10 @@
   //   square: the move of each step (from the pivot)
   //   arrow tip: where the step takes the reference point (a fixed arm right of the pivot):
   //     its direction is the angle, its length the scale (Shift: 15° steps)
+  // The square and the tip drag relative to where the drag started, and the step changes by the
+  // pointer's change divided by the count: copy n applies the step n times, so this way the last
+  // copy follows the pointer (turned as far, grown as much, moved about as far), and a small
+  // change no longer throws the far copies across the canvas. Alt: 10× finer still.
   // Dots show where each copy takes the reference point and the pivot.
   import { kaleidoscopeStep } from '../../shared/effects';
   import { compose } from '../../shared/layers';
@@ -43,7 +47,11 @@
   });
 
   let root = $state<HTMLDivElement>()!;
-  let drag: { kind: 'pivot' | 'move' | 'tip'; id: number } | null = null;
+  /**
+   * The handle being dragged. For the tip: the angle and scale at the start, and the pointer's
+   * turn around the step's pivot so far (degrees, past ±180 too) and distance at the start.
+   */
+  let drag: { kind: 'pivot' | 'move' | 'tip'; id: number; a0?: number; s0?: number; turn?: number; last?: number; r0?: number; p0?: [number, number]; m0?: [number, number] } | null = null;
   let timer: number | undefined;
 
   function world(e: PointerEvent): [number, number] {
@@ -72,6 +80,13 @@
     }
     live = { ...($state.snapshot(saved) as LayerEffect) };
     drag = { kind, id: e.pointerId };
+    if (kind === 'move') drag = { ...drag, p0: world(e), m0: [live.dx ?? 0, live.dy ?? 0] };
+    if (kind === 'tip') {
+      const [x, y] = world(e);
+      const vx = x - (live.cx ?? 0) - (live.dx ?? 0), vy = y - (live.cy ?? 0) - (live.dy ?? 0);
+      // (Not from right at the pivot: the scale would jump.)
+      drag = { ...drag, a0: live.angle ?? 0, s0: live.scale ?? 1, turn: 0, last: Math.atan2(vy, vx), r0: Math.max(Math.hypot(vx, vy), ARM / 4 / z) };
+    }
   }
 
   function move(e: PointerEvent) {
@@ -81,15 +96,25 @@
       live.cx = x;
       live.cy = y;
     } else if (drag.kind === 'move') {
-      live.dx = x - (live.cx ?? 0);
-      live.dy = y - (live.cy ?? 0);
+      const gain = (e.altKey ? 0.1 : 1) / Math.max(1, live.count ?? 1);
+      live.dx = drag.m0![0] + (x - drag.p0![0]) * gain;
+      live.dy = drag.m0![1] + (y - drag.p0![1]) * gain;
     } else {
-      // The tip, from the moved pivot: its direction is the angle, its length the scale.
+      // The tip, around the moved pivot: the pointer's turn changes the angle, its distance the
+      // scale, divided among the copies (see the top).
       const vx = x - (live.cx ?? 0) - (live.dx ?? 0), vy = y - (live.cy ?? 0) - (live.dy ?? 0);
-      let a = (Math.atan2(vy, vx) * 180) / Math.PI;
+      const th = Math.atan2(vy, vx);
+      let d = th - drag.last!;
+      d -= Math.round(d / (2 * Math.PI)) * 2 * Math.PI;
+      drag.turn! += (d * 180) / Math.PI;
+      drag.last = th;
+      const gain = (e.altKey ? 0.1 : 1) / Math.max(1, live.count ?? 1);
+      let a = drag.a0! + drag.turn! * gain;
       if (e.shiftKey) a = Math.round(a / 15) * 15;
-      live.angle = Math.round(a * 100) / 100;
-      live.scale = Math.min(100, Math.max(0.01, Math.hypot(vx, vy) / (ARM / z)));
+      a = ((((a + 180) % 360) + 360) % 360) - 180;
+      live.angle = Math.round(a * 1000) / 1000;
+      const k = drag.s0! * (Math.max(Math.hypot(vx, vy), 1e-9) / drag.r0!) ** gain;
+      live.scale = Math.round(Math.min(100, Math.max(0.01, k)) * 1e5) / 1e5;
     }
     send();
   }
@@ -126,10 +151,10 @@
         width="12"
         height="12"
         role="presentation"
-        onpointerdown={(e) => down(e, 'move')}><title>Move each step</title></rect
+        onpointerdown={(e) => down(e, 'move')}><title>Move each step (Alt: finer)</title></rect
       >
       <circle class="handle tip" cx={sx(geo.tip[0])} cy={sy(geo.tip[1])} r="8" role="presentation" onpointerdown={(e) => down(e, 'tip')}
-        ><title>Turn and scale each step (Shift: 15° steps)</title></circle
+        ><title>Turn and scale each step (Alt: finer; Shift: 15° steps)</title></circle
       >
       <circle class="handle pivot" cx={sx(geo.cx)} cy={sy(geo.cy)} r="9" role="presentation" onpointerdown={(e) => down(e, 'pivot')}><title>The pivot</title></circle>
       <circle class="pivdot" cx={sx(geo.cx)} cy={sy(geo.cy)} r="2.5" />

@@ -18,6 +18,8 @@
     width = 90,
     title = '',
     wide = false,
+    least,
+    center = 0,
     oninput,
     onchange,
   }: {
@@ -32,6 +34,13 @@
     title?: string;
     /** Stretch the slider to the available width (sheet layout). */
     wide?: boolean;
+    /** A log slider through `center`: the smallest distance from it (default from `step`). */
+    least?: number;
+    /**
+     * A log slider with min < center < max runs exponentially away from `center` both ways, with
+     * `center` in the middle of the track (a turn either way, a scale up or down from 100%).
+     */
+    center?: number;
     oninput?: (v: number) => void;
     /** The change is done: the drag ended, a key or the number field set the value. */
     onchange?: (v: number) => void;
@@ -40,32 +49,60 @@
   // Position 0..1 on the track. Log scale maps it to min..max exponentially: fine steps at the
   // low end (size, flow, spacing). Values round to three significant digits, never finer than
   // `step`; a linear slider rounds to `step`. A log slider from 0 (corner radius, rounding)
-  // keeps the first ZERO of the track for 0; the rest runs exponentially from `lo`.
+  // keeps the first ZERO of the track for 0; the rest runs exponentially from `lo`. A log slider
+  // through `center` (min < center < max: a turn either way, a scale up or down) has `center` in
+  // the middle, and each half runs exponentially from `lo` away from it out to its end: fine
+  // steps near the center and large ones at the ends.
   const ZERO = 0.05;
-  const zeroed = $derived(log && min <= 0);
-  const lo = $derived(zeroed ? Math.min(Math.max(step, 0.5), max / 10) : min);
-  const logPos = (v: number) => Math.log(v / lo) / Math.log(max / lo);
+  const signed = $derived(log && min < center && center < max);
+  const zeroed = $derived(log && !signed && min === 0);
+  const lo = $derived(least ?? (zeroed || signed ? Math.min(Math.max(step, 0.5), max / 10) : min));
+  const logPos = (v: number, hi = max) => Math.log(v / lo) / Math.log(hi / lo);
+  /** The far end of the half of a signed slider that `d` (from the center) is on. */
+  const side = (d: number) => (d > 0 ? max - center : center - min);
   const toPos = (v: number) => {
     if (!log) return (v - min) / (max - min);
+    if (signed) {
+      const d = v - center, a = Math.abs(d);
+      const off = a === 0 ? 0 : a < lo ? ZERO / 2 : ZERO + (0.5 - ZERO) * logPos(a, side(d));
+      return 0.5 + Math.sign(d) * off;
+    }
     if (!zeroed) return logPos(v);
     return v <= 0 ? 0 : v < lo ? ZERO / 2 : ZERO + (1 - ZERO) * logPos(v);
+  };
+  /** v rounded to three significant digits, never finer than `step`. */
+  const round3 = (v: number) => {
+    const q = Math.max(step, 10 ** (Math.floor(Math.log10(v)) - 2));
+    return Math.round(v / q) * q;
   };
   function fromPos(p: number): number {
     p = Math.min(1, Math.max(0, p));
     if (!log) return Math.round((min + p * (max - min)) / step) * step;
+    if (signed) {
+      const d = Math.abs(p - 0.5);
+      if (d < ZERO / 2) return center;
+      const m = Math.max(0, (d - ZERO) / (0.5 - ZERO));
+      const sgn = Math.sign(p - 0.5);
+      return center + sgn * round3(lo * (side(sgn) / lo) ** m);
+    }
     if (zeroed) {
       if (p < ZERO / 2) return 0;
       p = Math.max(0, (p - ZERO) / (1 - ZERO));
     }
-    const v = lo * (max / lo) ** p;
-    const q = Math.max(step, 10 ** (Math.floor(Math.log10(v)) - 2));
-    return Math.round(v / q) * q;
+    return round3(lo * (max / lo) ** p);
   }
   const pos = $derived(Math.min(1, Math.max(0, toPos(value))));
 
   // Percent: one decimal below 10%, where a log slider has finer steps.
+  // A slider through a center shows two decimals (a scale of 100.25%).
   const shown = $derived(
-    percent ? (value < 0.1 ? Math.round(value * 1000) / 10 : Math.round(value * 100)) : Math.round(value * 100) / 100,
+    percent
+      ? signed
+        ? Math.round(value * 10000) / 100
+        : value < 0.1
+          ? Math.round(value * 1000) / 10
+          : Math.round(value * 100)
+      : Math.round(value * 100) / 100,
   );
 
   function set(v: number) {
@@ -159,7 +196,8 @@
     onpointercancel={up}
     onkeydown={key}
   >
-    <div class="rail"><div class="fill" style:width="{pos * 100}%"></div></div>
+    <!-- Through 0, the fill runs from the middle. -->
+    <div class="rail"><div class="fill" style:margin-left="{signed ? Math.min(pos, 0.5) * 100 : 0}%" style:width="{(signed ? Math.abs(pos - 0.5) : pos) * 100}%"></div></div>
     <div class="thumb" style:left="{pos * 100}%"></div>
   </div>
   <input
