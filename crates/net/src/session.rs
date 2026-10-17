@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
-use vdraw_core::doc::{Doc, DocLayer, DocStroke, OpError, Paper, new_id};
+use vdraw_core::doc::{Doc, DocLayer, DocStroke, OpError, Paper, StrokeVr, new_id};
 
 /// What the socket thread says.
 enum Event {
@@ -179,6 +179,8 @@ pub struct LiveStroke {
     pub mask: Option<String>,
     pub brush: Value,
     pub pts: Vec<f64>,
+    /// A 3D stroke's depth and up sides so far (see `StrokeVr`).
+    pub vr: Option<StrokeVr>,
 }
 
 /// What changed in a session since it was last asked.
@@ -395,13 +397,20 @@ impl Session {
             "live" => {
                 let key = (s("by"), s("id"));
                 let pts: Vec<f64> = m.get("pts").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+                let vr: Option<StrokeVr> = m.get("vr").and_then(|v| serde_json::from_value(v.clone()).ok());
                 if m.get("start").and_then(Value::as_bool) == Some(true) || !self.lives.contains_key(&key) {
                     self.lives.insert(
                         key.clone(),
-                        LiveStroke { by: key.0.clone(), id: key.1.clone(), layer_id: s("layerId"), mask: m.get("mask").and_then(Value::as_str).map(str::to_string), brush: m.get("brush").cloned().unwrap_or(Value::Null), pts },
+                        LiveStroke { by: key.0.clone(), id: key.1.clone(), layer_id: s("layerId"), mask: m.get("mask").and_then(Value::as_str).map(str::to_string), brush: m.get("brush").cloned().unwrap_or(Value::Null), pts, vr },
                     );
                 } else if let Some(l) = self.lives.get_mut(&key) {
                     l.pts.extend(pts);
+                    if let (Some(have), Some(more)) = (&mut l.vr, vr) {
+                        have.z.extend(more.z);
+                        if let (Some(u), Some(mu)) = (&mut have.up, more.up) {
+                            u.extend(mu);
+                        }
+                    }
                 }
                 ch.live = true;
             }
@@ -445,10 +454,14 @@ impl Session {
     }
 
     /// A stroke's points while it is drawn (the first with `start`), for the others to see.
-    pub fn send_live(&self, id: &str, layer_id: &str, mask: Option<&str>, brush: &Value, pts: &[f64], start: bool) {
+    /// `vr`: a 3D stroke's depth and up sides for these points.
+    pub fn send_live(&self, id: &str, layer_id: &str, mask: Option<&str>, brush: &Value, pts: &[f64], vr: Option<&StrokeVr>, start: bool) {
         let mut m = json!({ "t": "live", "id": id, "layerId": layer_id, "brush": brush, "pts": pts, "start": start });
         if let Some(mk) = mask {
             m["mask"] = mk.into();
+        }
+        if let Some(v) = vr {
+            m["vr"] = serde_json::to_value(v).unwrap_or(Value::Null);
         }
         let _ = self.socket.tx.send(Out::Send(m));
     }
@@ -526,7 +539,7 @@ mod tests {
         // A stroke from a: pending at once, confirmed by its echo; b sees it.
         let id = new_id();
         let stroke = json!({"id": id, "layerId": layer, "brush": {"tool": "paint", "color": "#112233", "size": 8.0, "opacity": 1.0, "flow": 1.0, "hardness": 0.8, "spacing": 0.1, "pressureSize": true, "pressureFlow": false, "buildup": false}, "pts": [0.0, 0.0, 0.5, 40.0, 10.0, 0.6]});
-        a.send_live(&id, &layer, None, &stroke["brush"], &[0.0, 0.0, 0.5], true);
+        a.send_live(&id, &layer, None, &stroke["brush"], &[0.0, 0.0, 0.5], None, true);
         until(&mut b, "b sees the live stroke", |s| !s.lives.is_empty());
         a.send_op(json!({"type": "stroke.add", "stroke": stroke}));
         assert_eq!(a.view().strokes.len(), 1);

@@ -248,12 +248,14 @@ fn layer_row(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersState, 
     if blend != Blend::Normal && blend != Blend::Pass {
         tags.push(tag(blend).to_string());
     }
-    for t in tags {
-        let galley = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), TEXT_DIM);
+    // On a shared canvas, a VR layer (its strokes in 3D) says so, as the 2D app's badge.
+    let vr = painter.shared && !group && !p.layers[i].ordered;
+    for (t, color) in tags.into_iter().map(|t| (t, TEXT_DIM)).chain(vr.then(|| ("VR".to_string(), ACCENT))) {
+        let galley = ui.painter().layout_no_wrap(t, egui::FontId::proportional(12.0), color);
         let w = galley.size().x + 10.0;
         let r = Rect::from_center_size(pos2(right - w * 0.5, rect.center().y), vec2(w, 20.0));
         ui.painter().rect_filled(r, 3.0, BG_1);
-        ui.painter().galley(r.center() - galley.size() * 0.5, galley, TEXT_DIM);
+        ui.painter().galley(r.center() - galley.size() * 0.5, galley, color);
         right -= w + 4.0;
     }
     if let Some(enabled) = mask {

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::time::Instant;
-use vdraw_core::doc::{self, Doc, DocBrush, DocLayer, DocStroke, Frame};
+use vdraw_core::doc::{self, Doc, DocBrush, DocLayer, DocStroke, Frame, StrokeVr};
 use vdraw_core::{Blend, Stroke};
 use vdraw_net::session::{Session, State};
 use vdraw_render::OverlayLine;
@@ -62,10 +62,11 @@ struct Form {
     parent: Option<String>,
     clip: bool,
     mask: Option<String>,
+    vr: bool,
 }
 
 fn form(l: &DocLayer) -> Form {
-    Form { id: l.id.clone(), group: l.is_group(), parent: l.parent.clone(), clip: l.clip.unwrap_or(false), mask: l.mask.as_ref().map(|m| m.id.clone()) }
+    Form { id: l.id.clone(), group: l.is_group(), parent: l.parent.clone(), clip: l.clip.unwrap_or(false), mask: l.mask.as_ref().map(|m| m.id.clone()), vr: l.vr }
 }
 
 /// A layer as the panel edits it (no strokes): what a layer edit changed is sent as ops.
@@ -80,12 +81,14 @@ struct Meta {
     parent: Option<u32>,
     clip: bool,
     mask: Option<bool>,
+    /// A VR layer (its strokes in 3D).
+    vr: bool,
 }
 
 fn metas(p: &vdraw_core::Painting) -> Vec<Meta> {
     p.layers
         .iter()
-        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled) })
+        .map(|l| Meta { id: l.id, name: l.name.clone(), blend: l.blend, opacity: l.opacity, visible: l.visible, group: l.group, parent: l.parent, clip: l.clip, mask: l.mask.as_ref().map(|m| m.enabled), vr: !l.ordered && !l.group })
         .collect()
 }
 
@@ -363,7 +366,7 @@ impl Canvas {
         }
         for (i, mask, out, ins, want, prints) in plans {
             let ordered_in = |painter: &mut Painter, j: usize, s: &DocStroke, frame: &Frame| {
-                let stroke = doc::stroke(&s.id, &s.brush, &s.pts, frame);
+                let stroke = doc::stroke(&s.id, &s.brush, &s.pts, s.vr.as_ref(), frame);
                 if steps_changed {
                     let p = &mut painter.painting.layers[i];
                     let list = if mask { &mut p.mask.as_mut().unwrap().strokes } else { &mut p.strokes };
@@ -407,26 +410,44 @@ impl Canvas {
     /// A finished stroke as the document has it: its points on the paper (canvas units,
     /// rounded to a tenth of what a pixel shows at this zoom, as the 2D app does), and its
     /// brush as the 2D app's.
-    fn doc_stroke(&self, painter: &Painter, id: &str, layer: &str, mask: Option<&str>, stroke: &Stroke) -> Value {
+    fn doc_stroke(&self, painter: &Painter, id: &str, layer: &str, mask: Option<&str>, stroke: &Stroke, depth: bool) -> Value {
         let brush = self.doc_brush(painter, &stroke.brush);
-        let pts = self.doc_points(&stroke.samples[..stroke.samples.len().min(20_000)]);
+        let (pts, vr) = self.doc_points(&stroke.samples[..stroke.samples.len().min(20_000)], depth);
         let mut s = json!({ "id": id, "layerId": layer, "brush": brush, "pts": pts });
         if let Some(m) = mask {
             s["mask"] = m.into();
         }
+        if let Some(v) = vr {
+            s["vr"] = serde_json::to_value(v).unwrap_or(Value::Null);
+        }
         s
     }
 
-    fn doc_points(&self, samples: &[vdraw_core::Sample]) -> Vec<f64> {
+    /// Points as the document has them (x, y, pressure), and with `depth` (a VR layer's
+    /// stroke) their depth and the pen's up sides.
+    fn doc_points(&self, samples: &[vdraw_core::Sample], depth: bool) -> (Vec<f64>, Option<StrokeVr>) {
         // A pixel at arm's length is about half a millimeter.
         let device_scale = self.frame.k * self.scale() as f64 / 0.0005;
         let d = doc::point_decimals(device_scale);
         let mut out = Vec::with_capacity(samples.len() * 3);
+        let mut z = Vec::new();
+        let mut up = Vec::new();
+        let r3 = |v: f32| (v.clamp(-1.0, 1.0) as f64 * 1000.0).round() / 1000.0;
         for s in samples {
             let c = self.frame.canvas(s.pos);
             out.extend([doc::round_to(c[0], d), doc::round_to(c[1], d), (s.pressure.clamp(0.0, 1.0) as f64 * 1000.0).round() / 1000.0]);
+            if depth {
+                z.push(doc::round_to(c[2], d));
+                // Canvas axes: y runs down.
+                up.extend([r3(s.up.x), r3(-s.up.y), r3(s.up.z)]);
+            }
         }
-        out
+        (out, depth.then_some(StrokeVr { z, up: Some(up) }))
+    }
+
+    /// Whether strokes on a painting layer (by id) are 3D (a VR layer).
+    fn is_vr_layer(painter: &Painter, layer: u32) -> bool {
+        painter.painting.index_of(layer).is_some_and(|i| !painter.painting.layers[i].ordered && !painter.painting.layers[i].group)
     }
 
     fn doc_brush(&self, painter: &Painter, b: &vdraw_core::Brush) -> Value {
@@ -476,9 +497,9 @@ impl Canvas {
         }
         let Some(layer) = painter.painting.index_of(painter.active_layer).and_then(|i| self.doc_layer(i)).map(str::to_string) else { return };
         let mask = if painter.mask_target { painter.painting.index_of(painter.active_layer).and_then(|i| self.shown[i].mask_id.clone()) } else { None };
-        let pts = self.doc_points(&stroke.samples[self.live.1..n]);
+        let (pts, vr) = self.doc_points(&stroke.samples[self.live.1..n], Self::is_vr_layer(painter, painter.active_layer) && !painter.mask_target);
         let brush = self.doc_brush(painter, &stroke.brush);
-        self.session.send_live(&self.live.0, &layer, mask.as_deref(), &brush, &pts, !self.live.2);
+        self.session.send_live(&self.live.0, &layer, mask.as_deref(), &brush, &pts, vr.as_ref(), !self.live.2);
         self.live = (self.live.0.clone(), n, true, Instant::now());
     }
 
@@ -514,11 +535,12 @@ impl Canvas {
                         continue;
                     }
                     // The last points the others have not seen, then the stroke itself.
+                    let depth = Self::is_vr_layer(painter, layer) && !mask;
                     if self.live.0 == id && self.live.1 < stroke.samples.len() && self.live.2 {
-                        let pts = self.doc_points(&stroke.samples[self.live.1..]);
-                        self.session.send_live(&id, &doc_layer, mask_id.as_deref(), &self.doc_brush(painter, &stroke.brush), &pts, false);
+                        let (pts, vr) = self.doc_points(&stroke.samples[self.live.1..], depth);
+                        self.session.send_live(&id, &doc_layer, mask_id.as_deref(), &self.doc_brush(painter, &stroke.brush), &pts, vr.as_ref(), false);
                     }
-                    let s = self.doc_stroke(painter, &id, &doc_layer, mask_id.as_deref(), &stroke);
+                    let s = self.doc_stroke(painter, &id, &doc_layer, mask_id.as_deref(), &stroke, depth);
                     ops.push(json!({ "type": "stroke.add", "stroke": s }));
                     step.undo.push(json!({ "type": "stroke.remove", "id": id }));
                     step.redo.push(json!({ "type": "stroke.restore", "id": id }));
@@ -647,6 +669,9 @@ impl Canvas {
                 if m.clip {
                     layer["clip"] = true.into();
                 }
+                if m.vr {
+                    layer["vr"] = true.into();
+                }
                 adds.push(json!({ "type": "layer.add", "layer": layer }));
             }
             step.undo.push(json!({ "type": "layer.remove", "id": nid }));
@@ -749,7 +774,7 @@ impl Canvas {
                     continue;
                 }
                 let Ok(brush) = serde_json::from_value::<DocBrush>(l.brush.clone()) else { continue };
-                let stroke = doc::stroke(&l.id, &brush, &l.pts, &self.frame);
+                let stroke = doc::stroke(&l.id, &brush, &l.pts, l.vr.as_ref(), &self.frame);
                 self.lives.insert(key.clone(), Live { points: l.pts.len(), layer, mask, stroke });
             }
             if let Some(c) = self.lives.get(key) {
@@ -947,7 +972,7 @@ mod tests {
         assert_eq!(current(&painter), fresh(&painter));
         assert_eq!(painter.built.strokes.len(), 2);
         // Another's stroke being drawn shows over the layer's strokes.
-        other.send_live("Slivecccccccc", &layer, None, &brush, &[0.0, 50.0, 0.5, 30.0, 60.0, 0.5], true);
+        other.send_live("Slivecccccccc", &layer, None, &brush, &[0.0, 50.0, 0.5, 30.0, 60.0, 0.5], None, true);
         until(&mut c, &mut painter, &mut other, "the live stroke", &|c, _| !c.session.lives.is_empty());
         painter.update_drawing();
         c.draw_live(&mut painter);
