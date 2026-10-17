@@ -120,6 +120,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         }
         // VDRAW_SHARED: as on a shared canvas (the panel's rows for one).
         painter.shared = std::env::var("VDRAW_SHARED").is_ok();
+        let painter_shared = painter.shared;
         // VDRAW_HOME: the start screen (no server asked: no account).
         p.screen = if std::env::var("VDRAW_HOME").is_ok() { crate::panel::Screen::Home } else { crate::panel::Screen::Paint };
         let mut lobby = crate::lobby::Lobby::new(vdraw_net::identity::Identity::default());
@@ -128,7 +129,7 @@ pub fn run(path: &str, width: u32, height: u32, painting: vdraw_core::Painting, 
         let place = Placement::centered(cam.eye() + forward * 0.5, right, -up, -forward);
         // Twice: egui lays out sizes it measured in the frame before.
         for _ in 0..2 {
-            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets, lobby: &mut lobby, canvas: None });
+            let frame = p.run(Pointer { at: Some(egui::pos2(300.0, 150.0)), pressed: false, scroll: 0.0 }, Model { painter: &mut painter, palettes: &mut palettes, presets: &mut presets, lobby: &mut lobby, canvas: painter_shared.then(|| crate::panel::CanvasInfo { key: "K7QX-2MPD".into(), role: "editor".into(), state: "connected".into(), ..Default::default() }) });
             ui.update_textures(&frame.textures)?;
             primitives = frame.primitives;
         }

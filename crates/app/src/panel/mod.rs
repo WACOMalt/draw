@@ -339,6 +339,14 @@ impl Panel {
                 if icon_button(ui, "undo", vec2(38.0, 36.0), false, painter.can_undo()).clicked() {
                     painter.undo();
                 }
+                // Out of the canvas, back to the start screen.
+                if canvas.is_some() {
+                    let exit = egui::Button::new(RichText::new("Exit").size(14.0).color(TEXT)).fill(BG_2).stroke(stroke(1.0, LINE)).min_size(vec2(0.0, 36.0));
+                    if ui.add(exit).on_hover_text("Leave the canvas").clicked() {
+                        actions.push(Action::Leave);
+                    }
+                    ui.add_space(4.0);
+                }
             });
         });
         if let Some(why) = canvas.and_then(|c| c.refused.as_ref()) {
@@ -693,7 +701,8 @@ fn settings_tab(ui: &mut egui::Ui, painter: &mut Painter, canvas: Option<&Canvas
         "Right stick: turn (left, right), rise and sink",
         "Panel hand's stick click: hide or show the panel",
         "Roll the wrist: a flat tip turns with it",
-        "Grips: hold the canvas; with both hands, turn and zoom it",
+        "Grip: hold the canvas (it moves and turns with the hand)",
+        "Both grips: move, turn and zoom it",
     ] {
         ui.label(RichText::new(line).color(TEXT_DIM).size(14.0));
     }
