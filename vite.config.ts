@@ -13,6 +13,8 @@ export default defineConfig({
   worker: { format: 'es' },
   server: {
     port: 5173,
+    // vr/ is the VR app (Rust): its build folder is large and none of it is the page's.
+    watch: { ignored: ['**/vr/**'] },
     proxy: {
       '/api': SERVER,
       '/ws': { target: SERVER, ws: true },
