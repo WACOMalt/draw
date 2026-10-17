@@ -11,8 +11,8 @@
 //
 // Native parts: .bdraw files the system opens the app with (sent to the page through
 // preload.cjs), the .bdraw MIME type for AppImages (Gear Lever does not install it), and a
-// file manager thumbnailer for .bdraw (draw-thumbnailer.sh), and updates from the GitHub
-// releases (update.cjs).
+// file manager thumbnailer for .bdraw (draw-thumbnailer.sh), updates from the GitHub releases
+// (update.cjs), and "Open in VR": vdraw, the VR app, started on the open canvas (vr.cjs).
 
 const { app, BrowserWindow, Menu, ipcMain, net, protocol, session, shell } = require('electron');
 const { spawnSync } = require('node:child_process');
@@ -20,6 +20,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const updates = require('./update.cjs');
+const { createVr } = require('./vr.cjs');
 
 const APP_ORIGIN = 'tauri://localhost';
 const APP_DIR = path.join(__dirname, 'app');
@@ -175,7 +176,10 @@ function createWindow() {
   });
   // A new page load (reload, navigation) asks for the files again.
   wc.on('did-start-navigation', (details) => {
-    if (details.isMainFrame && !details.isSameDocument) pageReady = false;
+    if (!details.isMainFrame || details.isSameDocument) return;
+    pageReady = false;
+    // The page that opened VR is gone (a reload): VR ends with it.
+    vr.close();
   });
 
   void win.loadURL(`${APP_ORIGIN}/`);
@@ -197,6 +201,18 @@ ipcMain.handle('update-download', (e) => {
   return updates.download((fraction) => !wc.isDestroyed() && wc.send('update-progress', fraction));
 });
 ipcMain.handle('update-restart', (e) => fromPage(e) && updates.restart());
+
+// VR (vr.cjs): vdraw's lines go to the page.
+const vr = createVr({ app, send: (line) => win && !win.webContents.isDestroyed() && win.webContents.send('vr-line', line) });
+ipcMain.handle('vr-probe', (e) => (fromPage(e) ? vr.probe() : { ok: false, reason: 'not available' }));
+ipcMain.handle('vr-open', (e, hello) => {
+  if (!fromPage(e)) throw new Error('not allowed');
+  vr.open(hello);
+});
+ipcMain.handle('vr-close', (e) => {
+  if (fromPage(e)) vr.close();
+});
+app.on('will-quit', () => vr.quit());
 
 app.on('second-instance', (_e, argv) => {
   collect(argv);

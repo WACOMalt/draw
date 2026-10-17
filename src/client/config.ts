@@ -2,6 +2,8 @@
 // The app build (`vite build --mode tauri`, for the Tauri apps and the Linux Electron app) sets
 // VITE_SERVER_ORIGIN (see .env.tauri), because its page comes with the app.
 
+import type { VrBridge } from './vr';
+
 const env = (import.meta.env.VITE_SERVER_ORIGIN as string | undefined)?.replace(/\/+$/, '') ?? '';
 
 /** Prefix for fetch() calls: '' (same origin) or https://draw.bsums.xyz. */
@@ -37,6 +39,8 @@ export interface DrawDesktop {
     download(onProgress: (fraction: number) => void): Promise<void>;
     restart(): Promise<void>;
   };
+  /** Opens the canvas in VR (electron/vr.cjs, vr.ts). Missing in apps before it. */
+  vr?: VrBridge;
 }
 export const ELECTRON = (window as unknown as { drawDesktop?: DrawDesktop }).drawDesktop ?? null;
 

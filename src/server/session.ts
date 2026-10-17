@@ -40,6 +40,7 @@ export interface Client {
   live: Bucket;
   cursor: Bucket;
   avatar: Bucket;
+  status: Bucket;
 }
 
 export function newClient(ws: WebSocket, user: UserRow | undefined): Client {
@@ -56,6 +57,8 @@ export function newClient(ws: WebSocket, user: UserRow | undefined): Client {
     live: new Bucket(120, 60),
     cursor: new Bucket(40, 30),
     avatar: new Bucket(40, 30),
+    // Going into VR and back: a few at once, then one every few seconds.
+    status: new Bucket(4, 0.25),
   };
 }
 
@@ -228,7 +231,18 @@ export class Session {
         }
         return;
       }
+      case 'status':
+        this.setStatus(client, msg.inVr);
+        return;
     }
+  }
+
+  /** In VR or back (Peer.inVr): stored on the peer, so late joiners get it, and told to the others. */
+  private setStatus(client: Client, inVr: unknown): void {
+    if (client.embed || !client.peer || typeof inVr !== 'boolean' || client.peer.inVr === inVr) return;
+    if (!client.status.take()) return;
+    client.peer.inVr = inVr;
+    this.broadcast({ t: 'peer.status', id: client.id, inVr }, client);
   }
 
   /**
@@ -302,7 +316,7 @@ export class Session {
         // fall back to defaults
       }
       if (client.access.user) name = client.access.user.name.slice(0, LIMITS.maxPeerName);
-      client.peer = { id: client.id, name, color };
+      client.peer = { id: client.id, name, color, inVr: !client.embed && msg.inVr === true };
       const peers: Peer[] = [];
       if (!client.embed) for (const c of this.clients.values()) if (c.peer && c !== client && !c.embed) peers.push(c.peer);
       this.send(client, {

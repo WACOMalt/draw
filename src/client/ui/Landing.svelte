@@ -78,7 +78,7 @@
 <main>
   <div class="top">
     {#if !IS_DESKTOP}
-      <a class="download" href={DOWNLOAD_URL} target="_blank" rel="noopener" title="Desktop app for Windows, macOS and Linux"><Icon name="download" /> Download app</a>
+      <a class="download" href={DOWNLOAD_URL} target="_blank" rel="noopener" title="Desktop app for Windows, macOS and Linux. On Windows and Linux it also opens canvases in VR."><Icon name="download" /> Download app</a>
     {/if}
     <AccountButton />
   </div>

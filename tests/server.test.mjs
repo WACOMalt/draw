@@ -1340,6 +1340,44 @@ try {
     check(!!got, 'avatars: a leave is relayed (clients drop the ghost)');
   }
 
+  // --- "In VR": a 2D window whose person opened the canvas in VR (Peer.inVr) ---------------------
+  {
+    const sb = new Browser();
+    await account(sb, 'invr@example.com', 'In VR Tester');
+    const sc = (await sb.api('POST', '/api/sessions', { name: 'invr-test' })).data.key;
+    const s1 = await sb.join(sc);
+    const sw1 = await first(s1);
+    const s2 = await new Browser().join(sc);
+    const sw2 = await first(s2);
+    check(sw2.peers.find((p) => p.id === sw1.clientId)?.inVr === false, 'in VR: welcome peers carry inVr (false)');
+    const joined = await s1.next((m) => m.t === 'peer.join' && m.peer.id === sw2.clientId);
+    check(joined?.peer.inVr === false, 'in VR: peer.join carries inVr (false)');
+    s1.send({ t: 'status', inVr: true });
+    let got = await s2.next((m) => m.t === 'peer.status' && m.id === sw1.clientId, 2000);
+    check(got?.inVr === true, 'in VR: status is relayed as peer.status with the id');
+    check(!s1.msgs.some((m) => m.t === 'peer.status'), 'in VR: not echoed to the sender');
+    const late = await new Browser().join(sc);
+    const lw = await first(late);
+    check(lw.peers.find((p) => p.id === sw1.clientId)?.inVr === true, 'in VR: a late joiner gets inVr in welcome');
+    const count = () => s2.msgs.filter((m) => m.t === 'peer.status').length;
+    for (const bad of [{ t: 'status', inVr: 'yes' }, { t: 'status' }, { t: 'status', inVr: 1 }, { t: 'status', inVr: true }]) s1.send(bad);
+    await sleep(300);
+    check(count() === 1, 'in VR: a non-boolean, a missing value and an unchanged one are dropped');
+    s1.send({ t: 'status', inVr: false });
+    got = await s2.next((m) => m.t === 'peer.status' && m.inVr === false, 2000);
+    check(got?.id === sw1.clientId, 'in VR: back to 2D is relayed');
+    for (let i = 0; i < 20; i++) s1.send({ t: 'status', inVr: i % 2 === 0 });
+    await sleep(300);
+    const n = count() - 2;
+    check(n >= 1 && n <= 4, `in VR: rate limited (${n} of 20 relayed)`);
+    // A reconnect while in VR says so in its hello: others never see the window as a second person.
+    const s3 = await sb.join(sc, { inVr: true });
+    const sw3 = await first(s3);
+    got = await s2.next((m) => m.t === 'peer.join' && m.peer.id === sw3.clientId, 2000);
+    check(got?.peer.inVr === true, 'in VR: hello.inVr makes the join arrive as in VR');
+    for (const c of [s1, s2, s3, late]) c.ws.close();
+  }
+
   // --- admins manage every owned canvas like its owner ------------------------------------------
   const adm = (await funky.api('POST', '/api/sessions', { name: 'admin-test' })).data.key;
   await funky.api('POST', `/api/canvases/${adm}/links`, { kind: 'code', role: 'none' });

@@ -14,6 +14,7 @@ files:
   - app/**
   - thumbnail.cjs
   - update.cjs
+  - vr.cjs
   - thumb/**
 extraResources:
   - from: ../src-tauri/mime/xyz.bsums.draw.xml
@@ -22,6 +23,10 @@ extraResources:
     to: icon.png
   - from: draw-thumbnailer.sh
     to: draw-thumbnailer.sh
+  # vdraw, the VR app ("Open in VR", vr.cjs). Build it first: cd vr && cargo build -p vdraw
+  # --release --features static-openxr (the release workflow does).
+  - from: ../vr/target/release/vdraw
+    to: vdraw
 npmRebuild: false
 fileAssociations:
   - ext: bdraw

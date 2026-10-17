@@ -4,8 +4,11 @@
 // Opening a .bdraw file from the file manager starts the app with the path as an argument
 // (Windows, Linux) or sends RunEvent::Opened (macOS). The page asks for those paths and reads
 // them through the two commands below, which only read files the system opened the app with.
+//
+// "Open in VR" (Windows): vr.rs starts vdraw, the VR app, bundled as a sidecar.
 
 mod pen;
+mod vr;
 
 use std::{collections::HashSet, path::PathBuf, sync::Mutex};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
@@ -129,11 +132,12 @@ pub fn run() {
     opened.add(std::env::args_os().skip(1).map(PathBuf::from));
     tauri::Builder::default()
         .manage(opened)
+        .manage(vr::Vr::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         // Links out of the app (the release page of an update) open in the browser.
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![take_opened_files, read_opened_file])
+        .invoke_handler(tauri::generate_handler![take_opened_files, read_opened_file, vr::vr_probe, vr::vr_open, vr::vr_close])
         .setup(|app| {
             // Pen pressure from the native layer (see pen.rs).
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -151,6 +155,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building the Draw app")
         .run(|_app, _event| {
+            // Quitting ends vdraw too (its stdin closes).
+            if let tauri::RunEvent::Exit = _event {
+                vr::quit(_app);
+            }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if let tauri::RunEvent::Opened { urls } = _event {
                 use tauri::Emitter;
