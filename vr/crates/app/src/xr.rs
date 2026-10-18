@@ -583,7 +583,11 @@ pub fn run(start: Start, server: Option<String>, quit: Arc<AtomicBool>) -> Resul
                     if on_panel.is_some() {
                         Press::Panel
                     } else {
-                        painting_hand = h;
+                        // (While the other hand holds a kaleidoscope's ball, this trigger makes
+                        // it finer: the other hand stays the painting hand.)
+                        if painter.kaleido_hold.is_none() {
+                            painting_hand = h;
+                        }
                         Press::Paint
                     }
                 }
@@ -647,6 +651,19 @@ pub fn run(start: Start, server: Option<String>, quit: Arc<AtomicBool>) -> Resul
                 painter.grab(painting_hand, scene_from_world * rig.mat() * aim, grabbing, sticks[painting_hand].y, dt);
             }
             sticks[painting_hand] = Vec2::ZERO;
+        }
+        // The Kaleidoscope tool: the trigger holds a ball of the active layer's kaleidoscope;
+        // the other trigger makes it finer; the stick scales the step (and does not move you).
+        if painter.tools.tool == Tool::Kaleido {
+            if let Some(aim) = aims[painting_hand] {
+                let fine = press[1 - painting_hand] == Press::Paint;
+                painter.kaleido(painting_hand, scene_from_world * rig.mat() * aim, press[painting_hand] == Press::Paint, sticks[painting_hand].y, fine, dt);
+            }
+            if painter.kaleido_hold.is_some() {
+                sticks[painting_hand] = Vec2::ZERO;
+            }
+        } else {
+            painter.kaleido_hold = None;
         }
         loco.update(&mut rig, head_pose, sticks[0], sticks[1], dt);
 
@@ -744,7 +761,7 @@ pub fn run(start: Start, server: Option<String>, quit: Arc<AtomicBool>) -> Resul
         }
         // The overlays are drawn in the scene.
         let laser = laser.map(|(a, b)| (to_scene(a), to_scene(b)));
-        let tool_pos = aims[painting_hand].filter(|_| pointer.at.is_none() && !matches!(painter.tools.tool, Tool::Eyedropper | Tool::Transform)).and_then(|aim| tool_at(&rig, aim).map(|t| (aim, t)));
+        let tool_pos = aims[painting_hand].filter(|_| pointer.at.is_none() && !matches!(painter.tools.tool, Tool::Eyedropper | Tool::Transform | Tool::Kaleido)).and_then(|aim| tool_at(&rig, aim).map(|t| (aim, t)));
         // The laser to the paper.
         let laser = match (laser, tool_pos) {
             (None, Some((aim, (pos, _)))) if laser_mode => Some((to_scene(rig.point(aim.w_axis.truncate())), pos)),
@@ -767,6 +784,11 @@ pub fn run(start: Start, server: Option<String>, quit: Arc<AtomicBool>) -> Resul
                 }
             }
         });
+        // The Kaleidoscope tool's balls and the copies' path.
+        if painter.tools.tool == Tool::Kaleido {
+            let hand = aims[painting_hand].filter(|_| pointer.at.is_none()).map(|aim| to_scene(rig.point(aim.w_axis.truncate())));
+            painter.kaleido_lines(hand, &mut lines);
+        }
         painter.update_drawing();
         let mut tag_list: Vec<(String, [f32; 3], Vec3)> = Vec::new();
         if let Mode::Canvas(c) = &mut mode {

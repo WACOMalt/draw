@@ -8,7 +8,7 @@
 //! (`shapes.toPaint`, `shapes.fromPaint`) are not applied here: they ask for the document again.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 /// The most layers, and how deep groups nest (LIMITS).
@@ -841,7 +841,286 @@ pub fn stroke(id: &str, b: &DocBrush, pts: &[f64], vr: Option<&StrokeThreeD>, fr
     out
 }
 
+/// A kaleidoscope's settings (types.ts LayerEffect) as its step: p' = pivot + move + s·R·(p −
+/// pivot) in canvas units (effects.ts kaleidoscopeStep3), the turn its 3D `turn` or `angle`
+/// degrees about the axis out of the paper.
+fn kaleidoscope_step(e: &Value) -> glam::DMat4 {
+    let num = |k: &str, d: f64| e.get(k).and_then(Value::as_f64).unwrap_or(d);
+    let turn = e
+        .get("turn")
+        .and_then(Value::as_array)
+        .filter(|t| t.len() == 4)
+        .map(|t| glam::DQuat::from_xyzw(t[0].as_f64().unwrap_or(0.0), t[1].as_f64().unwrap_or(0.0), t[2].as_f64().unwrap_or(0.0), t[3].as_f64().unwrap_or(1.0)).normalize())
+        .unwrap_or_else(|| glam::DQuat::from_rotation_z(num("angle", 0.0).to_radians()));
+    let pivot = glam::DVec3::new(num("cx", 0.0), num("cy", 0.0), num("cz", 0.0));
+    let step = glam::DVec3::new(num("dx", 0.0), num("dy", 0.0), num("dz", 0.0));
+    glam::DMat4::from_translation(pivot + step) * glam::DMat4::from_scale_rotation_translation(glam::DVec3::splat(num("scale", 1.0)), turn, glam::DVec3::ZERO) * glam::DMat4::from_translation(-pivot)
+}
+
+impl Frame {
+    /// The frame as a transform: canvas units to the painting's space.
+    pub fn matrix(&self) -> glam::DMat4 {
+        glam::DMat4::from_translation(self.offset.as_dvec3()) * glam::DMat4::from_scale(glam::DVec3::new(self.k, -self.k, self.k)) * glam::DMat4::from_translation(glam::DVec3::new(-self.anchor[0], -self.anchor[1], 0.0))
+    }
+}
+
+/// A layer's kaleidoscope as the document has it (types.ts LayerEffect, kept whole: fields
+/// this client does not know go back as they came), whether the layer's strokes all have depth
+/// (its copies then move in 3D), and the frame they are drawn in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Kaleido {
+    pub effect: Map<String, Value>,
+    pub depth: bool,
+    pub frame: Frame,
+}
+
+impl Kaleido {
+    /// A new one, as the 2D app's (EffectsPanel fresh): six around the pivot (canvas units),
+    /// behind the layer.
+    pub fn new(cx: f64, cy: f64, depth: bool, frame: Frame) -> Self {
+        let effect = json!({"type": "kaleidoscope", "enabled": true, "radius": 0, "count": 5, "angle": 60, "scale": 1, "cx": cx, "cy": cy, "dx": 0, "dy": 0, "order": "behind"});
+        let mut k = Self { effect: effect.as_object().cloned().unwrap_or_default(), depth, frame };
+        k.fit(depth);
+        k
+    }
+
+    /// The step is a 3D one: a turn in 3D, or depths.
+    pub fn is_3d(&self) -> bool {
+        ["turn", "cz", "dz"].iter().any(|k| self.effect.contains_key(*k))
+    }
+
+    /// Gives it its layer's kind (effects.ts kaleidoscopeFixes): a 3D step where the layer's
+    /// strokes all have depth (its angle as a turn about the axis out of the paper), a flat one
+    /// elsewhere (`flatten`). True when it changed.
+    pub fn fit(&mut self, depth: bool) -> bool {
+        let was = self.clone();
+        self.depth = depth;
+        if depth && !self.effect.contains_key("turn") {
+            let q = glam::DQuat::from_rotation_z(self.num("angle", 0.0).to_radians());
+            self.set("turn", json!([q.x, q.y, q.z, q.w]));
+            self.set("angle", 0);
+        } else if !depth && self.is_3d() {
+            self.flatten();
+        }
+        *self != was
+    }
+
+    /// How far the step turns, degrees: a 3D step about its own axis (minus when the axis
+    /// points into the paper; effects.ts kaleidoscopeAngle).
+    pub fn angle(&self) -> f64 {
+        let Some(q) = self.turn() else { return self.num("angle", 0.0) };
+        let a = (2.0 * q.xyz().length().atan2(q.w)).to_degrees();
+        if q.z < 0.0 { -a } else { a }
+    }
+
+    /// Turns the step `deg` degrees (a 3D step about its own axis, kept; effects.ts
+    /// withKaleidoscopeAngle).
+    pub fn set_angle(&mut self, deg: f64) {
+        let Some(q) = self.turn() else {
+            self.set("angle", deg);
+            return;
+        };
+        let mut axis = q.xyz().try_normalize().unwrap_or(glam::DVec3::Z);
+        if axis.z < 0.0 {
+            axis = -axis;
+        }
+        let q = glam::DQuat::from_axis_angle(axis, deg.to_radians());
+        self.set("turn", json!([q.x, q.y, q.z, q.w]));
+    }
+
+    fn turn(&self) -> Option<glam::DQuat> {
+        let t = self.effect.get("turn")?.as_array()?;
+        (t.len() == 4).then(|| glam::DQuat::from_xyzw(t[0].as_f64().unwrap_or(0.0), t[1].as_f64().unwrap_or(0.0), t[2].as_f64().unwrap_or(0.0), t[3].as_f64().unwrap_or(1.0)).normalize())
+    }
+
+    pub fn num(&self, key: &str, default: f64) -> f64 {
+        self.effect.get(key).and_then(Value::as_f64).unwrap_or(default)
+    }
+
+    pub fn set(&mut self, key: &str, v: impl Into<Value>) {
+        self.effect.insert(key.into(), v.into());
+    }
+
+    pub fn on(&self) -> bool {
+        self.effect.get("enabled").and_then(Value::as_bool) == Some(true)
+    }
+
+    pub fn count(&self) -> usize {
+        self.num("count", 0.0).clamp(0.0, 64.0) as usize
+    }
+
+    pub fn behind(&self) -> bool {
+        self.effect.get("order").and_then(Value::as_str) == Some("behind")
+    }
+
+    /// The step turns out of the paper (only where the strokes have depth).
+    pub fn tilts(&self) -> bool {
+        self.effect.get("turn").and_then(Value::as_array).is_some_and(|t| t.len() == 4 && t[0].as_f64().unwrap_or(0.0).hypot(t[1].as_f64().unwrap_or(0.0)) > 1e-9)
+    }
+
+    /// The step in canvas units.
+    pub fn step(&self) -> glam::DMat4 {
+        kaleidoscope_step(&Value::Object(self.effect.clone()))
+    }
+
+    /// The pivot in canvas units.
+    pub fn pivot(&self) -> glam::DVec3 {
+        glam::DVec3::new(self.num("cx", 0.0), self.num("cy", 0.0), self.num("cz", 0.0))
+    }
+
+    /// The step in the painting's space.
+    pub fn step_scene(&self) -> glam::DMat4 {
+        let f = self.frame.matrix();
+        f * self.step() * f.inverse()
+    }
+
+    /// The pivot in the painting's space.
+    pub fn pivot_scene(&self) -> glam::Vec3 {
+        let p = self.pivot();
+        self.frame.point(p.x, p.y, p.z)
+    }
+
+    /// The copies (`Layer::copies`): copy i the step applied i times, behind the layer or in
+    /// front of it. Strokes with depth are copied in 3D; else as the 2D app shows the copies
+    /// (straight on, effects.ts kaleidoscopeCopies: in the paper at the pivot's depth). None
+    /// when it is off.
+    pub fn copies(&self) -> Vec<glam::Mat4> {
+        let count = self.count();
+        if !self.on() || count == 0 {
+            return Vec::new();
+        }
+        let step = self.step();
+        let cz = self.num("cz", 0.0);
+        let (f, inv) = (self.frame.matrix(), self.frame.matrix().inverse());
+        let mut m = glam::DMat4::IDENTITY;
+        let mut copies: Vec<glam::Mat4> = (0..count)
+            .map(|_| {
+                m = step * m;
+                let c = if self.depth {
+                    m
+                } else {
+                    // Seen straight on: x and y as at the pivot's depth; the depth scaled as the
+                    // paper is (so a stroke's size scales as its picture does).
+                    let (a, b, c, d) = (m.x_axis.x, m.x_axis.y, m.y_axis.x, m.y_axis.y);
+                    let t = m.z_axis.truncate() * cz + m.w_axis.truncate();
+                    glam::DMat4::from_cols(glam::DVec4::new(a, b, 0.0, 0.0), glam::DVec4::new(c, d, 0.0, 0.0), glam::DVec4::new(0.0, 0.0, (a * d - b * c).abs().sqrt(), 0.0), glam::DVec4::new(t.x, t.y, 0.0, 1.0))
+                };
+                (f * c * inv).as_mat4()
+            })
+            .collect();
+        if self.behind() {
+            copies.reverse();
+            copies.push(glam::Mat4::IDENTITY);
+        } else {
+            copies.insert(0, glam::Mat4::IDENTITY);
+        }
+        copies
+    }
+
+    /// Sets the step from one in the painting's space (a turn, one scale and a move), within
+    /// what the server takes. The pivot stays; the move is where the step takes it. A turn out
+    /// of the paper only where the strokes have depth (else its turn about the axis out of it).
+    pub fn set_step_scene(&mut self, s: glam::DMat4) {
+        let f = self.frame.matrix();
+        let c = f.inverse() * s * f;
+        let lin = glam::DMat3::from_mat4(c);
+        let k = lin.determinant().abs().cbrt();
+        if !(k > 1e-12 && k.is_finite()) {
+            return;
+        }
+        let q = glam::DQuat::from_mat3(&(lin * (1.0 / k))).normalize();
+        let pivot = self.pivot();
+        let d = c.transform_point3(pivot) - pivot;
+        let r = |v: f64, digits: f64| (v * digits).round() / digits;
+        self.set("scale", r(k.clamp(0.01, 100.0), 1e9));
+        self.set("dx", r(d.x, 1e6));
+        self.set("dy", r(d.y, 1e6));
+        if self.depth {
+            // A 3D layer's step is a 3D one. Same sign as before when it can (q and -q are
+            // one turn).
+            let q = if q.w < 0.0 { -q } else { q };
+            self.set("turn", json!([q.x, q.y, q.z, q.w]));
+            self.set("angle", 0);
+        } else {
+            self.effect.remove("turn");
+            let mut a = (2.0 * q.z.atan2(q.w)).to_degrees();
+            // Near the last angle (a step of 300 degrees stays 300, not -60).
+            let was = self.num("angle", 0.0);
+            while a - was > 180.0 {
+                a -= 360.0;
+            }
+            while was - a > 180.0 {
+                a += 360.0;
+            }
+            self.set("angle", r(a.clamp(-360.0, 360.0), 1e9));
+        }
+        if self.depth {
+            if d.z.abs() > 1e-9 {
+                self.set("dz", r(d.z, 1e6));
+            } else {
+                self.effect.remove("dz");
+            }
+        }
+    }
+
+    /// Makes a 3D step a flat one (the 2D app's Flatten): the turn in the paper and the scale
+    /// nearest to what the 2D view shows of the step (straight on, at the pivot), the same move
+    /// of the pivot; the tilt and the depths go.
+    pub fn flatten(&mut self) {
+        let m = self.step();
+        let cz = self.num("cz", 0.0);
+        let (a, b, c, d) = (m.x_axis.x, m.x_axis.y, m.y_axis.x, m.y_axis.y);
+        let (tx, ty) = (m.z_axis.x * cz + m.w_axis.x, m.z_axis.y * cz + m.w_axis.y);
+        let (cx, cy) = (self.num("cx", 0.0), self.num("cy", 0.0));
+        let angle = ((b - c).atan2(a + d).to_degrees() * 1000.0).round() / 1000.0;
+        let scale = (a * d - b * c).abs().sqrt().clamp(0.01, 100.0);
+        for key in ["turn", "cz", "dz"] {
+            self.effect.remove(key);
+        }
+        self.set("angle", angle);
+        self.set("scale", scale);
+        self.set("dx", a * cx + c * cy + tx - cx);
+        self.set("dy", b * cx + d * cy + ty - cy);
+    }
+
+    /// Moves the pivot to a point in the painting's space (its depth only where the strokes
+    /// have depth).
+    pub fn set_pivot_scene(&mut self, p: glam::Vec3) {
+        let [x, y, z] = self.frame.canvas(p);
+        self.set("cx", (x * 1e6).round() / 1e6);
+        self.set("cy", (y * 1e6).round() / 1e6);
+        if self.depth {
+            if z.abs() > 1e-9 {
+                self.set("cz", (z * 1e6).round() / 1e6);
+            } else {
+                self.effect.remove("cz");
+            }
+        }
+    }
+}
+
 impl Doc {
+    /// Whether a layer's strokes all have depth (shared/layers.ts allThreeD): a 3D paint layer,
+    /// or a group whose paint layers (one at least) all are.
+    pub fn all_threed(&self, l: &DocLayer) -> bool {
+        if !l.is_group() {
+            return l.threed && l.kind.is_none();
+        }
+        let ids = self.subtree_ids(&l.id);
+        let mut paint = self.layers.values().filter(|x| ids.contains(&x.id) && !self.effectively_deleted(x) && !x.is_group() && x.kind.as_deref() != Some("adjust")).peekable();
+        paint.peek().is_some() && paint.all(|x| x.threed && x.kind.is_none())
+    }
+
+    /// A layer's kaleidoscope (its first one, on or off), in the frame's space. None for an
+    /// adjustment layer, which takes no effects.
+    pub fn kaleido(&self, l: &DocLayer, frame: &Frame) -> Option<Kaleido> {
+        if l.kind.as_deref() == Some("adjust") {
+            return None;
+        }
+        let e = l.extra.get("effects")?.as_array()?.iter().find(|e| e.get("type").and_then(Value::as_str) == Some("kaleidoscope"))?;
+        Some(Kaleido { effect: e.as_object()?.clone(), depth: self.all_threed(l), frame: *frame })
+    }
+
     /// The layers a painting of the document has, in paint order: the live ones but shape
     /// layers.
     pub fn painted_layers(&self) -> Vec<&DocLayer> {
@@ -897,6 +1176,8 @@ impl Doc {
                 } else {
                     None
                 },
+                copies: Vec::new(),
+                kaleido: self.kaleido(l, frame),
             });
             ids.push(l.id.clone());
         }
@@ -905,6 +1186,9 @@ impl Doc {
             layer.parent = self.layers[id].parent.as_deref().and_then(|p| num.get(p).copied());
         }
         let mix = if self.mix == "pigment" { crate::Mix::Pigment } else { crate::Mix::Normal };
+        for l in &mut layers {
+            l.update_copies();
+        }
         let mut painting = crate::Painting { layers, mix, ..Default::default() };
         if painting.layers.is_empty() {
             painting.layers.push(crate::Layer { id: 1, name: "Layer 1".into(), ordered: true, ..Default::default() });
@@ -1070,6 +1354,50 @@ mod tests {
         assert_eq!(point_decimals(0.001), -2);
         assert_eq!(round_to(1234.5678, 1), 1234.6);
         assert_eq!(round_to(1234.5678, -2), 1200.0);
+    }
+
+    #[test]
+    fn a_kaleidoscope_copies_as_the_2d_app() {
+        let mut d = Doc::default();
+        d.apply(&json!({"type": "layer.add", "layer": layer("G1aaaa", 1.0, None, Some("group"))}), "c", 1).unwrap();
+        let mut l3 = layer("L1aaaa", 1.0, Some("G1aaaa"), None);
+        l3["threed"] = true.into();
+        d.apply(&json!({"type": "layer.add", "layer": l3}), "c", 2).unwrap();
+        d.apply(&json!({"type": "layer.add", "layer": layer("L2aaaa", 2.0, None, None)}), "c", 3).unwrap();
+        // Turn 60 degrees about x, about the pivot (10, 20, 5); then move 1 along x.
+        let h = 30f64.to_radians();
+        let e = json!([{"type": "kaleidoscope", "enabled": true, "radius": 0, "count": 2, "angle": 0, "scale": 1, "cx": 10, "cy": 20, "cz": 5, "dx": 1, "dy": 0, "order": "front", "turn": [h.sin(), 0, 0, h.cos()]}]);
+        for id in ["L1aaaa", "L2aaaa", "G1aaaa"] {
+            d.apply(&json!({"type": "layer.update", "id": id, "props": {"effects": e}}), "c", 4).unwrap();
+        }
+        let frame = Frame { anchor: [3.0, 4.0], k: 0.5, offset: glam::Vec3::new(1.0, 2.0, 3.0) };
+        let near = |a: glam::Vec3, b: glam::Vec3| assert!((a - b).length() < 1e-4, "{a} {b}");
+        let at = |d: &Doc, id: &str| d.kaleido(&d.layers[id], &frame).map_or(Vec::new(), |k| k.copies());
+        // A 3D layer: the copies turn in 3D (the point 3 below the pivot turns toward the viewer).
+        let c = at(&d, "L1aaaa");
+        assert_eq!((c.len(), c[0]), (3, glam::Mat4::IDENTITY), "the layer, then its copies");
+        let s3 = 3f32.sqrt();
+        near(c[1].transform_point3(frame.point(10.0, 23.0, 5.0)), frame.point(11.0, 21.5, 5.0 + 1.5 * s3 as f64));
+        near(c[1].transform_point3(frame.point(12.0, 20.0, 5.0)), frame.point(13.0, 20.0, 5.0));
+        // A flat layer: as the 2D view shows them (squashed across the tilt, at the pivot's depth).
+        let c = at(&d, "L2aaaa");
+        near(c[1].transform_point3(frame.point(10.0, 23.0, 0.0)), frame.point(11.0, 21.5, 0.0));
+        near(c[2].transform_point3(frame.point(10.0, 20.0, 0.0)), frame.point(12.0, 20.0, 0.0));
+        // The group: its paint layers all 3D, so in 3D.
+        near(at(&d, "G1aaaa")[1].transform_point3(frame.point(10.0, 23.0, 5.0)), frame.point(11.0, 21.5, 5.0 + 1.5 * s3 as f64));
+        // Behind the layer: the last copy first, the layer last; off: none.
+        let mut b = e.clone();
+        b[0]["order"] = "behind".into();
+        d.apply(&json!({"type": "layer.update", "id": "L2aaaa", "props": {"effects": b}}), "c", 5).unwrap();
+        let c = at(&d, "L2aaaa");
+        near(c[0].transform_point3(frame.point(10.0, 20.0, 0.0)), frame.point(12.0, 20.0, 0.0));
+        assert_eq!(c[2], glam::Mat4::IDENTITY);
+        b[0]["enabled"] = false.into();
+        d.apply(&json!({"type": "layer.update", "id": "L2aaaa", "props": {"effects": b}}), "c", 6).unwrap();
+        assert!(at(&d, "L2aaaa").is_empty());
+        // In the painting, by place.
+        let p = d.painting(&frame).painting;
+        assert_eq!(p.layers.iter().map(|l| l.copies.len()).collect::<Vec<_>>(), vec![3, 3, 0]);
     }
 
     #[test]

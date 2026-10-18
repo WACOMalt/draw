@@ -16,6 +16,8 @@ pub enum Tool {
     Eyedropper,
     /// Moves, turns and scales the active layer with the hand (the 2D app's transform).
     Transform,
+    /// Sets the active layer's kaleidoscope by hand (kaleido.rs).
+    Kaleido,
 }
 
 impl Tool {
@@ -27,6 +29,7 @@ impl Tool {
             Tool::StrokeEraser => "Stroke eraser",
             Tool::Eyedropper => "Eyedropper",
             Tool::Transform => "Move layer",
+            Tool::Kaleido => "Kaleidoscope",
         }
     }
 }
@@ -66,7 +69,7 @@ impl Tools {
         match self.tool {
             Tool::Brush => Some(Brush { erase: false, ..self.brush }),
             Tool::Eraser => Some(Brush { erase: true, ..self.eraser }),
-            Tool::StrokeEraser | Tool::Eyedropper | Tool::Transform => None,
+            Tool::StrokeEraser | Tool::Eyedropper | Tool::Transform | Tool::Kaleido => None,
         }
     }
 
@@ -86,7 +89,7 @@ impl Tools {
         match self.tool {
             Tool::Brush => Some((&mut self.brush, &mut self.angle[0])),
             Tool::Eraser => Some((&mut self.eraser, &mut self.angle[1])),
-            Tool::StrokeEraser | Tool::Eyedropper | Tool::Transform => None,
+            Tool::StrokeEraser | Tool::Eyedropper | Tool::Transform | Tool::Kaleido => None,
         }
     }
 

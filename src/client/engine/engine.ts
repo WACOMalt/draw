@@ -38,6 +38,7 @@ import { Net, type Channel } from './net';
 import { LocalNet } from '../local/localNet';
 import { blobToDataUrl, padded, renderPng, toAspect } from '../export/region';
 import { effectivelyDeleted, effectivelyVisible, invert, scale3, sortLayers, subtreeIds, threeDTargets, transformStroke3 } from '../../shared/layers';
+import { kaleidoscopeFixes } from '../../shared/effects';
 import { applyM3, invertM3, isIdentity3 } from '../../shared/transform3';
 import { nativePenFor, takePenSamples, type PenSample } from './nativePen';
 import { ShapeTool } from './shapeTool';
@@ -1414,9 +1415,30 @@ export class Engine {
       this.cancelTransform();
     }
     const redo: Op[] = change.map((x) => ({ type: 'layer.update', id: x.id, props: { threed: on } }));
+    const undo: Op[] = change.map((x) => ({ type: 'layer.update', id: x.id, props: { threed: !on } }));
+    // Kaleidoscopes take the layers' kind (3D or flat) in the same step.
+    const ids3 = new Set(change.map((x) => x.id));
+    const fix = this.kaleidoscopeFixOps((x) => (ids3.has(x.id) ? { ...x, threed: on } : x));
+    redo.push(...fix.redo);
+    undo.push(...fix.undo);
     for (const op of redo) this.sendOp(op);
-    this.pushUndo({ undo: change.map((x) => ({ type: 'layer.update', id: x.id, props: { threed: !on } })), redo });
+    this.pushUndo({ undo, redo });
     if (on && !ed.show3dLayers) this.setShow3dLayers(true);
+  }
+
+  /**
+   * The ops that give each kaleidoscope its layer's kind (a 3D step on a layer or group whose paint
+   * layers are all 3D, a flat step elsewhere) once the layers change as `next` says, and their undo.
+   */
+  private kaleidoscopeFixOps(next: (l: Layer) => Layer): { redo: Op[]; undo: Op[] } {
+    const layers = this.doc.layerView();
+    const live = [...layers.values()].filter((x) => !effectivelyDeleted(layers, x)).map(next);
+    const redo: Op[] = [], undo: Op[] = [];
+    for (const f of kaleidoscopeFixes(live, ed.kaleido3dOk)) {
+      redo.push({ type: 'layer.update', id: f.id, props: { effects: f.effects } });
+      undo.push({ type: 'layer.update', id: f.id, props: { effects: layers.get(f.id)?.effects ?? null } });
+    }
+    return { redo, undo };
   }
 
   setShow3dLayers(on: boolean): void {
@@ -1688,7 +1710,12 @@ export class Engine {
     const order = b && a ? (b.order + a.order) / 2 : b ? b.order + 1 : a ? a.order - 1 : 1;
     const props: Partial<LayerProps> = { order };
     if ((l.parent ?? null) !== parent) props.parent = parent;
-    this.updateLayer(id, props);
+    // Into or out of a group: its kaleidoscope (and the groups' around) may change kind.
+    const fix = props.parent !== undefined ? this.kaleidoscopeFixOps((x) => (x.id === id ? { ...x, parent } : x)) : { redo: [], undo: [] };
+    if (!fix.redo.length) return this.updateLayer(id, props);
+    const redo: Op[] = [{ type: 'layer.update', id, props }, ...fix.redo];
+    for (const op of redo) this.sendOp(op);
+    this.pushUndo({ undo: [{ type: 'layer.update', id, props: { order: l.order, parent: l.parent ?? null } }, ...fix.undo], redo });
   }
 
   /** Puts the layer (or group) into a new group in its place (Ctrl+G). */

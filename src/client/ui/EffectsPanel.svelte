@@ -4,7 +4,8 @@
   // sliders show them in screen pixels at the current zoom, as the brush size. Changes go out at
   // most every 60 ms, and the engine merges changes within 2 s into one undo step.
   import { EFFECT_TYPES, type EffectType, type Layer, type LayerEffect } from '../../shared/types';
-  import { kaleidoscopeCopies } from '../../shared/effects';
+  import { flattenKaleidoscope, kaleidoscopeAngle, liftKaleidoscope, withKaleidoscopeAngle } from '../../shared/effects';
+  import { allThreeD } from '../../shared/layers';
   import type { Engine } from '../engine/engine';
   import { ed } from '../state.svelte';
   import ShapeColor from './ShapeColor.svelte';
@@ -36,7 +37,9 @@
       case 'kaleidoscope': {
         // Six around the middle of the view.
         const [cx, cy] = viewCenter();
-        return { type, enabled: true, radius: 0, count: 5, angle: 60, scale: 1, cx, cy, dx: 0, dy: 0, order: 'behind' };
+        const e: LayerEffect = { type, enabled: true, radius: 0, count: 5, angle: 60, scale: 1, cx, cy, dx: 0, dy: 0, order: 'behind' };
+        // A 3D layer's (or 3D group's) kaleidoscope is a 3D one.
+        return three ? liftKaleidoscope(e) : e;
       }
     }
   }
@@ -75,23 +78,28 @@
     send();
   }
 
+  /** The kaleidoscope's step may move in 3D here (a 3D layer or group; a server that takes it). */
+  const three = $derived(ed.kaleido3dOk && allThreeD(ed.layers, layer.id));
+
   /**
-   * A 3D kaleidoscope step made a flat one: the turn in the paper and the scale nearest to what the
-   * 2D view shows of the step (its view straight on, at the pivot), the same move of the pivot; the
-   * tilt goes. The copies then no longer squash where they tilted.
+   * A 3D kaleidoscope step made a flat one (the nearest turn in the paper and scale; the tilt goes).
+   * On a 3D layer or group the layer goes flat with it (a kaleidoscope has its layer's kind), after
+   * a warning; the engine flattens the step in the same undo step.
    */
   function flatten(e: LayerEffect) {
-    const [a, b, c, d, tx, ty] = kaleidoscopeCopies({ ...e, count: 1 })[0];
-    const cx = e.cx ?? 0, cy = e.cy ?? 0;
-    const angle = Math.round(((Math.atan2(b - c, a + d) * 180) / Math.PI) * 1000) / 1000;
-    const scale = Math.min(100, Math.max(0.01, Math.sqrt(Math.abs(a * d - b * c))));
-    const patch: Partial<LayerEffect> = { angle, scale, dx: a * cx + c * cy + tx - cx, dy: b * cx + d * cy + ty - cy };
+    if (three) {
+      const what = layer.kind === 'group' ? 'every layer in this group' : 'this layer';
+      if (!confirm(`A flat kaleidoscope needs a flat layer: this also makes ${what} flat. Its strokes keep their depth but draw flat (Undo takes it back). Go on?`)) return;
+      engine?.setThreeD(layer.id, false);
+      return;
+    }
     const x = find('kaleidoscope');
     if (!x) return;
+    const f = flattenKaleidoscope(x);
     delete x.turn;
     delete x.cz;
     delete x.dz;
-    set('kaleidoscope', patch);
+    set('kaleidoscope', { angle: f.angle, scale: f.scale, dx: f.dx, dy: f.dy });
   }
 
   /** The world point in the middle of the view. */
@@ -149,21 +157,27 @@
           /></label
         >
         {#if e.turn}
-          <!-- A 3D step (from a 3D layer, or one turned out of the paper): its turn is in 3D. -->
+          <!-- A 3D step (a 3D layer's or group's): its turn is in 3D. -->
           <div class="field note">
-            <span>3D step: the copies turn in 3D{layer.threed ? '' : ' (seen straight on, as this layer is flat)'}.</span>
-            <button class="small" title="Make it a flat step: the nearest turn in the paper and scale; the tilt goes" disabled={!ed.canEdit} onclick={() => flatten(e)}>Flatten the step</button>
+            <span>3D step: the copies turn in 3D{three ? ' (tilt it with the gizmo: ball, red and green bars)' : ' (seen straight on, as this layer is flat)'}.</span>
+            <button class="small" title={three ? 'Make it a flat step: the layer goes flat too' : 'Make it a flat step: the nearest turn in the paper and scale; the tilt goes'} disabled={!ed.canEdit} onclick={() => flatten(e)}>Flatten{three ? ' (and the layer)' : ''}</button>
           </div>
-        {:else}
+        {/if}
+        {#if !e.turn || three}
         <div class="field">
-          <!-- Copies compound the step (copy n turns n times as far): fine steps near 0, a full turn either way at the ends. -->
-          <Slider label="Angle" value={e.angle ?? 0} min={-360} max={360} step={0.01} least={0.1} log width={80} title="Degrees each copy turns past the one before (fine near 0°)" oninput={(v) => set(t, { angle: v })} />
-          <button class="small" title="Even around a full turn: 360° ÷ (count + 1)" onclick={() => set(t, { angle: Math.round((360 / (n + 1)) * 1000) / 1000 })}>Even</button>
+          <!-- Copies compound the step (copy n turns n times as far): fine steps near 0, a full turn either way at the ends. A 3D step turns about its own axis. -->
+          <Slider label="Angle" value={kaleidoscopeAngle(e)} min={-360} max={360} step={0.01} least={0.1} log width={80} title="Degrees each copy turns past the one before (fine near 0°)" oninput={(v) => set(t, withKaleidoscopeAngle(e, v))} />
+          <button class="small" title="Even around a full turn: 360° ÷ (count + 1)" onclick={() => set(t, withKaleidoscopeAngle(e, Math.round((360 / (n + 1)) * 1000) / 1000))}>Even</button>
         </div>
         {/if}
         <Slider label="Scale" value={e.scale ?? 1} min={0.05} max={4} center={1} least={0.0001} step={0.0001} percent log width={100} title="Each copy's size, from the one before (fine near 100%: the copies multiply it)" oninput={(v) => set(t, { scale: v })} />
         <Slider label="Move X" value={px(e.dx ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now: each copy moves this far from the one before (fine near 0)" oninput={(v) => set(t, { dx: world(v) })} />
         <Slider label="Move Y" value={px(e.dy ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now (fine near 0)" oninput={(v) => set(t, { dy: world(v) })} />
+        {#if three}
+          <!-- Depths in screen pixels now, + toward the viewer (as the 3D transform's depth). -->
+          <Slider label="Move Z" value={px(e.dz ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="Screen pixels now: each copy moves this far toward you (+) or away (−)" oninput={(v) => set(t, { dz: world(v) || undefined })} />
+          <Slider label="Pivot Z" value={px(e.cz ?? 0)} min={-2000} max={2000} step={0.1} least={0.1} log width={100} title="The pivot's depth, screen pixels now: the 3D turn goes about this point" oninput={(v) => set(t, { cz: world(v) || undefined })} />
+        {/if}
         <div class="field">
           <span>Copies</span>
           <div class="seg">
