@@ -236,6 +236,8 @@ const MOVING_MS = 150;
 /** Radius in px above which the shader gets the edge of a dab relative to the target (putDab). */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
+/** The most of a frame's fill a tile still rendering from earlier frames gets (tileShare). */
+const HEAVY_SHARE = 0.5;
 /**
  * WebKit (the Linux desktop app, Safari) can show a canvas frame only at the next compositor
  * update. After the view settles, a few identical frames push the last real one to the screen.
@@ -850,10 +852,10 @@ export class GLRenderer implements Renderer {
       // A layer's copies go into its own tiles (one set of tiles, not one per copy) where that
       // looks the same as copies drawn one over the other: one paint layer, no other effects (a
       // copy's glow or shadow would fall on the copies below), no mask (it would cover the
-      // copies' union), no eraser (it would take paint from the copies below), no pigment (the
-      // copies would mix as paint).
+      // copies' union), no eraser (it would take paint from the copies below). (On a pigment
+      // canvas the copies mix as paint either way: merged, stroke by stroke.)
       const merged =
-        l.kind !== 'group' && fx.length === 1 && !l.mask?.enabled && this.mix !== 'pigment' && !(this.index.byLayer.get(l.id) ?? []).some((r) => r.stroke.brush.tool === 'erase');
+        l.kind !== 'group' && fx.length === 1 && !l.mask?.enabled && !(this.index.byLayer.get(l.id) ?? []).some((r) => r.stroke.brush.tool === 'erase');
       const sig = JSON.stringify([e.count, e.turn, e.angle, e.scale, e.cx, e.cy, e.cz, e.dx, e.dy, e.dz, e.order, merged, [...ms].sort()]);
       next.set(l.id, { sig, copies: kaleidoscopeCopies3(e), members: ms, merged, behind: e.order === 'behind' });
     }
@@ -1445,8 +1447,6 @@ export class GLRenderer implements Renderer {
       if (t.job) this.dropJob(t);
       t.stale = true;
     }
-    // Pigment copies mix as paint when merged: they go to frames of their own (and back).
-    this.updateTilted();
     this.invalidate();
   }
 
@@ -1467,6 +1467,7 @@ export class GLRenderer implements Renderer {
     gl.bindTexture(gl.TEXTURE_2D, src);
     gl.uniform1i(p.u.uPaint, 1);
     gl.uniform1f(p.u.uOpacity, opacity);
+    gl.uniform1i(p.u.uAtop, 0);
     this.quad(p, tmp, rect, uv);
     gl.activeTexture(gl.TEXTURE0);
     // Back into dst: only the rectangle.
@@ -1598,6 +1599,17 @@ export class GLRenderer implements Renderer {
     if (!t.job) return;
     this.tilePool.push(t.job.target);
     t.job = null;
+  }
+
+  /**
+   * The fill a tile may spend this frame: what is left of the frame's, but a tile that is still
+   * rendering from earlier frames (a heavy one) gets at most half of the frame's, so the tiles
+   * after it in this frame's order get their turn. One heavy tile in the view used to take every
+   * frame until it was done, and nothing else on screen filled in meanwhile.
+   */
+  private tileShare(t: Tile, fill: number, spent: number): number {
+    const left = fill - spent;
+    return t.job ? Math.min(left, fill * HEAVY_SHARE) : left;
   }
 
   /**
@@ -1789,6 +1801,8 @@ export class GLRenderer implements Renderer {
     // Tile work stops here: on screen at the frame's budgets, offline at the slice (if any).
     const over = () => (this.offline ? performance.now() - start > this.offlineSlice || spent >= this.offlineFill : spent >= fill || performance.now() - start > jsBudget);
     let pending = false;
+    /** Tiles still rendering that were held to their share this frame (tileShare). */
+    const capped: { t: Tile; view: boolean }[] = [];
     /** Work left in the view and its prefetch ring (not just in the coarser levels). */
     let viewPending = false;
     // First the view and a ring of PREFETCH tiles. Then COARSE_LEVELS coarser levels, centered:
@@ -1838,7 +1852,9 @@ export class GLRenderer implements Renderer {
             this.tiles.set(key, t);
           }
           t.used = this.frame;
-          spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
+          const left = fill - spent, share = this.offline ? this.offlineFill - spent : this.tileShare(t, fill, spent);
+          spent += this.renderTile(t, share);
+          if (!this.offline && t.job && share < left) capped.push({ t, view: r === ranges[0] });
           this.tilesDrawn++;
         }
       }
@@ -1863,9 +1879,23 @@ export class GLRenderer implements Renderer {
           this.tiles.set(key, t);
         }
         t.used = this.frame;
-        spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
+        const left = fill - spent, share = this.offline ? this.offlineFill - spent : this.tileShare(t, fill, spent);
+        spent += this.renderTile(t, share);
+        if (!this.offline && t.job && share < left) capped.push({ t, view: false });
         this.tilesDrawn++;
       }
+    }
+    // The heavy tiles held to their share (tileShare) get what the frame has left: alone, a heavy
+    // tile renders as fast as before.
+    for (const c of capped) {
+      if (!c.t.job) continue;
+      if (over()) break;
+      spent += this.renderTile(c.t, fill - spent);
+    }
+    for (const c of capped) {
+      if (!c.t.job) continue;
+      pending = true;
+      if (c.view) viewPending = true;
     }
     this.tileWorkLastFrame = spent > 0;
     // Offline in slices (offlineSlice): while tiles are left, no composite (it would be thrown
@@ -2284,7 +2314,8 @@ export class GLRenderer implements Renderer {
     if (layer.kind === 'adjust') return this.applyAdjust(layer, pair, g);
     if (activeEffects(layer).length) return this.blendOnto(this.layerPixels(layer, g), layer.blend, layer.opacity, pair, atop);
     const mode = BLEND_MODES.indexOf(modeOf(layer.blend));
-    if (mode <= 0 && !atop && !layer.mask?.enabled && this.livesFor(layer.id).length === 0 && !this.strokePreview?.byKey.has(layer.id)) {
+    // (On a pigment canvas a normal layer mixes as paint: through blendOnto.)
+    if (mode <= 0 && !atop && this.mix !== 'pigment' && !layer.mask?.enabled && this.livesFor(layer.id).length === 0 && !this.strokePreview?.byKey.has(layer.id)) {
       // Normal layer, no mask, nothing in progress: tiles go straight onto the composite.
       this.bindTarget(pair.a);
       this.blendFor(false);
@@ -2295,10 +2326,31 @@ export class GLRenderer implements Renderer {
     return this.blendOnto(this.buf(g, 'layer'), layer.blend, layer.opacity, pair, atop);
   }
 
-  /** Blends a screen-sized buffer onto `pair.a` with a blend mode and opacity. */
+  /**
+   * Blends a screen-sized buffer onto `pair.a` with a blend mode and opacity. On a pigment canvas
+   * the modes paint has work as paint (pigmentMode): normal mixes as paint (PIGMENT_FS), multiply
+   * multiplies the colors' spectra (BLEND_FS spectralMultiply); the others as usual.
+   */
   private blendOnto(src: Target, blend: LayerBlend, opacity: number, pair: Pair, atop: boolean): Pair {
     const gl = this.gl;
     const mode = BLEND_MODES.indexOf(modeOf(blend));
+    if (mode <= 0 && this.mix === 'pigment') {
+      this.bindTarget(pair.b);
+      gl.disable(gl.BLEND);
+      const p = this.progs.pigment;
+      gl.useProgram(p.prog);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, pair.a.tex);
+      gl.uniform1i(p.u.uBack, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, src.tex);
+      gl.uniform1i(p.u.uPaint, 1);
+      gl.uniform1f(p.u.uOpacity, opacity);
+      gl.uniform1i(p.u.uAtop, atop ? 1 : 0);
+      this.quad(p, pair.b, [0, 0, pair.b.w, pair.b.h]);
+      gl.activeTexture(gl.TEXTURE0);
+      return { a: pair.b, b: pair.a };
+    }
     if (mode <= 0 && !atop) {
       this.bindTarget(pair.a);
       this.blendFor(false);
@@ -2318,6 +2370,7 @@ export class GLRenderer implements Renderer {
     gl.uniform1f(p.u.uOpacity, opacity);
     gl.uniform1i(p.u.uMode, Math.max(0, mode));
     gl.uniform1i(p.u.uAtop, atop ? 1 : 0);
+    gl.uniform1i(p.u.uPigment, this.mix === 'pigment' ? 1 : 0);
     this.quad(p, pair.b, [0, 0, pair.b.w, pair.b.h]);
     gl.activeTexture(gl.TEXTURE0);
     return { a: pair.b, b: pair.a };
@@ -2682,18 +2735,22 @@ export class GLRenderer implements Renderer {
       } finally {
         this.keyMap = null;
       }
-      this.bindTarget(out);
-      this.blendFor(false);
-      this.copy(src.tex, out, [0, 0, out.w, out.h]);
+      this.overOnto(out, g, (t) => {
+        this.bindTarget(t);
+        this.blendFor(false);
+        this.copy(src.tex, t, [0, 0, t.w, t.h]);
+      });
     };
     this.bindTarget(out);
     this.clear();
     const n = geo.copies.length;
     // Behind: copy 1 nearest the layer, so the last copy goes down first.
     if (e.order === 'behind') for (let i = n - 1; i >= 0; i--) copy(i);
-    this.bindTarget(out);
-    this.blendFor(false);
-    this.copy(cur.tex, out, [0, 0, out.w, out.h]);
+    this.overOnto(out, g, (t) => {
+      this.bindTarget(t);
+      this.blendFor(false);
+      this.copy(cur.tex, t, [0, 0, t.w, t.h]);
+    });
     if (e.order !== 'behind') for (let i = 0; i < n; i++) copy(i);
     return out;
   }
@@ -2765,23 +2822,39 @@ export class GLRenderer implements Renderer {
     const copy = (p: Plan | null) => {
       if (!p) return;
       const { m, box } = p;
-      if (p.via === 'cur') return this.drawXform(cur, out, compose(to, compose(m, fromG)));
-      if (p.via === 'tiles') return this.drawThrough(plain!, box, g.s * p.grow, out, compose(to, m));
+      if (p.via === 'cur') return this.overOnto(out, g, (t) => this.drawXform(cur, t, compose(to, compose(m, fromG))));
+      if (p.via === 'tiles') return this.overOnto(out, g, (t) => this.drawThrough(plain!, box, g.s * p.grow, t, compose(to, m)));
       const f = frames.get(p.level);
       const kg = f?.kg ?? this.copyFrame({ x0: box.x0 - pad, y0: box.y0 - pad, x1: box.x1 + pad, y1: box.y1 + pad }, g.s * p.grow, g, `${g.ns}k:`);
       const src = f?.src ?? whole(kg);
-      this.drawXform(src, out, compose(to, compose(m, [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy])));
+      this.overOnto(out, g, (t) => this.drawXform(src, t, compose(to, compose(m, [1 / kg.s, 0, 0, 1 / kg.s, kg.wx, kg.wy]))));
       // Hand the GPU its work frame by frame: hundreds of frames with effects in one go can run
       // long enough for the browser to reset the GPU (a lost context).
       if (!f) this.gl.flush();
     };
     // Behind: copy 1 nearest the layer, so the last copy goes down first.
     if (e.order === 'behind') for (let i = plans.length - 1; i >= 0; i--) copy(plans[i]);
-    this.bindTarget(out);
-    this.blendFor(false);
-    this.copy(cur.tex, out, [0, 0, out.w, out.h]);
+    this.overOnto(out, g, (t) => {
+      this.bindTarget(t);
+      this.blendFor(false);
+      this.copy(cur.tex, t, [0, 0, t.w, t.h]);
+    });
     if (e.order !== 'behind') for (const p of plans) copy(p);
     return out;
+  }
+
+  /**
+   * One kaleidoscope copy (or the layer itself) onto `out` (a buffer of frame g), as `draw` draws
+   * it: over what is there, or on a pigment canvas mixed in as paint (copies are pictures of a
+   * layer, and layers there mix as paint): drawn into a scratch buffer first.
+   */
+  private overOnto(out: Target, g: Grid, draw: (t: Target) => void): void {
+    if (this.mix !== 'pigment') return draw(out);
+    const tmp = this.buf(g, 'kalCopy');
+    this.bindTarget(tmp);
+    this.clear();
+    draw(tmp);
+    this.pigmentOnto(out, tmp.tex, [0, 0, out.w, out.h], [0, 0, 1, 1], 1, this.buf(g, 'kalMix'));
   }
 
   /**

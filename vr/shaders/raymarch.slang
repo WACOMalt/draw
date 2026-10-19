@@ -885,28 +885,42 @@ float4 drawLayer(uint j, uint end, bool ordered, float3 o, float3 dir, float tFl
 
 // ---- Compositing, as the 2D app's (glRenderer compositeNodes), on premultiplied sRGB ----
 
+// A mode's color, as blendMode; on a pigment canvas (`paint`) multiply multiplies the colors'
+// spectra (the 2D app's BLEND_FS with uPigment).
+float3 blendColor(uint mode, float3 b, float3 s, bool paint)
+{
+    if (PIGMENT != 0 && paint && mode == 1)
+        return spectralMultiply(b, s);
+    return blendMode(mode, b, s);
+}
+
 // s blended onto b (W3C compositing and blending, with the backdrop's alpha): its mode where
-// the backdrop is, its own color where it is not.
-float4 blendOnto(float4 b, float4 s, uint mode, float opacity)
+// the backdrop is, its own color where it is not. `paint`: a pigment canvas, where a normal
+// layer mixes onto what is below as paint (the 2D app's blendOnto).
+float4 blendOnto(float4 b, float4 s, uint mode, float opacity, bool paint)
 {
     s *= opacity;
     if (s.a <= 0.0)
         return b;
+    if (PIGMENT != 0 && paint && mode == 0)
+        return pigmentOver(b, s);
     float3 cs = s.rgb / s.a;
     float3 cb = b.a > 0.0 ? b.rgb / b.a : float3(0.0);
-    float3 mixed = (1.0 - b.a) * cs + b.a * saturate(blendMode(mode, cb, cs));
+    float3 mixed = (1.0 - b.a) * cs + b.a * saturate(blendColor(mode, cb, cs, paint));
     return float4(s.a * mixed + b.rgb * (1.0 - s.a), s.a + b.a * (1.0 - s.a));
 }
 
 // s clipped to the base b: drawn atop, its color mixed in by its mode, b's alpha kept.
-float4 blendAtop(float4 b, float4 s, uint mode, float opacity)
+float4 blendAtop(float4 b, float4 s, uint mode, float opacity, bool paint)
 {
     s *= opacity;
     if (s.a <= 0.0 || b.a <= 0.0)
         return b;
+    if (PIGMENT != 0 && paint && mode == 0)
+        return pigmentAtop(b, s);
     float3 cs = s.rgb / s.a;
     float3 cb = b.rgb / b.a;
-    return float4(s.a * b.a * saturate(blendMode(mode, cb, cs)) + b.rgb * (1.0 - s.a), b.a);
+    return float4(s.a * b.a * saturate(blendColor(mode, cb, cs, paint)) + b.rgb * (1.0 - s.a), b.a);
 }
 
 // How deep groups that make a picture of their own nest (deeper ones pass through).
@@ -1062,6 +1076,8 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
     // A shared canvas starts as its paper, as the 2D app's (its layers blend and its
     // adjustments change the paper, not the room), and goes over the room at the end. A
     // painting in the room starts as the room.
+    // (Only a shared canvas's layers mix as paint on a pigment canvas: a painting in the room
+    // starts as the room, which is not paint.)
     bool own = params.ownCanvas != 0;
     float2 paper = picking ? float2(0.0, 0.0) : paperAt(o, dir, pix);
     float4 canvas = picking ? float4(0.0) : own ? float4(params.paper.rgb * paper.x, paper.x) : float4(srgbFromLinear(color), 1.0);
@@ -1090,7 +1106,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         {
             // The base below goes down first: the group's layers come after it.
             if (hasBase)
-                canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+                canvas = blendOnto(canvas, base, baseBlend, baseOpacity, own);
             hasBase = false;
             bool isolated = (step.flags & STEP_ISOLATED) != 0;
             if (depth < MAX_DEPTH)
@@ -1106,7 +1122,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         if (step.kind == STEP_CLOSE)
         {
             if (hasBase)
-                canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+                canvas = blendOnto(canvas, base, baseBlend, baseOpacity, own);
             hasBase = false;
             depth--;
             if (depth >= MAX_DEPTH)
@@ -1130,7 +1146,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             // The base below goes down first; then all below changes, by the adjustment's
             // opacity and its mask.
             if (hasBase)
-                canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+                canvas = blendOnto(canvas, base, baseBlend, baseOpacity, own);
             hasBase = false;
             float amount = step.opacity * (masked ? saturate(maskShow) : 1.0);
             masked = false;
@@ -1151,11 +1167,11 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
             masked = false;
         }
         if ((step.flags & STEP_CLIP) != 0 && hasBase)
-            base = blendAtop(base, drawn, step.blend, step.opacity);
+            base = blendAtop(base, drawn, step.blend, step.opacity, own);
         else
         {
             if (hasBase)
-                canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+                canvas = blendOnto(canvas, base, baseBlend, baseOpacity, own);
             base = drawn;
             baseBlend = step.blend;
             baseOpacity = step.opacity;
@@ -1163,7 +1179,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint gi: SV_Gr
         }
     }
     if (hasBase)
-        canvas = blendOnto(canvas, base, baseBlend, baseOpacity);
+        canvas = blendOnto(canvas, base, baseBlend, baseOpacity, own);
     if (picking)
     {
         // Linear color, not premultiplied, and how much paint there is.
