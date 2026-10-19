@@ -2,7 +2,7 @@
   // The layers panel: a tree, top layer first, groups as folders (Photoshop style). A row's grip
   // drags it (mouse, pen or finger): drop on the upper or lower part of a row to go above or below
   // it, on the middle of a group to go into it. Groups open and close with their arrow.
-  import { ADJUST_TYPES, BLEND_MODES, EFFECT_TYPES, LIMITS, type EffectType, type Layer, type LayerBlend, type LayerEffect, type Shape } from '../../shared/types';
+  import { ADJUST_TYPES, BLEND_MODES, EFFECT_TYPES, LIMITS, PIGMENT_BLENDS, type EffectType, type Layer, type LayerBlend, type LayerEffect, type Shape } from '../../shared/types';
   import { shapeLabel } from '../engine/shapeTool';
   import PresetIcon from './PresetIcon.svelte';
   import { OP_LABEL, partId } from '../../shared/compound';
@@ -124,6 +124,8 @@
     luminosity: 'Luminosity',
     add: 'Add (Linear Dodge)',
   };
+  /** On a pigment canvas, a blend mode with no paint version (it blends as usual there). */
+  const nonPigment = (m: LayerBlend) => ed.mix === 'pigment' && m !== 'pass' && !PIGMENT_BLENDS.includes(m);
   const blendModes = $derived<LayerBlend[]>(active?.kind === 'group' ? ['pass', ...BLEND_MODES] : [...BLEND_MODES]);
 
   // Slider drags send at most one op per 60 ms.
@@ -323,7 +325,8 @@
       onchange={(e) => active && engine?.updateLayer(active.id, { blend: e.currentTarget.value as LayerBlend })}
     >
       {#each blendModes as m}
-        <option value={m}>{BLEND_LABEL[m]}</option>
+        <!-- On a pigment canvas: the modes with no paint version say so. -->
+        <option value={m}>{BLEND_LABEL[m]}{nonPigment(m) ? ' (non-pigment)' : ''}</option>
       {/each}
     </select>
     {#key active?.id}
@@ -424,7 +427,7 @@
           {/each}
           {#if layer.threed}<span class="tag threed" title="A 3D layer: its strokes have depth (painted in VR in vdraw, or moved in 3D)">3D</span>
           {:else if row.group && isThreeD(layer)}<span class="tag threed" title="A 3D group: all its paint layers are 3D layers (the Select tool turns it in 3D)">3D</span>{/if}
-          {#if layer.blend !== 'normal' && layer.blend !== 'pass'}<span class="tag">{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
+          {#if layer.blend !== 'normal' && layer.blend !== 'pass'}<span class="tag" title={nonPigment(layer.blend) ? `${BLEND_LABEL[layer.blend]}: non-pigment (it does not mix as paint on this pigment canvas)` : BLEND_LABEL[layer.blend]}>{BLEND_LABEL[layer.blend].split(' ')[0]}</span>{/if}
           {#if layer.opacity < 1}<span class="tag">{Math.round(layer.opacity * 100)}%</span>{/if}
           {#if layer.effects?.length}
             <button

@@ -20,6 +20,11 @@ export const BLEND_MODES = [
   'add',
 ] as const;
 export type BlendMode = (typeof BLEND_MODES)[number];
+/**
+ * The blend modes that work as paint on a pigment canvas (MixMode 'pigment'): normal mixes as
+ * paint, multiply multiplies the colors' spectra. The others work as usual there ("non-pigment").
+ */
+export const PIGMENT_BLENDS: readonly string[] = ['normal', 'multiply'];
 
 export interface Brush {
   tool: 'paint' | 'erase';
@@ -421,7 +426,9 @@ export const isDefaultPaper = (p: Paper) => p.color === DEFAULT_PAPER.color && p
 /**
  * How a paint stroke mixes with the paint below it on its layer. 'normal': over it (alpha
  * compositing in RGB). 'pigment': as real paint (Kubelka-Munk spectral mixing): blue and yellow
- * make green, not grey. A setting of the canvas; layers still blend with their blend modes.
+ * make green, not grey. A setting of the canvas. It also changes the layers' blend modes that
+ * have a paint version (PIGMENT_BLENDS): a normal layer mixes onto what is below as paint, a
+ * multiply layer multiplies by spectrum; the other modes blend as usual.
  */
 export const MIX_MODES = ['normal', 'pigment'] as const;
 export type MixMode = (typeof MIX_MODES)[number];

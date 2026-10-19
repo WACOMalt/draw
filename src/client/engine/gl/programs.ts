@@ -190,7 +190,20 @@ uniform sampler2D uLayer;  // this layer
 uniform float uOpacity;
 uniform int uMode;
 uniform int uAtop;         // 1: clipped layer, only where the backdrop (the clip base) has alpha
+uniform int uPigment;      // 1: a pigment canvas: multiply is a spectral multiply
 out vec4 o;
+${SPECTRAL_GLSL}
+// Multiply as paint does it: the two colors' reflectance curves multiply wavelength by
+// wavelength (a filter takes away light at each wavelength), then back to sRGB. White leaves the
+// backdrop as it is and the result only darkens, as an RGB multiply, but the hues are paint's:
+// yellow on blue gives a dark green, not black.
+vec3 spectralMultiply(vec3 b, vec3 s) {
+  float Rb[SPECTRAL_SIZE], Rs[SPECTRAL_SIZE];
+  spectral_linear_to_reflectance(spectral_srgb_to_linear(b), Rb);
+  spectral_linear_to_reflectance(spectral_srgb_to_linear(s), Rs);
+  for (int i = 0; i < SPECTRAL_SIZE; i++) Rb[i] *= Rs[i];
+  return spectral_linear_to_srgb(spectral_xyz_to_linear(spectral_reflectance_to_xyz(Rb)));
+}
 
 float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
 vec3 clipColor(vec3 c) {
@@ -217,7 +230,7 @@ float softLight(float b, float s) {
   return b + (2.0 * s - 1.0) * (d - b);
 }
 vec3 blend(vec3 b, vec3 s) {
-  if (uMode == 1) return b * s;                                        // multiply
+  if (uMode == 1) return uPigment == 1 ? spectralMultiply(b, s) : b * s; // multiply
   if (uMode == 2) return b + s - b * s;                                // screen
   if (uMode == 3) return vec3(hardLight(s.r, b.r), hardLight(s.g, b.g), hardLight(s.b, b.b)); // overlay
   if (uMode == 4) return min(b, s);                                    // darken
@@ -400,6 +413,7 @@ in vec2 vScreen;
 uniform sampler2D uBack;
 uniform sampler2D uPaint;
 uniform float uOpacity;
+uniform int uAtop;         // 1: a clipped layer, only where the backdrop (the clip base) has paint
 out vec4 o;
 ${SPECTRAL_GLSL}
 // OKLab (Björn Ottosson), from linear sRGB.
@@ -508,6 +522,13 @@ void main() {
   vec4 d = texture(uBack, vScreen);
   vec4 s = texture(uPaint, vUv) * uOpacity;
   if (s.a <= 1e-4) { o = d; return; }
+  if (uAtop == 1) {
+    // Clipped: the paint mixes in only where the base has paint; the alpha stays the base's.
+    if (d.a <= 1e-4) { o = d; return; }
+    vec3 m = pigment_mix(clamp(d.rgb / d.a, 0.0, 1.0), 1.0 - s.a, clamp(s.rgb / s.a, 0.0, 1.0), s.a);
+    o = vec4(m * d.a, d.a);
+    return;
+  }
   if (d.a <= 1e-4) { o = s; return; }
   float ws = s.a, wd = d.a * (1.0 - s.a);
   float a = ws + wd;
@@ -549,11 +570,11 @@ export function createPrograms(gl: WebGL2RenderingContext) {
     copy: link(gl, QUAD_VS, COPY_FS, [...quad, 'uTex', 'uOpacity']),
     xform: link(gl, XFORM_VS, COPY_FS, ['uM', 'uSrcSize', 'uTarget', 'uTex', 'uOpacity']),
     present: link(gl, QUAD_VS, PRESENT_FS, [...quad, 'uTex', 'uDither', 'uCell']),
-    blend: link(gl, QUAD_VS, BLEND_FS, [...quad, 'uBack', 'uLayer', 'uOpacity', 'uMode', 'uAtop']),
+    blend: link(gl, QUAD_VS, BLEND_FS, [...quad, 'uBack', 'uLayer', 'uOpacity', 'uMode', 'uAtop', 'uPigment']),
     mask: link(gl, QUAD_VS, MASK_FS, [...quad, 'uMask']),
     adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity', 'uFxMap']),
     blur: link(gl, QUAD_VS, BLUR_FS, [...quad, 'uTex', 'uStep', 'uN', 'uOff', 'uW']),
-    pigment: link(gl, QUAD_VS, PIGMENT_FS, [...quad, 'uBack', 'uPaint', 'uOpacity']),
+    pigment: link(gl, QUAD_VS, PIGMENT_FS, [...quad, 'uBack', 'uPaint', 'uOpacity', 'uAtop']),
     fx: link(gl, QUAD_VS, FX_FS, [...quad, 'uLayer', 'uFx', 'uFxMap', 'uMode', 'uColor', 'uOpacity', 'uSpread']),
     dab: link(gl, DAB_VS, DAB_FS, [
       'uTarget',
