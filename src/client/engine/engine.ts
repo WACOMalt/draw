@@ -2616,7 +2616,7 @@ export class Engine {
     this.previewAt = Date.now();
     try {
       const { layers, strokes, shapes, paper, mix } = this.snapshot();
-      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes, paper, mix);
+      const png = await renderPng(layers, strokes, seq, frame, W, H, shapes, paper, mix, true);
       if (!png || png.size > maxBytes) return;
       const bmp = await createImageBitmap(png);
       const ok = bmp.width === W && bmp.height === H;

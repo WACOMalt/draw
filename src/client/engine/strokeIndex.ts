@@ -24,8 +24,15 @@ export interface StrokeRec {
   dabs: DabList | null;
 }
 
+/**
+ * The id a stroke's random dab numbers come from: a copy's (a tilted kaleidoscope's `id@node:i`,
+ * the render test's `id~k`) is its original's, so the copy scatters and jitters as the original
+ * does. (Stroke ids are base 62: no @ or ~.)
+ */
+export const seedId = (id: string): string => id.replace(/[@~].*$/, '');
+
 export function strokeDabs(rec: StrokeRec): DabList {
-  return (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts, strokeSeed(rec.stroke.id)));
+  return (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts, strokeSeed(seedId(rec.stroke.id))));
 }
 
 export class StrokeIndex {

@@ -11,6 +11,11 @@ import { GLRenderer } from '../engine/gl/glRenderer';
 export const PIECE = 2048;
 /** Tile work per step of renderAsync (ms), between pauses for the page. */
 const SLICE = 100;
+/** A render in the background (the link preview): tile work per step, and the pause after it (ms). */
+const BG_SLICE = 8;
+const BG_PAUSE = 50;
+/** ... and its GPU work per step (dab area in pixels, as the screen's fill budget). */
+const BG_FILL = 1e7;
 
 export class RegionRenderer {
   private canvas = document.createElement('canvas');
@@ -63,9 +68,17 @@ export class RegionRenderer {
   /**
    * As render, in slices of SLICE ms of tile work with a pause between them, so the page can paint
    * and take a Cancel: a phone needs long to draw the tiles of a first piece. `onTiles`: the tiles
-   * drawn for this piece so far. `signal` stops it (an AbortError).
+   * drawn for this piece so far. `signal` stops it (an AbortError). `slice` and `pause` (ms): a
+   * render in the background takes short slices and long pauses, so the view keeps its frames.
    */
-  async renderAsync(x: number, y: number, scale: number, w: number, h: number, opts: { onTiles?: (n: number) => void; signal?: AbortSignal } = {}): Promise<Uint8ClampedArray<ArrayBuffer>> {
+  async renderAsync(
+    x: number,
+    y: number,
+    scale: number,
+    w: number,
+    h: number,
+    opts: { onTiles?: (n: number) => void; signal?: AbortSignal; slice?: number; pause?: number; fill?: number } = {},
+  ): Promise<Uint8ClampedArray<ArrayBuffer>> {
     if (w !== this.w || h !== this.h) {
       this.r.resize(w, h, 1);
       this.w = w;
@@ -73,15 +86,17 @@ export class RegionRenderer {
     }
     this.r.setView(x, y, scale);
     const t0 = this.r.tilesDrawn;
-    this.r.offlineSlice = SLICE;
+    this.r.offlineSlice = opts.slice ?? SLICE;
+    this.r.offlineFill = opts.fill ?? Infinity;
     try {
       while (this.r.renderStep()) {
         opts.onTiles?.(this.r.tilesDrawn - t0);
-        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, opts.pause ?? 0));
         if (opts.signal?.aborted) throw new DOMException('cancelled', 'AbortError');
       }
     } finally {
       this.r.offlineSlice = Infinity;
+      this.r.offlineFill = Infinity;
     }
     const px = this.r.contextLost() ? null : this.r.readRGBA(this.alpha);
     if (!px) throw new Error('The graphics context was lost');
@@ -108,9 +123,20 @@ export function flatPaper(p: unknown): Paper {
 
 /**
  * A PNG of `b` fitted into at most maxW × maxH pixels (aspect kept), on the paper (see flatPaper:
- * link previews and thumbnails are opaque).
+ * link previews and thumbnails are opaque). `background`: nobody waits for it (see renderAsync).
  */
-export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number, b: Bounds, maxW: number, maxH: number, shapes: Shape[] = [], paper?: unknown, mix?: unknown): Promise<Blob | null> {
+export async function renderPng(
+  layers: Layer[],
+  strokes: Stroke[],
+  seq: number,
+  b: Bounds,
+  maxW: number,
+  maxH: number,
+  shapes: Shape[] = [],
+  paper?: unknown,
+  mix?: unknown,
+  background = false,
+): Promise<Blob | null> {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
   if (!(bw > 0 && bh > 0)) return null;
   const scale = Math.min(maxW / bw, maxH / bh);
@@ -118,7 +144,9 @@ export async function renderPng(layers: Layer[], strokes: Stroke[], seq: number,
   const h = Math.max(1, Math.min(PIECE, Math.round(bh * scale)));
   const rr = new RegionRenderer(layers, strokes, seq, shapes, false, flatPaper(paper), mix === 'pigment' ? 'pigment' : 'normal');
   try {
-    const px = rr.render(b.x0, b.y0, scale, w, h);
+    // In slices: one blocking render of a heavy canvas froze the page for seconds. In the
+    // background (the link preview), short slices and long pauses leave the view its frames.
+    const px = await rr.renderAsync(b.x0, b.y0, scale, w, h, background ? { slice: BG_SLICE, pause: BG_PAUSE, fill: BG_FILL } : {});
     const c = new OffscreenCanvas(w, h);
     c.getContext('2d')!.putImageData(new ImageData(px, w, h), 0, 0);
     return await c.convertToBlob({ type: 'image/png' });

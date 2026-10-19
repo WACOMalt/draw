@@ -57,6 +57,19 @@ interface Box {
 
 const apply = (m: Affine, x: number, y: number): [number, number] => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
 
+/**
+ * A tilted kaleidoscope's copies (GLRenderer.tilted): the step's copies, the paint layers whose
+ * strokes it copies, and whether the copies go into those layers' own tiles (`merged`).
+ */
+interface Tilted {
+  sig: string;
+  copies: Affine3[];
+  members: Set<string>;
+  merged: boolean;
+  behind: boolean;
+}
+/** Merged copies: copy i of a stroke draws after (in front) or before (behind) every stroke of copy i - 1. */
+const COPY_SEQ = 1e12;
 /** A stroke's copy i for the tilted kaleidoscope of `node` (GLRenderer.tilted). */
 const copyId = (id: string, node: string, i: number) => `${id}@${node}:${i}`;
 /** The layer of such copies: the layer's id with the node and the copy. */
@@ -279,7 +292,7 @@ export class GLRenderer implements Renderer {
    * transforms, the 3D layers whose strokes it copies, and the step's signature. The copied
    * strokes live in the index like any (copyId, copyKey), and keep up with their originals.
    */
-  private tilted = new Map<string, { sig: string; copies: Affine3[]; members: Set<string> }>();
+  private tilted = new Map<string, Tilted>();
   /** While a tilted kaleidoscope copy renders: its members' layer and mask keys → the copy's. */
   private keyMap: ((key: string) => string) | null = null;
   private tipTex!: WebGLTexture;
@@ -335,6 +348,11 @@ export class GLRenderer implements Renderer {
    * so a caller can let the page paint between calls (the export, renderAsync). Infinity: all at once.
    */
   offlineSlice = Infinity;
+  /**
+   * Offline in slices: also the GPU work (fill, as `fill` on screen) of one slice. A slice of a
+   * few ms of JavaScript can queue seconds of GPU work, and the screen's frames wait for it.
+   */
+  offlineFill = Infinity;
   /** Tiles drawn so far (a count for progress). */
   tilesDrawn = 0;
   /** How long the last frame's compositing took (ms; JavaScript time, the GPU may add to it). */
@@ -760,7 +778,9 @@ export class GLRenderer implements Renderer {
 
   addStroke(stroke: Stroke, seq: number): void {
     this.addRec(stroke);
-    for (const [node, k] of this.tilted) if (k.members.has(stroke.layerId)) k.copies.forEach((m, i) => this.addCopy(stroke, node, i, m));
+    // An eraser in a layer whose copies are merged: they go back to frames of their own.
+    if (stroke.brush.tool === 'erase' && [...this.tilted.values()].some((k) => k.merged && k.members.has(stroke.layerId))) this.updateTilted();
+    else for (const [node, k] of this.tilted) if (k.members.has(stroke.layerId)) k.copies.forEach((m, i) => this.addCopy(stroke, node, i, m, k));
     this.appliedSeq = seq;
     this.invalidate();
   }
@@ -788,6 +808,8 @@ export class GLRenderer implements Renderer {
   removeStroke(id: string, seq: number): void {
     const rec = this.removeRec(id);
     if (rec) for (const [node, k] of this.tilted) if (k.members.has(rec.stroke.layerId)) k.copies.forEach((_, i) => this.removeRec(copyId(id, node, i)));
+    // The last eraser of a layer gone: its copies may merge again.
+    if (rec?.stroke.brush.tool === 'erase' && [...this.tilted.values()].some((k) => k.members.has(rec.stroke.layerId))) this.updateTilted();
     this.appliedSeq = seq;
     this.invalidate();
   }
@@ -814,9 +836,10 @@ export class GLRenderer implements Renderer {
 
   /** Brings `tilted` up to date with the layers: copies made, or dropped, where a step changed. */
   private updateTilted(): void {
-    const next = new Map<string, { sig: string; copies: Affine3[]; members: Set<string> }>();
+    const next = new Map<string, Tilted>();
     for (const l of this.layers) {
-      const e = activeEffects(l).find((x) => x.type === 'kaleidoscope');
+      const fx = activeEffects(l);
+      const e = fx.find((x) => x.type === 'kaleidoscope');
       if (!e || !kaleidoscopeTilts(e)) continue;
       // The paint layers whose strokes it copies; all must be 3D (else the copies are a picture,
       // seen straight on: kaleidoscopeCopies).
@@ -824,8 +847,15 @@ export class GLRenderer implements Renderer {
       const members = this.layers.filter((x) => ids.has(x.id) && x.kind !== 'group' && x.kind !== 'adjust');
       if (!members.length || members.some((x) => !x.threed || (x.kind ?? 'paint') !== 'paint')) continue;
       const ms = new Set(members.map((x) => x.id));
-      const sig = JSON.stringify([e.count, e.turn, e.angle, e.scale, e.cx, e.cy, e.cz, e.dx, e.dy, e.dz, [...ms].sort()]);
-      next.set(l.id, { sig, copies: kaleidoscopeCopies3(e), members: ms });
+      // A layer's copies go into its own tiles (one set of tiles, not one per copy) where that
+      // looks the same as copies drawn one over the other: one paint layer, no other effects (a
+      // copy's glow or shadow would fall on the copies below), no mask (it would cover the
+      // copies' union), no eraser (it would take paint from the copies below), no pigment (the
+      // copies would mix as paint).
+      const merged =
+        l.kind !== 'group' && fx.length === 1 && !l.mask?.enabled && this.mix !== 'pigment' && !(this.index.byLayer.get(l.id) ?? []).some((r) => r.stroke.brush.tool === 'erase');
+      const sig = JSON.stringify([e.count, e.turn, e.angle, e.scale, e.cx, e.cy, e.cz, e.dx, e.dy, e.dz, e.order, merged, [...ms].sort()]);
+      next.set(l.id, { sig, copies: kaleidoscopeCopies3(e), members: ms, merged, behind: e.order === 'behind' });
     }
     for (const [node, k] of this.tilted) if (next.get(node)?.sig !== k.sig) this.dropCopies(node, k);
     for (const [node, k] of next) {
@@ -833,20 +863,34 @@ export class GLRenderer implements Renderer {
       for (const id of k.members)
         for (const [key, list] of [...this.index.byLayer]) {
           if (key !== id && !key.startsWith(`${id}#`)) continue;
-          for (const r of list) k.copies.forEach((m, i) => this.addCopy(r.stroke, node, i, m));
+          // (Not the merged copies already in the list.)
+          for (const r of [...list]) if (!r.stroke.id.includes('@')) k.copies.forEach((m, i) => this.addCopy(r.stroke, node, i, m, k));
         }
     }
     this.tilted = next;
   }
 
-  /** Copy i of a stroke for a tilted kaleidoscope of `node`: moved in 3D (none if it cannot be). */
-  private addCopy(st: Stroke, node: string, i: number, m: Affine3): void {
+  /**
+   * Copy i of a stroke for a tilted kaleidoscope of `node`: moved in 3D (none if it cannot be). In
+   * a layer of its own for the copy, or merged into the stroke's layer, after (in front) or before
+   * (behind) the copies nearer the layer.
+   */
+  private addCopy(st: Stroke, node: string, i: number, m: Affine3, k: Tilted): void {
     const t = transformStroke3(st, m, LIMITS.maxCoord, [LIMITS.minBrushWorld, LIMITS.maxBrushWorld]);
-    if (t) this.addRec({ ...st, ...t, id: copyId(st.id, node, i), layerId: copyKey(st.layerId, node, i) });
+    if (!t) return;
+    if (k.merged) this.addRec({ ...st, ...t, id: copyId(st.id, node, i), seq: st.seq + (k.behind ? -1 : 1) * (i + 1) * COPY_SEQ });
+    else this.addRec({ ...st, ...t, id: copyId(st.id, node, i), layerId: copyKey(st.layerId, node, i) });
   }
 
   /** Drops the copied strokes of a tilted kaleidoscope, and their tiles. */
-  private dropCopies(node: string, k: { members: Set<string> }): void {
+  private dropCopies(node: string, k: Tilted): void {
+    if (k.merged) {
+      // In the layers' own lists: out one by one (the tiles they touched draw again).
+      const tag = `@${node}:`;
+      for (const id of k.members)
+        for (const [key, list] of [...this.index.byLayer]) if (key === id || key.startsWith(`${id}#`)) for (const r of [...list]) if (r.stroke.id.includes(tag)) this.removeRec(r.stroke.id);
+      return;
+    }
     const of = (key: string) => [...k.members].some((id) => key.startsWith(`${id}@${node}:`));
     for (const [key, list] of [...this.index.byLayer]) if (of(key)) for (const r of [...list]) this.index.remove(r.stroke.id);
     for (const [key, t] of [...this.tiles]) {
@@ -1401,6 +1445,8 @@ export class GLRenderer implements Renderer {
       if (t.job) this.dropJob(t);
       t.stale = true;
     }
+    // Pigment copies mix as paint when merged: they go to frames of their own (and back).
+    this.updateTilted();
     this.invalidate();
   }
 
@@ -1741,7 +1787,7 @@ export class GLRenderer implements Renderer {
     const jsBudget = Math.max(moving ? TILE_BUDGET_MS : TILE_BUDGET_STILL_MS, this.compositeMs / 2);
     let spent = 0;
     // Tile work stops here: on screen at the frame's budgets, offline at the slice (if any).
-    const over = () => (this.offline ? performance.now() - start > this.offlineSlice : spent >= fill || performance.now() - start > jsBudget);
+    const over = () => (this.offline ? performance.now() - start > this.offlineSlice || spent >= this.offlineFill : spent >= fill || performance.now() - start > jsBudget);
     let pending = false;
     /** Work left in the view and its prefetch ring (not just in the coarser levels). */
     let viewPending = false;
@@ -1792,7 +1838,7 @@ export class GLRenderer implements Renderer {
             this.tiles.set(key, t);
           }
           t.used = this.frame;
-          spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+          spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
           this.tilesDrawn++;
         }
       }
@@ -1817,7 +1863,7 @@ export class GLRenderer implements Renderer {
           this.tiles.set(key, t);
         }
         t.used = this.frame;
-        spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+        spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
         this.tilesDrawn++;
       }
     }
@@ -2518,6 +2564,8 @@ export class GLRenderer implements Renderer {
     // A tilt on 3D layers: the copies from the strokes (not inside such a copy: there they are
     // seen straight on, as a picture).
     const geo = this.keyMap ? undefined : this.tilted.get(id);
+    // Merged: the copies are in the layer's own tiles already.
+    if (geo?.merged) return cur;
     if (geo) return this.kaleidoscope3(kal, g, cur, whole, id, geo);
     return this.kaleidoscope(kal, g, cur, whole, content, pad, plain);
   }
@@ -2577,7 +2625,9 @@ export class GLRenderer implements Renderer {
     }
     const kal = kaleidoscope ? fx.find((e) => e.type === 'kaleidoscope') : undefined;
     const geo = kal && !this.keyMap ? this.tilted.get(l.id) : undefined;
-    if (geo) {
+    if (geo?.merged) {
+      // The copies are among the layer's strokes: in its bounds already.
+    } else if (geo) {
       // The copied strokes themselves (their boxes, moved in 3D, seen straight on).
       for (const id of geo.members)
         for (const [key, list] of this.index.byLayer) if (key.startsWith(`${id}@${l.id}:`) && !key.includes('#')) for (const r of list) add(r.x0, r.y0, r.x1, r.y1);
@@ -2618,7 +2668,7 @@ export class GLRenderer implements Renderer {
    * effects, in frame g itself; the copies and `cur` go into one buffer, in the order as the
    * flat kaleidoscope's.
    */
-  private kaleidoscope3(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target, id: string, geo: { copies: Affine3[]; members: Set<string> }): Target {
+  private kaleidoscope3(e: LayerEffect, g: Grid, cur: Target, whole: (kg: Grid) => Target, id: string, geo: Tilted): Target {
     const out = this.buf(g, 'kalOut');
     const kg: Grid = { ...g, ns: `${g.ns}k3:` };
     const copy = (i: number) => {
