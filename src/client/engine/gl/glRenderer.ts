@@ -236,6 +236,8 @@ const MOVING_MS = 150;
 /** Radius in px above which the shader gets the edge of a dab relative to the target (putDab). */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
+/** The most of a frame's fill a tile still rendering from earlier frames gets (tileShare). */
+const HEAVY_SHARE = 0.5;
 /**
  * WebKit (the Linux desktop app, Safari) can show a canvas frame only at the next compositor
  * update. After the view settles, a few identical frames push the last real one to the screen.
@@ -1601,6 +1603,17 @@ export class GLRenderer implements Renderer {
   }
 
   /**
+   * The fill a tile may spend this frame: what is left of the frame's, but a tile that is still
+   * rendering from earlier frames (a heavy one) gets at most half of the frame's, so the tiles
+   * after it in this frame's order get their turn. One heavy tile in the view used to take every
+   * frame until it was done, and nothing else on screen filled in meanwhile.
+   */
+  private tileShare(t: Tile, fill: number, spent: number): number {
+    const left = fill - spent;
+    return t.job ? Math.min(left, fill * HEAVY_SHARE) : left;
+  }
+
+  /**
    * Brings one tile up to date, or moves it closer. A full render (stale or new) draws into a
    * fresh target and may span frames: it stops once `budget` is spent and goes on next frame.
    * Appended strokes draw at once (they are few). Returns the work spent.
@@ -1789,6 +1802,8 @@ export class GLRenderer implements Renderer {
     // Tile work stops here: on screen at the frame's budgets, offline at the slice (if any).
     const over = () => (this.offline ? performance.now() - start > this.offlineSlice || spent >= this.offlineFill : spent >= fill || performance.now() - start > jsBudget);
     let pending = false;
+    /** Tiles still rendering that were held to their share this frame (tileShare). */
+    const capped: { t: Tile; view: boolean }[] = [];
     /** Work left in the view and its prefetch ring (not just in the coarser levels). */
     let viewPending = false;
     // First the view and a ring of PREFETCH tiles. Then COARSE_LEVELS coarser levels, centered:
@@ -1838,7 +1853,9 @@ export class GLRenderer implements Renderer {
             this.tiles.set(key, t);
           }
           t.used = this.frame;
-          spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
+          const left = fill - spent, share = this.offline ? this.offlineFill - spent : this.tileShare(t, fill, spent);
+          spent += this.renderTile(t, share);
+          if (!this.offline && t.job && share < left) capped.push({ t, view: r === ranges[0] });
           this.tilesDrawn++;
         }
       }
@@ -1863,9 +1880,23 @@ export class GLRenderer implements Renderer {
           this.tiles.set(key, t);
         }
         t.used = this.frame;
-        spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
+        const left = fill - spent, share = this.offline ? this.offlineFill - spent : this.tileShare(t, fill, spent);
+        spent += this.renderTile(t, share);
+        if (!this.offline && t.job && share < left) capped.push({ t, view: false });
         this.tilesDrawn++;
       }
+    }
+    // The heavy tiles held to their share (tileShare) get what the frame has left: alone, a heavy
+    // tile renders as fast as before.
+    for (const c of capped) {
+      if (!c.t.job) continue;
+      if (over()) break;
+      spent += this.renderTile(c.t, fill - spent);
+    }
+    for (const c of capped) {
+      if (!c.t.job) continue;
+      pending = true;
+      if (c.view) viewPending = true;
     }
     this.tileWorkLastFrame = spent > 0;
     // Offline in slices (offlineSlice): while tiles are left, no composite (it would be thrown
