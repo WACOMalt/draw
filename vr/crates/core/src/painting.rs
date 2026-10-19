@@ -63,6 +63,12 @@ impl Blend {
         serde_json::from_value(serde_json::Value::String(name.to_string())).unwrap_or_default()
     }
 
+    /// It works as paint on a pigment canvas (types.ts PIGMENT_BLENDS): normal mixes as paint,
+    /// multiply multiplies the colors' spectra. The others blend as usual there.
+    pub fn pigment(self) -> bool {
+        matches!(self, Blend::Normal | Blend::Multiply | Blend::Pass)
+    }
+
     /// The 2D app's label (LayersPanel).
     pub fn label(self) -> &'static str {
         match self {

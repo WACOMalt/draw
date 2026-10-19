@@ -179,3 +179,26 @@ public float4 pigmentOver(float4 d, float4 s)
     float3 c = pigmentMix(saturate(d.rgb / d.a), wd, saturate(s.rgb / s.a), ws);
     return float4(c * a, a);
 }
+
+// Paint s clipped to paint d (the 2D app's PIGMENT_FS with uAtop): s mixes in where d has paint,
+// by its coverage; d's alpha is kept.
+public float4 pigmentAtop(float4 d, float4 s)
+{
+    if (s.a <= 1e-4 || d.a <= 1e-4)
+        return d;
+    float3 c = pigmentMix(saturate(d.rgb / d.a), 1.0 - s.a, saturate(s.rgb / s.a), s.a);
+    return float4(c * d.a, d.a);
+}
+
+// Multiply as paint does it (the 2D app's BLEND_FS spectralMultiply): the reflectance curves
+// multiply wavelength by wavelength. White leaves b as it is and it only darkens, but the hues
+// are paint's: yellow on blue gives a dark green, not black.
+public float3 spectralMultiply(float3 b, float3 s)
+{
+    float Rb[38], Rs[38];
+    reflectance(toLinear(b), Rb);
+    reflectance(toLinear(s), Rs);
+    for (int i = 0; i < 38; i++)
+        Rb[i] *= Rs[i];
+    return xyzToSrgb(toXyz(Rb));
+}

@@ -54,8 +54,11 @@ pub fn layers_tab(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersSt
     ui.horizontal(|ui| {
         let current = painter.painting.layers[active].blend;
         let mut chosen = current;
+        // On a pigment canvas, the modes with no paint version say so (as the 2D app's menu).
+        let pigment = painter.shared && painter.painting.mix == vdraw_core::Mix::Pigment;
+        let name = |b: Blend| if pigment && !b.pigment() { format!("{} (non-pigment)", b.label()) } else { b.label().to_string() };
         egui::ComboBox::from_id_salt("blend")
-            .selected_text(current.label())
+            .selected_text(name(current))
             .width(170.0)
             .height(520.0)
             .show_ui(ui, |ui| {
@@ -64,7 +67,7 @@ pub fn layers_tab(ui: &mut egui::Ui, painter: &mut Painter, state: &mut LayersSt
                     ui.selectable_value(&mut chosen, Blend::Pass, Blend::Pass.label());
                 }
                 for b in Blend::LAYER {
-                    ui.selectable_value(&mut chosen, b, b.label());
+                    ui.selectable_value(&mut chosen, b, name(b));
                 }
             });
         if chosen != current {
