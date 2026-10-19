@@ -1,5 +1,5 @@
-// Pigment paint mixing, as the 2D app does it (multiplayer-canvas, branch claude/pigment:
-// src/client/engine/gl/spectral.ts, and pigment_mix and PIGMENT_FS in programs.ts).
+// Pigment paint mixing, as the 2D app does it (src/client/engine/gl/spectral.ts, and
+// pigment_mix and PIGMENT_FS in programs.ts).
 //
 // Kubelka-Munk spectral paint mixing, from spectral.js by Ronald van Wijnen (MIT License,
 // https://github.com/rvanwijnen/spectral.js, shader/spectral.glsl):
@@ -90,26 +90,29 @@ float KS(float R) { return (1.0 - R) * (1.0 - R) / (2.0 * R); }
 // cancellation that makes noise of dark paint (large ks) in 32-bit floats.
 float KM(float ks) { return 1.0 / (1.0 + ks + sqrt(ks * ks + 2.0 * ks)); }
 
-// Two sRGB paints by amount (spectral.js spectral_mix with tinting strength 1, the
-// concentrations computed once).
-float3 spectralMix2(float3 color1, float factor1, float3 color2, float factor2)
+// Linear sRGB of an XYZ color, not clamped.
+float3 xyzToLinear(float3 xyz)
 {
-    float R1[38], R2[38];
-    reflectance(toLinear(color1), R1);
-    reflectance(toLinear(color2), R2);
-    float c1 = factor1 * factor1 * luminance(R1);
-    float c2 = factor2 * factor2 * luminance(R2);
+    return float3(
+        dot(float3(3.2409699419045200, -1.537383177570090, -0.4986107602930030), xyz),
+        dot(float3(-0.9692436362808790, 1.875967501507720, 0.0415550574071756), xyz),
+        dot(float3(0.0556300796969936, -0.203976958888976, 1.0569715142428700), xyz));
+}
+
+// Two paints by their K/S curves and concentrations (spectral.js spectral_mix with tinting
+// strength 1; the 2D app's spectral_km): linear sRGB, not clamped.
+float3 spectralKm(float K1[38], float K2[38], float c1, float c2)
+{
     float total = max(c1 + c2, SPECTRAL_EPSILON);
     float R[38];
     for (int i = 0; i < 38; i++)
-        R[i] = KM((KS(R1[i]) * c1 + KS(R2[i]) * c2) / total);
-    return xyzToSrgb(toXyz(R));
+        R[i] = KM((K1[i] * c1 + K2[i] * c2) / total);
+    return xyzToLinear(toXyz(R));
 }
 
-// OKLab (Bjorn Ottosson), from and to sRGB.
-float3 oklab(float3 srgb)
+// OKLab (Bjorn Ottosson), from linear sRGB.
+float3 oklab(float3 c)
 {
-    float3 c = toLinear(srgb);
     float3 lms = float3(
         dot(float3(0.4122214708, 0.5363325363, 0.0514459929), c),
         dot(float3(0.2119034982, 0.6806995451, 0.1073969566), c),
@@ -121,32 +124,98 @@ float3 oklab(float3 srgb)
         dot(float3(0.0259040371, 0.7827717662, -0.8086757660), lms));
 }
 
-float3 oklabToSrgb(float3 lab)
+// Linear sRGB of an OKLab color, not clamped.
+float3 oklabToLinear(float3 lab)
 {
     float3 l = float3(
         dot(float3(1.0, 0.3963377774, 0.2158037573), lab),
         dot(float3(1.0, -0.1055613458, -0.0638541728), lab),
         dot(float3(1.0, -0.0894841775, -1.2914855480), lab));
     l = l * l * l;
-    return toSrgb(float3(
+    return float3(
         dot(float3(4.0767416621, -3.3077115913, 0.2309699292), l),
         dot(float3(-1.2684380046, 2.6097574011, -0.3413193965), l),
-        dot(float3(-0.0041960863, -0.7034186147, 1.7076147010), l)));
+        dot(float3(-0.0041960863, -0.7034186147, 1.7076147010), l));
 }
 
-// Paint d (amount wd) and paint s (amount ws), sRGB, as the 2D app's pigment_mix. Kubelka-Munk
-// alone mixes red and blue into a grey brown (their curves share almost no wavelength); a
-// second mix keeps the lightness and the hue (the short way round) of the two paints in OKLab,
-// with less chroma lost (average chroma x cos(dh/2)^0.5 in the middle). The more colorful mix
-// wins, smoothly (weights chroma^4): blue and yellow stay the Kubelka-Munk green, red and blue
-// make purple.
+float overshoot(float3 c) { return max(max(max(c.r, c.g), c.b) - 1.0, -min(min(c.r, c.g), c.b)); }
+
+// sRGB of an OKLab color, into the gamut with its hue kept (the 2D app's srgb): along the line
+// to a grey (L0, 0, 0) (Bjorn Ottosson's adaptive L0 projection, alpha 0.05), by bisection.
+// Near the corners of the gamut (pure blue, green) a hue 1 or 2 degrees off the corner can hold
+// much less chroma, so the projection alone would band where a mix grazes the edge. Thus a small
+// overshoot clamps (its hue error is small), and the projection takes over by an overshoot of
+// 0.02.
+float3 oklabToSrgb(float3 lab)
+{
+    float3 c = oklabToLinear(lab);
+    float over = overshoot(c);
+    if (over <= 0.0)
+        return toSrgb(c);
+    float C = length(lab.yz), Ld = lab.x - 0.5, e1 = 0.5 + abs(Ld) + 0.05 * C;
+    float3 g = float3(0.5 * (1.0 + sign(Ld) * (e1 - sqrt(max(e1 * e1 - 2.0 * abs(Ld), 0.0)))), 0.0, 0.0);
+    float lo = 0.0, hi = 1.0;
+    for (int n = 0; n < 12; n++)
+    {
+        float m = 0.5 * (lo + hi);
+        if (overshoot(oklabToLinear(g + (lab - g) * m)) <= 1e-5)
+            lo = m;
+        else
+            hi = m;
+    }
+    float3 kept = oklab(saturate(oklabToLinear(g + (lab - g) * lo)));
+    float3 clamped = oklab(saturate(c));
+    return toSrgb(oklabToLinear(lerp(clamped, kept, smoothstep(0.0, 0.02, over))));
+}
+
+// Paint d (amount wd) and paint s (amount ws), sRGB: the 2D app's pigment_mix.
+//
+// Kubelka-Munk at an even rate: where one paint absorbs a band of wavelengths almost fully, a
+// trace of it overrules the other paint, so a plain mix by amount stays at the strong paint for
+// most of the way and then jumps to the weak one in the last percent. A bisection on the KM
+// amount (in logit space) finds the mix that sits the fraction t of the OKLab way from d to s.
+//
+// Kubelka-Munk alone also mixes red and blue into a grey brown (their curves share almost no
+// wavelength). A second mix keeps the lightness and the hue (the short way round) of the two
+// paints in OKLab, with less chroma lost (average chroma x cos(dh/2)^0.5 in the middle). The
+// more colorful mix wins, smoothly (weights chroma^4): blue and yellow stay the Kubelka-Munk
+// green, red and blue make purple.
 public float3 pigmentMix(float3 d, float wd, float3 s, float ws)
 {
     float t = ws / max(ws + wd, 1e-12);
-    // spectral.js weighs paints by the square of their factor: the square root keeps the weight
-    // in proportion to the coverage, so a thin glaze still tints.
-    float3 k = oklab(spectralMix2(d, sqrt(wd), s, sqrt(ws)));
-    float3 a = oklab(d), b = oklab(s);
+    float3 ld = toLinear(d), ls = toLinear(s);
+    float R[38], K1[38], K2[38];
+    reflectance(ld, R);
+    float l1 = luminance(R);
+    for (int i = 0; i < 38; i++)
+        K1[i] = KS(R[i]);
+    reflectance(ls, R);
+    float l2 = luminance(R);
+    for (int i = 0; i < 38; i++)
+        K2[i] = KS(R[i]);
+    float3 a = oklab(ld), b = oklab(ls);
+    // The amount of s is 1 / (1 + e^-z), and the concentrations are amount x luminance
+    // (spectral.js).
+    float lo = -12.0, hi = 12.0, plo = 0.0, phi = 1.0;
+    for (int n = 0; n < 6; n++)
+    {
+        float z = 0.5 * (lo + hi);
+        float3 m = oklab(spectralKm(K1, K2, l1 / (1.0 + exp(z)), l2 / (1.0 + exp(-z))));
+        float da = distance(m, a), db = distance(m, b);
+        float p = da / (da + db + 1e-9);
+        if (p < t)
+        {
+            lo = z;
+            plo = p;
+        }
+        else
+        {
+            hi = z;
+            phi = p;
+        }
+    }
+    float zm = lerp(lo, hi, saturate((t - plo) / max(phi - plo, 1e-6)));
+    float3 k = oklab(spectralKm(K1, K2, l1 / (1.0 + exp(zm)), l2 / (1.0 + exp(-zm))));
     float ca = length(a.yz), cb = length(b.yz);
     float ha = atan2(a.z, a.y), hb = atan2(b.z, b.y);
     if (ca < 1e-4)
