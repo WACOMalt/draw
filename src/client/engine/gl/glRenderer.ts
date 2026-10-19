@@ -335,6 +335,11 @@ export class GLRenderer implements Renderer {
    * so a caller can let the page paint between calls (the export, renderAsync). Infinity: all at once.
    */
   offlineSlice = Infinity;
+  /**
+   * Offline in slices: also the GPU work (fill, as `fill` on screen) of one slice. A slice of a
+   * few ms of JavaScript can queue seconds of GPU work, and the screen's frames wait for it.
+   */
+  offlineFill = Infinity;
   /** Tiles drawn so far (a count for progress). */
   tilesDrawn = 0;
   /** How long the last frame's compositing took (ms; JavaScript time, the GPU may add to it). */
@@ -1741,7 +1746,7 @@ export class GLRenderer implements Renderer {
     const jsBudget = Math.max(moving ? TILE_BUDGET_MS : TILE_BUDGET_STILL_MS, this.compositeMs / 2);
     let spent = 0;
     // Tile work stops here: on screen at the frame's budgets, offline at the slice (if any).
-    const over = () => (this.offline ? performance.now() - start > this.offlineSlice : spent >= fill || performance.now() - start > jsBudget);
+    const over = () => (this.offline ? performance.now() - start > this.offlineSlice || spent >= this.offlineFill : spent >= fill || performance.now() - start > jsBudget);
     let pending = false;
     /** Work left in the view and its prefetch ring (not just in the coarser levels). */
     let viewPending = false;
@@ -1792,7 +1797,7 @@ export class GLRenderer implements Renderer {
             this.tiles.set(key, t);
           }
           t.used = this.frame;
-          spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+          spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
           this.tilesDrawn++;
         }
       }
@@ -1817,7 +1822,7 @@ export class GLRenderer implements Renderer {
           this.tiles.set(key, t);
         }
         t.used = this.frame;
-        spent += this.renderTile(t, this.offline ? Infinity : fill - spent);
+        spent += this.renderTile(t, this.offline ? this.offlineFill - spent : fill - spent);
         this.tilesDrawn++;
       }
     }
