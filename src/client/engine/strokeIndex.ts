@@ -2,7 +2,7 @@
 // Used by the WebGL renderer (main thread) and the Canvas 2D tile worker.
 
 import { computeDabs, strokeSeed, type DabList } from '../../shared/brush';
-import type { Stroke } from '../../shared/types';
+import type { Brush, Stroke } from '../../shared/types';
 import { vectorShape } from '../../shared/flatten';
 import { shapeBounds } from '../../shared/shapes';
 
@@ -31,8 +31,37 @@ export interface StrokeRec {
  */
 export const seedId = (id: string): string => id.replace(/[@~].*$/, '');
 
+/**
+ * Dab lists by stroke, for every renderer of the page (one per thread): an export uses the walks
+ * the view did, and the other way round. An export walked every stroke again on the main thread
+ * (a third of its time on a canvas of many strokes). A committed stroke's points and brush do not
+ * change in place (a change makes new ones), and an entry is good only for the ones it came from.
+ */
+let walked = new WeakMap<Stroke, { pts: number[]; brush: Brush; n: number; list: DabList }>();
+
+/** The stroke's dab list if a renderer of this thread walked it (then on `rec` too), else null. */
+export function cachedDabs(rec: StrokeRec): DabList | null {
+  if (rec.dabs) return rec.dabs;
+  const s = rec.stroke, e = walked.get(s);
+  if (e && e.pts === s.pts && e.brush === s.brush && e.n === s.pts.length) rec.dabs = e.list;
+  return rec.dabs;
+}
+
+/** Keeps a stroke's dab list on `rec`, and for the other renderers. */
+export function keepDabs(rec: StrokeRec, list: DabList): DabList {
+  const s = rec.stroke;
+  rec.dabs = list;
+  walked.set(s, { pts: s.pts, brush: s.brush, n: s.pts.length, list });
+  return list;
+}
+
+/** Forgets every kept dab list (the benchmark's cold steps). */
+export function forgetDabs(): void {
+  walked = new WeakMap();
+}
+
 export function strokeDabs(rec: StrokeRec): DabList {
-  return (rec.dabs ??= computeDabs(rec.stroke.brush, rec.stroke.pts, strokeSeed(seedId(rec.stroke.id))));
+  return cachedDabs(rec) ?? keepDabs(rec, computeDabs(rec.stroke.brush, rec.stroke.pts, strokeSeed(seedId(rec.stroke.id))));
 }
 
 export class StrokeIndex {
