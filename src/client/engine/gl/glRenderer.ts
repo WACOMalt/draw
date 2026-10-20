@@ -13,7 +13,7 @@ import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
-import { createPrograms, type Program, type Programs } from './programs';
+import { createPrograms, RUN_SLOTS, type Program, type Programs } from './programs';
 import { perfProfile, type PerfProfile } from '../perf';
 import { ShapeIndex, shapeRec, shapeTouches, type ShapeRec } from '../shapeIndex';
 import { drawShapes } from '../shapeRaster';
@@ -272,6 +272,8 @@ export class GLRenderer implements Renderer {
   private compA!: Target;
   private compB!: Target;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
+  /** RUN_SLOTS tile-sized slots, 4 a row: a run of strokes that build up apart (drawRun). */
+  private runAtlas!: Target;
   /** Tile-sized buffer for a pigment mix (pigmentOnto). */
   private mixT!: Target;
   /** How paint strokes mix with the paint below (setMix). */
@@ -467,6 +469,7 @@ export class GLRenderer implements Renderer {
     this.luts.clear();
 
     this.strokeT = this.makeTarget(TILE, TILE);
+    this.runAtlas = this.makeTarget(TILE * 4, TILE * Math.ceil(RUN_SLOTS / 4));
     this.mixT = this.makeTarget(TILE, TILE);
     this.pickT = this.makeTarget(1, 1, true);
     this.shapeTex = this.makeTexture();
@@ -1506,6 +1509,13 @@ export class GLRenderer implements Renderer {
     do {
       const key = this.batchKey(list[i], scale);
       if (key === null) {
+        const kind = this.runKind(target, list[i], scale);
+        if (kind) {
+          const r = this.drawRun(kind, target, list, i, wx0, wy0, scale, budget - work);
+          work += r.work;
+          i = r.next;
+          continue;
+        }
         work += this.drawStroke(target, list[i++], wx0, wy0, scale);
         continue;
       }
@@ -1570,6 +1580,107 @@ export class GLRenderer implements Renderer {
       work += 3 * bw * bh; // clear, copy
     }
     return work;
+  }
+
+  /**
+   * How a stroke can go in a run (drawRun): one that builds up in a buffer of its own first
+   * (viaBuffer), into a tile: 'pigment' mixes as paint, 'over' goes on by its opacity (or takes
+   * paint away, an eraser). Null: alone (drawStroke).
+   */
+  private runKind(target: Target, rec: StrokeRec, scale: number): 'pigment' | 'over' | null {
+    if (rec.stroke.vector || target.w !== TILE || target.h !== TILE || this.strokeT.w !== TILE) return null;
+    const b = rec.stroke.brush;
+    const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2;
+    if (!this.viaBuffer(b, dot)) return null;
+    return this.pigmentFor(b) ? 'pigment' : 'over';
+  }
+
+  /**
+   * Strokes list[from], ... of one runKind (up to RUN_SLOTS, until `budget` is spent; at least
+   * one), as drawStroke draws them one by one: each builds up in a slot of its own (runAtlas),
+   * then they go onto the tile in order. Two passes for the run, not two passes and four target
+   * changes for each stroke: a phone's GPU pays for every change of target, and a pigment canvas
+   * sends every stroke this way. The same pixels as drawStroke (a pigment run keeps the paint in
+   * 32-bit floats between its strokes, where drawStroke rounded to the tile's precision).
+   */
+  private drawRun(kind: 'pigment' | 'over', target: Target, list: StrokeRec[], from: number, wx0: number, wy0: number, scale: number, budget: number): { work: number; next: number } {
+    const gl = this.gl;
+    const w = target.w, h = target.h, A = this.runAtlas;
+    type Item = { slot: [number, number]; box: [number, number, number, number]; opacity: number; erase: boolean };
+    const items: Item[] = [];
+    let work = 0;
+    let i = from;
+    this.bindTarget(A);
+    // 1. Each stroke's dabs into its slot: the viewport puts the tile there.
+    while (i < list.length && items.length < RUN_SLOTS && (i === from || work < budget) && this.runKind(target, list[i], scale) === kind) {
+      const rec = list[i++];
+      const b = rec.stroke.brush;
+      const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
+      if (n === 0) continue;
+      work += 2000 + fill;
+      const x0 = Math.max(0, Math.floor((rec.x0 - wx0) * scale) - 1), y0 = Math.max(0, Math.floor((rec.y0 - wy0) * scale) - 1);
+      const x1 = Math.min(w, Math.ceil((rec.x1 - wx0) * scale) + 1), y1 = Math.min(h, Math.ceil((rec.y1 - wy0) * scale) + 1);
+      if (x1 <= x0 || y1 <= y0) continue;
+      const k = items.length;
+      const slot: [number, number] = [(k % 4) * TILE, Math.floor(k / 4) * TILE];
+      const grain = dot ? null : this.grainFor(b, rec.stroke.pts[0], rec.stroke.pts[1], wx0, wy0, scale);
+      gl.viewport(slot[0], slot[1], w, h);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(slot[0] + x0, slot[1] + y0, x1 - x0, y1 - y0);
+      this.clear();
+      gl.disable(gl.SCISSOR_TEST);
+      this.blendFor(false);
+      this.drawDabs(n, brush, w, h, grain, true);
+      items.push({ slot, box: [x0, y0, x1, y1], opacity: b.opacity, erase: b.tool === 'erase' });
+      const area = (x1 - x0) * (y1 - y0);
+      work += (kind === 'pigment' ? 120 : 3) * area;
+    }
+    if (!items.length) return { work: Math.max(work, 1), next: i };
+    // 2. Onto the tile, in order.
+    if (kind === 'over') {
+      this.bindTarget(target);
+      for (const it of items) {
+        const [x0, y0, x1, y1] = it.box;
+        this.blendFor(it.erase);
+        this.copy(A.tex, target, [x0, y0, x1 - x0, y1 - y0], it.opacity, [(it.slot[0] + x0) / A.w, (it.slot[1] + y0) / A.h, (it.slot[0] + x1) / A.w, (it.slot[1] + y1) / A.h]);
+      }
+      return { work, next: i };
+    }
+    // Pigment: one pass mixes the run into a copy of the tile (a pass cannot read the target it
+    // writes), which then goes back over the run's boxes.
+    const tmp = this.mixT;
+    let ux0 = w, uy0 = h, ux1 = 0, uy1 = 0;
+    const rects = new Float32Array(4 * RUN_SLOTS), slots = new Float32Array(2 * RUN_SLOTS), ops = new Float32Array(RUN_SLOTS);
+    items.forEach((it, k) => {
+      rects.set(it.box, 4 * k);
+      slots.set(it.slot, 2 * k);
+      ops[k] = it.opacity;
+      ux0 = Math.min(ux0, it.box[0]);
+      uy0 = Math.min(uy0, it.box[1]);
+      ux1 = Math.max(ux1, it.box[2]);
+      uy1 = Math.max(uy1, it.box[3]);
+    });
+    const rect: [number, number, number, number] = [ux0, uy0, ux1 - ux0, uy1 - uy0];
+    this.bindTarget(tmp);
+    gl.disable(gl.BLEND);
+    const p = this.progs.pigmentRun;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, target.tex);
+    gl.uniform1i(p.u.uBack, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, A.tex);
+    gl.uniform1i(p.u.uAtlas, 1);
+    gl.uniform1i(p.u.uCount, items.length);
+    gl.uniform4fv(p.u.uRect, rects);
+    gl.uniform2fv(p.u.uSlot, slots);
+    gl.uniform1fv(p.u.uOp, ops);
+    this.quad(p, tmp, rect, [rect[0] / tmp.w, rect[1] / tmp.h, (rect[0] + rect[2]) / tmp.w, (rect[1] + rect[3]) / tmp.h]);
+    gl.activeTexture(gl.TEXTURE0);
+    this.bindTarget(target);
+    gl.disable(gl.BLEND);
+    this.copy(tmp.tex, target, rect, 1, [rect[0] / tmp.w, rect[1] / tmp.h, (rect[0] + rect[2]) / tmp.w, (rect[1] + rect[3]) / tmp.h]);
+    return { work, next: i };
   }
 
   /**

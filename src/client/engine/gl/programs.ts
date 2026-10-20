@@ -406,16 +406,11 @@ void main() {
  * (alpha-over coverage), so an opaque stroke still covers and a thin one mixes in. Alpha
  * composites as normal. Premultiplied in and out.
  */
-const PIGMENT_FS = `#version 300 es
-precision highp float;
-in vec2 vUv;
-in vec2 vScreen;
-uniform sampler2D uBack;
-uniform sampler2D uPaint;
-uniform float uOpacity;
-uniform int uAtop;         // 1: a clipped layer, only where the backdrop (the clip base) has paint
-out vec4 o;
-${SPECTRAL_GLSL}
+/**
+ * The pigment mix of two paints (pigment_mix) and what it needs: OKLab, the gamut mapping. For
+ * PIGMENT_FS (a stroke onto paint) and PIGMENT_RUN_FS (a run of strokes onto a tile, in order).
+ */
+const PIGMENT_GLSL = `
 // OKLab (Björn Ottosson), from linear sRGB.
 vec3 oklab(vec3 c) {
   vec3 lms = vec3(
@@ -518,6 +513,19 @@ vec3 pigment_mix(vec3 d, float wd, vec3 s, float ws) {
   float w = cv4 / (cv4 + ck4 + 1e-12);
   return srgb(mix(k, v, w));
 }
+`;
+
+const PIGMENT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in vec2 vScreen;
+uniform sampler2D uBack;
+uniform sampler2D uPaint;
+uniform float uOpacity;
+uniform int uAtop;         // 1: a clipped layer, only where the backdrop (the clip base) has paint
+out vec4 o;
+${SPECTRAL_GLSL}
+${PIGMENT_GLSL}
 void main() {
   vec4 d = texture(uBack, vScreen);
   vec4 s = texture(uPaint, vUv) * uOpacity;
@@ -534,6 +542,44 @@ void main() {
   float a = ws + wd;
   vec3 c = pigment_mix(clamp(d.rgb / d.a, 0.0, 1.0), wd, clamp(s.rgb / s.a, 0.0, 1.0), ws);
   o = vec4(c * a, a);
+}`;
+
+/** The most strokes one PIGMENT_RUN_FS pass mixes (GLRenderer RUN_SLOTS). */
+export const RUN_SLOTS = 16;
+
+/**
+ * A run of pigment strokes onto a tile, in order, in one pass: stroke i's paint (its built-up
+ * dabs in slot i of the run atlas, times its opacity) mixes into the paint so far as PIGMENT_FS
+ * mixes one stroke, inside its box (tile px). The paint stays in 32-bit floats from stroke to
+ * stroke: one pass and one write instead of two passes and a write per stroke.
+ */
+const PIGMENT_RUN_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uBack;   // the tile so far
+uniform sampler2D uAtlas;  // the strokes' paint, one slot each
+uniform int uCount;
+uniform vec4 uRect[${RUN_SLOTS}];   // x0, y0, x1, y1 (tile px)
+uniform vec2 uSlot[${RUN_SLOTS}];   // the slot's corner in the atlas (px)
+uniform float uOp[${RUN_SLOTS}];
+out vec4 o;
+${SPECTRAL_GLSL}
+${PIGMENT_GLSL}
+void main() {
+  vec2 f = gl_FragCoord.xy;
+  ivec2 p = ivec2(f);
+  vec4 d = texelFetch(uBack, p, 0);
+  for (int i = 0; i < ${RUN_SLOTS}; i++) {
+    if (i >= uCount) break;
+    vec4 r = uRect[i];
+    if (f.x < r.x || f.y < r.y || f.x >= r.z || f.y >= r.w) continue;
+    vec4 s = texelFetch(uAtlas, ivec2(uSlot[i]) + p, 0) * uOp[i];
+    if (s.a <= 1e-4) continue;
+    if (d.a <= 1e-4) { d = s; continue; }
+    float ws = s.a, wd = d.a * (1.0 - s.a);
+    float a = ws + wd;
+    d = vec4(pigment_mix(clamp(d.rgb / d.a, 0.0, 1.0), wd, clamp(s.rgb / s.a, 0.0, 1.0), ws) * a, a);
+  }
+  o = d;
 }`;
 
 export interface Program {
@@ -575,6 +621,7 @@ export function createPrograms(gl: WebGL2RenderingContext) {
     adjust: link(gl, QUAD_VS, ADJUST_FS, [...quad, 'uBack', 'uLut', 'uMask', 'uMaskOn', 'uType', 'uHsl', 'uOpacity', 'uFxMap']),
     blur: link(gl, QUAD_VS, BLUR_FS, [...quad, 'uTex', 'uStep', 'uN', 'uOff', 'uW']),
     pigment: link(gl, QUAD_VS, PIGMENT_FS, [...quad, 'uBack', 'uPaint', 'uOpacity', 'uAtop']),
+    pigmentRun: link(gl, QUAD_VS, PIGMENT_RUN_FS, [...quad, 'uBack', 'uAtlas', 'uCount', 'uRect', 'uSlot', 'uOp']),
     fx: link(gl, QUAD_VS, FX_FS, [...quad, 'uLayer', 'uFx', 'uFxMap', 'uMode', 'uColor', 'uOpacity', 'uSpread']),
     dab: link(gl, DAB_VS, DAB_FS, [
       'uTarget',
