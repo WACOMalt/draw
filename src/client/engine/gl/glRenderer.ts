@@ -13,7 +13,7 @@ import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
-import { createPrograms, type Program, type Programs } from './programs';
+import { createPrograms, RUN_SLOTS, type Program, type Programs } from './programs';
 import { perfProfile, type PerfProfile } from '../perf';
 import { ShapeIndex, shapeRec, shapeTouches, type ShapeRec } from '../shapeIndex';
 import { drawShapes } from '../shapeRaster';
@@ -236,6 +236,15 @@ const MOVING_MS = 150;
 /** Radius in px above which the shader gets the edge of a dab relative to the target (putDab). */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
+/**
+ * Exact tiles: a level at the screen's (or an export's) own scale, whose grid lies on its pixels,
+ * so tiles composite 1:1 with no resampling (the power-of-two levels are drawn up to 1.15× larger
+ * or 1.74× smaller, a little soft or aliased). Its lod key is the real lod + EXACT_TAG, so it
+ * never meets a power-of-two level. On screen it renders once the view has been still for
+ * EXACT_DELAY ms and its power-of-two tiles are done, and shows once all of it is drawn.
+ */
+const EXACT_TAG = 1000;
+const EXACT_DELAY = 250;
 /** The most of a frame's fill a tile still rendering from earlier frames gets (tileShare). */
 const HEAVY_SHARE = 0.5;
 /**
@@ -271,7 +280,14 @@ export class GLRenderer implements Renderer {
 
   private compA!: Target;
   private compB!: Target;
+  /** The exact level (EXACT_TAG): its real lod and the world point its grid starts at. */
+  private exact: { lod: number; ox: number; oy: number } | null = null;
+  private exactTimer = 0;
+  /** The last frame showed the view's exact tiles (all drawn). */
+  exactShown = false;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
+  /** RUN_SLOTS tile-sized slots, 4 a row: a run of strokes that build up apart (drawRun). */
+  private runAtlas!: Target;
   /** Tile-sized buffer for a pigment mix (pigmentOnto). */
   private mixT!: Target;
   /** How paint strokes mix with the paint below (setMix). */
@@ -467,6 +483,7 @@ export class GLRenderer implements Renderer {
     this.luts.clear();
 
     this.strokeT = this.makeTarget(TILE, TILE);
+    this.runAtlas = this.makeTarget(TILE * 4, TILE * Math.ceil(RUN_SLOTS / 4));
     this.mixT = this.makeTarget(TILE, TILE);
     this.pickT = this.makeTarget(1, 1, true);
     this.shapeTex = this.makeTexture();
@@ -654,6 +671,11 @@ export class GLRenderer implements Renderer {
     this.viewVersion++;
     this.lastViewChange = performance.now();
     this.invalidate();
+    // A frame once the view has been still long enough for its exact tiles (render).
+    if (!this.offline) {
+      window.clearTimeout(this.exactTimer);
+      this.exactTimer = window.setTimeout(() => this.invalidate(), EXACT_DELAY + 20);
+    }
   }
 
   toWorld(cssX: number, cssY: number): [number, number] {
@@ -1370,8 +1392,41 @@ export class GLRenderer implements Renderer {
   // --- tiles -------------------------------------------------------------------------------------
 
   private tileBounds(t: { lod: number; tx: number; ty: number }): [number, number, number, number] {
-    const tw = tileWorld(t.lod);
-    return [t.tx * tw, t.ty * tw, (t.tx + 1) * tw, (t.ty + 1) * tw];
+    const [lod, ox, oy] = this.level(t.lod);
+    const tw = tileWorld(lod);
+    return [ox + t.tx * tw, oy + t.ty * tw, ox + (t.tx + 1) * tw, oy + (t.ty + 1) * tw];
+  }
+
+  /** A tile level's real lod and the world point its grid starts at (the exact level's own). */
+  private level(lod: number): [number, number, number] {
+    if (lod >= EXACT_TAG / 2 && this.exact) return [lod - EXACT_TAG, this.exact.ox, this.exact.oy];
+    return [lod, 0, 0];
+  }
+
+  /**
+   * The exact level for `ds` device px per world unit at the view (vx, vy): its grid on the view's
+   * pixels. The current one when the view moved by whole pixels at the same scale (its tiles are
+   * good still). Null when the power-of-two tiles are exact already.
+   */
+  private exactFor(ds: number, vx: number, vy: number): { lod: number; ox: number; oy: number } | null {
+    const lod = -Math.log2(ds);
+    const whole = (v: number) => Math.abs(v - Math.round(v)) < 1e-3;
+    const cur = this.exact;
+    if (cur && Math.abs(cur.lod - lod) < 1e-12 && whole((vx - cur.ox) * ds) && whole((vy - cur.oy) * ds)) return cur;
+    if (whole(lod) && whole(vx * ds) && whole(vy * ds)) return null;
+    return { lod, ox: vx - Math.floor(vx * ds) / ds, oy: vy - Math.floor(vy * ds) / ds };
+  }
+
+  /** Makes `e` the exact level: the tiles of another one go (their grid is somewhere else). */
+  private setExact(e: { lod: number; ox: number; oy: number }): void {
+    if (e === this.exact) return;
+    for (const [key, t] of [...this.tiles]) {
+      if (t.lod < EXACT_TAG / 2) continue;
+      if (t.job) this.dropJob(t);
+      if (t.target) this.tilePool.push(t.target);
+      this.tiles.delete(key);
+    }
+    this.exact = e;
   }
 
   private allocTile(): Target {
@@ -1506,6 +1561,13 @@ export class GLRenderer implements Renderer {
     do {
       const key = this.batchKey(list[i], scale);
       if (key === null) {
+        const kind = this.runKind(target, list[i], scale);
+        if (kind) {
+          const r = this.drawRun(kind, target, list, i, wx0, wy0, scale, budget - work);
+          work += r.work;
+          i = r.next;
+          continue;
+        }
         work += this.drawStroke(target, list[i++], wx0, wy0, scale);
         continue;
       }
@@ -1573,6 +1635,107 @@ export class GLRenderer implements Renderer {
   }
 
   /**
+   * How a stroke can go in a run (drawRun): one that builds up in a buffer of its own first
+   * (viaBuffer), into a tile: 'pigment' mixes as paint, 'over' goes on by its opacity (or takes
+   * paint away, an eraser). Null: alone (drawStroke).
+   */
+  private runKind(target: Target, rec: StrokeRec, scale: number): 'pigment' | 'over' | null {
+    if (rec.stroke.vector || target.w !== TILE || target.h !== TILE || this.strokeT.w !== TILE) return null;
+    const b = rec.stroke.brush;
+    const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2;
+    if (!this.viaBuffer(b, dot)) return null;
+    return this.pigmentFor(b) ? 'pigment' : 'over';
+  }
+
+  /**
+   * Strokes list[from], ... of one runKind (up to RUN_SLOTS, until `budget` is spent; at least
+   * one), as drawStroke draws them one by one: each builds up in a slot of its own (runAtlas),
+   * then they go onto the tile in order. Two passes for the run, not two passes and four target
+   * changes for each stroke: a phone's GPU pays for every change of target, and a pigment canvas
+   * sends every stroke this way. The same pixels as drawStroke (a pigment run keeps the paint in
+   * 32-bit floats between its strokes, where drawStroke rounded to the tile's precision).
+   */
+  private drawRun(kind: 'pigment' | 'over', target: Target, list: StrokeRec[], from: number, wx0: number, wy0: number, scale: number, budget: number): { work: number; next: number } {
+    const gl = this.gl;
+    const w = target.w, h = target.h, A = this.runAtlas;
+    type Item = { slot: [number, number]; box: [number, number, number, number]; opacity: number; erase: boolean };
+    const items: Item[] = [];
+    let work = 0;
+    let i = from;
+    this.bindTarget(A);
+    // 1. Each stroke's dabs into its slot: the viewport puts the tile there.
+    while (i < list.length && items.length < RUN_SLOTS && (i === from || work < budget) && this.runKind(target, list[i], scale) === kind) {
+      const rec = list[i++];
+      const b = rec.stroke.brush;
+      const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
+      if (n === 0) continue;
+      work += 2000 + fill;
+      const x0 = Math.max(0, Math.floor((rec.x0 - wx0) * scale) - 1), y0 = Math.max(0, Math.floor((rec.y0 - wy0) * scale) - 1);
+      const x1 = Math.min(w, Math.ceil((rec.x1 - wx0) * scale) + 1), y1 = Math.min(h, Math.ceil((rec.y1 - wy0) * scale) + 1);
+      if (x1 <= x0 || y1 <= y0) continue;
+      const k = items.length;
+      const slot: [number, number] = [(k % 4) * TILE, Math.floor(k / 4) * TILE];
+      const grain = dot ? null : this.grainFor(b, rec.stroke.pts[0], rec.stroke.pts[1], wx0, wy0, scale);
+      gl.viewport(slot[0], slot[1], w, h);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(slot[0] + x0, slot[1] + y0, x1 - x0, y1 - y0);
+      this.clear();
+      gl.disable(gl.SCISSOR_TEST);
+      this.blendFor(false);
+      this.drawDabs(n, brush, w, h, grain, true);
+      items.push({ slot, box: [x0, y0, x1, y1], opacity: b.opacity, erase: b.tool === 'erase' });
+      const area = (x1 - x0) * (y1 - y0);
+      work += (kind === 'pigment' ? 120 : 3) * area;
+    }
+    if (!items.length) return { work: Math.max(work, 1), next: i };
+    // 2. Onto the tile, in order.
+    if (kind === 'over') {
+      this.bindTarget(target);
+      for (const it of items) {
+        const [x0, y0, x1, y1] = it.box;
+        this.blendFor(it.erase);
+        this.copy(A.tex, target, [x0, y0, x1 - x0, y1 - y0], it.opacity, [(it.slot[0] + x0) / A.w, (it.slot[1] + y0) / A.h, (it.slot[0] + x1) / A.w, (it.slot[1] + y1) / A.h]);
+      }
+      return { work, next: i };
+    }
+    // Pigment: one pass mixes the run into a copy of the tile (a pass cannot read the target it
+    // writes), which then goes back over the run's boxes.
+    const tmp = this.mixT;
+    let ux0 = w, uy0 = h, ux1 = 0, uy1 = 0;
+    const rects = new Float32Array(4 * RUN_SLOTS), slots = new Float32Array(2 * RUN_SLOTS), ops = new Float32Array(RUN_SLOTS);
+    items.forEach((it, k) => {
+      rects.set(it.box, 4 * k);
+      slots.set(it.slot, 2 * k);
+      ops[k] = it.opacity;
+      ux0 = Math.min(ux0, it.box[0]);
+      uy0 = Math.min(uy0, it.box[1]);
+      ux1 = Math.max(ux1, it.box[2]);
+      uy1 = Math.max(uy1, it.box[3]);
+    });
+    const rect: [number, number, number, number] = [ux0, uy0, ux1 - ux0, uy1 - uy0];
+    this.bindTarget(tmp);
+    gl.disable(gl.BLEND);
+    const p = this.progs.pigmentRun;
+    gl.useProgram(p.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, target.tex);
+    gl.uniform1i(p.u.uBack, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, A.tex);
+    gl.uniform1i(p.u.uAtlas, 1);
+    gl.uniform1i(p.u.uCount, items.length);
+    gl.uniform4fv(p.u.uRect, rects);
+    gl.uniform2fv(p.u.uSlot, slots);
+    gl.uniform1fv(p.u.uOp, ops);
+    this.quad(p, tmp, rect, [rect[0] / tmp.w, rect[1] / tmp.h, (rect[0] + rect[2]) / tmp.w, (rect[1] + rect[3]) / tmp.h]);
+    gl.activeTexture(gl.TEXTURE0);
+    this.bindTarget(target);
+    gl.disable(gl.BLEND);
+    this.copy(tmp.tex, target, rect, 1, [rect[0] / tmp.w, rect[1] / tmp.h, (rect[0] + rect[2]) / tmp.w, (rect[1] + rect[3]) / tmp.h]);
+    return { work, next: i };
+  }
+
+  /**
    * A vector stroke (a shape made paint) onto a tile target: drawn as the shape on the shape
    * canvas, then over the tile's pixels, in its stroke order.
    */
@@ -1599,6 +1762,17 @@ export class GLRenderer implements Renderer {
     if (!t.job) return;
     this.tilePool.push(t.job.target);
     t.job = null;
+  }
+
+  /** Every tile of a range is drawn and current, for each of `keys`. */
+  private rangeReady(r: TileRange, keys: string[]): boolean {
+    for (const layer of keys)
+      for (let ty = r.ty0; ty <= r.ty1; ty++)
+        for (let tx = r.tx0; tx <= r.tx1; tx++) {
+          const t = this.tiles.get(tileKey(layer, r.lod, tx, ty));
+          if (!t?.rendered || this.needsWork(t)) return false;
+        }
+    return true;
   }
 
   /**
@@ -1754,12 +1928,30 @@ export class GLRenderer implements Renderer {
     this.frame++;
     const gl = this.gl;
     const ds = this.view.zoom * this.dpr;
-    const lod = lodFor(ds);
-    const tw = tileWorld(lod);
     const vx = this.view.x, vy = this.view.y;
-    const tx0 = Math.floor(vx / tw), ty0 = Math.floor(vy / tw);
-    const tx1 = Math.floor((vx + this.cssW / this.view.zoom) / tw);
-    const ty1 = Math.floor((vy + this.cssH / this.view.zoom) / tw);
+    // The exact level (EXACT_TAG): offline always (exports); on screen once the view is still and
+    // its power-of-two tiles are done, and no stroke of this device is being drawn.
+    let drawingHere = false;
+    for (const l of this.live.values()) if (!l.remote && !l.ended) drawingHere = true;
+    const ex = this.offline || (performance.now() - this.lastViewChange >= EXACT_DELAY && !this.lastViewPending && !drawingHere) ? this.exactFor(ds, vx, vy) : null;
+    if (ex) this.setExact(ex);
+    const etw = ex ? tileWorld(ex.lod) : 0;
+    const exactRange: TileRange | null = ex
+      ? {
+          lod: ex.lod + EXACT_TAG,
+          tx0: Math.floor((vx - ex.ox) / etw + 1e-9),
+          ty0: Math.floor((vy - ex.oy) / etw + 1e-9),
+          tx1: Math.floor((vx - ex.ox + this.cssW / this.view.zoom) / etw - 1e-9),
+          ty1: Math.floor((vy - ex.oy + this.cssH / this.view.zoom) / etw - 1e-9),
+        }
+      : null;
+    // Offline the exact level is the only one; on screen the power-of-two one, then the exact one.
+    const lod = ex && this.offline ? ex.lod + EXACT_TAG : lodFor(ds);
+    const tw = ex && this.offline ? etw : tileWorld(lod);
+    const ox = ex && this.offline ? ex.ox : 0, oy = ex && this.offline ? ex.oy : 0;
+    const tx0 = exactRange && this.offline ? exactRange.tx0 : Math.floor(vx / tw), ty0 = exactRange && this.offline ? exactRange.ty0 : Math.floor(vy / tw);
+    const tx1 = exactRange && this.offline ? exactRange.tx1 : Math.floor((vx + this.cssW / this.view.zoom) / tw);
+    const ty1 = exactRange && this.offline ? exactRange.ty1 : Math.floor((vy + this.cssH / this.view.zoom) / tw);
     // Paint and adjustment layers that show: visible, in groups that are all visible.
     const visible = this.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(this.byId, l));
     // Tile sets to keep current, topmost first: each paint layer, and each enabled layer mask.
@@ -1816,6 +2008,11 @@ export class GLRenderer implements Renderer {
     // Effect frames (blurs, glows, shadows) read these tiles: their level, with their margin.
     for (const r of this.effectRanges()) ranges.push(r);
     let total = ranges.reduce((n, r) => n + area(r), 0);
+    // Then the view's exact tiles (on screen; offline they are the view's own), within memory.
+    if (exactRange && !this.offline && total + area(exactRange) <= this.hardMaxTiles) {
+      ranges.push(exactRange);
+      total += area(exactRange);
+    }
     for (let up = 1; up <= (this.offline ? 0 : this.profile.coarseLevels) && lod + up <= MAX_LOD; up++) {
       const ctw = tileWorld(lod + up);
       const m = (2 ** up - 1) / 2; // margin on each side, in views: 2× the view, then 4×
@@ -1832,7 +2029,7 @@ export class GLRenderer implements Renderer {
       ranges.push(coarse);
     }
     outer: for (const r of ranges) {
-      const rtw = tileWorld(r.lod);
+      const rtw = tileWorld(this.level(r.lod)[0]);
       const cx = (vx + vw / 2) / rtw - 0.5, cy = (vy + vh / 2) / rtw - 0.5;
       const order: [number, number][] = [];
       for (let ty = r.ty0; ty <= r.ty1; ty++) for (let tx = r.tx0; tx <= r.tx1; tx++) order.push([tx, ty]);
@@ -1918,14 +2115,19 @@ export class GLRenderer implements Renderer {
     // 3. Composite the layers, bottom to top. A layer with clipped layers right above it is the
     //    base of a clipping group: the group draws in its own buffer, each clipped layer only where
     //    the base has alpha ("atop"), then goes onto the composite with the base's blend and opacity.
+    // On screen the exact tiles show once all of them are drawn (else the power-of-two ones).
+    const showExact = !this.offline && !!exactRange && ranges.includes(exactRange) && this.rangeReady(exactRange, keys);
+    this.exactShown = showExact;
+    const gl0 = showExact ? exactRange!.lod : lod, gtw = showExact ? etw : tw;
+    const gox = showExact ? ex!.ox : ox, goy = showExact ? ex!.oy : oy;
     const grid: Grid = {
-      lod,
-      tx0,
-      ty0,
-      tx1,
-      ty1,
-      X: (tx) => Math.round((tx * tw - vx) * ds),
-      Y: (ty) => Math.round((ty * tw - vy) * ds),
+      lod: gl0,
+      tx0: showExact ? exactRange!.tx0 : tx0,
+      ty0: showExact ? exactRange!.ty0 : ty0,
+      tx1: showExact ? exactRange!.tx1 : tx1,
+      ty1: showExact ? exactRange!.ty1 : ty1,
+      X: (tx) => Math.round((gox + tx * gtw - vx) * ds),
+      Y: (ty) => Math.round((goy + ty * gtw - vy) * ds),
       w: this.canvas.width,
       h: this.canvas.height,
       ns: '',
