@@ -12,6 +12,7 @@ import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
 import { dabPool } from '../dabPool';
+import { profiler } from '../../perf/profiler';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
 import { createPrograms, RUN_SLOTS, type Program, type Programs } from './programs';
@@ -382,6 +383,11 @@ export class GLRenderer implements Renderer {
   private cleanup: (() => void)[] = [];
   /** The page's dab walkers (null: the main thread walks, as strokeDabs does). */
   private pool: ReturnType<typeof dabPool> = null;
+  // --- profiler (perf/profiler.ts, when on) ---
+  private readonly profId = Math.random().toString(36).slice(2, 8);
+  private profExt: { TIME_ELAPSED_EXT: number } | null | undefined;
+  private profQ: { q: WebGLQuery; frame: number; phase: 'tiles' | 'comp'; layer?: { id: string; name: string; fx: string } }[] = [];
+  private profTileStart = 0;
 
   /**
    * `offline`: a renderer for exports, on a canvas that is not on screen. It renders only when
@@ -407,6 +413,7 @@ export class GLRenderer implements Renderer {
     const lost = (e: Event) => {
       e.preventDefault();
       this.lost = true;
+      profiler.event('context lost', this.offline ? 'export renderer' : 'view');
     };
     const restored = () => {
       this.lost = false;
@@ -1349,6 +1356,10 @@ export class GLRenderer implements Renderer {
       gl.bufferData(gl.ARRAY_BUFFER, this.dabCap, gl.DYNAMIC_DRAW);
     }
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.inst, 0, n * INST);
+    if (profiler.on) {
+      profiler.cur.draws++;
+      profiler.cur.uploadKB += (n * INST * 4) / 1024;
+    }
     gl.bindVertexArray(this.dabVao);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
     gl.bindVertexArray(null);
@@ -1356,6 +1367,7 @@ export class GLRenderer implements Renderer {
 
   private bindTarget(t: Target | null): void {
     const gl = this.gl;
+    if (profiler.on) profiler.cur.binds++;
     gl.bindFramebuffer(gl.FRAMEBUFFER, t ? t.fbo : null);
     gl.viewport(0, 0, t ? t.w : this.canvas.width, t ? t.h : this.canvas.height);
   }
@@ -1386,6 +1398,7 @@ export class GLRenderer implements Renderer {
     gl.uniform1f(p.u.uFlipY, target ? 0 : 1);
     gl.bindVertexArray(this.quadVao);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (profiler.on) profiler.cur.draws++;
   }
 
   private copy(tex: WebGLTexture, target: Target | null, dst: [number, number, number, number], opacity = 1, src?: [number, number, number, number]): void {
@@ -1482,6 +1495,9 @@ export class GLRenderer implements Renderer {
       fill += Math.max(16, 4 * r * r);
     }
     this.paintDabs(at, at + n, brush);
+    if (profiler.on) {
+      profiler.cur.dabs += n;
+    }
     return { n, fill, brush, dot };
   }
 
@@ -1656,7 +1672,9 @@ export class GLRenderer implements Renderer {
     if (rec.dabs || rec.stroke.vector || this.offline || !this.pool) return true;
     if ((rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2) return true;
     this.pool.request([rec], true);
-    return !this.pool.pending(rec);
+    const ready = !this.pool.pending(rec);
+    if (!ready && profiler.on) profiler.cur.walkWaits++;
+    return ready;
   }
 
   /** Resolves once the workers have walked every stroke's dabs (an export waits, then draws). */
@@ -1794,6 +1812,84 @@ export class GLRenderer implements Renderer {
     t.job = null;
   }
 
+  // --- profiler -------------------------------------------------------------------------------
+
+  /**
+   * For the benchmark (perf/bench.ts): forgets every tile and every dab walk, as a fresh load
+   * of the canvas starts (the walks are asked for again).
+   */
+  profDropCaches(): void {
+    for (const [key, t] of [...this.tiles]) {
+      if (t.job) this.dropJob(t);
+      if (t.target) this.freeTarget(t.target);
+      this.tiles.delete(key);
+    }
+    for (const rec of this.index.recs.values()) rec.dabs = null;
+    this.pool?.request(this.index.recs.values());
+    this.invalidate();
+  }
+
+  /** For the profiler's report: the GPU, the profile, the buffers. */
+  profInfo(): Record<string, unknown> {
+    const gl = this.gl;
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    if (this.profExt === undefined) this.profExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    return {
+      gpu: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+      profile: this.profile.name,
+      bits: this.precision,
+      pixelRatio: this.dpr,
+      canvas: [this.canvas.width, this.canvas.height],
+      maxTiles: this.maxTiles,
+      hardMaxTiles: this.hardMaxTiles,
+      gpuTimer: !!this.profExt,
+      maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+      workers: !!this.pool,
+    };
+  }
+
+  /** The view's state, for the benchmark: done drawing, complete, showing its exact tiles. */
+  profState(): { viewPending: boolean; pending: boolean; exact: boolean; frame: number } {
+    return { viewPending: this.lastViewPending, pending: this.lastPendingWork, exact: this.exactShown, frame: this.frame };
+  }
+
+  /** A GPU timer query for a phase (none where the browser has no timer, or one is open). */
+  private profBegin(phase: 'tiles' | 'comp', layer?: { id: string; name: string; fx: string }): boolean {
+    if (this.profExt === undefined) this.profExt = this.gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    if (!this.profExt) return false;
+    const q = this.gl.createQuery();
+    if (!q) return false;
+    this.gl.beginQuery(this.profExt.TIME_ELAPSED_EXT, q);
+    this.profQ.push({ q, frame: this.frame, phase, layer });
+    return true;
+  }
+
+  private profEnd(): void {
+    if (this.profExt) this.gl.endQuery(this.profExt.TIME_ELAPSED_EXT);
+  }
+
+  /** The GPU times that came back, into their frames (and layers). */
+  private profPoll(): void {
+    if (!this.profQ.length) return;
+    const gl = this.gl;
+    const disjoint = this.profExt && gl.getParameter((this.profExt as unknown as { GPU_DISJOINT_EXT: number }).GPU_DISJOINT_EXT);
+    this.profQ = this.profQ.filter((x) => {
+      if (!gl.getQueryParameter(x.q, gl.QUERY_RESULT_AVAILABLE)) return true;
+      const ms = gl.getQueryParameter(x.q, gl.QUERY_RESULT) / 1e6;
+      gl.deleteQuery(x.q);
+      if (disjoint) return false;
+      profiler.gpu(this.profId, x.frame, x.phase, ms);
+      if (x.layer) profiler.layer(x.layer.id, x.layer.name, x.layer.fx, 0, ms);
+      return false;
+    });
+  }
+
+  private profFrame(f: { interval: number; tilesCpu: number; compCpu: number; budget: number; fill: number; moving: boolean; pending: boolean; viewPending: boolean }): void {
+    let cache = 0;
+    for (const t of this.tiles.values()) if (t.target) cache++;
+    profiler.frameEnd({ ...f, frame: this.frame, src: this.offline ? 'export' : 'view', exact: this.exactShown, cacheTiles: cache, w: this.canvas.width, h: this.canvas.height, zoom: this.view.zoom }, this.profId);
+  }
+
   /** Every tile of a range is drawn and current, for each of `keys`. */
   private rangeReady(r: TileRange, keys: string[]): boolean {
     for (const layer of keys)
@@ -1822,6 +1918,18 @@ export class GLRenderer implements Renderer {
    * Appended strokes draw at once (they are few). Returns the work spent.
    */
   private renderTile(t: Tile, budget: number): number {
+    if (!profiler.on) return this.renderTile0(t, budget);
+    const t0 = performance.now(), d0 = profiler.cur.dabs;
+    const before = t.job?.list.length;
+    const work = this.renderTile0(t, budget);
+    const strokes = before ?? t.job?.list.length ?? (this.index.byLayer.get(t.layer)?.length ?? 0);
+    profiler.cur.tileCalls++;
+    if (!t.job) profiler.cur.tilesDone++;
+    profiler.tile({ t: profiler.now(), frame: this.frame, layer: t.layer, lod: Math.round(this.level(t.lod)[0] * 100) / 100, strokes, dabs: profiler.cur.dabs - d0, ms: performance.now() - t0, done: !t.job });
+    return work;
+  }
+
+  private renderTile0(t: Tile, budget: number): number {
     if (this.shapeLayers.has(t.layer)) return this.renderShapeTile(t);
     const [wx0, wy0, wx1, wy1] = this.tileBounds(t);
     const scale = TILE / (wx1 - wx0);
@@ -1898,6 +2006,7 @@ export class GLRenderer implements Renderer {
         if (this.tilePool.length < 32) this.tilePool.push(t.target);
         else this.freeTarget(t.target);
         count--;
+        if (profiler.on) profiler.cur.evicted++;
       }
       if (t.job) {
         this.freeTarget(t.job.target);
@@ -1958,6 +2067,12 @@ export class GLRenderer implements Renderer {
     } else this.tail--;
     if (this.lost || this.gl.isContextLost()) return;
     this.frame++;
+    if (profiler.on) {
+      this.profPoll();
+      profiler.frameBegin();
+      profiler.phase = this.offline ? 'export tiles' : 'tiles';
+      this.profBegin('tiles');
+    }
     const gl = this.gl;
     const ds = this.view.zoom * this.dpr;
     const vx = this.view.x, vy = this.view.y;
@@ -2127,12 +2242,16 @@ export class GLRenderer implements Renderer {
       if (c.view) viewPending = true;
     }
     this.tileWorkLastFrame = spent > 0;
+    const tilesCpu = performance.now() - start;
+    if (profiler.on) this.profEnd();
     // Offline in slices (offlineSlice): while tiles are left, no composite (it would be thrown
     // away); the caller lets the page breathe and calls again.
     if (this.offline && pending) {
       this.lastPending = true;
+      if (profiler.on) this.profFrame({ interval, tilesCpu, compCpu: 0, budget: this.offlineFill, fill: spent, moving, pending, viewPending });
       return;
     }
+    if (profiler.on) profiler.phase = this.offline ? 'export composite' : 'composite';
     const c0 = performance.now();
     this.lastPendingWork = pending;
     this.lastViewPending = viewPending;
@@ -2192,6 +2311,18 @@ export class GLRenderer implements Renderer {
 
     gl.flush();
     this.compositeMs = performance.now() - c0;
+    if (profiler.on) {
+      // No GPU timer here: every 30th frame, how long the CPU waits for the GPU to finish.
+      let sync: number | undefined;
+      if (!this.profExt && this.frame % 30 === 0) {
+        const s0 = performance.now();
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+        sync = performance.now() - s0;
+      }
+      this.profFrame({ interval, tilesCpu, compCpu: this.compositeMs, budget: fill, fill: spent, moving, pending, viewPending });
+      if (sync !== undefined) profiler.gpu(this.profId, this.frame, 'sync', sync);
+      profiler.phase = 'idle';
+    }
     // Tiles drawn missing or out of date: another frame renders them.
     if (this.wanted.size) pending = true;
     this.evictTiles(ranges, ranges.reduce((n, r) => n + area(r), 0));
@@ -2241,6 +2372,21 @@ export class GLRenderer implements Renderer {
 
   /** One layer or group onto `pair.a` (`atop`: only where `pair.a` has alpha, for clipping). */
   private compositeNode(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
+    // The profiler times each top-level layer or group on screen (its effect and kaleidoscope
+    // frames included): CPU now, GPU when its timer query comes back.
+    if (!profiler.on || depth !== 0 || g.ns !== '') return this.compositeNode0(node, pair, g, atop, depth);
+    const l = node.layer;
+    const fx = activeEffects(l).map((e) => (e.type === 'kaleidoscope' ? `kaleidoscope ×${e.count}${e.turn ? ' 3D' : ''}` : e.type)).join(', ') + (l.blend !== 'normal' && l.blend !== 'pass' ? `${activeEffects(l).length ? ', ' : ''}${l.blend}` : '');
+    const info = { id: l.id, name: l.name, fx };
+    const timed = this.profBegin('comp', info);
+    const t0 = performance.now();
+    const out = this.compositeNode0(node, pair, g, atop, depth);
+    if (timed) this.profEnd();
+    profiler.layer(l.id, l.name, fx, performance.now() - t0);
+    return out;
+  }
+
+  private compositeNode0(node: LayerNode, pair: Pair, g: Grid, atop: boolean, depth: number): Pair {
     const l = node.layer;
     // The transform preview shows on screen only (an effect frame draws the tiles as they are).
     const pv = g.ns === '' ? this.previews.get(l.id) : undefined;
