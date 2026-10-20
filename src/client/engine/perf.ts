@@ -26,12 +26,14 @@ export interface PerfProfile {
   fill: number;
   /** Coarser tile levels kept around the view (fast zoom out, no blank tiles while panning). */
   coarseLevels: number;
+  /** Pages of strokes' dabs in GPU memory (16 MB each, dabStore.ts). */
+  dabPages: number;
 }
 
 const PROFILES: Record<PerfName, PerfProfile> = {
-  full: { name: 'full', maxScale: Infinity, bits: 16, maxTiles: 512, hardMaxTiles: 1200, fill: 8e6, coarseLevels: 2 },
-  phone: { name: 'phone', maxScale: 2, bits: 16, maxTiles: 160, hardMaxTiles: 320, fill: 1.5e6, coarseLevels: 2 },
-  light: { name: 'light', maxScale: 1.5, bits: 8, maxTiles: 128, hardMaxTiles: 256, fill: 8e5, coarseLevels: 1 },
+  full: { name: 'full', maxScale: Infinity, bits: 16, maxTiles: 512, hardMaxTiles: 1200, fill: 8e6, coarseLevels: 2, dabPages: 4 },
+  phone: { name: 'phone', maxScale: 2, bits: 16, maxTiles: 160, hardMaxTiles: 320, fill: 1.5e6, coarseLevels: 2, dabPages: 2 },
+  light: { name: 'light', maxScale: 1.5, bits: 8, maxTiles: 128, hardMaxTiles: 256, fill: 8e5, coarseLevels: 1, dabPages: 1 },
 };
 
 /** Exports and previews: full quality on every device. */
