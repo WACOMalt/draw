@@ -15,7 +15,15 @@ import { buildSync } from 'esbuild';
 import { solveChallenge } from 'altcha-lib';
 import { deriveKey } from 'altcha-lib/algorithms/pbkdf2';
 
-const PORT = 3400 + Math.floor(Math.random() * 500);
+// Ports fetch refuses (the Fetch standard's bad ports): a test server on one of them failed the
+// run with "fetch failed: bad port" (3544 + 501 = 4045).
+const BAD_PORTS = new Set([3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697]);
+/** The first port from `p` on that fetch takes. */
+const okPort = (p) => {
+  while (BAD_PORTS.has(p)) p++;
+  return p;
+};
+const PORT = okPort(3400 + Math.floor(Math.random() * 500));
 const BASE = `http://127.0.0.1:${PORT}`;
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'draw-test-'));
 const DB = path.join(dir, 'canvas.db');
@@ -1482,7 +1490,7 @@ try {
 
   // --- email confirmation mode (EMAIL_VERIFICATION=1), on a second server ------------------------
   {
-    const port2 = PORT + 501;
+    const port2 = okPort(PORT + 501);
     const base2 = `http://127.0.0.1:${port2}`;
     const mail2 = path.join(dir, 'mail2');
     const srv2 = spawn(process.execPath, ['dist/server/index.js'], {
