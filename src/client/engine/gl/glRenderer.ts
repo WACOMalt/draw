@@ -11,6 +11,7 @@ import { compose, effectivelyVisible, invert, layerTree, subtreeIds, transformSt
 import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
 import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
+import { dabPool } from '../dabPool';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
 import { createPrograms, RUN_SLOTS, type Program, type Programs } from './programs';
@@ -379,6 +380,8 @@ export class GLRenderer implements Renderer {
   /** The previous frame drew tiles: its interval says how much GPU work fits. */
   private tileWorkLastFrame = false;
   private cleanup: (() => void)[] = [];
+  /** The page's dab walkers (null: the main thread walks, as strokeDabs does). */
+  private pool: ReturnType<typeof dabPool> = null;
 
   /**
    * `offline`: a renderer for exports, on a canvas that is not on screen. It renders only when
@@ -397,6 +400,10 @@ export class GLRenderer implements Renderer {
     this.fillBudget = profile.fill;
     this.fillMoving = profile.fill * 0.35;
     this.initGL();
+    // Dab walks in workers (dabPool): a walk that comes back draws its tiles. Offline (exports)
+    // the renderer walks on its own thread: there, workers did not make it faster.
+    this.pool = offline ? null : dabPool();
+    if (this.pool) this.cleanup.push(this.pool.onReady(() => this.invalidate()));
     const lost = (e: Event) => {
       e.preventDefault();
       this.lost = true;
@@ -789,6 +796,8 @@ export class GLRenderer implements Renderer {
   resetStrokes(strokes: Stroke[], seq: number): void {
     this.index.clear();
     for (const s of strokes) this.index.add(s);
+    // Every stroke's dabs, walked in the background (tiles ask for theirs first: dabsReady).
+    this.pool?.request(this.index.recs.values());
     for (const t of this.tiles.values()) {
       t.stale = true;
       t.append = [];
@@ -812,6 +821,7 @@ export class GLRenderer implements Renderer {
   /** Puts a stroke in the index; the tiles it touches draw it (on top) or render again. */
   private addRec(stroke: Stroke): void {
     const rec = this.index.add(stroke);
+    this.pool?.request([rec]);
     const key = strokeKey(stroke);
     for (const t of this.tiles.values()) {
       if (t.layer !== key) continue;
@@ -1559,6 +1569,8 @@ export class GLRenderer implements Renderer {
     let i = from;
     const w = target.w, h = target.h;
     do {
+      // A walk still in a worker's hands: the tile goes on from here when it is back.
+      if (!this.dabsReady(list[i], scale)) return { work: Math.max(work, 1), next: i };
       const key = this.batchKey(list[i], scale);
       if (key === null) {
         const kind = this.runKind(target, list[i], scale);
@@ -1573,7 +1585,7 @@ export class GLRenderer implements Renderer {
       }
       let n = 0;
       let brush: Brush | null = null;
-      while (i < list.length && (n === 0 || (work < budget && n < MAX_BATCH)) && this.batchKey(list[i], scale) === key) {
+      while (i < list.length && (n === 0 || (work < budget && n < MAX_BATCH)) && this.batchKey(list[i], scale) === key && this.dabsReady(list[i], scale)) {
         const s = this.stageStroke(list[i++], n, wx0, wy0, scale, w, h);
         if (!s.n) continue;
         n += s.n;
@@ -1635,6 +1647,24 @@ export class GLRenderer implements Renderer {
   }
 
   /**
+   * The stroke's dabs can be drawn now: walked already, or none needed (a vector stroke, a stroke
+   * that is one dot here). On screen, a walk the workers have in hand is waited for (asked for
+   * first), so the main thread does not walk it too; offline (exports) the main thread walks
+   * what is left (strokeDabs), after renderAsync waited for the workers.
+   */
+  private dabsReady(rec: StrokeRec, scale: number): boolean {
+    if (rec.dabs || rec.stroke.vector || this.offline || !this.pool) return true;
+    if ((rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2) return true;
+    this.pool.request([rec], true);
+    return !this.pool.pending(rec);
+  }
+
+  /** Resolves once the workers have walked every stroke's dabs (an export waits, then draws). */
+  dabsWalked(): Promise<void> {
+    return this.pool ? this.pool.whenReady(this.index.recs.values()) : Promise.resolve();
+  }
+
+  /**
    * How a stroke can go in a run (drawRun): one that builds up in a buffer of its own first
    * (viaBuffer), into a tile: 'pigment' mixes as paint, 'over' goes on by its opacity (or takes
    * paint away, an eraser). Null: alone (drawStroke).
@@ -1664,7 +1694,7 @@ export class GLRenderer implements Renderer {
     let i = from;
     this.bindTarget(A);
     // 1. Each stroke's dabs into its slot: the viewport puts the tile there.
-    while (i < list.length && items.length < RUN_SLOTS && (i === from || work < budget) && this.runKind(target, list[i], scale) === kind) {
+    while (i < list.length && items.length < RUN_SLOTS && (i === from || work < budget) && this.runKind(target, list[i], scale) === kind && this.dabsReady(list[i], scale)) {
       const rec = list[i++];
       const b = rec.stroke.brush;
       const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
@@ -1809,6 +1839,8 @@ export class GLRenderer implements Renderer {
         this.bindTarget(target);
         this.clear();
         t.job = { target, list, next: 0 };
+        // All the tile's walks at once, before the rest: one wait for the tile, not one a stroke.
+        this.pool?.request(list, true);
         work += TILE * TILE;
       }
       const job = t.job;
