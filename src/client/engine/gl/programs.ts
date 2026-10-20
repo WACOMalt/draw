@@ -5,6 +5,7 @@
 // All colors are premultiplied by alpha.
 
 import { SPECTRAL_GLSL } from './spectral';
+import { PAGE_W } from './dabStore';
 
 const QUAD_VS = `#version 300 es
 precision highp float;
@@ -108,6 +109,88 @@ void main() {
   vTrue = aHuge.yz;
   vEdge = aEdge;
   vec2 p = aDab.xy + vLocal;
+  gl_Position = vec4(p / uTarget * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+/**
+ * Dabs from the GPU dab store (dabStore.ts): one record per 64-dab chunk (attribute divisor 64),
+ * instance k of it is dab k of the chunk. The record: the chunk's center in target px (from
+ * double precision on the CPU), the scale, the dabs in the chunk, the color and hardness, and
+ * where its dabs are (page, first texel; turned: cos and sin follow the 64 dabs). A dot record
+ * (n < 0) is one dab of its own, radius in px in place of the scale. The same dab as putDab:
+ * sub-pixel dabs are one pixel with alpha by area, and no huge dabs come here (GPU_CHUNK_PX).
+ */
+export const DAB_PAGES = 4;
+const DAB_GPU_VS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 aChunk;    // center x, y (px), scale (a dot: radius px), dabs (a dot: -1)
+layout(location = 2) in vec4 aPaint;    // r, g, b, hardness
+layout(location = 3) in ivec3 aSrc;     // page, first texel, turned (1)
+uniform vec2 uTarget;
+uniform sampler2D uDabs0;
+uniform sampler2D uDabs1;
+uniform sampler2D uDabs2;
+uniform sampler2D uDabs3;
+out vec2 vLocal;
+flat out float vRv;
+flat out float vR;
+flat out float vA;
+flat out vec2 vRot;
+flat out vec3 vColor;
+flat out float vHardness;
+flat out float vD;
+flat out vec2 vTrue;
+flat out vec3 vEdge;
+vec4 dab(int page, int t) {
+  ivec2 at = ivec2(t % ${PAGE_W}, t / ${PAGE_W});
+  if (page == 0) return texelFetch(uDabs0, at, 0);
+  if (page == 1) return texelFetch(uDabs1, at, 0);
+  if (page == 2) return texelFetch(uDabs2, at, 0);
+  return texelFetch(uDabs3, at, 0);
+}
+void main() {
+  int k = gl_InstanceID % 64;
+  float cx, cy, rp, a;
+  vec2 rot = vec2(1.0, 0.0);
+  gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // culled: outside the target
+  if (aChunk.w < 0.0) {
+    if (k > 0) return;
+    cx = aChunk.x;
+    cy = aChunk.y;
+    rp = aChunk.z;
+    a = 1.0;
+  } else {
+    if (float(k) >= aChunk.w) return;
+    vec4 d = dab(aSrc.x, aSrc.y + k);
+    cx = aChunk.x + d.x * aChunk.z;
+    cy = aChunk.y + d.y * aChunk.z;
+    rp = d.z * aChunk.z;
+    a = d.w;
+    if (aSrc.z == 1) {
+      vec4 e = dab(aSrc.x, aSrc.y + 64 + k / 2);
+      rot = (k % 2 == 0) ? e.xy : e.zw;
+    }
+  }
+  if (rp < 0.5) {
+    a *= 4.0 * rp * rp;
+    rp = 0.5;
+  }
+  if (a <= 1e-5) return;
+  float ext = rp + 1.0;
+  vLocal = (aCorner * 2.0 - 1.0) * ext;
+  vRv = rp;
+  vR = rp;
+  vA = min(a, 1.0);
+  vRot = rot;
+  vColor = aPaint.rgb;
+  vHardness = aPaint.a;
+  vD = 0.0;
+  vTrue = vec2(0.0);
+  vEdge = vec3(0.0);
+  vec2 p = vec2(cx, cy) + vLocal;
   gl_Position = vec4(p / uTarget * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
@@ -623,6 +706,21 @@ export function createPrograms(gl: WebGL2RenderingContext) {
     pigment: link(gl, QUAD_VS, PIGMENT_FS, [...quad, 'uBack', 'uPaint', 'uOpacity', 'uAtop']),
     pigmentRun: link(gl, QUAD_VS, PIGMENT_RUN_FS, [...quad, 'uBack', 'uAtlas', 'uCount', 'uRect', 'uSlot', 'uOp']),
     fx: link(gl, QUAD_VS, FX_FS, [...quad, 'uLayer', 'uFx', 'uFxMap', 'uMode', 'uColor', 'uOpacity', 'uSpread']),
+    dabGpu: link(gl, DAB_GPU_VS, DAB_FS, [
+      'uTarget',
+      'uTip',
+      'uRoundness',
+      'uTips',
+      'uGrain',
+      'uGrains',
+      'uGrainStrength',
+      'uGrainOrigin',
+      'uGrainPx',
+      'uDabs0',
+      'uDabs1',
+      'uDabs2',
+      'uDabs3',
+    ]),
     dab: link(gl, DAB_VS, DAB_FS, [
       'uTarget',
       'uTip',

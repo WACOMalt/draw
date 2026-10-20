@@ -15,7 +15,8 @@ import { dabPool } from '../dabPool';
 import { profiler } from '../../perf/profiler';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
 import { GRAIN_SIZE, TIP_SIZE, grainIndex, grainMap, tipIndex, tipMask } from '../tips';
-import { createPrograms, RUN_SLOTS, type Program, type Programs } from './programs';
+import { createPrograms, DAB_PAGES, RUN_SLOTS, type Program, type Programs } from './programs';
+import { DabStore, GPU_CHUNK_PX } from './dabStore';
 import { perfProfile, type PerfProfile } from '../perf';
 import { ShapeIndex, shapeRec, shapeTouches, type ShapeRec } from '../shapeIndex';
 import { drawShapes } from '../shapeRaster';
@@ -104,8 +105,13 @@ const INST = 17;
 const LEVEL_FRAMES = 4;
 /** Most frame buffers kept for reuse (see putSpare). */
 const SPARE = 24;
-/** Most dabs in one batched draw call. */
+/** Most dabs in one batched draw call (chunk records: most chunks). */
 const MAX_BATCH = 65536;
+/**
+ * Values per chunk record of the GPU dab store (DAB_GPU_VS): center x, y in target px, scale (a
+ * dot: radius px), dabs (a dot: -1); r, g, b, hardness; then 3 ints: page, first texel, turned.
+ */
+const CREC = 11;
 
 /**
  * A 3D transform not applied yet (setStrokePreview): the strokes of these keys (layers and layer
@@ -287,6 +293,14 @@ export class GLRenderer implements Renderer {
   private dabVbo!: WebGLBuffer;
   private dabCap = 0;
   private inst = new Float32Array(INST * 4096);
+  /** Strokes' dabs in GPU memory (dabStore.ts); null: every dab is staged on the CPU. */
+  private store: DabStore | null = null;
+  private chunkVao!: WebGLVertexArrayObject;
+  private chunkVbo!: WebGLBuffer;
+  private chunkCap = 0;
+  private crec = new ArrayBuffer(CREC * 4 * 1024);
+  private crecF = new Float32Array(this.crec);
+  private crecI = new Int32Array(this.crec);
   private fmt!: { internal: number; format: number; type: number };
 
   private compA!: Target;
@@ -502,6 +516,30 @@ export class GLRenderer implements Renderer {
     gl.vertexAttribPointer(6, 3, gl.FLOAT, false, stride, 56);
     gl.vertexAttribDivisor(6, 1);
     gl.bindVertexArray(null);
+
+    // Chunk records of the GPU dab store: each one for 64 instances.
+    this.chunkVbo = gl.createBuffer()!;
+    this.chunkCap = 0;
+    this.chunkVao = gl.createVertexArray()!;
+    gl.bindVertexArray(this.chunkVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVbo);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.chunkVbo);
+    const cs = CREC * 4;
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, cs, 0);
+    gl.vertexAttribDivisor(1, DAB_CHUNK);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, cs, 16);
+    gl.vertexAttribDivisor(2, DAB_CHUNK);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribIPointer(3, 3, gl.INT, cs, 32);
+    gl.vertexAttribDivisor(3, DAB_CHUNK);
+    gl.bindVertexArray(null);
+    // The old store's textures went with a lost context.
+    const pages = Math.min(DAB_PAGES, this.profile.dabPages);
+    this.store = pages > 0 && new URLSearchParams(location.search).get('gpudabs') !== '0' ? new DabStore(gl, pages) : null;
 
     // Tips and grains upload on first use (tips.ts generates them on the CPU).
     this.tipTex = this.makeArray(TIP_SIZE, BRUSH_TIPS.length, false);
@@ -1336,33 +1374,7 @@ export class GLRenderer implements Renderer {
     const gl = this.gl;
     const p = this.progs.dab;
     gl.useProgram(p.prog);
-    gl.uniform2f(p.u.uTarget, w, h);
-    const shape = brushShape(brush);
-    const tip = shape.tip === 'round' ? -1 : tipIndex(shape.tip);
-    if (tip >= 0 && !this.tipsReady.has(tip)) {
-      this.uploadLayer(this.tipTex, TIP_SIZE, tip, tipMask(shape.tip));
-      this.tipsReady.add(tip);
-    }
-    gl.uniform1i(p.u.uTip, tip);
-    gl.uniform1f(p.u.uRoundness, shape.roundness);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.tipTex);
-    gl.uniform1i(p.u.uTips, 1);
-    const gi = grain && brush.grain ? grainIndex(brush.grain) : -1;
-    if (gi >= 0 && !this.grainsReady.has(gi)) {
-      this.uploadLayer(this.grainTex, GRAIN_SIZE, gi, grainMap(brush.grain!));
-      this.grainsReady.add(gi);
-    }
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.grainTex);
-    gl.uniform1i(p.u.uGrains, 2);
-    gl.uniform1i(p.u.uGrain, gi);
-    if (gi >= 0) {
-      gl.uniform1f(p.u.uGrainStrength, brush.grainStrength ?? 0.5);
-      gl.uniform2f(p.u.uGrainOrigin, grain![0], grain![1]);
-      gl.uniform1f(p.u.uGrainPx, grain![2]);
-    }
-    gl.activeTexture(gl.TEXTURE0);
+    this.brushUniforms(p, brush, w, h, grain);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dabVbo);
     const bytes = n * INST * 4;
     if (bytes > this.dabCap) {
@@ -1377,6 +1389,39 @@ export class GLRenderer implements Renderer {
     gl.bindVertexArray(this.dabVao);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
     gl.bindVertexArray(null);
+  }
+
+  /** The brush's uniforms of a dab program (tip, roundness, grain) for a w × h target. */
+  private brushUniforms(p: Program, brush: Brush, w: number, h: number, grain: [number, number, number] | null): void {
+    const gl = this.gl;
+    gl.uniform2f(p.u.uTarget, w, h);
+    const shape = brushShape(brush);
+    const tip = shape.tip === 'round' ? -1 : tipIndex(shape.tip);
+    if (tip >= 0 && !this.tipsReady.has(tip)) {
+      this.uploadLayer(this.tipTex, TIP_SIZE, tip, tipMask(shape.tip));
+      this.tipsReady.add(tip);
+    }
+    // Both uploads before the bindings: an upload binds its texture to the active unit.
+    const gi = grain && brush.grain ? grainIndex(brush.grain) : -1;
+    if (gi >= 0 && !this.grainsReady.has(gi)) {
+      this.uploadLayer(this.grainTex, GRAIN_SIZE, gi, grainMap(brush.grain!));
+      this.grainsReady.add(gi);
+    }
+    gl.uniform1i(p.u.uTip, tip);
+    gl.uniform1f(p.u.uRoundness, shape.roundness);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.tipTex);
+    gl.uniform1i(p.u.uTips, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.grainTex);
+    gl.uniform1i(p.u.uGrains, 2);
+    gl.uniform1i(p.u.uGrain, gi);
+    if (gi >= 0) {
+      gl.uniform1f(p.u.uGrainStrength, brush.grainStrength ?? 0.5);
+      gl.uniform2f(p.u.uGrainOrigin, grain![0], grain![1]);
+      gl.uniform1f(p.u.uGrainPx, grain![2]);
+    }
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   private bindTarget(t: Target | null): void {
@@ -1475,9 +1520,11 @@ export class GLRenderer implements Renderer {
    * color and hardness. A stroke that covers about one pixel here becomes one dot instead of
    * every dab (that dot has no tip, rotation or grain: it stands for a whole tiny stroke).
    * Returns the instances added, a fill estimate (the quad of each dab cut to the target, at least
-   * 16 px), and the brush that draws them.
+   * 16 px), and the brush that draws them. `gpu` (dabGpu): chunk records of the GPU dab store
+   * from record `at` on instead, and n counts records.
    */
-  private stageStroke(rec: StrokeRec, at: number, wx0: number, wy0: number, scale: number, w: number, h: number): { n: number; fill: number; brush: Brush; dot: boolean } {
+  private stageStroke(rec: StrokeRec, at: number, wx0: number, wy0: number, scale: number, w: number, h: number, gpu = false): { n: number; fill: number; brush: Brush; dot: boolean } {
+    if (gpu) return this.stageChunks(rec, at, wx0, wy0, scale, w, h);
     const b = rec.stroke.brush;
     const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2;
     let n = 0;
@@ -1517,6 +1564,138 @@ export class GLRenderer implements Renderer {
       profiler.cur.dabs += n;
     }
     return { n, fill, brush, dot };
+  }
+
+  /**
+   * The stroke's dabs come from the GPU dab store here: a store, room for the stroke (it goes up
+   * now if it was not), and chunks small enough at this scale (GPU_CHUNK_PX). A stroke that is
+   * one dot here needs no room. Else its dabs are staged on the CPU (stageStroke).
+   */
+  private dabGpu(rec: StrokeRec, scale: number): boolean {
+    if (!this.store || rec.stroke.vector) return false;
+    if ((rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2) return true;
+    const e = this.store.get(strokeDabs(rec), this.turned(rec.stroke.brush));
+    return !!e && e.extent * scale <= GPU_CHUNK_PX;
+  }
+
+  /** The brush turns its tip: the dabs need their rotation (round tips that are circles do not). */
+  private turned(b: Brush): boolean {
+    const s = brushShape(b);
+    return s.tip !== 'round' || s.roundness !== 1;
+  }
+
+  /** Room for n chunk records. */
+  private reserveChunks(n: number): void {
+    if (this.crecF.length >= n * CREC) return;
+    let cap = this.crecF.length;
+    while (cap < n * CREC) cap *= 2;
+    const next = new ArrayBuffer(cap * 4);
+    new Uint8Array(next).set(new Uint8Array(this.crec));
+    this.crec = next;
+    this.crecF = new Float32Array(next);
+    this.crecI = new Int32Array(next);
+  }
+
+  /** stageStroke for a stroke whose dabs are in the GPU dab store (dabGpu): its chunk records. */
+  private stageChunks(rec: StrokeRec, at: number, wx0: number, wy0: number, scale: number, w: number, h: number): { n: number; fill: number; brush: Brush; dot: boolean } {
+    const b = rec.stroke.brush;
+    const dot = (rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2;
+    const [cr, cg, cb] = hexToRgb(b.color);
+    const put = (o: number) => {
+      const F = this.crecF;
+      F[o + 4] = cr;
+      F[o + 5] = cg;
+      F[o + 6] = cb;
+      F[o + 7] = b.hardness;
+    };
+    if (dot) {
+      // One dab for the whole stroke, as stageStroke's dot.
+      const r = (Math.max(rec.x1 - rec.x0, rec.y1 - rec.y0) / 2) * scale;
+      const cx = ((rec.x0 + rec.x1) / 2 - wx0) * scale, cy = ((rec.y0 + rec.y1) / 2 - wy0) * scale;
+      const brush = { ...b, tip: undefined, roundness: undefined };
+      if (cx + r + 1 < 0 || cx - r - 1 > w || cy + r + 1 < 0 || cy - r - 1 > h) return { n: 0, fill: 0, brush, dot };
+      this.reserveChunks(at + 1);
+      const F = this.crecF, I = this.crecI;
+      const o = at * CREC;
+      F[o] = cx;
+      F[o + 1] = cy;
+      F[o + 2] = r;
+      F[o + 3] = -1;
+      put(o);
+      I[o + 8] = 0;
+      I[o + 9] = 0;
+      I[o + 10] = 0;
+      if (profiler.on) profiler.cur.dabs++;
+      return { n: 1, fill: 16, brush, dot };
+    }
+    const list = strokeDabs(rec);
+    const e = this.store!.get(list, this.turned(b))!;
+    const { chunks, count } = list;
+    const wx1 = wx0 + w / scale, wy1 = wy0 + h / scale;
+    const nc = e.r2.length;
+    this.reserveChunks(at + nc);
+    // (After reserveChunks: it can make new arrays.)
+    const F = this.crecF, I = this.crecI;
+    let n = 0, fill = 0, dabs = 0;
+    for (let c = 0; c < nc; c++) {
+      const co = c * 4;
+      const x0 = chunks[co], y0 = chunks[co + 1], x1 = chunks[co + 2], y1 = chunks[co + 3];
+      if (x1 <= wx0 || x0 >= wx1 || y1 <= wy0 || y0 >= wy1) continue;
+      const k = Math.min(DAB_CHUNK, count - c * DAB_CHUNK);
+      const o = (at + n) * CREC;
+      F[o] = ((x0 + x1) / 2 - wx0) * scale;
+      F[o + 1] = ((y0 + y1) / 2 - wy0) * scale;
+      F[o + 2] = scale;
+      F[o + 3] = k;
+      put(o);
+      I[o + 8] = e.page;
+      I[o + 9] = DabStore.chunkTexel(e, c);
+      I[o + 10] = e.turned ? 1 : 0;
+      n++;
+      dabs += k;
+      // The fill: the dabs' quads, at most the chunk's box on the target for each.
+      const cw = Math.min(w, (x1 - wx0) * scale) - Math.max(0, (x0 - wx0) * scale), ch = Math.min(h, (y1 - wy0) * scale) - Math.max(0, (y0 - wy0) * scale);
+      fill += Math.max(16 * k, Math.min(4 * scale * scale * e.r2[c], k * cw * ch));
+    }
+    if (profiler.on) profiler.cur.dabs += dabs;
+    return { n, fill, brush: b, dot };
+  }
+
+  /** Draws n chunk records (stageChunks) into the bound target, as drawDabs draws instances. */
+  private drawChunks(n: number, brush: Brush, w: number, h: number, grain: [number, number, number] | null): void {
+    if (n === 0) return;
+    const gl = this.gl;
+    const p = this.progs.dabGpu;
+    gl.useProgram(p.prog);
+    this.brushUniforms(p, brush, w, h, grain);
+    const store = this.store!;
+    for (let i = 0; i < DAB_PAGES; i++) {
+      gl.activeTexture(gl.TEXTURE3 + i);
+      gl.bindTexture(gl.TEXTURE_2D, store.pages[i] ?? store.pages[0]);
+      gl.uniform1i(p.u[`uDabs${i}`], 3 + i);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.chunkVbo);
+    const bytes = n * CREC * 4;
+    if (bytes > this.chunkCap) {
+      this.chunkCap = Math.max(bytes, this.chunkCap * 2, 65536);
+      gl.bufferData(gl.ARRAY_BUFFER, this.chunkCap, gl.DYNAMIC_DRAW);
+    }
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.crecF, 0, n * CREC);
+    if (profiler.on) {
+      profiler.cur.draws++;
+      profiler.cur.uploadKB += bytes / 1024 + store.uploadedBytes / 1024;
+    }
+    store.uploadedBytes = 0;
+    gl.bindVertexArray(this.chunkVao);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n * DAB_CHUNK);
+    gl.bindVertexArray(null);
+  }
+
+  /** Draws what stageStroke staged: chunk records (`gpu`) or instances. */
+  private drawStaged(gpu: boolean, n: number, brush: Brush, w: number, h: number, grain: [number, number, number] | null): void {
+    if (gpu) this.drawChunks(n, brush, w, h, grain);
+    else this.drawDabs(n, brush, w, h, grain, true);
   }
 
   /**
@@ -1602,6 +1781,15 @@ export class GLRenderer implements Renderer {
     let work = 0;
     let i = from;
     const w = target.w, h = target.h;
+    // After a stroke that cannot use the GPU dab store (no room), the rest stage on the CPU: a
+    // switch between the two ends a batch, and strokes that took turns made a call each.
+    let cpu = false;
+    const gpuFor = (rec: StrokeRec) => {
+      if (cpu) return false;
+      const g = this.dabGpu(rec, scale);
+      if (!g && !rec.stroke.vector) cpu = true;
+      return g;
+    };
     do {
       // A walk still in a worker's hands: the tile goes on from here when it is back.
       if (!this.dabsReady(list[i], scale)) return { work: Math.max(work, 1), next: i };
@@ -1619,8 +1807,10 @@ export class GLRenderer implements Renderer {
       }
       let n = 0;
       let brush: Brush | null = null;
-      while (i < list.length && (n === 0 || (work < budget && n < MAX_BATCH)) && this.batchKey(list[i], scale) === key && this.dabsReady(list[i], scale)) {
-        const s = this.stageStroke(list[i++], n, wx0, wy0, scale, w, h);
+      // A batch is all chunk records (GPU dab store) or all instances.
+      const gpu = gpuFor(list[i]);
+      while (i < list.length && (n === 0 || (work < budget && n < MAX_BATCH)) && this.batchKey(list[i], scale) === key && this.dabsReady(list[i], scale) && gpuFor(list[i]) === gpu) {
+        const s = this.stageStroke(list[i++], n, wx0, wy0, scale, w, h, gpu);
         if (!s.n) continue;
         n += s.n;
         work += s.fill;
@@ -1630,7 +1820,7 @@ export class GLRenderer implements Renderer {
       work += 2000; // the draw call
       this.bindTarget(target);
       this.blendFor(key[0] === 'e');
-      this.drawDabs(n, brush!, w, h, null, true);
+      this.drawStaged(gpu, n, brush!, w, h, null);
     } while (i < list.length && work < budget);
     return { work, next: i };
   }
@@ -1640,7 +1830,8 @@ export class GLRenderer implements Renderer {
     if (rec.stroke.vector) return this.drawVectorStroke(target, rec, wx0, wy0, scale);
     const b = rec.stroke.brush;
     const w = target.w, h = target.h;
-    const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
+    const gpu = this.dabGpu(rec, scale);
+    const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h, gpu);
     if (n === 0) return 0;
     let work = 2000 + fill; // the draw call and the dabs
     const erase = b.tool === 'erase';
@@ -1650,7 +1841,7 @@ export class GLRenderer implements Renderer {
       // straight onto the tile with the same result as a separate stroke buffer.
       this.bindTarget(target);
       this.blendFor(erase);
-      this.drawDabs(n, brush, w, h, grain, true);
+      this.drawStaged(gpu, n, brush, w, h, grain);
     } else {
       // Only the box of the stroke on the tile: zoomed out, one tile holds hundreds of strokes.
       const x0 = Math.max(0, Math.floor((rec.x0 - wx0) * scale) - 1), y0 = Math.max(0, Math.floor((rec.y0 - wy0) * scale) - 1);
@@ -1664,7 +1855,7 @@ export class GLRenderer implements Renderer {
       this.clear();
       gl.disable(gl.SCISSOR_TEST);
       this.blendFor(false);
-      this.drawDabs(n, brush, w, h, grain, true);
+      this.drawStaged(gpu, n, brush, w, h, grain);
       const sw = this.strokeT.w, sh = this.strokeT.h;
       const uv: [number, number, number, number] = [x0 / sw, y0 / sh, x1 / sw, y1 / sh];
       if (this.pigmentFor(b)) {
@@ -1733,7 +1924,8 @@ export class GLRenderer implements Renderer {
     while (i < list.length && items.length < RUN_SLOTS && (i === from || work < budget) && this.runKind(target, list[i], scale) === kind && this.dabsReady(list[i], scale)) {
       const rec = list[i++];
       const b = rec.stroke.brush;
-      const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h);
+      const gpu = this.dabGpu(rec, scale);
+      const { n, fill, brush, dot } = this.stageStroke(rec, 0, wx0, wy0, scale, w, h, gpu);
       if (n === 0) continue;
       work += 2000 + fill;
       const x0 = Math.max(0, Math.floor((rec.x0 - wx0) * scale) - 1), y0 = Math.max(0, Math.floor((rec.y0 - wy0) * scale) - 1);
@@ -1741,14 +1933,19 @@ export class GLRenderer implements Renderer {
       if (x1 <= x0 || y1 <= y0) continue;
       const k = items.length;
       const slot: [number, number] = [(k % 4) * TILE, Math.floor(k / 4) * TILE];
+      // Grain is placed by gl_FragCoord: in the atlas, the slot moves it.
       const grain = dot ? null : this.grainFor(b, rec.stroke.pts[0], rec.stroke.pts[1], wx0, wy0, scale);
+      if (grain) {
+        grain[0] += slot[0];
+        grain[1] += slot[1];
+      }
       gl.viewport(slot[0], slot[1], w, h);
       gl.enable(gl.SCISSOR_TEST);
       gl.scissor(slot[0] + x0, slot[1] + y0, x1 - x0, y1 - y0);
       this.clear();
       gl.disable(gl.SCISSOR_TEST);
       this.blendFor(false);
-      this.drawDabs(n, brush, w, h, grain, true);
+      this.drawStaged(gpu, n, brush, w, h, grain);
       items.push({ slot, box: [x0, y0, x1, y1], opacity: b.opacity, erase: b.tool === 'erase' });
       const area = (x1 - x0) * (y1 - y0);
       work += (kind === 'pigment' ? 120 : 3) * area;
@@ -1844,6 +2041,7 @@ export class GLRenderer implements Renderer {
     }
     for (const rec of this.index.recs.values()) rec.dabs = null;
     forgetDabs();
+    this.store?.clear();
     this.pool?.request(this.index.recs.values());
     this.invalidate();
   }
@@ -1864,6 +2062,7 @@ export class GLRenderer implements Renderer {
       gpuTimer: !!this.profExt,
       maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE),
       workers: !!this.pool,
+      dabStore: this.store ? { pages: this.store.pages.length, maxPages: this.store.maxPages, mb: this.store.bytes / 2 ** 20 } : null,
     };
   }
 
