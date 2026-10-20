@@ -10,7 +10,7 @@ import { byZ } from '../../../shared/shapes';
 import { compose, effectivelyVisible, invert, layerTree, subtreeIds, transformStroke3, type LayerNode } from '../../../shared/layers';
 import { LUT_SIZE, toneLut } from '../adjust';
 import type { Renderer, ViewState } from '../renderer';
-import { StrokeIndex, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
+import { StrokeIndex, cachedDabs, forgetDabs, intersects, maskKey, strokeDabs, strokeKey, type StrokeRec } from '../strokeIndex';
 import { dabPool } from '../dabPool';
 import { profiler } from '../../perf/profiler';
 import { MAX_LOD, TILE, lodFor, tileKey, tileWorld } from '../tiles';
@@ -1474,8 +1474,8 @@ export class GLRenderer implements Renderer {
    * Puts the dabs of a stroke that touch a w × h target at instances from `at` on, with their
    * color and hardness. A stroke that covers about one pixel here becomes one dot instead of
    * every dab (that dot has no tip, rotation or grain: it stands for a whole tiny stroke).
-   * Returns the instances added, a fill estimate (the quad of each dab, true radius capped at the
-   * tile, at least 16 px), and the brush that draws them.
+   * Returns the instances added, a fill estimate (the quad of each dab cut to the target, at least
+   * 16 px), and the brush that draws them.
    */
   private stageStroke(rec: StrokeRec, at: number, wx0: number, wy0: number, scale: number, w: number, h: number): { n: number; fill: number; brush: Brush; dot: boolean } {
     const b = rec.stroke.brush;
@@ -1687,7 +1687,7 @@ export class GLRenderer implements Renderer {
    * what is left (strokeDabs), after renderAsync waited for the workers.
    */
   private dabsReady(rec: StrokeRec, scale: number): boolean {
-    if (rec.dabs || rec.stroke.vector || this.offline || !this.pool) return true;
+    if (rec.stroke.vector || cachedDabs(rec) || this.offline || !this.pool) return true;
     if ((rec.x1 - rec.x0) * scale < 2 && (rec.y1 - rec.y0) * scale < 2) return true;
     this.pool.request([rec], true);
     const ready = !this.pool.pending(rec);
@@ -1843,6 +1843,7 @@ export class GLRenderer implements Renderer {
       this.tiles.delete(key);
     }
     for (const rec of this.index.recs.values()) rec.dabs = null;
+    forgetDabs();
     this.pool?.request(this.index.recs.values());
     this.invalidate();
   }

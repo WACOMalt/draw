@@ -5,7 +5,7 @@
 // asks for the ones it needs first, and the main thread waits only for those.
 
 import { strokeSeed } from '../../shared/brush';
-import { seedId, type StrokeRec } from './strokeIndex';
+import { cachedDabs, keepDabs, seedId, type StrokeRec } from './strokeIndex';
 import DabWorker from './dabs.worker?worker';
 import type { DabJob, DabResult } from './dabs.worker';
 
@@ -56,7 +56,7 @@ class DabPool {
   /** Asks for the dab lists of these records (in the background, or `urgent`: before the rest). */
   request(recs: Iterable<StrokeRec>, urgent = false): void {
     for (const rec of recs) {
-      if (rec.dabs || rec.stroke.vector) continue;
+      if (rec.stroke.vector || cachedDabs(rec)) continue;
       const id = this.ids.get(rec);
       if (id !== undefined && this.open.has(id)) {
         if (urgent) this.promote(id);
@@ -119,7 +119,7 @@ class DabPool {
       const e = this.open.get(r.id);
       if (!e) continue;
       this.open.delete(r.id);
-      if (!e.rec.dabs) e.rec.dabs = r.list;
+      if (!e.rec.dabs) keepDabs(e.rec, r.list);
     }
     this.settle();
     for (const f of this.listeners) f();
