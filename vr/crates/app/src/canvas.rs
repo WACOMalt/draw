@@ -1028,9 +1028,11 @@ impl Canvas {
                 step.redo.push(json!({ "type": "layer.update", "id": id, "props": props }));
             }
         }
+        // A group removed goes with every layer in it (as the 2D app's deleteLayer), inner
+        // layers first: none stays alive inside a deleted group.
         let mut removes = Vec::new();
         for b in &self.synced {
-            if now.contains_key(&b.id) || b.parent.is_some_and(|par| !now.contains_key(&par)) {
+            if now.contains_key(&b.id) {
                 continue;
             }
             let Some(id) = self.doc_id(b.id) else { continue };

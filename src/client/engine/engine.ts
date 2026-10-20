@@ -1611,8 +1611,13 @@ export class Engine {
       ed.activeLayerId = (below ?? layers.find((l) => !gone.has(l.id)))!.id;
     }
     if (ed.transform && gone.has(ed.transform.id)) this.cancelTransform();
-    this.sendOp({ type: 'layer.remove', id });
-    this.pushUndo({ undo: [{ type: 'layer.restore', id }], redo: [{ type: 'layer.remove', id }] });
+    // A group goes with every live layer in it (each deleted in the document, not only hidden
+    // in a deleted group): files and other clients no longer carry layers nobody can see. Inner
+    // layers first, the group last; undo brings back these, not layers deleted before.
+    const ids = layers.filter((l) => gone.has(l.id)).map((l) => l.id);
+    const redo: Op[] = ids.map((x) => ({ type: 'layer.remove', id: x }));
+    for (const op of redo) this.sendOp(op);
+    this.pushUndo({ undo: [...ids].reverse().map((x) => ({ type: 'layer.restore', id: x })), redo });
   }
 
   /** Sets layer properties. Calls with the same `key` within 2 s merge into one undo step. */
