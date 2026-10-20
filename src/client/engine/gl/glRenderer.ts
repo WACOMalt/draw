@@ -230,7 +230,8 @@ const TILE_BUDGET_STILL_MS = 12;
  * used to cut the only budget to the minimum, and a phone took minutes to draw a canvas.
  */
 const FILL_MIN = 2e5;
-const FILL_MAX = 6e7;
+/** The most fill a frame may take: a desktop GPU fills about this in a few ms. */
+const FILL_MAX = 1e9;
 const MOVING_TARGET_MS = 20;
 const STILL_TARGET_MS = 40;
 /** The view counts as moving this long after a change. */
@@ -247,6 +248,14 @@ const MAX_APPEND = 64;
  */
 const EXACT_TAG = 1000;
 const EXACT_DELAY = 250;
+/**
+ * A composite that takes longer than this (ms, the frame after it: GPU work included) is heavy:
+ * while tiles are still coming, the view composites at most every HEAVY_GAP ms (or 3× its cost),
+ * and the frames between go to tiles. A canvas of kaleidoscopes with effects took 700 ms a
+ * composite, and recomposited every frame while its tiles came in: 25 frames in 19 s.
+ */
+const HEAVY_COMPOSITE_MS = 80;
+const HEAVY_GAP = 500;
 /** The most of a frame's fill a tile still rendering from earlier frames gets (tileShare). */
 const HEAVY_SHARE = 0.5;
 /**
@@ -285,6 +294,11 @@ export class GLRenderer implements Renderer {
   /** The exact level (EXACT_TAG): its real lod and the world point its grid starts at. */
   private exact: { lod: number; ox: number; oy: number } | null = null;
   private exactTimer = 0;
+  /** The last composite: when, what it cost (the next frame's interval), and the view it showed. */
+  private compositeAt = 0;
+  private compositeCost = 0;
+  private composedLast = false;
+  private composedView = -1;
   /** The last frame showed the view's exact tiles (all drawn). */
   exactShown = false;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
@@ -1490,9 +1504,13 @@ export class GLRenderer implements Renderer {
     if (n === 0) return { n, fill: 0, brush, dot };
     let fill = 0;
     const f = this.inst;
+    // What the GPU fills: each dab's quad cut to the target (the viewport cuts the rest). Whole
+    // quads (up to 257 px square each) counted dense large brushes many times over, and the
+    // budget let about one such tile render a frame while the GPU idled.
     for (let i = at; i < at + n; i++) {
-      const r = Math.min(f[i * INST + 4], TILE) + 1;
-      fill += Math.max(16, 4 * r * r);
+      const o = i * INST, e = f[o + 2] + 1;
+      const cw = Math.min(w, f[o] + e) - Math.max(0, f[o] - e), ch = Math.min(h, f[o + 1] + e) - Math.max(0, f[o + 1] - e);
+      fill += Math.max(16, cw * ch);
     }
     this.paintDabs(at, at + n, brush);
     if (profiler.on) {
@@ -2114,6 +2132,9 @@ export class GLRenderer implements Renderer {
     //    longer ones cut it. While the view moves, tiles get a smaller share.
     const start = performance.now();
     const interval = start - this.lastFrameAt;
+    // What the last composite cost: this frame came that much later (its GPU work included).
+    if (this.composedLast && !this.outOfBand) this.compositeCost = interval;
+    this.composedLast = false;
     if (!this.outOfBand) {
       this.lastFrameAt = start;
       this.watchSpeed(interval, start);
@@ -2128,7 +2149,9 @@ export class GLRenderer implements Renderer {
     const tileTime = interval - this.compositeMs;
     if (this.tileWorkLastFrame && tileTime < 150 && !this.outOfBand) {
       const b = moving ? this.fillMoving : this.fillBudget;
-      const next = tileTime > target * 1.15 ? Math.max(FILL_MIN, b * 0.75) : tileTime < target * 0.85 ? Math.min(FILL_MAX, b * 1.1) : b;
+      // Far under the target: grow fast (a fast GPU reached its share only after many frames).
+      const grow = tileTime < target * 0.6 ? 1.25 : 1.1;
+      const next = tileTime > target * 1.15 ? Math.max(FILL_MIN, b * 0.75) : tileTime < target * 0.85 ? Math.min(FILL_MAX, b * grow) : b;
       if (moving) this.fillMoving = next;
       else this.fillBudget = next;
     }
@@ -2156,6 +2179,13 @@ export class GLRenderer implements Renderer {
     for (const r of this.effectRanges()) ranges.push(r);
     let total = ranges.reduce((n, r) => n + area(r), 0);
     // Then the view's exact tiles (on screen; offline they are the view's own), within memory.
+    // When they and the view's prefetch ring do not both fit (many layers), the still view keeps
+    // its exact tiles: the ring only speeds up the next pan.
+    if (exactRange && !this.offline && total + area(exactRange) > this.hardMaxTiles && ring > 0) {
+      total -= area(ranges[0]);
+      ranges[0] = { lod, tx0, ty0, tx1, ty1 };
+      total += area(ranges[0]);
+    }
     if (exactRange && !this.offline && total + area(exactRange) <= this.hardMaxTiles) {
       ranges.push(exactRange);
       total += area(exactRange);
@@ -2255,6 +2285,26 @@ export class GLRenderer implements Renderer {
     const c0 = performance.now();
     this.lastPendingWork = pending;
     this.lastViewPending = viewPending;
+    // A heavy composite while tiles are still coming: keep the picture on screen (tiles draw into
+    // their own buffers, the canvas keeps its last frame) and give this frame to tiles. Not when
+    // the view moved since that picture, or a stroke or preview is being drawn.
+    if (
+      !this.offline &&
+      pending &&
+      this.compositeCost > HEAVY_COMPOSITE_MS &&
+      this.composedView === this.viewVersion &&
+      this.live.size === 0 &&
+      !this.strokePreview &&
+      this.previews.size === 0 &&
+      start - this.compositeAt < Math.max(HEAVY_GAP, 3 * this.compositeCost)
+    ) {
+      if (profiler.on) {
+        this.profFrame({ interval, tilesCpu, compCpu: 0, budget: fill, fill: spent, moving, pending, viewPending });
+        profiler.phase = 'idle';
+      }
+      this.invalidate();
+      return;
+    }
     // A committed stroke's buffer can go once the tiles show it.
     if (!pending) {
       for (const l of [...this.live.values()]) if (l.commitSeq !== null && l.commitSeq <= this.appliedSeq) this.liveCancel(l.id);
@@ -2311,6 +2361,9 @@ export class GLRenderer implements Renderer {
 
     gl.flush();
     this.compositeMs = performance.now() - c0;
+    this.compositeAt = start;
+    this.composedLast = true;
+    this.composedView = this.viewVersion;
     if (profiler.on) {
       // No GPU timer here: every 30th frame, how long the CPU waits for the GPU to finish.
       let sync: number | undefined;
@@ -2327,6 +2380,9 @@ export class GLRenderer implements Renderer {
     if (this.wanted.size) pending = true;
     this.evictTiles(ranges, ranges.reduce((n, r) => n + area(r), 0));
     this.lastPending = pending;
+    // The view just completed and its exact tiles have not begun (they begin at the start of a
+    // frame): one more frame begins them.
+    if (!pending && !this.offline && !ex && !viewPending && !drawingHere && performance.now() - this.lastViewChange >= EXACT_DELAY && this.exactFor(ds, vx, vy)) pending = true;
     if (pending) this.invalidate();
     else if (this.tail > 0 && !this.raf) this.raf = requestAnimationFrame(() => this.render());
   }
