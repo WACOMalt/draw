@@ -236,6 +236,15 @@ const MOVING_MS = 150;
 /** Radius in px above which the shader gets the edge of a dab relative to the target (putDab). */
 const HUGE_PX = 1e6;
 const MAX_APPEND = 64;
+/**
+ * Exact tiles: a level at the screen's (or an export's) own scale, whose grid lies on its pixels,
+ * so tiles composite 1:1 with no resampling (the power-of-two levels are drawn up to 1.15× larger
+ * or 1.74× smaller, a little soft or aliased). Its lod key is the real lod + EXACT_TAG, so it
+ * never meets a power-of-two level. On screen it renders once the view has been still for
+ * EXACT_DELAY ms and its power-of-two tiles are done, and shows once all of it is drawn.
+ */
+const EXACT_TAG = 1000;
+const EXACT_DELAY = 250;
 /** The most of a frame's fill a tile still rendering from earlier frames gets (tileShare). */
 const HEAVY_SHARE = 0.5;
 /**
@@ -271,6 +280,11 @@ export class GLRenderer implements Renderer {
 
   private compA!: Target;
   private compB!: Target;
+  /** The exact level (EXACT_TAG): its real lod and the world point its grid starts at. */
+  private exact: { lod: number; ox: number; oy: number } | null = null;
+  private exactTimer = 0;
+  /** The last frame showed the view's exact tiles (all drawn). */
+  exactShown = false;
   private strokeT!: Target; // tile-sized buffer for strokes with opacity < 1
   /** RUN_SLOTS tile-sized slots, 4 a row: a run of strokes that build up apart (drawRun). */
   private runAtlas!: Target;
@@ -657,6 +671,11 @@ export class GLRenderer implements Renderer {
     this.viewVersion++;
     this.lastViewChange = performance.now();
     this.invalidate();
+    // A frame once the view has been still long enough for its exact tiles (render).
+    if (!this.offline) {
+      window.clearTimeout(this.exactTimer);
+      this.exactTimer = window.setTimeout(() => this.invalidate(), EXACT_DELAY + 20);
+    }
   }
 
   toWorld(cssX: number, cssY: number): [number, number] {
@@ -1373,8 +1392,41 @@ export class GLRenderer implements Renderer {
   // --- tiles -------------------------------------------------------------------------------------
 
   private tileBounds(t: { lod: number; tx: number; ty: number }): [number, number, number, number] {
-    const tw = tileWorld(t.lod);
-    return [t.tx * tw, t.ty * tw, (t.tx + 1) * tw, (t.ty + 1) * tw];
+    const [lod, ox, oy] = this.level(t.lod);
+    const tw = tileWorld(lod);
+    return [ox + t.tx * tw, oy + t.ty * tw, ox + (t.tx + 1) * tw, oy + (t.ty + 1) * tw];
+  }
+
+  /** A tile level's real lod and the world point its grid starts at (the exact level's own). */
+  private level(lod: number): [number, number, number] {
+    if (lod >= EXACT_TAG / 2 && this.exact) return [lod - EXACT_TAG, this.exact.ox, this.exact.oy];
+    return [lod, 0, 0];
+  }
+
+  /**
+   * The exact level for `ds` device px per world unit at the view (vx, vy): its grid on the view's
+   * pixels. The current one when the view moved by whole pixels at the same scale (its tiles are
+   * good still). Null when the power-of-two tiles are exact already.
+   */
+  private exactFor(ds: number, vx: number, vy: number): { lod: number; ox: number; oy: number } | null {
+    const lod = -Math.log2(ds);
+    const whole = (v: number) => Math.abs(v - Math.round(v)) < 1e-3;
+    const cur = this.exact;
+    if (cur && Math.abs(cur.lod - lod) < 1e-12 && whole((vx - cur.ox) * ds) && whole((vy - cur.oy) * ds)) return cur;
+    if (whole(lod) && whole(vx * ds) && whole(vy * ds)) return null;
+    return { lod, ox: vx - Math.floor(vx * ds) / ds, oy: vy - Math.floor(vy * ds) / ds };
+  }
+
+  /** Makes `e` the exact level: the tiles of another one go (their grid is somewhere else). */
+  private setExact(e: { lod: number; ox: number; oy: number }): void {
+    if (e === this.exact) return;
+    for (const [key, t] of [...this.tiles]) {
+      if (t.lod < EXACT_TAG / 2) continue;
+      if (t.job) this.dropJob(t);
+      if (t.target) this.tilePool.push(t.target);
+      this.tiles.delete(key);
+    }
+    this.exact = e;
   }
 
   private allocTile(): Target {
@@ -1712,6 +1764,17 @@ export class GLRenderer implements Renderer {
     t.job = null;
   }
 
+  /** Every tile of a range is drawn and current, for each of `keys`. */
+  private rangeReady(r: TileRange, keys: string[]): boolean {
+    for (const layer of keys)
+      for (let ty = r.ty0; ty <= r.ty1; ty++)
+        for (let tx = r.tx0; tx <= r.tx1; tx++) {
+          const t = this.tiles.get(tileKey(layer, r.lod, tx, ty));
+          if (!t?.rendered || this.needsWork(t)) return false;
+        }
+    return true;
+  }
+
   /**
    * The fill a tile may spend this frame: what is left of the frame's, but a tile that is still
    * rendering from earlier frames (a heavy one) gets at most half of the frame's, so the tiles
@@ -1865,12 +1928,30 @@ export class GLRenderer implements Renderer {
     this.frame++;
     const gl = this.gl;
     const ds = this.view.zoom * this.dpr;
-    const lod = lodFor(ds);
-    const tw = tileWorld(lod);
     const vx = this.view.x, vy = this.view.y;
-    const tx0 = Math.floor(vx / tw), ty0 = Math.floor(vy / tw);
-    const tx1 = Math.floor((vx + this.cssW / this.view.zoom) / tw);
-    const ty1 = Math.floor((vy + this.cssH / this.view.zoom) / tw);
+    // The exact level (EXACT_TAG): offline always (exports); on screen once the view is still and
+    // its power-of-two tiles are done, and no stroke of this device is being drawn.
+    let drawingHere = false;
+    for (const l of this.live.values()) if (!l.remote && !l.ended) drawingHere = true;
+    const ex = this.offline || (performance.now() - this.lastViewChange >= EXACT_DELAY && !this.lastViewPending && !drawingHere) ? this.exactFor(ds, vx, vy) : null;
+    if (ex) this.setExact(ex);
+    const etw = ex ? tileWorld(ex.lod) : 0;
+    const exactRange: TileRange | null = ex
+      ? {
+          lod: ex.lod + EXACT_TAG,
+          tx0: Math.floor((vx - ex.ox) / etw + 1e-9),
+          ty0: Math.floor((vy - ex.oy) / etw + 1e-9),
+          tx1: Math.floor((vx - ex.ox + this.cssW / this.view.zoom) / etw - 1e-9),
+          ty1: Math.floor((vy - ex.oy + this.cssH / this.view.zoom) / etw - 1e-9),
+        }
+      : null;
+    // Offline the exact level is the only one; on screen the power-of-two one, then the exact one.
+    const lod = ex && this.offline ? ex.lod + EXACT_TAG : lodFor(ds);
+    const tw = ex && this.offline ? etw : tileWorld(lod);
+    const ox = ex && this.offline ? ex.ox : 0, oy = ex && this.offline ? ex.oy : 0;
+    const tx0 = exactRange && this.offline ? exactRange.tx0 : Math.floor(vx / tw), ty0 = exactRange && this.offline ? exactRange.ty0 : Math.floor(vy / tw);
+    const tx1 = exactRange && this.offline ? exactRange.tx1 : Math.floor((vx + this.cssW / this.view.zoom) / tw);
+    const ty1 = exactRange && this.offline ? exactRange.ty1 : Math.floor((vy + this.cssH / this.view.zoom) / tw);
     // Paint and adjustment layers that show: visible, in groups that are all visible.
     const visible = this.layers.filter((l) => l.kind !== 'group' && effectivelyVisible(this.byId, l));
     // Tile sets to keep current, topmost first: each paint layer, and each enabled layer mask.
@@ -1927,6 +2008,11 @@ export class GLRenderer implements Renderer {
     // Effect frames (blurs, glows, shadows) read these tiles: their level, with their margin.
     for (const r of this.effectRanges()) ranges.push(r);
     let total = ranges.reduce((n, r) => n + area(r), 0);
+    // Then the view's exact tiles (on screen; offline they are the view's own), within memory.
+    if (exactRange && !this.offline && total + area(exactRange) <= this.hardMaxTiles) {
+      ranges.push(exactRange);
+      total += area(exactRange);
+    }
     for (let up = 1; up <= (this.offline ? 0 : this.profile.coarseLevels) && lod + up <= MAX_LOD; up++) {
       const ctw = tileWorld(lod + up);
       const m = (2 ** up - 1) / 2; // margin on each side, in views: 2× the view, then 4×
@@ -1943,7 +2029,7 @@ export class GLRenderer implements Renderer {
       ranges.push(coarse);
     }
     outer: for (const r of ranges) {
-      const rtw = tileWorld(r.lod);
+      const rtw = tileWorld(this.level(r.lod)[0]);
       const cx = (vx + vw / 2) / rtw - 0.5, cy = (vy + vh / 2) / rtw - 0.5;
       const order: [number, number][] = [];
       for (let ty = r.ty0; ty <= r.ty1; ty++) for (let tx = r.tx0; tx <= r.tx1; tx++) order.push([tx, ty]);
@@ -2029,14 +2115,19 @@ export class GLRenderer implements Renderer {
     // 3. Composite the layers, bottom to top. A layer with clipped layers right above it is the
     //    base of a clipping group: the group draws in its own buffer, each clipped layer only where
     //    the base has alpha ("atop"), then goes onto the composite with the base's blend and opacity.
+    // On screen the exact tiles show once all of them are drawn (else the power-of-two ones).
+    const showExact = !this.offline && !!exactRange && ranges.includes(exactRange) && this.rangeReady(exactRange, keys);
+    this.exactShown = showExact;
+    const gl0 = showExact ? exactRange!.lod : lod, gtw = showExact ? etw : tw;
+    const gox = showExact ? ex!.ox : ox, goy = showExact ? ex!.oy : oy;
     const grid: Grid = {
-      lod,
-      tx0,
-      ty0,
-      tx1,
-      ty1,
-      X: (tx) => Math.round((tx * tw - vx) * ds),
-      Y: (ty) => Math.round((ty * tw - vy) * ds),
+      lod: gl0,
+      tx0: showExact ? exactRange!.tx0 : tx0,
+      ty0: showExact ? exactRange!.ty0 : ty0,
+      tx1: showExact ? exactRange!.tx1 : tx1,
+      ty1: showExact ? exactRange!.ty1 : ty1,
+      X: (tx) => Math.round((gox + tx * gtw - vx) * ds),
+      Y: (ty) => Math.round((goy + ty * gtw - vy) * ds),
       w: this.canvas.width,
       h: this.canvas.height,
       ns: '',
