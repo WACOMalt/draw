@@ -1376,6 +1376,16 @@ try {
     vw = await welcome();
     const plain = vw.layers.filter((l) => l.id === 'vrFALSE001');
     check(shared.makeBdraw(plain, [], 'test').version === 2 && shared.BDRAW_VERSION === 12, '3D: a file without threed keeps its old version');
+    // A layer in a deleted group (alive itself: from before groups took their layers with them)
+    // stays out of the file, with its strokes.
+    {
+      const G = { id: 'grpDELgone', name: 'G', order: 1, blend: 'pass', opacity: 1, visible: true, kind: 'group', deleted: true };
+      const K = { id: 'kidINgone1', name: 'K', order: 1, blend: 'normal', opacity: 1, visible: true, parent: 'grpDELgone' };
+      const T = { id: 'topLAYER01', name: 'T', order: 2, blend: 'normal', opacity: 1, visible: true };
+      const st = (id, layerId, seq) => ({ ...strokeOp(layerId).op.stroke, id, layerId, seq });
+      const f = shared.makeBdraw([G, K, T], [st('stkINgone1', 'kidINgone1', 1), st('stkONtop01', 'topLAYER01', 2)], 'test');
+      check(f.layers.map((l) => l.id).join() === 'topLAYER01' && f.strokes.map((x) => x.id).join() === 'stkONtop01', '.bdraw: layers in a deleted group stay out, with their strokes');
+    }
     const onlyStroke = shared.makeBdraw([vw.layers.find((l) => l.id === L1)], vw.strokes, 'test');
     check(onlyStroke.version === 11 && onlyStroke.strokes.find((x) => x.threed)?.threed.z.join() === '0,5', '3D: a 3D stroke makes a version 11 file');
     // (vrLAYER001 has a 3D kaleidoscope step by now: without it, a plain 3D layer.)

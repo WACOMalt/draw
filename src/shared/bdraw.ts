@@ -7,6 +7,7 @@
 // checks as live ops.
 
 import { docFeatures } from './features';
+import { effectivelyDeleted } from './layers';
 import { isDefaultPaper, type Layer, type MixMode, type Paper, type Shape, type Stroke } from './types';
 
 export const BDRAW_EXT = 'bdraw';
@@ -59,7 +60,9 @@ export function makeBdraw(
   paper?: Paper,
   mix: MixMode = 'normal',
 ): BdrawFile {
-  const live = [...layers].filter((l) => !l.deleted).sort((a, b) => a.order - b.order);
+  // Not deleted, and not in a deleted group (the 2D app shows neither).
+  const all = new Map([...layers].map((l) => [l.id, l]));
+  const live = [...all.values()].filter((l) => !effectivelyDeleted(all, l)).sort((a, b) => a.order - b.order);
   const ids = new Set(live.map((l) => l.id));
   const liveShapes = [...shapes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.z - b.z);
   const liveStrokes = [...strokes].filter((s) => !s.deleted && ids.has(s.layerId)).sort((a, b) => a.seq - b.seq);
