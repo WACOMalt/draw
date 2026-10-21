@@ -3211,7 +3211,11 @@ export class GLRenderer implements Renderer {
       const dx = e.dx ?? 0, dy = e.dy ?? 0;
       let src: Target;
       let map: [number, number, number, number];
-      if (g.ns === '') {
+      // A copy of a tilted kaleidoscope (kaleidoscope3) on the screen frame is the screen frame
+      // with the copy's strokes: its effects too need the pixels around the view. Blurred inside
+      // its own buffer, a copy's shadow lost what lay past the edge, and every export piece showed
+      // its edges.
+      if (g.ns === '' || g.ns === 'k3:') {
         // Screen: from an effect frame, with the pixels around the view.
         const f = this.fxGrid(sigma, dx, dy);
         src = this.gaussian(source(f.g), f.sigma, `${f.g.ns}g`);
