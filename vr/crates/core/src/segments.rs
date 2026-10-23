@@ -240,6 +240,11 @@ pub fn clusters(chunks: &[GpuChunk], base: u32, out: &mut Vec<GpuCluster>) {
     }
 }
 
+/// The detail a kaleidoscope's copies keep, in the painting's units (m). A shared canvas is
+/// made again at a new scale when it is scaled past 4 times (canvas.rs SCALE_RANGE), so this
+/// shows at most 1 mm wide: about a pixel at arm's length.
+pub const COPY_DETAIL: f32 = 0.00025;
+
 /// How far apart the resampled points are: a third of the radius (round cones then overlap
 /// enough to look smooth), but at least 0.5 mm.
 fn spacing(radius: f32) -> f32 {
@@ -423,9 +428,19 @@ impl Stroke {
     /// flow and spacing (its core covered by its opacity when the flow builds up), its path
     /// filtered by `filter` first.
     pub fn tube_segments(&self, filter: OneEuro3, id: u32, out: &mut Vec<GpuSegment>) {
+        self.tube_segments_at(filter, id, 0.0, out);
+    }
+
+    /// `tube_segments` with detail down to `detail` (m) only: points closer than half of it
+    /// merge, a segment strays from the points by up to half of it and runs to 8 times it, and
+    /// dabs closer than it are drawn as a trail (their dynamics left out). For a kaleidoscope's
+    /// small copies, whose detail is too fine to see.
+    pub fn tube_segments_at(&self, filter: OneEuro3, id: u32, detail: f32, out: &mut Vec<GpuSegment>) {
         let brush = &self.brush;
-        // Dynamics and airbrush change each dab: single dabs.
-        if brush.jitters() || brush.buildup {
+        // Dynamics and airbrush change each dab: single dabs (unless they are closer than the
+        // detail).
+        let dab_step = brush.dab_settings().spacing.max(0.005) * 2.0 * brush.radius;
+        if (brush.jitters() || brush.buildup) && dab_step >= detail {
             self.dab_stamps(filter, id, out);
             return;
         }
@@ -436,7 +451,7 @@ impl Stroke {
         let mut ups: Vec<Vec3> = Vec::with_capacity(self.samples.len());
         for s in &self.samples {
             let pos = if brush.dabs.is_some() { s.pos } else { f.filter(s.time, s.pos) };
-            if pts.last().is_none_or(|&(p, _)| (pos - p).length() > 1e-4) {
+            if pts.last().is_none_or(|&(p, _)| (pos - p).length() > (0.5 * detail).max(1e-4)) {
                 pts.push((pos, s.pressure));
                 ups.push(align(s.up, ups.last().copied()));
             }
@@ -473,15 +488,17 @@ impl Stroke {
             for j in i + 2..pts.len() {
                 let (b, qb) = pts[j];
                 let rb = brush.radius_at(qb);
-                if (b - a).length() > 6.0 * ra.min(rb) || !near(ra, rb) || !near(da, density(qb)) || turned(i, j) {
+                // Thinner than the detail: changes of size and flow do not show.
+                let fine = ra.max(rb) < detail;
+                if (b - a).length() > (6.0 * ra.min(rb)).max(8.0 * detail) || !fine && (!near(ra, rb) || !near(da, density(qb))) || turned(i, j) {
                     break;
                 }
-                let tol = (0.1 * ra.min(rb)).max(2e-4);
+                let tol = (0.1 * ra.min(rb)).max(2e-4).max(0.5 * detail);
                 let axis = (b - a).normalize_or_zero();
                 let straight = (i + 1..j).all(|m| {
                     let (p, q) = pts[m];
                     let d = p - a;
-                    (d - axis * d.dot(axis)).length() <= tol && near(ra, brush.radius_at(q)) && near(da, density(q)) && !turned(i, m)
+                    (d - axis * d.dot(axis)).length() <= tol && (fine || near(ra, brush.radius_at(q)) && near(da, density(q))) && !turned(i, m)
                 });
                 if !straight {
                     break;
@@ -504,6 +521,25 @@ impl Stroke {
             self.tube_segments(filter, id, out);
         } else {
             self.segments(filter, id, out);
+        }
+    }
+
+    /// `segments_in` for a kaleidoscope's copy, the stroke moved by `m`: the identity draws
+    /// the stroke as it is; a copy has detail down to `COPY_DETAIL` only (a stroke thinner
+    /// than that is left out), so small copies (of many, nested) have few segments.
+    pub fn copy_segments_in(&self, m: &glam::Mat4, filter: OneEuro3, id: u32, ordered: bool, out: &mut Vec<GpuSegment>) {
+        if *m == glam::Mat4::IDENTITY {
+            self.segments_in(filter, id, ordered, out);
+        } else if let Some(t) = self.transformed(m) {
+            // Thinner than the detail: it does not show.
+            if 2.0 * t.brush.radius < COPY_DETAIL {
+                return;
+            }
+            if ordered {
+                t.tube_segments_at(filter, id, COPY_DETAIL, out);
+            } else {
+                t.segments(filter, id, out);
+            }
         }
     }
 
@@ -708,6 +744,30 @@ mod tests {
         out.clear();
         one.tube_segments(OneEuro3::default(), 0, &mut out);
         assert!(out.len() == 1 && out[0].a() == out[0].b());
+    }
+
+    #[test]
+    fn a_small_copy_keeps_only_the_detail_that_shows() {
+        let dabs = crate::stroke::Dabs { flow: 0.5, spacing: 0.1, pressure_flow: false };
+        let brush = Brush { radius: 0.01, pressure_size: false, hardness: 0.5, dabs: Some(dabs), ..Default::default() };
+        // A zigzag with 4 mm teeth (10 segments as it is).
+        let mut z = Stroke::new(brush);
+        for i in 0..=40 {
+            let y = if (i / 4) % 2 == 0 { (i % 4) as f32 } else { 4.0 - (i % 4) as f32 };
+            z.push(Sample::new(Vec3::new(i as f32 * 0.001, y * 0.001, 0.0), 1.0, i as f64));
+        }
+        let count = |m: glam::Mat4| {
+            let mut out = Vec::new();
+            z.copy_segments_in(&m, OneEuro3::default(), 0, true, &mut out);
+            out.len()
+        };
+        assert_eq!(count(glam::Mat4::IDENTITY), 10);
+        // Turned, at its size: all its corners still.
+        assert_eq!(count(glam::Mat4::from_rotation_z(1.0)), 10);
+        // At 2%: its teeth (0.08 mm) are finer than the detail: one or two segments.
+        assert!(count(glam::Mat4::from_scale(Vec3::splat(0.02))) <= 2);
+        // At 1%: 0.2 mm wide, thinner than the detail: left out.
+        assert_eq!(count(glam::Mat4::from_scale(Vec3::splat(0.01))), 0);
     }
 
     #[test]

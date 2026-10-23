@@ -623,11 +623,7 @@ impl Painting {
         let first = out.len();
         for m in &copies {
             for (j, s) in list.iter().enumerate() {
-                if *m == Mat4::IDENTITY {
-                    s.segments_in(self.filter, base + j as u32, l.ordered, out);
-                } else if let Some(t) = s.transformed(m) {
-                    t.segments_in(self.filter, base + j as u32, l.ordered, out);
-                }
+                s.copy_segments_in(m, self.filter, base + j as u32, l.ordered, out);
             }
         }
         built.runs.push(LayerRun { step: built.steps.len(), first, count: out.len() - first });

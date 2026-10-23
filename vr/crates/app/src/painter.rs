@@ -744,11 +744,7 @@ impl Painter {
         for (step, copies) in built.runs_of(layer, mask) {
             let first = out.len();
             for m in copies {
-                if *m == glam::Mat4::IDENTITY {
-                    stroke.segments_in(painting.filter, id, ordered, out);
-                } else if let Some(t) = stroke.transformed(m) {
-                    t.segments_in(painting.filter, id, ordered, out);
-                }
+                stroke.copy_segments_in(m, painting.filter, id, ordered, out);
             }
             runs.push(vdraw_core::LayerRun { step, first, count: out.len() - first });
         }
